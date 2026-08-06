@@ -397,9 +397,15 @@ pub trait Mailer: Send + Sync {
     /// Cheap connectivity probe used by `/healthz` (e.g. SMTP NOOP or config check).
     async fn ping(&self) -> Result<()>;
 
-    /// Sends a plain-text email. Templated multipart mail arrives with the `mail` crate
-    /// build-out.
+    /// Sends a plain-text email.
     async fn send(&self, to: &str, subject: &str, body: &str) -> Result<()>;
+
+    /// Sends a two-part (text + HTML alternative) email. The default falls back to the
+    /// plain-text path so simple implementations stay one method.
+    async fn send_multipart(&self, to: &str, subject: &str, text: &str, html: &str) -> Result<()> {
+        let _ = html;
+        self.send(to, subject, text).await
+    }
 }
 
 /// The full set of identity & access repository handles, as one cloneable bundle.

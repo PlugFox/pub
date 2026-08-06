@@ -69,6 +69,169 @@ pub struct Settings {
     pub telemetry: TelemetryConfig,
     /// Multi-instance topology.
     pub cluster: ClusterConfig,
+    /// Authentication: JWT keyring, OTP pepper, session windows, rate limits.
+    pub auth: AuthConfig,
+    /// Outbound SMTP; unset host = the in-memory dev mailer.
+    pub smtp: SmtpConfig,
+}
+
+/// Deployment mode: gates the dev-only secret fallbacks (S-25).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    /// Local development: missing auth secrets fall back to loud ephemeral values.
+    #[default]
+    Dev,
+    /// Production-like: missing pepper/signing key is a startup error.
+    Production,
+}
+
+impl RunMode {
+    /// Canonical lowercase name as used in config files.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Production => "production",
+        }
+    }
+}
+
+/// Authentication section (S-03, S-07, S-08, S-24, S-25, S-31; decisions 03/13/17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Access-JWT TTL in minutes; must stay ≤ 15 (S-07).
+    pub access_ttl_minutes: u64,
+    /// Refresh-session sliding idle timeout in days (decision 03 default: 30).
+    pub refresh_idle_days: u64,
+    /// Refresh-session absolute cap in days (decision 03 default: 90).
+    pub refresh_absolute_days: u64,
+    /// Server pepper for OTP HMACs (secret — S-25). Required in production mode; dev mode
+    /// falls back to an ephemeral value with a loud warning.
+    pub otp_pepper: Option<String>,
+    /// CLI token prefix incl. the trailing underscore (decision 17 default: `pub_`).
+    pub token_prefix: String,
+    /// Whether a successful first OTP login may create an account.
+    pub allow_registration: bool,
+    /// Sign-in email-domain allowlist; empty = every domain allowed (S-31).
+    pub allowed_email_domains: Vec<String>,
+    /// Ed25519 signing/verify keyring (S-07/S-27).
+    pub jwt: JwtConfig,
+    /// Auth-plane rate limits (S-24 defaults).
+    pub rate_limit: AuthRateLimitConfig,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            access_ttl_minutes: 15,
+            refresh_idle_days: 30,
+            refresh_absolute_days: 90,
+            otp_pepper: None,
+            token_prefix: "pub_".to_owned(),
+            allow_registration: true,
+            allowed_email_domains: Vec::new(),
+            jwt: JwtConfig::default(),
+            rate_limit: AuthRateLimitConfig::default(),
+        }
+    }
+}
+
+/// Ed25519 access-token keyring (S-07): one signing key, N verify keys, rotated by `kid`
+/// overlap (S-27). Seeds are base64-encoded 32-byte values (secrets — S-25).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JwtConfig {
+    /// `kid` of the signing key. Required whenever `signing_key` is set.
+    pub kid: Option<String>,
+    /// Base64-encoded 32-byte Ed25519 seed used for signing (secret). Required in production
+    /// mode; dev mode falls back to an ephemeral keyring with a loud warning.
+    pub signing_key: Option<String>,
+    /// Previous-generation verify keys kept during rotation overlap.
+    pub verify_keys: Vec<JwtVerifyKey>,
+}
+
+/// One retired-but-still-verifying key (S-27 rotation overlap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JwtVerifyKey {
+    /// Key id embedded in tokens signed by this key.
+    pub kid: String,
+    /// Base64-encoded 32-byte Ed25519 seed (secret).
+    pub key: String,
+}
+
+/// Auth-plane rate limits (S-24). Only the OTP-request knobs exist in this slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthRateLimitConfig {
+    /// OTP requests per email per hour (S-24: 5).
+    pub otp_per_email_hour: u32,
+    /// OTP requests per IP per hour (S-24: 20).
+    pub otp_per_ip_hour: u32,
+}
+
+impl Default for AuthRateLimitConfig {
+    fn default() -> Self {
+        Self { otp_per_email_hour: 5, otp_per_ip_hour: 20 }
+    }
+}
+
+/// SMTP transport security mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpSecurityMode {
+    /// Implicit TLS from the first byte (usually port 465).
+    Tls,
+    /// Plaintext upgraded via STARTTLS (usually port 587) — the default.
+    #[default]
+    Starttls,
+    /// No transport security — local relays and tests only.
+    None,
+}
+
+impl SmtpSecurityMode {
+    /// Canonical lowercase name as used in config files.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Starttls => "starttls",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Outbound SMTP settings. `host` unset selects the in-memory mailer (dev/test).
+///
+/// The password is boot-config/env only for now; it moves into runtime settings
+/// envelope-encrypted with the env KEK later (S-26).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmtpConfig {
+    /// SMTP server hostname; unset = no SMTP, use the in-memory mailer.
+    pub host: Option<String>,
+    /// SMTP server port.
+    pub port: u16,
+    /// Optional login user.
+    pub username: Option<String>,
+    /// Password for `username` (secret — always masked in the startup summary).
+    pub password: Option<String>,
+    /// `From:` mailbox, e.g. `Pub <noreply@pub.example>`.
+    pub from: String,
+    /// Transport security: `tls` | `starttls` | `none`.
+    pub security: SmtpSecurityMode,
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: 587,
+            username: None,
+            password: None,
+            from: "Pub <noreply@localhost>".to_owned(),
+            security: SmtpSecurityMode::Starttls,
+        }
+    }
 }
 
 /// HTTP server settings.
@@ -79,11 +242,14 @@ pub struct ServerConfig {
     pub listen: String,
     /// Public base URL clients use to reach this instance (used in `PUB_HOSTED_URL` snippets).
     pub public_url: String,
+    /// Deployment mode: `dev` (default) allows ephemeral auth-secret fallbacks; `production`
+    /// makes missing secrets a startup error (S-25).
+    pub mode: RunMode,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { listen: "0.0.0.0:8080".to_owned(), public_url: "http://localhost:8080".to_owned() }
+        Self { listen: "0.0.0.0:8080".to_owned(), public_url: "http://localhost:8080".to_owned(), mode: RunMode::Dev }
     }
 }
 
@@ -292,6 +458,7 @@ impl Settings {
         let mut out = String::from("effective configuration:\n");
         let _ = writeln!(out, "  server.listen        = {}", self.server.listen);
         let _ = writeln!(out, "  server.public_url    = {}", self.server.public_url);
+        let _ = writeln!(out, "  server.mode          = {}", self.server.mode.as_str());
         let _ = writeln!(out, "  database.kind        = {}", self.database.kind.as_str());
         match self.database.kind {
             DatabaseKind::Sqlite => {
@@ -324,6 +491,51 @@ impl Settings {
         let _ = writeln!(out, "  telemetry.prometheus = {}", self.telemetry.prometheus);
         let _ = writeln!(out, "  telemetry.otlp       = {}", self.telemetry.otlp);
         let _ = writeln!(out, "  cluster.replicas     = {}", self.cluster.replicas);
+
+        // Auth: secrets masked (S-25); kids are public metadata and are listed for rotation
+        // sanity checks.
+        let _ = writeln!(out, "  auth.access_ttl      = {} min", self.auth.access_ttl_minutes);
+        let _ = writeln!(
+            out,
+            "  auth.refresh         = idle {} d / absolute {} d",
+            self.auth.refresh_idle_days, self.auth.refresh_absolute_days
+        );
+        let _ = writeln!(out, "  auth.otp_pepper      = {}", mask_opt(&self.auth.otp_pepper));
+        let _ = writeln!(out, "  auth.token_prefix    = {}", self.auth.token_prefix);
+        let _ = writeln!(out, "  auth.registration    = {}", self.auth.allow_registration);
+        let domains = if self.auth.allowed_email_domains.is_empty() {
+            "<all>".to_owned()
+        } else {
+            self.auth.allowed_email_domains.join(", ")
+        };
+        let _ = writeln!(out, "  auth.email_domains   = {domains}");
+        let _ = writeln!(out, "  auth.jwt.kid         = {}", opt(&self.auth.jwt.kid));
+        let _ = writeln!(out, "  auth.jwt.signing_key = {}", mask_opt(&self.auth.jwt.signing_key));
+        let verify_kids: Vec<&str> = self.auth.jwt.verify_keys.iter().map(|k| k.kid.as_str()).collect();
+        let _ = writeln!(
+            out,
+            "  auth.jwt.verify_kids = {}",
+            if verify_kids.is_empty() { "<none>".to_owned() } else { verify_kids.join(", ") }
+        );
+        let _ = writeln!(
+            out,
+            "  auth.rate_limit      = otp {}/h/email, {}/h/ip",
+            self.auth.rate_limit.otp_per_email_hour, self.auth.rate_limit.otp_per_ip_hour
+        );
+
+        match &self.smtp.host {
+            Some(host) => {
+                let _ = writeln!(out, "  smtp.host            = {host}");
+                let _ = writeln!(out, "  smtp.port            = {}", self.smtp.port);
+                let _ = writeln!(out, "  smtp.security        = {}", self.smtp.security.as_str());
+                let _ = writeln!(out, "  smtp.username        = {}", opt(&self.smtp.username));
+                let _ = writeln!(out, "  smtp.password        = {}", mask_opt(&self.smtp.password));
+                let _ = writeln!(out, "  smtp.from            = {}", self.smtp.from);
+            }
+            None => {
+                let _ = writeln!(out, "  smtp                 = <unset — in-memory mailer>");
+            }
+        }
         out
     }
 }

@@ -1,11 +1,12 @@
 //! HTTP surface of the Pub registry: axum routers, OpenAPI (utoipa), embedded static
 //! assets, and the tower middleware stack.
 //!
-//! Skeleton scope: `/healthz`, `/api/v1/ping`, `/api/openapi.json`, and SPA-style serving of
-//! the embedded frontend. Protocol routes (`/o/{org}/pub/…`, `/pub/…`), auth extractors,
-//! and rate limiting land in later roadmap steps.
+//! Current scope: system endpoints, the email-OTP auth vertical (S-03/S-04), session and
+//! CLI-token management (S-08/S-09/S-13), and minimal orgs. Protocol routes (`/o/{org}/pub/…`,
+//! `/pub/…`) land in later roadmap steps.
 //!
-//! Middleware order (docs/rules/api.md): request-id → tracing → security headers.
+//! Middleware order (docs/rules/api.md): request-id → tracing → security headers → rate
+//! limit → auth (typed extractors in handlers).
 
 use axum::Json;
 use axum::Router;
@@ -15,16 +16,34 @@ use tower::ServiceBuilder;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
-use utoipa::OpenApi;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 mod assets;
+pub mod dto;
 pub mod envelope;
+pub mod error;
+pub mod extract;
+pub mod guard;
 pub mod routes;
 mod state;
 
-pub use state::AppState;
+pub use state::{AppState, Clock};
+
+/// Registers the `bearer_auth` scheme referenced by authed routes (docs/rules/api.md).
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearer_auth",
+            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).bearer_format("JWT").build()),
+        );
+    }
+}
 
 /// Root OpenAPI document; route annotations are merged in by [`router`].
 #[derive(OpenApi)]
@@ -33,7 +52,14 @@ pub use state::AppState;
         title = "Pub API",
         description = "Self-hosted package registry — app REST API and system endpoints."
     ),
-    tags((name = "system", description = "Health and system endpoints"))
+    modifiers(&SecurityAddon),
+    tags(
+        (name = "system", description = "Health and system endpoints"),
+        (name = "auth", description = "Email-OTP sign-in, refresh, logout"),
+        (name = "sessions", description = "Web session management"),
+        (name = "tokens", description = "CLI/API tokens"),
+        (name = "orgs", description = "Organizations"),
+    )
 )]
 struct ApiDoc;
 
@@ -41,8 +67,18 @@ struct ApiDoc;
 /// and the middleware stack.
 pub fn router(state: AppState) -> Router {
     let (api_router, openapi) = OpenApiRouter::<AppState>::with_openapi(ApiDoc::openapi())
-        .routes(routes!(routes::healthz))
-        .routes(routes!(routes::ping))
+        .routes(routes!(routes::system::healthz))
+        .routes(routes!(routes::system::ping))
+        .routes(routes!(routes::auth::otp_request))
+        .routes(routes!(routes::auth::otp_verify))
+        .routes(routes!(routes::auth::refresh))
+        .routes(routes!(routes::auth::logout))
+        .routes(routes!(routes::sessions::list))
+        .routes(routes!(routes::sessions::revoke))
+        .routes(routes!(routes::sessions::revoke_all))
+        .routes(routes!(routes::tokens::create, routes::tokens::list))
+        .routes(routes!(routes::tokens::revoke))
+        .routes(routes!(routes::orgs::create, routes::orgs::list))
         .split_for_parts();
 
     Router::new()
@@ -67,7 +103,12 @@ pub fn router(state: AppState) -> Router {
                 .layer(SetResponseHeaderLayer::if_not_present(
                     header::X_FRAME_OPTIONS,
                     HeaderValue::from_static("DENY"),
-                )),
+                ))
+                // Auth rate limits (S-24) run after the header layers, before handlers; the
+                // guard scopes itself to auth paths internally.
+                .layer(axum::middleware::from_fn_with_state(state.clone(), guard::auth_rate_limit))
+                // S-12 mutation guard: custom header + JSON-only bodies on /api mutations.
+                .layer(axum::middleware::from_fn(guard::mutation_guard)),
         )
         .with_state(state)
 }

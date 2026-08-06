@@ -15,7 +15,9 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 pub-api = { workspace = true }
+pub-auth = { workspace = true }
 pub-blob = { workspace = true }
+pub-mail = { workspace = true }
 pub-config = { workspace = true }
 pub-core = { workspace = true }
 pub-db-postgres = { workspace = true }

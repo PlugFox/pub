@@ -5,16 +5,22 @@
 //! with graceful shutdown.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{CommandFactory as _, FromArgMatches as _};
 use pub_api::AppState;
+use pub_auth::flows::{AuthPolicy, AuthService};
+use pub_auth::jwt::Keyring;
+use pub_auth::random::{OsRandom, RandomSource as _};
 use pub_blob::ObjectStoreBlob;
-use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, Settings};
-use pub_core::traits::{BlobStore, Kv, Repositories};
+use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, Settings, SmtpSecurityMode};
+use pub_core::session::SessionLimits;
+use pub_core::traits::{BlobStore, Kv, Mailer, Repositories};
 use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
 use pub_kv::{MemoryKv, RedisKv};
+use pub_mail::{InMemoryMailer, SmtpMailer, SmtpSecurity, SmtpSettings};
 use pub_telemetry::LogFormat;
 
 /// Version string surfaced by `pubd --version`: crate version + git hash + build date.
@@ -36,9 +42,11 @@ async fn main() -> anyhow::Result<()> {
     let repos = build_database(&settings).await?;
     let blob = build_blob(&settings)?;
     let kv = build_kv(&settings)?;
+    let mailer = build_mailer(&settings)?;
+    let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer))?;
 
     let listen = settings.server.listen.clone();
-    let state = AppState::new(settings, repos, blob, kv);
+    let state = AppState::new(settings, repos, blob, kv, auth);
     let app = pub_api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("failed to bind {listen}"))?;
@@ -88,6 +96,94 @@ fn build_kv(settings: &Settings) -> anyhow::Result<Arc<dyn Kv>> {
         KvKind::Redis => Arc::new(RedisKv::from_config(&settings.kv).context("failed to configure redis kv")?),
     };
     Ok(kv)
+}
+
+/// SMTP configured → [`SmtpMailer`]; otherwise the in-memory mailer with a loud warning
+/// (dev convenience — OTP mails end up in memory, never delivered).
+fn build_mailer(settings: &Settings) -> anyhow::Result<Arc<dyn Mailer>> {
+    let mailer: Arc<dyn Mailer> = match &settings.smtp.host {
+        Some(host) => {
+            let smtp = SmtpSettings {
+                host: host.clone(),
+                port: settings.smtp.port,
+                username: settings.smtp.username.clone(),
+                // Env/boot-config only for now; moves into KEK-encrypted runtime settings
+                // later (S-26).
+                password: settings.smtp.password.clone(),
+                from: settings.smtp.from.clone(),
+                security: match settings.smtp.security {
+                    SmtpSecurityMode::Tls => SmtpSecurity::Tls,
+                    SmtpSecurityMode::Starttls => SmtpSecurity::Starttls,
+                    SmtpSecurityMode::None => SmtpSecurity::None,
+                },
+            };
+            tracing::info!(host = %smtp.host, port = smtp.port, "smtp mailer configured");
+            Arc::new(SmtpMailer::new(&smtp).map_err(|err| anyhow::anyhow!("{err}"))?)
+        }
+        None => {
+            tracing::warn!(
+                "smtp.host is not configured — using the in-memory mailer: \
+                 OTP and notification emails are NOT delivered anywhere"
+            );
+            Arc::new(InMemoryMailer::new())
+        }
+    };
+    Ok(mailer)
+}
+
+/// Builds the auth service: keyring + pepper from config, with loud ephemeral dev fallbacks
+/// (the config validator guarantees real secrets in production mode — S-25).
+fn build_auth(
+    settings: &Settings,
+    repos: Repositories,
+    kv: Arc<dyn Kv>,
+    mailer: Arc<dyn Mailer>,
+) -> anyhow::Result<Arc<AuthService>> {
+    let rng = Arc::new(OsRandom);
+    let auth_cfg = &settings.auth;
+
+    let keyring = match (&auth_cfg.jwt.kid, &auth_cfg.jwt.signing_key) {
+        (Some(kid), Some(key)) => {
+            let verify: Vec<(String, String)> =
+                auth_cfg.jwt.verify_keys.iter().map(|entry| (entry.kid.clone(), entry.key.clone())).collect();
+            Keyring::from_base64(kid, key, &verify).map_err(|err| anyhow::anyhow!("{err}"))?
+        }
+        _ => {
+            tracing::warn!(
+                "auth.jwt.signing_key is not configured — generated an EPHEMERAL dev keyring: \
+                 every session and access token dies with this process (dev mode only, S-25)"
+            );
+            Keyring::ephemeral(rng.as_ref())
+        }
+    };
+
+    let otp_pepper = match &auth_cfg.otp_pepper {
+        Some(pepper) => pepper.clone().into_bytes(),
+        None => {
+            tracing::warn!(
+                "auth.otp_pepper is not configured — generated an EPHEMERAL dev pepper: \
+                 outstanding OTP codes die with this process (dev mode only, S-25)"
+            );
+            let mut pepper = [0u8; 32];
+            rng.fill(&mut pepper);
+            pepper.to_vec()
+        }
+    };
+
+    let policy = AuthPolicy {
+        access_ttl: Duration::from_secs(auth_cfg.access_ttl_minutes * 60),
+        session_limits: SessionLimits {
+            idle_timeout: Duration::from_secs(auth_cfg.refresh_idle_days * 24 * 3600),
+            absolute_cap: Duration::from_secs(auth_cfg.refresh_absolute_days * 24 * 3600),
+        },
+        otp_pepper,
+        token_prefix: auth_cfg.token_prefix.clone(),
+        allow_registration: auth_cfg.allow_registration,
+        allowed_email_domains: auth_cfg.allowed_email_domains.iter().map(|d| d.to_ascii_lowercase()).collect(),
+        otp_per_email_hour: auth_cfg.rate_limit.otp_per_email_hour,
+        otp_per_ip_hour: auth_cfg.rate_limit.otp_per_ip_hour,
+    };
+    Ok(Arc::new(AuthService::new(repos, kv, mailer, keyring, policy, rng)))
 }
 
 /// Resolves on SIGINT (Ctrl+C) or SIGTERM (orchestrator stop).

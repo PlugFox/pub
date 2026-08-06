@@ -27,6 +27,17 @@ pub enum Error {
     /// The API layer decides whether this surfaces as 403 or 404 (decision 05 ladder).
     #[error("forbidden: {message}")]
     Forbidden { message: String },
+    /// Authentication is absent, malformed, expired, or otherwise invalid (S-07/S-08).
+    /// Deliberately coarse: callers never learn *why* a credential failed.
+    #[error("unauthorized: {message}")]
+    Unauthorized { message: String },
+    /// OTP verification failed: wrong code, expired record, or unknown pending id — all
+    /// indistinguishable by design (S-03 single-use policy + S-04 anti-enumeration).
+    #[error("invalid or expired code")]
+    InvalidCode,
+    /// A rate limit tripped (S-24); carries the client-facing `Retry-After` hint in seconds.
+    #[error("rate limited, retry after {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
     /// The resource exists but its validity window has passed (invitation, session, token).
     #[error("expired: {what}")]
     Expired { what: String },
@@ -66,6 +77,9 @@ impl Error {
             Self::NotFound { .. } => "not_found",
             Self::Conflict { .. } => "conflict",
             Self::Forbidden { .. } => "forbidden",
+            Self::Unauthorized { .. } => "unauthorized",
+            Self::InvalidCode => "invalid_code",
+            Self::RateLimited { .. } => "rate_limited",
             Self::Expired { .. } => "expired",
             Self::LastOwner { .. } => "last_owner",
             Self::RefreshReused { .. } => "refresh_reused",
@@ -89,6 +103,9 @@ mod tests {
             Error::NotFound { what: "w".into() },
             Error::Conflict { message: "m".into() },
             Error::Forbidden { message: "m".into() },
+            Error::Unauthorized { message: "m".into() },
+            Error::InvalidCode,
+            Error::RateLimited { retry_after_secs: 60 },
             Error::Expired { what: "w".into() },
             Error::LastOwner { org: crate::OrgId::new() },
             Error::RefreshReused { session: crate::SessionId::new() },
@@ -111,6 +128,9 @@ mod tests {
                 "not_found",
                 "conflict",
                 "forbidden",
+                "unauthorized",
+                "invalid_code",
+                "rate_limited",
                 "expired",
                 "last_owner",
                 "refresh_reused",

@@ -1,0 +1,7 @@
+Your sign-in code: {{ code }}
+
+Requested from IP: {{ requester_ip }}
+This code expires in {{ expiry_minutes }} minutes and can be used once.
+
+If you did not request this code, you can safely ignore this message —
+nobody can sign in without it.

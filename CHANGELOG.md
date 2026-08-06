@@ -2,6 +2,21 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-06 — auth vertical slice: email OTP, sessions/JWT, CLI tokens
+
+### Added
+
+- (server) `pub-auth` crate ([crates/auth](server/crates/auth/)): Ed25519 JWT keyring with strict-`kid` resolution, pinned `EdDSA`, ±30 s skew, and rotation overlap (S-07/S-27); email OTP primitives — 8-digit CSPRNG codes, peppered HMAC-SHA-256 storage form, constant-time compare, KV pending-auth records under opaque 128-bit ids with 10-min TTL, ≤5 attempts, ≥60 s resend that invalidates the prior code, single-use (S-03); CLI-token format `pub_` + 30 base62 + CRC32 checksum with offline validation, SHA-256 at rest, first-8 display hint (S-13, decisions 13/17); fixed-window KV rate counters (S-24); and the `AuthService` flow facade (request/verify OTP, refresh with reuse-revokes-family, logout/revoke with DB + KV-blocklist revocation per S-08/S-09, org-role-gated token minting through `authorize()`), all clock-injected and audit-logging (`auth.otp.requested`, `auth.login.success/failure`, `auth.throttled`, `session.revoked`, `token.created/revoked`).
+- (server) `pub-mail` crate: `SmtpMailer` (lettre, rustls, tls/starttls/none) and `InMemoryMailer` test/dev double behind the core `Mailer` trait (new `send_multipart` with plain-text fallback); askama text+HTML templates for the OTP email rendering code, requester IP, and expiry minutes.
+- (server) App API auth surface ([crates/api](server/crates/api/)): `POST /api/v1/auth/otp/{request,verify}` (uniform anti-enumeration responses incl. domain-allowlist rejections — S-04/S-31; every OTP failure is the same `invalid_code` 401), `POST /api/v1/auth/refresh` (`refresh_reused` 401 on reuse), `POST /api/v1/auth/logout`, session management (`GET /api/v1/sessions` with current flag, `DELETE /api/v1/sessions/{sid}`, `POST /api/v1/sessions/revoke-all` — S-09/S-10), CLI tokens (`POST/GET /api/v1/tokens`, `DELETE /api/v1/tokens/{id}` — show-once secret, S-13), and minimal orgs (`POST/GET /api/v1/orgs`); `AuthContext` extractor verifying Bearer JWTs against the keyring plus the revoked-`sid` KV fast path that fails closed with 503 on KV loss (S-09); S-12 mutation guard (`X-Pub-Request: 1` + JSON-only bodies) and a KV-backed per-IP OTP rate-limit layer with 429 + `Retry-After` (S-24); `bearer_auth` scheme registered in OpenAPI.
+- (server) Config: `server.mode` (`dev`/`production`), `[auth]` section (access TTL capped at 15 min per S-07, refresh idle/absolute days, OTP pepper, token prefix, registration flag, S-31 email-domain allowlist, JWT signing/verify keys with seed validation, S-24 rate-limit numbers) and `[smtp]` section; production mode refuses to boot without pepper/signing key (S-25), dev mode falls back to loud ephemeral secrets in `pubd`; effective-config summary masks all new secrets.
+- (server) 15 integration tests over the full in-memory stack with an injected clock ([api/tests/auth.rs](server/crates/api/tests/auth.rs)), security behavior named by requirement: S-03 (happy path/single-use, attempt exhaustion, resend), S-04, S-31, S-07, S-08, S-09, S-12, S-13 (×2 + scope gating), S-24, plus session and org happy paths.
+
+### Changed
+
+- (server) `core::Error` gained `Unauthorized`, `InvalidCode`, and `RateLimited` variants (stable codes `unauthorized`/`invalid_code`/`rate_limited`); the API error mapper turns them into 401/401/429 (+`Retry-After`) and maps KV failures to 503 (fail closed).
+- (server) `AppState` now carries the `AuthService` and an injectable clock; `pubd` builds the mailer (SMTP when configured, in-memory with a warning otherwise) and the auth service at startup.
+
 ## 2026-08-06 — Postgres identity backend
 
 ### Added

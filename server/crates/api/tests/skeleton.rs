@@ -1,33 +1,16 @@
 //! Integration tests for the API skeleton: full router over in-memory backends
 //! (docs/rules/rust.md — no containers locally).
 
-use std::sync::Arc;
+mod common;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
-use pub_api::AppState;
-use pub_blob::ObjectStoreBlob;
-use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings};
-use pub_db_sqlite::SqliteDb;
-use pub_kv::MemoryKv;
 use tower::ServiceExt;
 
 async fn test_router() -> Router {
-    // Report the kinds that are actually wired below.
-    let mut settings = Settings {
-        database: DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() },
-        ..Settings::default()
-    };
-    settings.blob.kind = BlobKind::Memory;
-    settings.kv.kind = KvKind::Memory;
-
-    let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
-    db.run_migrations().await.expect("migrate");
-    let state =
-        AppState::new(settings, db.repositories(), Arc::new(ObjectStoreBlob::memory()), Arc::new(MemoryKv::new()));
-    pub_api::router(state)
+    common::TestApp::new().await.router
 }
 
 async fn get(path: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {

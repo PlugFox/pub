@@ -219,8 +219,198 @@ fn summary_masks_redis_password() {
 fn summary_lists_defaults() {
     let summary = load_from(&CliArgs::default(), no_env()).unwrap().summary();
     assert!(summary.contains("server.listen        = 0.0.0.0:8080"));
+    assert!(summary.contains("server.mode          = dev"));
     assert!(summary.contains("database.kind        = sqlite"));
     assert!(summary.contains("blob.kind            = fs"));
     assert!(summary.contains("kv.kind              = memory"));
     assert!(summary.contains("cluster.replicas     = 1"));
+    assert!(summary.contains("smtp                 = <unset — in-memory mailer>"));
+}
+
+// --- auth section ---
+
+/// A valid base64-encoded 32-byte Ed25519 seed.
+fn seed_b64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+}
+
+#[test]
+fn auth_defaults_match_security_doc() {
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.server.mode, RunMode::Dev);
+    assert_eq!(settings.auth.access_ttl_minutes, 15); // S-07
+    assert_eq!(settings.auth.refresh_idle_days, 30); // decision 03
+    assert_eq!(settings.auth.refresh_absolute_days, 90);
+    assert_eq!(settings.auth.otp_pepper, None);
+    assert_eq!(settings.auth.token_prefix, "pub_"); // decision 17
+    assert!(settings.auth.allow_registration);
+    assert!(settings.auth.allowed_email_domains.is_empty()); // S-31: empty = allow all
+    assert_eq!(settings.auth.rate_limit.otp_per_email_hour, 5); // S-24
+    assert_eq!(settings.auth.rate_limit.otp_per_ip_hour, 20); // S-24
+    assert_eq!(settings.smtp.port, 587);
+    assert_eq!(settings.smtp.security, SmtpSecurityMode::Starttls);
+}
+
+#[test]
+fn production_mode_requires_pepper_and_signing_key() {
+    // Missing both.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_SERVER__MODE", "production")])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("otp_pepper")), "unexpected: {err}");
+    // Pepper present, key still missing.
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_SERVER__MODE", "production"), ("PUB_AUTH__OTP_PEPPER", "long-random-pepper")]),
+    )
+    .unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("signing_key")), "unexpected: {err}");
+    // Everything present passes.
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_SERVER__MODE", "production"),
+            ("PUB_AUTH__OTP_PEPPER", "long-random-pepper"),
+            ("PUB_AUTH__JWT__KID", "2026-08"),
+            ("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64()),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(settings.server.mode, RunMode::Production);
+    assert_eq!(settings.auth.jwt.kid.as_deref(), Some("2026-08"));
+}
+
+#[test]
+fn dev_mode_allows_missing_auth_secrets() {
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.auth.otp_pepper, None);
+    assert_eq!(settings.auth.jwt.signing_key, None);
+}
+
+#[test]
+fn access_ttl_above_15_minutes_is_rejected() {
+    // S-07: access TTL ≤ 15 min is normative.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__ACCESS_TTL_MINUTES", "16")])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("S-07")), "unexpected: {err}");
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__ACCESS_TTL_MINUTES", "0")])).unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid(_)));
+}
+
+#[test]
+fn refresh_windows_must_be_ordered() {
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_AUTH__REFRESH_IDLE_DAYS", "90"), ("PUB_AUTH__REFRESH_ABSOLUTE_DAYS", "30")]),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid(_)));
+}
+
+#[test]
+fn malformed_signing_key_is_rejected() {
+    // Not base64.
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_AUTH__JWT__KID", "k1"), ("PUB_AUTH__JWT__SIGNING_KEY", "!!not-base64!!")]),
+    )
+    .unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("base64")), "unexpected: {err}");
+    // Wrong decoded length.
+    use base64::Engine as _;
+    let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+    let err =
+        load_from(&CliArgs::default(), env(&[("PUB_AUTH__JWT__KID", "k1"), ("PUB_AUTH__JWT__SIGNING_KEY", &short)]))
+            .unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("32 bytes")), "unexpected: {err}");
+    // Key without a kid.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64())])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("kid")), "unexpected: {err}");
+}
+
+#[test]
+fn verify_keys_load_from_toml_and_reject_duplicates() {
+    let seed = seed_b64();
+    let file = toml_file(&format!(
+        "[auth.jwt]\nkid = \"gen2\"\nsigning_key = \"{seed}\"\n\
+         [[auth.jwt.verify_keys]]\nkid = \"gen1\"\nkey = \"{seed}\"\n"
+    ));
+    let cli = CliArgs { config: Some(file.path().to_path_buf()), ..CliArgs::default() };
+    let settings = load_from(&cli, no_env()).unwrap();
+    assert_eq!(settings.auth.jwt.verify_keys.len(), 1);
+    assert_eq!(settings.auth.jwt.verify_keys[0].kid, "gen1");
+
+    // Duplicate kid across signing and verify keys is rejected.
+    let dup = toml_file(&format!(
+        "[auth.jwt]\nkid = \"gen1\"\nsigning_key = \"{seed}\"\n\
+         [[auth.jwt.verify_keys]]\nkid = \"gen1\"\nkey = \"{seed}\"\n"
+    ));
+    let cli = CliArgs { config: Some(dup.path().to_path_buf()), ..CliArgs::default() };
+    let err = load_from(&cli, no_env()).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("unique")), "unexpected: {err}");
+}
+
+#[test]
+fn token_prefix_shape_is_enforced() {
+    for bad in ["pub", "_", "PUB_", "pu b_", ""] {
+        let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__TOKEN_PREFIX", bad)])).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)), "accepted token_prefix {bad:?}");
+    }
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_AUTH__TOKEN_PREFIX", "acme_")])).unwrap();
+    assert_eq!(settings.auth.token_prefix, "acme_");
+}
+
+#[test]
+fn zero_rate_limits_are_rejected() {
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__RATE_LIMIT__OTP_PER_EMAIL_HOUR", "0")])).unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid(_)));
+}
+
+// --- smtp section ---
+
+#[test]
+fn smtp_username_without_password_is_rejected() {
+    let err =
+        load_from(&CliArgs::default(), env(&[("PUB_SMTP__HOST", "smtp.corp.com"), ("PUB_SMTP__USERNAME", "mailer")]))
+            .unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid(_)));
+}
+
+#[test]
+fn smtp_full_config_is_accepted_and_summary_masks_password() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_SMTP__HOST", "smtp.corp.com"),
+            ("PUB_SMTP__PORT", "465"),
+            ("PUB_SMTP__SECURITY", "tls"),
+            ("PUB_SMTP__USERNAME", "mailer"),
+            // May come via env only for now; becomes a KEK-encrypted runtime setting later (S-26).
+            ("PUB_SMTP__PASSWORD", "smtp-secret-value"),
+            ("PUB_SMTP__FROM", "Pub <noreply@corp.com>"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(settings.smtp.host.as_deref(), Some("smtp.corp.com"));
+    assert_eq!(settings.smtp.port, 465);
+    assert_eq!(settings.smtp.security, SmtpSecurityMode::Tls);
+    let summary = settings.summary();
+    assert!(!summary.contains("smtp-secret-value"), "smtp password leaked:\n{summary}");
+    assert!(summary.contains("smtp.password        = ***"));
+}
+
+#[test]
+fn summary_masks_auth_secrets() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_AUTH__OTP_PEPPER", "super-secret-pepper"),
+            ("PUB_AUTH__JWT__KID", "2026-08"),
+            ("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64()),
+        ]),
+    )
+    .unwrap();
+    let summary = settings.summary();
+    assert!(!summary.contains("super-secret-pepper"), "pepper leaked:\n{summary}");
+    assert!(!summary.contains(&seed_b64()), "signing key leaked:\n{summary}");
+    assert!(summary.contains("auth.otp_pepper      = ***"));
+    assert!(summary.contains("auth.jwt.kid         = 2026-08"), "kid is not a secret:\n{summary}");
 }

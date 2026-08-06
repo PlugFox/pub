@@ -52,7 +52,7 @@ tower = "0.5.3"
 tower-http = { version = "0.7.0", features = ["trace", "request-id", "set-header"] }
 http = "1.5.0"
 http-body-util = "0.1.4"
-utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.2.0"
 rust-embed = "8.12.0"
 mime_guess = "2.0.5"
@@ -64,6 +64,31 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 object_store = { version = "0.14.1", features = ["aws"] }
 moka = { version = "0.12.15", features = ["future"] }
 deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1"] }
+
+# --- crypto & auth ---
+# default-features = false: only seed-based signing/verification is used — drops the bundled
+# RNG integration ("rand_core") and batch verification; "std" keeps std error types,
+# "fast" keeps the precomputed tables, "zeroize" wipes key material on drop.
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["std", "fast", "zeroize"] }
+hmac = "0.12.1"
+sha2 = "0.10.9"
+subtle = "2.6.1"
+crc32fast = "1.4.2"
+base64 = "0.22.1"
+getrandom = "0.3.3"
+
+# --- mail ---
+# default-features = false: rustls instead of native-tls (no OpenSSL linkage) and the async
+# tokio transport only — the blocking transport is never used.
+lettre = { version = "0.11.11", default-features = false, features = [
+    "builder",
+    "hostname",
+    "smtp-transport",
+    "pool",
+    "tokio1",
+    "tokio1-rustls-tls",
+] }
+askama = "0.14.0"
 
 # --- config & cli ---
 # default-features = false: only TOML config files are supported (decision 09); drops yaml/json5/ron parsers.

@@ -8,8 +8,10 @@ publish.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+chrono = { workspace = true }
 http = { workspace = true }
 mime_guess = { workspace = true }
+pub-auth = { workspace = true }
 pub-config = { workspace = true }
 pub-core = { workspace = true }
 rust-embed = { workspace = true }
@@ -17,13 +19,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+tracing = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 http-body-util = { workspace = true }
 pub-blob = { workspace = true }
 pub-db-sqlite = { workspace = true }
 pub-kv = { workspace = true }
+pub-mail = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
