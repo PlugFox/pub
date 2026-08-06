@@ -45,6 +45,42 @@ impl Settings {
 
         self.validate_auth()?;
         self.validate_smtp()?;
+        self.validate_registry()?;
+        Ok(())
+    }
+
+    /// Registry ingest limits (S-20) and lifecycle policy (decision 06).
+    fn validate_registry(&self) -> Result<(), ConfigError> {
+        let registry = &self.registry;
+        if registry.max_archive_bytes == 0 {
+            return Err(invalid("registry.max_archive_bytes must be greater than 0"));
+        }
+        if registry.max_uncompressed_bytes < registry.max_archive_bytes {
+            // Anything else is unreachable-by-construction: an archive can never decompress
+            // to less than its compressed size, so the publish path would reject everything.
+            return Err(invalid(format!(
+                "registry.max_uncompressed_bytes ({}) must not be below registry.max_archive_bytes ({})",
+                registry.max_uncompressed_bytes, registry.max_archive_bytes
+            )));
+        }
+        if registry.max_entries == 0 {
+            return Err(invalid("registry.max_entries must be greater than 0"));
+        }
+        if registry.max_compression_ratio == 0 {
+            return Err(invalid("registry.max_compression_ratio must be greater than 0"));
+        }
+        if registry.max_captured_file_bytes == 0 {
+            return Err(invalid("registry.max_captured_file_bytes must be greater than 0"));
+        }
+        if registry.unretract_window_days < 0 {
+            return Err(invalid("registry.unretract_window_days must not be negative"));
+        }
+        // Zero would be a registry nobody can publish to — a misconfiguration that looks
+        // exactly like an outage from the CLI (S-24 limits throttle abuse, they never close a
+        // plane); an operator who wants that revokes the tokens instead.
+        if registry.rate_limit.publish_per_hour_org == 0 {
+            return Err(invalid("registry.rate_limit.publish_per_hour_org must be greater than 0"));
+        }
         Ok(())
     }
 
@@ -141,6 +177,7 @@ impl Settings {
         if auth.rate_limit.otp_per_email_hour == 0
             || auth.rate_limit.otp_per_ip_hour == 0
             || auth.rate_limit.login_per_ip_minute == 0
+            || auth.rate_limit.token_auth_fail_per_ip_minute == 0
         {
             return Err(invalid("auth.rate_limit values must be at least 1 (S-24)"));
         }

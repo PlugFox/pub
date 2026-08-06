@@ -45,6 +45,14 @@ Package names are **globally unique per instance per format**: a name is claimed
 
 **Consequences.** One URL per org covers private deps, instance-public deps, and pub.dev simultaneously — no `hosted:` boilerplate per dependency. Resolution policy is enforceable per org: upstream `allow` (default) now, `delay` quarantine and `allowlist` later. Cross-org name contention exists by design (flat pub ecosystem semantics); squatting inside an instance is an admin-policy matter, with org name-prefix reservations (e.g. `acme_*` reserved at claim time, never proxied) as the planned enforcement mechanism (later tier).
 
+**Implementation addendum (2026-08-07, pub protocol HTTP surface).** Three things the "resolution order" sentence left implicit, decided while wiring it:
+
+- **The base is the namespace, not the principal.** Inside `/o/{org}/pub` a package owned by *another* org resolves only if it is **public** — another org's private package stays invisible **even to a principal who is a member of that other org**. Without this rule the same `PUB_HOSTED_URL` would mean a different package set per user, and a `pubspec.lock` written by one developer would stop resolving for their colleague. The public root `/pub` likewise resolves nothing private, not even the caller's own. The rule lives in `PackageRepo::resolve_in_base` (a *provided* method, like `resolve` — one policy above two SQL dialects) and is asserted by a contract function on both backends.
+- **"Local always wins" is structural.** `Resolution::Unclaimed` is the only value that may ever authorize an upstream lookup, and it is produced on exactly one code path: after `lookup_claim` returned `None`. A locally claimed name therefore cannot reach the proxy no matter what a caller does with the result, and the pub-protocol handlers never call `get_by_name` on a read path at all.
+- **Publishing a name another org holds answers 403, not 404** — a narrow, deliberate exception to the visibility-first ladder ([decision 05](#05--anonymous-read-configurable-default-allowed)), scoped to the *publish* verb. The caller has already proven publish authority in its own org, cross-org name contention is accepted by this decision as a design property, and the alternative — "package not found" in response to an attempt to *create* one — is actively misleading on the CLI's one messaging channel. The message names the package (which the caller supplied) and never the holding org. **Ownership is decided before existence** (corrected 2026-08-07 during the conformance review): the publish pipeline checks the claim before the duplicate-version pre-check, because answering "version 1.0.0 already exists" to a caller who does not hold the name is a version-existence oracle for somebody else's private package, spendable one publish attempt at a time. Both routes to the denial emit the same sentence, so an existing version is indistinguishable from a new one.
+
+Publishing is refused at the public root with a 403 pointing at the org URL: a publish needs an owning org, and the root has none.
+
 ## 02 — sqlx repository traits with per-backend implementation crates
 
 **Context.** SQLite and PostgreSQL must both be first-class (config-driven). sqlx `Any` driver loses compile-time checking and native type mapping. SeaORM 2.0 (kellnr's route) offers one migration set but is days old and takes SQL control away; the owner explicitly chose sqlx.
@@ -87,9 +95,21 @@ With `require_auth_for_read` enabled, anonymous requests get the spec-mandated *
 
 **Consequences.** Returning 404 where the spec mandates 401 for protected resources is a **deliberate, documented deviation** (anti-enumeration). Cost: a teammate without a configured token sees "package doesn't exist" instead of "add a token" — mitigated by the org UI's setup snippet (exact `dart pub token add` command) and docs.
 
+**Implementation addendum (2026-08-07, pub protocol HTTP surface).**
+
+- **Where the flag lives, for now.** `require_auth_for_read` ships as boot config (`registry.require_auth_for_read`, default `false`) rather than a `settings`-table row: the runtime-settings cache of [decision 09](#09--always-compiled-backends-runtime-config-selection) does not exist yet. It moves into the table when that lands; the flag's semantics do not depend on where it is read from. This is the one place where the current code reads an "instance setting" from boot config.
+- **Ordering inside the ladder.** Credentials are judged **before** existence: the auth extractor runs ahead of the org lookup, so with `require_auth_for_read` on, an anonymous caller gets 401 for an unknown org slug too, instead of a 404 that would confirm which orgs exist on the instance. Org slugs get the same anti-enumeration treatment as package names — an unknown `/o/{slug}/pub` is 404 with no challenge.
+- **Unrouted paths under a registry base answer the spec error shape**, not the SPA shell: a client asking for an endpoint we have not implemented (`…/advisories` today) must get parseable JSON, not an HTML page.
+
 ## 06 — Retract + admin-only hard delete with tombstone
 
 **Decision.** Published versions are immutable; version numbers are never reusable. The normal lifecycle tool is **retraction** (version stays downloadable, excluded from new resolutions) plus package-level `discontinued`/`replaced-by` and `unlisted`. Hard delete exists for corporate reality (leaked secrets, legal takedown): requires org owner/admin role **and** step-up authentication, writes an audit event, removes bytes from blob storage, and leaves a tombstone — the name+version stays burned forever. Deviation from pub.dev's "publishing is forever" is deliberate and gated.
+
+**Implementation addendum (2026-08-07, registry data layer + publish pipeline).** Three details the design left open, decided while building it:
+
+- **What a tombstone is, physically.** Hard delete does not delete the row: it sets `versions.tombstone`, clears the metadata document (`pubspec` → `{}`) and the rendered README/CHANGELOG, and keeps `archive_sha256` and `archive_size`. Clearing the payload matters because the usual reason for a hard delete *is* leaked material; keeping the hash keeps blob accounting honest. The `(package_id, version)` unique index is deliberately **not** partial, so it covers tombstones and the number can never be republished. Tombstoned versions vanish from listings but remain findable by exact version, so callers can distinguish "burned" from "never existed".
+- **Blob removal is conditional.** Storage is content-addressed, so several versions can share one object (byte-identical uploads; later, proxy-cached upstream archives). The service deletes the blob only when no live version still references the hash — otherwise it keeps the bytes and records `blob_removed: false` in the audit event. Deleting shared bytes would break a hash already pinned in somebody's `pubspec.lock` ([protocol.md sharp edge 3](protocol.md#sharp-edges-violate--break-clients)).
+- **Un-retraction has a window; retraction does not.** Retracting is always allowed; restoring is allowed for `registry.unretract_window_days` (default **7**, pub.dev's rule) after the retraction. The flag propagates into resolvers and lockfile decisions, so flipping it back weeks later resurrects a version the ecosystem has already routed around. The window lives in the service layer — the repository only records the flag.
 
 ## 07 — Upstream proxy: read-through cache AND mirror mode
 
@@ -129,6 +149,13 @@ Retraction/discontinued/advisories metadata from upstream is refreshed on listin
 ## 13 — CLI/API token format
 
 **Decision.** GitHub-style: `<prefix>_<30 base62 chars><6 base62 CRC32 checksum>` (~178 bits entropy; prefix TBD with product name, see 17). Stored as SHA-256 hash + first-8-chars display hint (argon2 deliberately not used: tokens are high-entropy and verified per request — crates.io rationale). Scopes: `read`, `publish`, `retract`, `admin`; org-bound, optional package-name patterns; default expiry 90 days; last-used tracking (write-throttled); show-once UX with the exact `dart pub token add` command; published regex for secret scanners; revocation effective within ≤60 s (no server-side token caching beyond that). The credential-type enum leaves room for short-lived exchanged CI credentials — trusted publishing via GitHub/GitLab OIDC token exchange (later tier).
+
+**Implementation addendum (2026-08-07, pub protocol HTTP surface).**
+
+- **The header, and nowhere else.** Tokens are accepted on `Authorization: Bearer` only. The spec defines no query-parameter credential and the client sends none, so `?token=` is not supported — a query credential lands in access logs, proxy logs, and `Referer` headers, and would reach users' `pubspec.lock` files through `archive_url`.
+- **The offline checks are the plane boundary.** Prefix + length + base62 charset + CRC32 run before the hash lookup, which is what makes a browser access JWT structurally unusable on pub routes ([decision 03](#03--sessions-jwt-access--refresh-sessions-kv-backed-revocation)'s "never mixed") without a hand-written special case, and keeps fabricated strings off the database.
+- **Package patterns**: a trailing `*` matches any suffix, anything else is an exact name; an empty list means no narrowing. Deliberately not a regex — this is an authorization decision, and a catastrophic-backtracking pattern would be a denial of service with extra steps. Patterns narrow reads of **private** packages only (a public package is readable with no credential at all, so hiding one would make a token worse than none) and are enforced at publish **finalize**, which is the first moment a package name exists in the flow.
+- **The role is re-derived per request** from the durable membership, never cached in the token row: a token outlives role changes by design, so a user who has left the org authenticates and authorizes nothing.
 
 ## 14 — Frontend shape
 
@@ -171,6 +198,11 @@ Recorded so foxic's CI shape is not imported blindly. Leanings: releases must **
 - Upstream proxying generalizes: per-format upstreams (pub.dev, registry.npmjs.org, crates.io) share the ingest pipeline, integrity rules (S-19), and policy engine (S-16).
 
 **Consequences.** Pub-specific logic (pubspec parsing, advisories mapping, README pipeline specifics) lives in the pub protocol module and format adapters — never in shared entities. npm's `@scope/name` maps naturally onto orgs; cargo needs a sparse-index endpoint — both are protocol-module work, not core rework. Non-goal for v1: shipping any second format.
+
+**Implementation addendum (2026-08-07, registry data layer).** Two shared seams were fixed while landing the entities; both are format-agnostic by construction and neither can be retrofitted cheaply:
+
+- **Version ordering is a stored precedence key.** `core::SemVer` implements semver.org §11 precedence (pre-release rules included, build metadata excluded), and `SemVer::sort_key()` projects a version onto a string whose *bytewise* order equals that precedence: fixed-width zero-padded core numbers, a release/pre-release marker, and one prefixed segment per pre-release identifier separated by a byte below every legal identifier character. Storing it (`versions.version_sort`) makes version listing and keyset pagination one index scan instead of an in-memory sort, and keeps ordering identical on both backends. It is **collation-sensitive**: the Postgres column carries `COLLATE "C"` because a locale/ICU collation folds punctuation and case and silently reorders pre-releases (verified: an ICU-collated column sorts `1.0.0-a-b` before `1.0.0-a.b`, which is backwards). The contract suite orders a table containing exactly those adversarial pairs on both backends. Other formats reuse the same key — npm and cargo are semver too.
+- **Blob keys are `<format>/<sha256[0..2]>/<sha256>.tar.gz`.** Content addressing already makes the hash unique, so the format prefix is not for collision avoidance: it keeps per-format lifecycle operations (a bulk purge, a per-format retention policy, a bucket-level rule) expressible as a prefix, and the two-character shard keeps directory fan-out sane on the filesystem backend.
 
 ## 22 — Domain event bus; webhooks and integrations on top
 

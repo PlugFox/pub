@@ -21,11 +21,17 @@ use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::OsRandom;
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings};
+use pub_core::event::{EventSink, NoopEventSink};
 use pub_core::session::SessionLimits;
-use pub_core::traits::{Kv, Mailer, Repositories};
+use pub_core::token::{NewToken, TokenScope};
+use pub_core::traits::JobLock;
+use pub_core::traits::{BlobStore, Kv, Mailer, Repositories};
+use pub_core::{OrgId, UserId};
 use pub_db_sqlite::SqliteDb;
+use pub_jobs::InMemoryJobLock;
 use pub_kv::MemoryKv;
 use pub_mail::InMemoryMailer;
+use pub_registry::{RegistryPolicy, RegistryService};
 use tower::ServiceExt as _;
 
 /// Deterministic base instant shared by every scenario.
@@ -63,6 +69,18 @@ pub struct TestOptions {
     pub oidc_providers: Vec<ProviderConfig>,
     /// S-06 step-up window in minutes.
     pub step_up_minutes: u64,
+    /// The instance's public URL. The protocol suite points it at a reverse-proxy subpath to
+    /// prove sharp edge 8.
+    pub public_url: String,
+    /// Decision 05: flip the pub protocol to token-only reads.
+    pub require_auth_for_read: bool,
+    /// Blob backend override — the protocol suite runs byte-stability against fs as well as
+    /// the in-memory store.
+    pub blob: Option<Arc<dyn BlobStore>>,
+    /// S-24 failed-token-auth budget per IP per minute.
+    pub token_auth_fail_per_ip_minute: u32,
+    /// S-24 publish-upload budget per org per hour.
+    pub publish_per_hour_org: u32,
 }
 
 impl Default for TestOptions {
@@ -75,6 +93,11 @@ impl Default for TestOptions {
             kv: None,
             oidc_providers: Vec::new(),
             step_up_minutes: 15,
+            public_url: INSTANCE_ORIGIN.to_owned(),
+            require_auth_for_read: false,
+            blob: None,
+            token_auth_fail_per_ip_minute: 30,
+            publish_per_hour_org: 30,
         }
     }
 }
@@ -130,6 +153,8 @@ pub struct TestApp {
     pub kv: Arc<MemoryKv>,
     /// The outbox — OTP codes are read from here.
     pub mailer: Arc<InMemoryMailer>,
+    /// The assembled state, so a scenario can rebuild the app over the same backends.
+    pub state: AppState,
     clock: Arc<Mutex<DateTime<Utc>>>,
 }
 
@@ -148,7 +173,9 @@ impl TestApp {
         settings.blob.kind = BlobKind::Memory;
         settings.kv.kind = KvKind::Memory;
         settings.server.trust_proxy_headers = options.trust_proxy_headers;
-        settings.server.public_url = INSTANCE_ORIGIN.to_owned();
+        settings.server.public_url = options.public_url.clone();
+        settings.registry.require_auth_for_read = options.require_auth_for_read;
+        settings.registry.rate_limit.publish_per_hour_org = options.publish_per_hour_org;
 
         let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
         db.run_migrations().await.expect("migrate");
@@ -168,6 +195,7 @@ impl TestApp {
             otp_per_email_hour: 5,
             otp_per_ip_hour: 20,
             login_per_ip_minute: options.login_per_ip_minute,
+            token_auth_fail_per_ip_minute: options.token_auth_fail_per_ip_minute,
             kek: TEST_KEK.to_vec(),
             step_up_window: StdDuration::from_secs(options.step_up_minutes * 60),
             totp_issuer: "Pub".to_owned(),
@@ -185,9 +213,52 @@ impl TestApp {
 
         let clock = Arc::new(Mutex::new(t0()));
         let clock_handle = Arc::clone(&clock);
-        let state = AppState::new(settings, repos.clone(), Arc::new(ObjectStoreBlob::memory()), kv_handle, auth)
+        let blob: Arc<dyn BlobStore> =
+            options.blob.clone().unwrap_or_else(|| Arc::new(ObjectStoreBlob::memory()) as Arc<dyn BlobStore>);
+        let registry = Arc::new(RegistryService::new(
+            repos.clone(),
+            Arc::clone(&blob),
+            Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
+            Arc::new(NoopEventSink) as Arc<dyn EventSink>,
+            RegistryPolicy::default(),
+        ));
+        let state = AppState::new(settings, repos.clone(), blob, kv_handle, auth, registry)
             .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
-        Self { router: pub_api::router(state), repos, kv, mailer, clock }
+        Self { router: pub_api::router(state.clone()), repos, kv, mailer, state, clock }
+    }
+
+    /// Rebuilds the whole application over the **same** backends, as a process restart would.
+    ///
+    /// The point is what survives: the database rows, the blob objects, and the KV entries are
+    /// the durable state, and every in-process cache, lock, and router is thrown away. The
+    /// byte-stability conformance test publishes on one instance and downloads from another.
+    pub fn restart(&self) -> Self {
+        let settings = (*self.state.settings).clone();
+        let registry = Arc::new(RegistryService::new(
+            self.state.repos.clone(),
+            Arc::clone(&self.state.blob),
+            Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
+            Arc::new(NoopEventSink) as Arc<dyn EventSink>,
+            RegistryPolicy::default(),
+        ));
+        let clock_handle = Arc::clone(&self.clock);
+        let state = AppState::new(
+            settings,
+            self.state.repos.clone(),
+            Arc::clone(&self.state.blob),
+            Arc::clone(&self.state.kv),
+            Arc::clone(&self.state.auth),
+            registry,
+        )
+        .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
+        Self {
+            router: pub_api::router(state.clone()),
+            repos: self.repos.clone(),
+            kv: Arc::clone(&self.kv),
+            mailer: Arc::clone(&self.mailer),
+            state,
+            clock: Arc::clone(&self.clock),
+        }
     }
 
     /// The injected current time.
@@ -202,15 +273,23 @@ impl TestApp {
 
     /// Sends a request and parses the JSON body (`null` for empty bodies).
     pub async fn send(&self, request: Request<Body>) -> ApiResponse {
+        let raw = self.send_raw(request).await;
+        let json = if raw.body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw.body).unwrap_or_else(|err| {
+                panic!("response body must be valid JSON ({err}): {:?}", String::from_utf8_lossy(&raw.body))
+            })
+        };
+        ApiResponse { status: raw.status, headers: raw.headers, json }
+    }
+
+    /// Sends a request and keeps the body as bytes (archives are not JSON).
+    pub async fn send_raw(&self, request: Request<Body>) -> RawResponse {
         let response = self.router.clone().oneshot(request).await.expect("infallible router");
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await.expect("read body").to_bytes();
-        let json = if bytes.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(&bytes).expect("response body must be valid JSON")
-        };
-        ApiResponse { status: parts.status, headers: parts.headers, json }
+        RawResponse { status: parts.status, headers: parts.headers, body: bytes.to_vec() }
     }
 
     /// Fires every request concurrently on the shared router and returns the responses in
@@ -315,6 +394,189 @@ impl TestApp {
         assert_eq!(response.status, StatusCode::OK, "otp verify failed: {:?}", response.json);
         response.json["data"].clone()
     }
+}
+
+// --- pub protocol (docs/protocol.md) ---
+
+/// The `Accept` header the real `dart pub` client sends on API requests.
+pub const PUB_ACCEPT: &str = "application/vnd.pub.v2+json";
+
+/// The media type every pub-protocol JSON response must carry.
+pub const PUB_MEDIA_TYPE: &str = "application/vnd.pub.v2+json";
+
+impl TestApp {
+    /// A request shaped like the pub client's: bearer via `Authorization`, `Accept` per the
+    /// spec, and **none** of the app-API headers (`x-pub-request`, JSON content types) — the
+    /// CLI cannot send those, so a pub route that needed one would be unusable.
+    pub fn pub_request(&self, method: Method, path: &str, token: Option<&str>, accept: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-forwarded-for", DEFAULT_IP)
+            .header(header::USER_AGENT, "Dart pub 3.9.0");
+        if let Some(accept) = accept {
+            builder = builder.header(header::ACCEPT, accept);
+        }
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).expect("build request")
+    }
+
+    /// GET a pub-protocol JSON endpoint with the client's own `Accept`.
+    pub async fn pub_get(&self, path: &str, token: Option<&str>) -> ApiResponse {
+        self.send(self.pub_request(Method::GET, path, token, Some(PUB_ACCEPT))).await
+    }
+
+    /// GET with an explicit (or absent) `Accept` — sharp edge 6.
+    pub async fn pub_get_accepting(&self, path: &str, token: Option<&str>, accept: Option<&str>) -> ApiResponse {
+        self.send(self.pub_request(Method::GET, path, token, accept)).await
+    }
+
+    /// GET keeping the raw bytes (archive downloads).
+    pub async fn pub_get_raw(&self, path: &str, token: Option<&str>) -> RawResponse {
+        self.send_raw(self.pub_request(Method::GET, path, token, None)).await
+    }
+
+    /// POST a `multipart/form-data` body with the archive in field `file`, exactly as
+    /// `http.MultipartRequest` builds it in the client.
+    pub async fn pub_upload(&self, path: &str, token: Option<&str>, archive: &[u8]) -> RawResponse {
+        const BOUNDARY: &str = "dart-pub-boundary-4242";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"content-disposition: form-data; name=\"file\"; filename=\"package.tar.gz\"\r\n\
+              content-type: application/octet-stream\r\n\r\n",
+        );
+        body.extend_from_slice(archive);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("x-forwarded-for", DEFAULT_IP)
+            .header(header::USER_AGENT, "Dart pub 3.9.0")
+            .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"));
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        self.send_raw(builder.body(Body::from(body)).expect("build request")).await
+    }
+
+    /// Turns an absolute URL the server advertised into the path its listener actually sees.
+    ///
+    /// This *is* the reverse proxy of docs/protocol.md sharp edge 8: it asserts the URL starts
+    /// with the instance's configured public URL — **path prefix included** — and strips
+    /// exactly that much, which is what nginx does when the app is mounted under a subpath.
+    /// A URL that escapes the public base fails the assertion instead of quietly 404ing.
+    pub fn proxied(&self, url: &str) -> String {
+        let public = self.state.settings.server.public_url.trim_end_matches('/');
+        let rest =
+            url.strip_prefix(public).unwrap_or_else(|| panic!("{url} is not under the instance public url {public}"));
+        if rest.is_empty() { "/".to_owned() } else { rest.to_owned() }
+    }
+
+    /// Runs the three-step publish flow against `base` and returns the finalize response.
+    ///
+    /// Deliberately follows the client's own algorithm — GET the ticket, POST to whatever
+    /// `url` it names, GET whatever `Location` comes back — so a change to any of those URLs
+    /// is caught here rather than by a hardcoded path.
+    pub async fn publish(&self, base: &str, token: &str, archive: &[u8]) -> ApiResponse {
+        let ticket = self.pub_get(&format!("{base}/api/packages/versions/new"), Some(token)).await;
+        assert_eq!(ticket.status, StatusCode::OK, "publish step 1 failed: {:?}", ticket.json);
+        let url = ticket.json["url"].as_str().expect("upload url").to_owned();
+        let upload = self.pub_upload(&self.proxied(&url), Some(token), archive).await;
+        assert_eq!(upload.status, StatusCode::NO_CONTENT, "publish step 2 must answer 204");
+        let location = upload.headers[header::LOCATION].to_str().expect("location").to_owned();
+        self.pub_get(&self.proxied(&location), Some(token)).await
+    }
+
+    /// Signs `email` in, creates org `slug`, and returns `(access_token, org_id)`.
+    pub async fn org_owner(&self, email: &str, slug: &str) -> (String, OrgId) {
+        let login = self.login(email).await;
+        let access = login["access_token"].as_str().expect("access token").to_owned();
+        let created = self.post("/api/v1/orgs", Some(&access), serde_json::json!({ "name": slug, "slug": slug })).await;
+        assert_eq!(created.status, StatusCode::OK, "org creation failed: {:?}", created.json);
+        let org: OrgId = created.json["data"]["id"].as_str().expect("org id").parse().expect("uuid");
+        (access, org)
+    }
+
+    /// Mints a CLI token through the real app API (S-13 show-once path).
+    pub async fn mint_token(&self, access: &str, org: OrgId, scopes: &[&str]) -> String {
+        let body = serde_json::json!({ "org_id": org.to_string(), "scopes": scopes, "label": "conformance" });
+        let response = self.post("/api/v1/tokens", Some(access), body).await;
+        assert_eq!(response.status, StatusCode::OK, "token mint failed: {:?}", response.json);
+        response.json["data"]["secret"].as_str().expect("secret").to_owned()
+    }
+
+    /// Inserts a CLI token straight into the repository, returning its plaintext.
+    ///
+    /// The mint API does not expose package patterns or custom expiry yet; the conformance
+    /// suite needs both to exercise S-13 narrowing and expired-credential handling.
+    pub async fn insert_token(
+        &self,
+        user: UserId,
+        org: OrgId,
+        scopes: &[TokenScope],
+        patterns: &[&str],
+        expires_at: Option<DateTime<Utc>>,
+    ) -> String {
+        let minted = pub_auth::token::mint("pub_", &OsRandom);
+        self.repos
+            .tokens
+            .create(
+                NewToken {
+                    user_id: user,
+                    org_id: org,
+                    name: "direct".to_owned(),
+                    token_hash: minted.hash.clone(),
+                    display_hint: minted.display_hint.clone(),
+                    scopes: scopes.to_vec(),
+                    package_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+                    expires_at,
+                },
+                self.now(),
+            )
+            .await
+            .expect("insert token");
+        minted.secret
+    }
+
+    /// The user id behind an access token's session (tests seed memberships directly).
+    pub async fn user_of(&self, email: &str) -> UserId {
+        self.repos.users.find_by_email(email).await.expect("lookup").expect("user exists").id
+    }
+}
+
+/// A response whose body was not parsed.
+pub struct RawResponse {
+    /// HTTP status.
+    pub status: StatusCode,
+    /// Response headers.
+    pub headers: HeaderMap,
+    /// Raw body bytes.
+    pub body: Vec<u8>,
+}
+
+/// Builds a `.tar.gz` package archive with a minimal valid pubspec.
+pub fn package_archive(name: &str, version: &str) -> Vec<u8> {
+    use std::io::Write as _;
+
+    let pubspec = format!("name: {name}\nversion: {version}\ndescription: Conformance fixture.\n");
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut append = |path: &str, content: &str| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, content.as_bytes()).expect("append");
+    };
+    append("pubspec.yaml", &pubspec);
+    append("README.md", &format!("# {name}\n\nFixture package.\n"));
+    let tar = builder.into_inner().expect("finish tar");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&tar).expect("gzip");
+    encoder.finish().expect("finish gzip")
 }
 
 /// Default client IP for requests (documentation range).

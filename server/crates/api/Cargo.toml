@@ -7,13 +7,17 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-axum = { workspace = true }
+# "multipart": publish step 2 is a multipart/form-data sink (docs/protocol.md endpoint 3);
+# axum does not enable it by default.
+axum = { workspace = true, features = ["multipart"] }
+bytes = { workspace = true }
 chrono = { workspace = true }
 http = { workspace = true }
 mime_guess = { workspace = true }
 pub-auth = { workspace = true }
 pub-config = { workspace = true }
 pub-core = { workspace = true }
+pub-registry = { workspace = true }
 rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +33,11 @@ utoipa-axum = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# The conformance suite publishes real `.tar.gz` packages through the HTTP surface — a
+# hand-rolled fixture would not exercise the ingest path the CLI actually drives.
+flate2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
 # The adversarial suite forges tokens the way an attacker would: raw Ed25519 key material
 # reused as an HMAC secret (algorithm confusion).
 ed25519-dalek = { workspace = true }
@@ -36,6 +45,7 @@ hmac = { workspace = true }
 http-body-util = { workspace = true }
 pub-blob = { workspace = true }
 pub-db-sqlite = { workspace = true }
+pub-jobs = { workspace = true }
 pub-kv = { workspace = true }
 pub-mail = { workspace = true }
 # The mock OIDC issuer signs real RS256 id_tokens with a throwaway RSA key (S-01 tests).

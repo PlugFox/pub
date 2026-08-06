@@ -128,3 +128,38 @@ async fn settings_repo_contract() {
     pub_db_tests::contract::settings_repo(&db.repos()).await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn package_repo_contract() {
+    let Some(db) = TestDb::create("package_repo_contract").await else { return };
+    pub_db_tests::contract::package_repo(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn version_ordering_contract() {
+    let Some(db) = TestDb::create("version_ordering_contract").await else { return };
+    pub_db_tests::contract::version_ordering(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn publish_invariants_contract_s18() {
+    let Some(db) = TestDb::create("publish_invariants_contract_s18").await else { return };
+    pub_db_tests::contract::publish_invariants(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_visibility_contract_s04() {
+    let Some(db) = TestDb::create("resolve_visibility_contract_s04").await else { return };
+    pub_db_tests::contract::resolve_visibility(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolve_in_base_scope_contract_decision01() {
+    let Some(db) = TestDb::create("resolve_in_base_scope_contract_decision01").await else { return };
+    pub_db_tests::contract::resolve_in_base_scope(&db.repos()).await;
+    db.cleanup().await;
+}

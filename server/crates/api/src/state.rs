@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use pub_auth::flows::AuthService;
 use pub_config::Settings;
 use pub_core::traits::{BlobStore, Kv, Repositories};
+use pub_registry::RegistryService;
 
 /// Clock handle: handlers read `now` from here and pass it down — repositories and flows
 /// never touch the wall clock, so tests can pin time (docs/rules/rust.md).
@@ -25,6 +26,9 @@ pub struct AppState {
     pub kv: Arc<dyn Kv>,
     /// Auth flows facade (OTP, sessions, JWT keyring, CLI tokens).
     pub auth: Arc<AuthService>,
+    /// Registry services (publish pipeline, retraction, hard delete). The pub protocol routes
+    /// land on top of this in the next roadmap step.
+    pub registry: Arc<RegistryService>,
     /// Source of "now" for request handling.
     pub clock: Clock,
 }
@@ -37,8 +41,9 @@ impl AppState {
         blob: Arc<dyn BlobStore>,
         kv: Arc<dyn Kv>,
         auth: Arc<AuthService>,
+        registry: Arc<RegistryService>,
     ) -> Self {
-        Self { settings: Arc::new(settings), repos, blob, kv, auth, clock: Arc::new(Utc::now) }
+        Self { settings: Arc::new(settings), repos, blob, kv, auth, registry, clock: Arc::new(Utc::now) }
     }
 
     /// Replaces the clock — deterministic time for tests.

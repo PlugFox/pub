@@ -3,11 +3,13 @@
 //!
 //! Current scope: system endpoints, the full v1 auth surface — email OTP (S-03/S-04),
 //! multi-provider OIDC (S-01/S-02), TOTP second factor + step-up (S-05/S-06) — session and
-//! CLI-token management (S-08/S-09/S-13), and minimal orgs. Protocol routes
-//! (`/o/{org}/pub/…`, `/pub/…`) land in later roadmap steps.
+//! CLI-token management (S-08/S-09/S-13), minimal orgs, and the Hosted Pub Repository Spec v2
+//! surface on both virtual bases (`/o/{org}/pub`, `/pub` — see [`protocol`]).
 //!
 //! Middleware order (docs/rules/api.md): request-id → tracing → security headers → rate
-//! limit → auth (typed extractors in handlers).
+//! limit → auth (typed extractors in handlers). The two app-API guards deliberately scope
+//! themselves to `/api/…`: the pub protocol has its own contract (no custom header, no JSON
+//! bodies, no browser origin) and must never inherit them.
 
 use axum::Json;
 use axum::Router;
@@ -28,6 +30,7 @@ pub mod envelope;
 pub mod error;
 pub mod extract;
 pub mod guard;
+pub mod protocol;
 pub mod routes;
 mod state;
 
@@ -60,6 +63,7 @@ impl Modify for SecurityAddon {
         (name = "sessions", description = "Web session management"),
         (name = "tokens", description = "CLI/API tokens"),
         (name = "orgs", description = "Organizations"),
+        (name = "pub", description = "Hosted Pub Repository Spec v2 (docs/protocol.md) — spec shapes, no envelope"),
     )
 )]
 struct ApiDoc;
@@ -88,6 +92,8 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::tokens::create, routes::tokens::list))
         .routes(routes!(routes::tokens::revoke))
         .routes(routes!(routes::orgs::create, routes::orgs::list))
+        // Pub protocol on both virtual bases (decision 01); spec shapes, never the envelope.
+        .merge(protocol::router(&state))
         .split_for_parts();
 
     Router::new()

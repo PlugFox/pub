@@ -25,6 +25,7 @@ use sqlx::SqlitePool;
 mod audit;
 mod credentials;
 mod orgs;
+mod packages;
 mod sessions;
 mod settings;
 mod tokens;
@@ -33,6 +34,7 @@ mod users;
 pub use audit::SqliteAuditRepo;
 pub use credentials::SqliteCredentialRepo;
 pub use orgs::SqliteOrgRepo;
+pub use packages::SqlitePackageRepo;
 pub use sessions::SqliteSessionRepo;
 pub use settings::SqliteSettingsRepo;
 pub use tokens::SqliteTokenRepo;
@@ -51,6 +53,7 @@ pub(crate) use q;
 /// Bundles fresh repository instances over `pool` into the shared [`Repositories`] handle.
 pub fn repositories(pool: SqlitePool) -> Repositories {
     Repositories {
+        packages: Arc::new(SqlitePackageRepo::new(pool.clone())),
         users: Arc::new(SqliteUserRepo::new(pool.clone())),
         credentials: Arc::new(SqliteCredentialRepo::new(pool.clone())),
         orgs: Arc::new(SqliteOrgRepo::new(pool.clone())),

@@ -9,6 +9,8 @@ publish.workspace = true
 # NOTE: zero infrastructure dependencies (no sqlx / object_store / redis / axum) — docs/rules/rust.md.
 [dependencies]
 async-trait = { workspace = true }
+# base64: opaque keyset cursors (page.rs). A pure-Rust leaf crate — not infrastructure.
+base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
@@ -17,3 +19,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Async trait defaults (EventSink) need a runtime to be exercised in unit tests.
+tokio = { workspace = true }

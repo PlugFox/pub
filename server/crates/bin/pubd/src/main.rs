@@ -17,12 +17,16 @@ use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::{OsRandom, RandomSource as _};
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, Settings, SmtpSecurityMode};
+use pub_core::event::{EventSink, NoopEventSink};
 use pub_core::session::SessionLimits;
+use pub_core::traits::JobLock;
 use pub_core::traits::{BlobStore, Kv, Mailer, Repositories};
 use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
+use pub_jobs::InMemoryJobLock;
 use pub_kv::{MemoryKv, RedisKv};
 use pub_mail::{InMemoryMailer, SmtpMailer, SmtpSecurity, SmtpSettings};
+use pub_registry::{ArchiveLimits, RegistryPolicy, RegistryService};
 use pub_telemetry::LogFormat;
 
 /// Version string surfaced by `pubd --version`: crate version + git hash + build date.
@@ -46,9 +50,10 @@ async fn main() -> anyhow::Result<()> {
     let kv = build_kv(&settings)?;
     let mailer = build_mailer(&settings)?;
     let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer))?;
+    let registry = build_registry(&settings, repos.clone(), Arc::clone(&blob));
 
     let listen = settings.server.listen.clone();
-    let state = AppState::new(settings, repos, blob, kv, auth);
+    let state = AppState::new(settings, repos, blob, kv, auth, registry);
     let app = pub_api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("failed to bind {listen}"))?;
@@ -94,6 +99,31 @@ fn build_blob(settings: &Settings) -> anyhow::Result<Arc<dyn BlobStore>> {
         BlobKind::Memory => Arc::new(ObjectStoreBlob::memory()),
     };
     Ok(blob)
+}
+
+/// Builds the registry services from the `[registry]` config section (S-20 limits,
+/// decision 06 restore window).
+///
+/// The publish lock is the in-process [`JobLock`] for now; the Redis-backed implementation
+/// arrives with the multi-instance tier (decision 03), and the event sink is a no-op until
+/// the domain event bus lands (decision 22). Both are `Arc<dyn …>` seams, so swapping them is
+/// a wiring change here and nowhere else.
+fn build_registry(settings: &Settings, repos: Repositories, blob: Arc<dyn BlobStore>) -> Arc<RegistryService> {
+    let cfg = &settings.registry;
+    let policy = RegistryPolicy {
+        archive: ArchiveLimits {
+            max_archive_bytes: cfg.max_archive_bytes,
+            max_uncompressed_bytes: cfg.max_uncompressed_bytes,
+            max_entries: cfg.max_entries,
+            max_compression_ratio: cfg.max_compression_ratio,
+            max_captured_file_bytes: cfg.max_captured_file_bytes,
+        },
+        unretract_window: chrono::Duration::days(cfg.unretract_window_days),
+        ..RegistryPolicy::default()
+    };
+    let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
+    let events: Arc<dyn EventSink> = Arc::new(NoopEventSink);
+    Arc::new(RegistryService::new(repos, blob, lock, events, policy))
 }
 
 /// Selects the KV backend by config kind (decision 09; redis is mandatory for replicas > 1).
@@ -232,6 +262,7 @@ fn build_auth(
         otp_per_email_hour: auth_cfg.rate_limit.otp_per_email_hour,
         otp_per_ip_hour: auth_cfg.rate_limit.otp_per_ip_hour,
         login_per_ip_minute: auth_cfg.rate_limit.login_per_ip_minute,
+        token_auth_fail_per_ip_minute: auth_cfg.rate_limit.token_auth_fail_per_ip_minute,
         kek,
         step_up_window: Duration::from_secs(auth_cfg.step_up_minutes * 60),
         totp_issuer: "Pub".to_owned(),

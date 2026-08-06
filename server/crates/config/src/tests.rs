@@ -596,3 +596,47 @@ fn summary_masks_auth_secrets() {
     assert!(summary.contains("auth.otp_pepper      = ***"));
     assert!(summary.contains("auth.jwt.kid         = 2026-08"), "kid is not a secret:\n{summary}");
 }
+
+#[test]
+fn s20_registry_limits_default_to_the_normative_numbers() {
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.registry.max_archive_bytes, 100 * 1024 * 1024, "S-20 default archive cap is 100 MB");
+    assert_eq!(settings.registry.max_uncompressed_bytes, 256 * 1024 * 1024);
+    assert_eq!(settings.registry.max_entries, 10_000);
+    assert_eq!(settings.registry.max_compression_ratio, 100);
+    assert_eq!(settings.registry.unretract_window_days, 7, "decision 06 restore window");
+    let summary = settings.summary();
+    assert!(summary.contains("registry.limits      = archive 100 MB"), "{summary}");
+    assert!(summary.contains("registry.unretract   = 7 d"), "{summary}");
+}
+
+#[test]
+fn registry_limits_are_configurable_from_the_environment() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_REGISTRY__MAX_ARCHIVE_BYTES", "5242880"),
+            ("PUB_REGISTRY__MAX_UNCOMPRESSED_BYTES", "52428800"),
+            ("PUB_REGISTRY__UNRETRACT_WINDOW_DAYS", "3"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(settings.registry.max_archive_bytes, 5 * 1024 * 1024);
+    assert_eq!(settings.registry.unretract_window_days, 3);
+}
+
+#[test]
+fn nonsensical_registry_limits_are_startup_errors() {
+    let cases: &[(&str, &str)] = &[
+        ("PUB_REGISTRY__MAX_ARCHIVE_BYTES", "0"),
+        ("PUB_REGISTRY__MAX_ENTRIES", "0"),
+        ("PUB_REGISTRY__MAX_COMPRESSION_RATIO", "0"),
+        ("PUB_REGISTRY__MAX_CAPTURED_FILE_BYTES", "0"),
+        ("PUB_REGISTRY__UNRETRACT_WINDOW_DAYS", "-1"),
+        // An uncompressed cap below the compressed cap would reject every upload.
+        ("PUB_REGISTRY__MAX_UNCOMPRESSED_BYTES", "1024"),
+    ];
+    for (key, value) in cases {
+        assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
+    }
+}

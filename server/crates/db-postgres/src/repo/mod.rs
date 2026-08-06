@@ -35,6 +35,7 @@ use sqlx::PgPool;
 mod audit;
 mod credentials;
 mod orgs;
+mod packages;
 mod sessions;
 mod settings;
 mod tokens;
@@ -43,6 +44,7 @@ mod users;
 pub use audit::PgAuditRepo;
 pub use credentials::PgCredentialRepo;
 pub use orgs::PgOrgRepo;
+pub use packages::PgPackageRepo;
 pub use sessions::PgSessionRepo;
 pub use settings::PgSettingsRepo;
 pub use tokens::PgTokenRepo;
@@ -61,6 +63,7 @@ pub(crate) use q;
 /// Bundles fresh repository instances over `pool` into the shared [`Repositories`] handle.
 pub fn repositories(pool: PgPool) -> Repositories {
     Repositories {
+        packages: Arc::new(PgPackageRepo::new(pool.clone())),
         users: Arc::new(PgUserRepo::new(pool.clone())),
         credentials: Arc::new(PgCredentialRepo::new(pool.clone())),
         orgs: Arc::new(PgOrgRepo::new(pool.clone())),

@@ -95,6 +95,23 @@ impl BlobStore for ObjectStoreBlob {
         let stream = result.into_stream().map(|chunk| chunk.map_err(blob_err)).boxed();
         Ok(DownloadPlan::Stream(stream))
     }
+
+    /// Direct read rather than the trait's stream-draining default: `object_store` hands back
+    /// the whole object in one call, and this path stays correct once the S3 backend starts
+    /// answering [`DownloadPlan::Redirect`] for client downloads.
+    async fn get(&self, key: &str) -> Result<Bytes> {
+        let result = self.store.get(&ObjectPath::from(key)).await.map_err(blob_err)?;
+        result.bytes().await.map_err(blob_err)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        match self.store.delete(&ObjectPath::from(key)).await {
+            // Idempotent by contract: a retried hard delete or a GC pass over an already
+            // cleaned store must not fail.
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(blob_err(err)),
+        }
+    }
 }
 
 fn blob_err(err: object_store::Error) -> Error {
@@ -143,6 +160,27 @@ mod tests {
         let blob = ObjectStoreBlob::memory();
         let err = blob.download("sha256/missing").await.unwrap_err();
         assert_eq!(err.code(), "not_found");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_object_and_is_idempotent() {
+        let blob = ObjectStoreBlob::memory();
+        blob.put("pub/ab/abcd.tar.gz", Bytes::from_static(b"bytes")).await.unwrap();
+        blob.delete("pub/ab/abcd.tar.gz").await.unwrap();
+        assert_eq!(blob.download("pub/ab/abcd.tar.gz").await.unwrap_err().code(), "not_found");
+        // Deleting an absent key is not an error (hard-delete retries, GC sweeps).
+        blob.delete("pub/ab/abcd.tar.gz").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fs_delete_removes_the_object_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BlobConfig { path: dir.path().join("blobs").to_string_lossy().into_owned(), ..BlobConfig::default() };
+        let blob = ObjectStoreBlob::fs(&cfg).unwrap();
+        blob.put("pub/cd/cdef.tar.gz", Bytes::from_static(b"bytes")).await.unwrap();
+        blob.delete("pub/cd/cdef.tar.gz").await.unwrap();
+        assert_eq!(blob.download("pub/cd/cdef.tar.gz").await.unwrap_err().code(), "not_found");
+        blob.delete("pub/cd/cdef.tar.gz").await.unwrap();
     }
 
     #[tokio::test]

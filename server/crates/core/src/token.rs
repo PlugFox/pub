@@ -59,6 +59,26 @@ impl FromStr for TokenScope {
     }
 }
 
+/// Whether `name` is inside a token's package-pattern narrowing (S-13).
+///
+/// An **empty** pattern list means "no narrowing" — the token's org binding and scopes are the
+/// only limits. Otherwise the name must match at least one pattern.
+///
+/// The pattern vocabulary is deliberately one wildcard wide: a trailing `*` matches any suffix
+/// (`acme_*`), everything else is an exact name. Package names are `[a-z0-9_]` (no dots, no
+/// slashes, no `*`), so this covers the only grouping that exists in a flat namespace — the
+/// org's name prefix — without inviting a regex engine into an authorization decision, where
+/// a catastrophic-backtracking pattern would be a denial of service with extra steps.
+pub fn patterns_allow(patterns: &[String], name: &str) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    patterns.iter().any(|pattern| match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    })
+}
+
 /// A CLI/API token. The hash is deliberately not exposed on the domain struct — lookups go
 /// through hash-keyed repository methods.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,5 +154,40 @@ mod tests {
             serde_json::to_string(&vec![TokenScope::Read, TokenScope::Publish]).unwrap(),
             r#"["read","publish"]"#
         );
+    }
+
+    #[test]
+    fn no_patterns_means_no_narrowing() {
+        assert!(patterns_allow(&[], "anything"));
+    }
+
+    #[test]
+    fn prefix_pattern_matches_the_prefix_only() {
+        let patterns = vec!["acme_*".to_owned()];
+        assert!(patterns_allow(&patterns, "acme_core"));
+        assert!(patterns_allow(&patterns, "acme_"));
+        assert!(!patterns_allow(&patterns, "acme"));
+        assert!(!patterns_allow(&patterns, "other_acme_core"));
+    }
+
+    #[test]
+    fn bare_pattern_is_an_exact_name() {
+        let patterns = vec!["acme_core".to_owned()];
+        assert!(patterns_allow(&patterns, "acme_core"));
+        // No implicit prefix semantics: a bare pattern never matches a longer name.
+        assert!(!patterns_allow(&patterns, "acme_core_extra"));
+    }
+
+    #[test]
+    fn any_matching_pattern_admits() {
+        let patterns = vec!["acme_*".to_owned(), "shared_utils".to_owned()];
+        assert!(patterns_allow(&patterns, "shared_utils"));
+        assert!(patterns_allow(&patterns, "acme_core"));
+        assert!(!patterns_allow(&patterns, "evil_pkg"));
+    }
+
+    #[test]
+    fn a_lone_star_admits_everything() {
+        assert!(patterns_allow(&["*".to_owned()], "whatever"));
     }
 }

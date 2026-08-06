@@ -6,9 +6,9 @@
 //! polymorphism, never cargo features.
 //!
 //! The identity & access repositories (`UserRepo`, `CredentialRepo`, `OrgRepo`, `SessionRepo`,
-//! `TokenRepo`, `AuditRepo`, `SettingsRepo`) carry their full method sets; the remaining
-//! traits are still skeleton-phase (health probe + one representative method) and grow with
-//! their roadmap steps.
+//! `TokenRepo`, `AuditRepo`, `SettingsRepo`) and the registry repository (`PackageRepo`) carry
+//! their full method sets; the remaining traits are still skeleton-phase (health probe + one
+//! representative method) and grow with their roadmap steps.
 //!
 //! Time is always a parameter (`now: DateTime<Utc>`): repositories never read the clock, so
 //! expiry, throttling, and validity windows are deterministic under test.
@@ -24,14 +24,22 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::audit::{AuditEvent, AuditFilter, NewAuditEvent};
+use crate::authorize::{Action, ActorContext, Resource, authorize};
 use crate::credential::Credential;
 use crate::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership};
+use crate::package::{
+    BaseScope, NameClaim, NewPackage, NewVersion, Package, PackageOptions, PublishedVersion, Resolution, Version,
+    Visibility,
+};
 use crate::page::Page;
+use crate::semver::SemVer;
 use crate::session::{NewSession, Session, SessionLimits};
 use crate::settings::SettingEntry;
 use crate::token::{NewToken, Token};
 use crate::user::{NewUser, User, UserStatus};
-use crate::{CredentialId, Format, InvitationId, OrgId, PackageId, Result, RoleLevel, SessionId, TokenId, UserId};
+use crate::{
+    CredentialId, Format, InvitationId, OrgId, PackageId, Result, RoleLevel, SessionId, TokenId, UserId, VersionId,
+};
 
 /// Stream of archive bytes, e.g. a package tarball body.
 pub type ByteStream = BoxStream<'static, Result<Bytes>>;
@@ -65,15 +73,189 @@ pub struct KvMessage {
     pub payload: String,
 }
 
-/// Package metadata persistence — packages are unique per `(format, name)` per instance
-/// (decision 21).
+/// Registry persistence: packages, immutable versions, and name claims — all keyed by
+/// `(format, name)` instance-wide (decisions 01, 06, 21).
+///
+/// Three contracts are load-bearing and are asserted by the shared contract suite against
+/// every backend:
+///
+/// 1. **Publishing is one transaction.** [`PackageRepo::create_version`] checks the name
+///    claim, creates the claim + package row on a first publish, and inserts the version — or
+///    changes nothing. There is no window in which a claim exists without its package, or a
+///    version without its claim.
+/// 2. **Version numbers are never reusable** (decision 06, S-18). The `(package, version)`
+///    uniqueness covers tombstoned rows too, so a hard-deleted number stays burned forever.
+/// 3. **Ordering is semver precedence**, carried by [`crate::SemVer::sort_key`] in a
+///    bytewise-collated column — never by the version text, under which `1.0.0-beta.11` would
+///    precede `1.0.0-beta.2`.
 #[async_trait]
 pub trait PackageRepo: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.
     async fn ping(&self) -> Result<()>;
 
-    /// Whether a package with this `(format, name)` exists on the instance (claim lookup).
-    async fn exists(&self, format: Format, name: &str) -> Result<bool>;
+    /// Creates a package row without publishing anything (explicit name reservation).
+    ///
+    /// The `(format, name)` name claim is created in the same transaction. A name already
+    /// claimed — by any org — is [`crate::Error::Conflict`].
+    async fn create_package(&self, new: NewPackage, now: DateTime<Utc>) -> Result<Package>;
+
+    /// The package with this id; `None` when unknown.
+    async fn get_package(&self, id: PackageId) -> Result<Option<Package>>;
+
+    /// The package with this `(format, name)`; `None` when the name has no package row (it
+    /// may still be claimed — see [`PackageRepo::lookup_claim`]).
+    async fn get_by_name(&self, format: Format, name: &str) -> Result<Option<Package>>;
+
+    /// The org's packages ordered by name, keyset-paginated over `(name, id)`.
+    ///
+    /// Includes unlisted and discontinued packages: this is the owner-facing listing, and
+    /// hiding rows here would make them unmanageable. `limit` is clamped to a sane range; a
+    /// malformed `cursor` is [`crate::Error::Invalid`].
+    async fn list_for_org(&self, org: OrgId, cursor: Option<&str>, limit: u32) -> Result<Page<Package>>;
+
+    /// Replaces the package's mutable options (visibility, discontinued, replaced_by,
+    /// unlisted) and bumps `updated_at`. Unknown id → `NotFound`.
+    async fn set_options(&self, id: PackageId, options: &PackageOptions, now: DateTime<Utc>) -> Result<Package>;
+
+    /// Publishes a version — atomically, per contract 1 above.
+    ///
+    /// Errors: the name is claimed by another org → [`crate::Error::Forbidden`]; the version
+    /// already exists (**including as a tombstone**) → [`crate::Error::Conflict`]; a
+    /// concurrent first publish of the same name losing the race → `Conflict`.
+    async fn create_version(&self, new: NewVersion, now: DateTime<Utc>) -> Result<PublishedVersion>;
+
+    /// The package's row for exactly this version (tombstones included, so callers can tell
+    /// "never existed" from "burned"); `None` when unknown.
+    async fn get_version(&self, package: PackageId, version: &SemVer) -> Result<Option<Version>>;
+
+    /// The package's live versions in ascending semver precedence order, keyset-paginated
+    /// over `(sort key, id)`.
+    ///
+    /// Retracted versions are **included and flagged** ([`Version::is_retracted`]) — they stay
+    /// downloadable for lockfile-pinned builds (docs/protocol.md sharp edge 9). Tombstoned
+    /// versions are excluded: their metadata and bytes are gone.
+    async fn list_versions(&self, package: PackageId, cursor: Option<&str>, limit: u32) -> Result<Page<Version>>;
+
+    /// Sets or clears the retraction flag; returns the updated row. Idempotent — retracting a
+    /// retracted version keeps the original `retracted_at`. Unknown id → `NotFound`; a
+    /// tombstoned version → `Conflict` (there is nothing left to retract).
+    ///
+    /// The *policy* around restoring (the window in which un-retraction is allowed) lives in
+    /// the service layer; the repository only records the flag.
+    async fn set_retracted(&self, id: VersionId, retracted: bool, now: DateTime<Utc>) -> Result<Version>;
+
+    /// Hard-deletes a version (decision 06): clears the metadata document and rendered HTML
+    /// and marks the row a tombstone, so the number can never be reused (S-18).
+    ///
+    /// Returns the tombstone row. Unknown id → `NotFound`; an already-tombstoned version →
+    /// `Conflict`. Removing the archive bytes is the caller's job — the blob may be shared
+    /// with other versions (identical content hashes).
+    ///
+    /// Takes no `now`: the row keeps its original timestamps, and *when* the deletion happened
+    /// is recorded where it belongs — the audit log (S-22).
+    async fn hard_delete_version(&self, id: VersionId) -> Result<Version>;
+
+    /// How many **live** (non-tombstone) versions reference this content hash.
+    ///
+    /// Content addressing means one blob can back several versions; this is the check that
+    /// keeps a hard delete from erasing bytes another version still serves (byte stability,
+    /// docs/protocol.md sharp edge 3).
+    async fn count_versions_with_sha256(&self, sha256: &str) -> Result<u64>;
+
+    /// Claims `(format, name)` for `org` (decision 01).
+    ///
+    /// Idempotent for the holder: re-claiming a name the org already holds returns the
+    /// existing claim. A name held by another org is [`crate::Error::Conflict`] — claims are
+    /// never silently transferred.
+    async fn claim_name(&self, format: Format, name: &str, org: OrgId, now: DateTime<Utc>) -> Result<NameClaim>;
+
+    /// The claim on `(format, name)`; `None` when the name is unclaimed on this instance —
+    /// which is the *only* condition under which the proxy may serve it (S-16).
+    async fn lookup_claim(&self, format: Format, name: &str) -> Result<Option<NameClaim>>;
+
+    /// Resolves `(format, name)` for a principal: who owns the name, and may this actor read
+    /// it (decision 01 resolution order, decision 05 / S-04 visibility ladder).
+    ///
+    /// Provided, not implemented per backend: visibility is *policy*, and a second copy of it
+    /// in a second SQL dialect is how the two backends drift apart. Backends supply the two
+    /// lookups; the rule lives here and runs through the [`crate::authorize`] chokepoint.
+    ///
+    /// Callers must map both [`Resolution::Restricted`] and [`Resolution::Unclaimed`] to the
+    /// same 404 on read paths (S-04 anti-enumeration).
+    async fn resolve(&self, format: Format, name: &str, actor: &ActorContext) -> Result<Resolution> {
+        if let Some(package) = self.get_by_name(format, name).await? {
+            let readable = match package.visibility {
+                Visibility::Public => true,
+                Visibility::Private => authorize(actor, Action::ReadPackages, &Resource::Org(package.org_id)).is_ok(),
+            };
+            return Ok(if readable {
+                Resolution::Readable(package)
+            } else {
+                Resolution::Restricted { owner: package.org_id }
+            });
+        }
+        // A claim without a package row is still local: the name is burned here and must
+        // never fall through to upstream (S-16 "local always wins").
+        Ok(match self.lookup_claim(format, name).await? {
+            Some(claim) => Resolution::Restricted { owner: claim.org_id },
+            None => Resolution::Unclaimed,
+        })
+    }
+
+    /// Resolves `(format, name)` **as seen from a virtual registry base** — decision 01's
+    /// resolution order in code: org-owned → instance-public → (upstream, iff unclaimed).
+    ///
+    /// This is the only resolution the pub protocol routes are allowed to call, and it is a
+    /// *provided* method for the same reason [`PackageRepo::resolve`] is: the policy exists
+    /// once, above both SQL dialects, and runs through the [`crate::authorize`] chokepoint.
+    ///
+    /// **Local always wins** (S-16) is structural here rather than conventional:
+    /// [`Resolution::Unclaimed`] — the sole value that permits an upstream lookup — is
+    /// produced on exactly one path, after [`PackageRepo::lookup_claim`] came back empty. A
+    /// locally claimed name can only ever yield `Readable` or `Restricted`, so no caller can
+    /// reach upstream for it, whatever it does with the result. Both non-readable outcomes
+    /// (`Restricted` and, for a base with no proxy, `Unclaimed`) must map to the **same 404**
+    /// (S-04 anti-enumeration).
+    ///
+    /// Differences from [`PackageRepo::resolve`], which answers the instance-wide question
+    /// the web UI asks:
+    ///
+    /// - Under [`BaseScope::Org`], another org's **private** package is invisible even to a
+    ///   principal who is a member of that other org — it is not in this base's resolution
+    ///   order at all (see [`BaseScope`]).
+    /// - Under [`BaseScope::PublicRoot`], nothing private resolves, not even the caller's own.
+    async fn resolve_in_base(
+        &self,
+        format: Format,
+        name: &str,
+        base: BaseScope,
+        actor: &ActorContext,
+    ) -> Result<Resolution> {
+        if let Some(package) = self.get_by_name(format, name).await? {
+            let readable = match (base, package.visibility) {
+                // Step 1: the base's own org — public and private alike, the latter behind
+                // the role gate.
+                (BaseScope::Org(org), visibility) if org == package.org_id => {
+                    visibility == Visibility::Public
+                        || authorize(actor, Action::ReadPackages, &Resource::Org(package.org_id)).is_ok()
+                }
+                // Step 2: instance-public packages owned by other orgs.
+                (_, Visibility::Public) => true,
+                // Another org's private package: not part of this base's namespace.
+                (_, Visibility::Private) => false,
+            };
+            return Ok(if readable {
+                Resolution::Readable(package)
+            } else {
+                Resolution::Restricted { owner: package.org_id }
+            });
+        }
+        // Step 3 is only reachable when the name is claimed nowhere on this instance.
+        Ok(match self.lookup_claim(format, name).await? {
+            Some(claim) => Resolution::Restricted { owner: claim.org_id },
+            None => Resolution::Unclaimed,
+        })
+    }
 }
 
 /// User account persistence.
@@ -391,6 +573,41 @@ pub trait BlobStore: Send + Sync {
     /// Plans a download for `key`: presigned redirect where supported, streamed bytes
     /// otherwise. [`crate::Error::NotFound`] when the key does not exist.
     async fn download(&self, key: &str) -> Result<DownloadPlan>;
+
+    /// Reads a blob's bytes into this process.
+    ///
+    /// Deliberately distinct from [`BlobStore::download`]: that one *plans a client response*
+    /// and may hand back a presigned redirect, which is useless to the server itself. Internal
+    /// consumers — the publish finalizer picking up a staged upload, the proxy re-verifying a
+    /// cached archive's sha256 (S-19) — need the bytes here.
+    ///
+    /// The default drains a streamed plan, which is correct for every backend that never
+    /// redirects; a signing backend must override it with a direct read.
+    async fn get(&self, key: &str) -> Result<Bytes> {
+        match self.download(key).await? {
+            DownloadPlan::Stream(mut stream) => {
+                use futures::StreamExt as _;
+
+                let mut buf = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                Ok(Bytes::from(buf))
+            }
+            DownloadPlan::Redirect(_) => Err(crate::Error::Blob {
+                message: format!("blob backend cannot read {key} in-process: it only plans redirects"),
+            }),
+        }
+    }
+
+    /// Removes a blob. Deleting an absent key is **not** an error — the operation is
+    /// idempotent so a retried hard delete or a GC sweep over a partially cleaned store
+    /// cannot fail (decision 06 hard delete, unreferenced-blob GC).
+    ///
+    /// Callers must check that no live version still references the content hash: blobs are
+    /// content-addressed, so identical uploads share one object (docs/protocol.md sharp
+    /// edge 3 — served bytes are stable forever).
+    async fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// Key-value store **and** pub/sub broker (decision 03) — one seam for revocation fast paths,
@@ -456,13 +673,15 @@ pub trait Mailer: Send + Sync {
     }
 }
 
-/// The full set of identity & access repository handles, as one cloneable bundle.
+/// The full set of repository handles, as one cloneable bundle.
 ///
 /// Constructed once at startup by the selected database crate (`SqliteDb::repositories()` /
 /// `PostgresDb::repositories()`) and carried in `AppState`; the contract test suite runs
 /// against this bundle, so every backend is exercised through the same trait surface.
 #[derive(Clone)]
 pub struct Repositories {
+    /// Packages, versions, and name claims.
+    pub packages: Arc<dyn PackageRepo>,
     /// User accounts.
     pub users: Arc<dyn UserRepo>,
     /// Identity credentials.

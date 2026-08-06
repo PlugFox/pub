@@ -57,3 +57,28 @@ async fn audit_repo_contract_s22() {
 async fn settings_repo_contract() {
     pub_db_tests::contract::settings_repo(&fresh_repos().await).await;
 }
+
+#[tokio::test]
+async fn package_repo_contract() {
+    pub_db_tests::contract::package_repo(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn version_ordering_contract() {
+    pub_db_tests::contract::version_ordering(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn publish_invariants_contract_s18() {
+    pub_db_tests::contract::publish_invariants(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn resolve_visibility_contract_s04() {
+    pub_db_tests::contract::resolve_visibility(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn resolve_in_base_scope_contract_decision01() {
+    pub_db_tests::contract::resolve_in_base_scope(&fresh_repos().await).await;
+}

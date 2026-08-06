@@ -122,6 +122,8 @@ pub struct Settings {
     pub auth: AuthConfig,
     /// Outbound SMTP; unset host = the in-memory dev mailer.
     pub smtp: SmtpConfig,
+    /// Registry ingest limits and version-lifecycle policy.
+    pub registry: RegistryConfig,
 }
 
 /// Deployment mode: gates the dev-only secret fallbacks (S-25).
@@ -250,11 +252,15 @@ pub struct AuthRateLimitConfig {
     pub otp_per_ip_hour: u32,
     /// Credential-redemption attempts (OTP verify, refresh) per IP per minute (S-24: 10).
     pub login_per_ip_minute: u32,
+    /// Failed CLI-token authentications per IP per minute on the pub protocol (S-24: 30).
+    /// Only *failures* count — a working token is unthrottled by this bucket, because the
+    /// pub client sends its credential on every resolve and every download.
+    pub token_auth_fail_per_ip_minute: u32,
 }
 
 impl Default for AuthRateLimitConfig {
     fn default() -> Self {
-        Self { otp_per_email_hour: 5, otp_per_ip_hour: 20, login_per_ip_minute: 10 }
+        Self { otp_per_email_hour: 5, otp_per_ip_hour: 20, login_per_ip_minute: 10, token_auth_fail_per_ip_minute: 30 }
     }
 }
 
@@ -508,6 +514,74 @@ pub struct TelemetryConfig {
     pub otlp: bool,
 }
 
+/// Registry ingest limits and lifecycle policy (S-20, decision 06).
+///
+/// These are the numbers an operator actually tunes: a monorepo shop raises the archive cap,
+/// an air-gapped mirror lowers it. The defaults match the normative ones in S-20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegistryConfig {
+    /// Maximum compressed upload size in bytes (S-20 default: 100 MB).
+    pub max_archive_bytes: u64,
+    /// Maximum total decompressed size of an archive in bytes (gzip-bomb ceiling).
+    pub max_uncompressed_bytes: u64,
+    /// Maximum number of tar entries in an archive.
+    pub max_entries: usize,
+    /// Maximum decompressed:compressed expansion ratio.
+    pub max_compression_ratio: u64,
+    /// Maximum size of a single captured file (pubspec, README, CHANGELOG, example).
+    pub max_captured_file_bytes: u64,
+    /// Days after a retraction during which the version may still be restored (decision 06;
+    /// pub.dev's rule is 7).
+    pub unretract_window_days: i64,
+    /// Whether *reading* the registry requires a CLI token (decision 05).
+    ///
+    /// `false` (default): public and proxied packages resolve anonymously, pub.dev-style.
+    /// `true`: every pub-protocol read demands a token and anonymous requests get the
+    /// spec-mandated 401 + onboarding message — with nothing anonymous-readable there is
+    /// nothing to enumerate, so the anti-enumeration 404 stops being load-bearing.
+    ///
+    /// Boot config for now. Decision 09 files this under runtime settings; it moves into the
+    /// `settings` table when the `ArcSwap` settings cache lands, and the flag's *semantics*
+    /// are unaffected by where it is read from.
+    pub require_auth_for_read: bool,
+    /// Abuse limits on the registry write path (S-24).
+    pub rate_limit: RegistryRateLimit,
+}
+
+/// Registry-plane rate limits (S-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegistryRateLimit {
+    /// Publish uploads accepted per org per hour (S-24: 30).
+    ///
+    /// The budget is spent by the *upload* step, which is where an attempt costs storage:
+    /// step 1 hands out a URL, step 3 only finishes what was already paid for. It bounds the
+    /// staging area an org can occupy with uploads it never finalizes.
+    pub publish_per_hour_org: u32,
+}
+
+impl Default for RegistryRateLimit {
+    fn default() -> Self {
+        Self { publish_per_hour_org: 30 }
+    }
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            max_archive_bytes: 100 * 1024 * 1024,
+            max_uncompressed_bytes: 256 * 1024 * 1024,
+            max_entries: 10_000,
+            max_compression_ratio: 100,
+            max_captured_file_bytes: 4 * 1024 * 1024,
+            unretract_window_days: 7,
+            require_auth_for_read: false,
+            rate_limit: RegistryRateLimit::default(),
+        }
+    }
+}
+
 /// Multi-instance topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -645,6 +719,18 @@ impl Settings {
         let _ = writeln!(out, "  telemetry.prometheus = {}", self.telemetry.prometheus);
         let _ = writeln!(out, "  telemetry.otlp       = {}", self.telemetry.otlp);
         let _ = writeln!(out, "  cluster.replicas     = {}", self.cluster.replicas);
+        let _ = writeln!(
+            out,
+            "  registry.limits      = archive {} MB, uncompressed {} MB, {} entries, ratio {}x",
+            self.registry.max_archive_bytes / (1024 * 1024),
+            self.registry.max_uncompressed_bytes / (1024 * 1024),
+            self.registry.max_entries,
+            self.registry.max_compression_ratio
+        );
+        let _ = writeln!(out, "  registry.unretract   = {} d", self.registry.unretract_window_days);
+        let _ = writeln!(out, "  registry.auth_read   = {}", self.registry.require_auth_for_read);
+        let _ =
+            writeln!(out, "  registry.rate_limit  = publish {}/h/org", self.registry.rate_limit.publish_per_hour_org);
 
         // Auth: secrets masked (S-25); kids are public metadata and are listed for rotation
         // sanity checks.

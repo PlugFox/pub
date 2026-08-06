@@ -10,11 +10,14 @@ pub mod audit;
 pub mod authorize;
 pub mod credential;
 pub mod error;
+pub mod event;
 pub mod format;
 pub mod id;
 pub mod org;
+pub mod package;
 pub mod page;
 pub mod role;
+pub mod semver;
 pub mod session;
 pub mod settings;
 pub mod token;
@@ -22,10 +25,12 @@ pub mod traits;
 pub mod user;
 
 pub use error::Error;
+pub use event::DomainEvent;
 pub use format::Format;
 pub use id::{CredentialId, InvitationId, OrgId, PackageId, SessionId, TokenId, UserId, VersionId};
 pub use page::Page;
 pub use role::RoleLevel;
+pub use semver::SemVer;
 
 /// Crate-wide result alias defaulting to [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;

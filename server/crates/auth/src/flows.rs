@@ -28,7 +28,7 @@ use pub_core::session::{NewSession, Session, SessionLimits};
 use pub_core::token::{NewToken, Token, TokenScope};
 use pub_core::traits::{Kv, Mailer, Repositories};
 use pub_core::user::{NewUser, User, UserStatus};
-use pub_core::{Error, OrgId, Result, SessionId, TokenId, UserId};
+use pub_core::{Error, OrgId, Result, RoleLevel, SessionId, TokenId, UserId};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,11 @@ pub const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
 
 /// Upper bound on a caller-chosen token lifetime (10 years — effectively "long", still finite).
 pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
+
+/// How stale `tokens.last_used_at` may get before another write happens (S-13 "write-throttled").
+/// The pub client authenticates on every resolve and download; without a throttle a single
+/// `pub get` would issue dozens of writes to one row.
+const TOKEN_LAST_USED_THROTTLE: StdDuration = StdDuration::from_secs(5 * 60);
 
 /// Instance auth policy, resolved from boot config (and later from runtime settings — the
 /// registration/domain knobs are instance settings per S-31; they live here so the flows
@@ -71,6 +76,9 @@ pub struct AuthPolicy {
     /// Credential redemptions (OTP verify, refresh) per IP per minute (S-24: 10) — enforced
     /// by the API rate-limit layer.
     pub login_per_ip_minute: u32,
+    /// Failed CLI-token authentications per IP per minute (S-24: 30) — enforced by
+    /// [`AuthService::authenticate_cli_token`].
+    pub token_auth_fail_per_ip_minute: u32,
     /// 32-byte key-encryption key sealing TOTP seeds at rest (S-05/S-25).
     pub kek: Vec<u8>,
     /// How long a step-up (fresh second factor / fresh login) stays valid (S-06; default
@@ -93,6 +101,7 @@ impl std::fmt::Debug for AuthPolicy {
             .field("otp_per_email_hour", &self.otp_per_email_hour)
             .field("otp_per_ip_hour", &self.otp_per_ip_hour)
             .field("login_per_ip_minute", &self.login_per_ip_minute)
+            .field("token_auth_fail_per_ip_minute", &self.token_auth_fail_per_ip_minute)
             .field("kek", &"<redacted>")
             .field("step_up_window", &self.step_up_window)
             .field("totp_issuer", &self.totp_issuer)
@@ -987,6 +996,98 @@ impl AuthService {
         )
         .await;
         Ok(())
+    }
+
+    // --- CLI token authentication (S-13, S-14, S-24) ---
+
+    /// Authenticates a presented CLI token secret — the pub protocol's whole credential check.
+    ///
+    /// The order is the security property. The **offline** checks (prefix, length, charset,
+    /// CRC32 — decision 13) run first, so a fabricated, truncated, or foreign-prefixed string
+    /// never reaches the database; a browser access JWT fails them structurally, which is how
+    /// the two credential planes stay unmixed (decision 03) without a special case. Only then
+    /// is the SHA-256 looked up, and only tokens active *at `now`* come back — unknown,
+    /// revoked, and expired are deliberately indistinguishable (uniform 401, S-14).
+    ///
+    /// Failures spend an S-24 budget keyed on the client IP; once it is gone the error becomes
+    /// [`Error::RateLimited`] instead of [`Error::Unauthorized`], which also stops a brute
+    /// force from destroying a bystander's stored credential (the pub client deletes its token
+    /// on 401 — docs/protocol.md sharp edge 1).
+    pub async fn authenticate_cli_token(&self, secret: &str, meta: &ClientMeta, now: DateTime<Utc>) -> Result<Token> {
+        if token::validate(secret, &self.policy.token_prefix).is_err() {
+            return Err(self.token_auth_failure(meta, "malformed", now).await);
+        }
+        let hash = token::sha256_hex(secret);
+        match self.repos.tokens.find_active_by_hash(&hash, now).await? {
+            Some(token) => Ok(token),
+            None => Err(self.token_auth_failure(meta, "unknown_revoked_or_expired", now).await),
+        }
+    }
+
+    /// The token's principal for the [`authorize`] chokepoint (decision 19).
+    ///
+    /// The role is read from the **durable** membership, not from any cached claim: a token
+    /// outlives role changes by design, so its authority has to be re-derived per request.
+    /// A user who has left the org holds [`RoleLevel::NONE`] and the token authenticates but
+    /// authorizes nothing.
+    pub async fn token_actor(&self, token: &Token) -> Result<ActorContext> {
+        let role = self
+            .repos
+            .orgs
+            .get_member(token.org_id, token.user_id)
+            .await?
+            .map(|member| member.role)
+            .unwrap_or(RoleLevel::NONE);
+        Ok(ActorContext::user(token.user_id, BTreeMap::from([(token.org_id, role)])))
+    }
+
+    /// Write-throttled last-used/last-IP tracking (S-13).
+    ///
+    /// Best-effort by contract: the pub client authenticates on *every* resolve and download,
+    /// so a bookkeeping failure must never fail the request it is bookkeeping for.
+    pub async fn touch_cli_token(&self, token: &Token, ip: Option<&str>, now: DateTime<Utc>) {
+        if let Err(err) = self.repos.tokens.touch_last_used(token.id, ip, TOKEN_LAST_USED_THROTTLE, now).await {
+            tracing::warn!(error = %err, "token last-used tracking failed");
+        }
+    }
+
+    /// Spends one S-24 token-auth failure budget unit and returns the caller-facing error.
+    ///
+    /// A KV outage here degrades to a plain denial rather than propagating: the request has
+    /// *already* failed authentication, so failing closed and failing open coincide, and a
+    /// 503 would only teach an attacker that the throttle is down.
+    async fn token_auth_failure(&self, meta: &ClientMeta, reason: &str, now: DateTime<Utc>) -> Error {
+        let ip = meta.ip.as_deref().unwrap_or("unknown");
+        let key = format!("rl:token_auth:ip:{ip}");
+        let window = Duration::minutes(1);
+        match ratelimit::hit(self.kv.as_ref(), &key, self.policy.token_auth_fail_per_ip_minute, window, now).await {
+            Ok(ratelimit::Decision::Allowed) => {}
+            Ok(ratelimit::Decision::Limited { retry_after_secs }) => {
+                self.audit_as(
+                    AuditActor::System,
+                    meta,
+                    "auth.throttled",
+                    None,
+                    AuditResult::Failure,
+                    serde_json::json!({ "limit": "token_auth_per_ip" }),
+                    now,
+                )
+                .await;
+                return Error::RateLimited { retry_after_secs };
+            }
+            Err(err) => tracing::error!(error = %err, "token-auth throttle accounting failed"),
+        }
+        self.audit_as(
+            AuditActor::System,
+            meta,
+            "auth.token.failure",
+            None,
+            AuditResult::Failure,
+            serde_json::json!({ "reason": reason }),
+            now,
+        )
+        .await;
+        Error::Unauthorized { message: "invalid or expired token".into() }
     }
 
     // --- internals ---

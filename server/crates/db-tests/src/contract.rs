@@ -2,17 +2,20 @@
 //! repository trait end to end, corner cases included. Panics (assert) on violation — the
 //! caller wraps each function in its own test.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone as _, Utc};
 use pub_core::audit::{AuditActor, AuditFilter, AuditResult, NewAuditEvent};
+use pub_core::authorize::ActorContext;
 use pub_core::credential::CredentialType;
 use pub_core::org::{NewInvitation, NewOrg};
+use pub_core::package::{BaseScope, NewPackage, NewVersion, PackageOptions, Publisher, Resolution, Visibility};
 use pub_core::session::{NewSession, SessionLimits};
 use pub_core::token::{NewToken, TokenScope};
 use pub_core::traits::Repositories;
 use pub_core::user::{NewUser, UserStatus};
-use pub_core::{OrgId, RoleLevel, UserId};
+use pub_core::{Format, OrgId, RoleLevel, SemVer, UserId};
 
 /// Deterministic base instant for every scenario (no wall clock in tests).
 fn t0() -> DateTime<Utc> {
@@ -900,4 +903,574 @@ pub async fn settings_repo(repos: &Repositories) {
     let smtp_entry = all.iter().find(|e| e.key == "smtp").unwrap();
     assert_eq!(smtp_entry.value, smtp2);
     assert_eq!(smtp_entry.version, 2);
+}
+
+/// Builds a publish payload for `(org, name, version)` with deterministic content.
+fn new_version(org: OrgId, name: &str, version: &str, publisher: UserId) -> NewVersion {
+    NewVersion {
+        format: Format::Pub,
+        package_name: name.to_owned(),
+        org_id: org,
+        visibility: Visibility::Private,
+        version: SemVer::parse(version).expect("valid version"),
+        pubspec: serde_json::json!({ "name": name, "version": version }),
+        // Distinct content per (name, version) — sha256 shape only matters to the column.
+        archive_sha256: format!("{:0>64}", format!("{name}{version}").replace('.', "")),
+        archive_size: 1024,
+        published_by: Publisher { user_id: publisher, token_id: None },
+        readme_html: None,
+        changelog_html: None,
+    }
+}
+
+/// `PackageRepo` package surface: creation, lookups, keyset listing, and option replacement.
+pub async fn package_repo(repos: &Repositories) {
+    repos.packages.ping().await.expect("ping");
+
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    let other = seed_org(repos, "other", alice.id).await;
+
+    // create_package claims the name in the same step (decision 01).
+    let package = repos
+        .packages
+        .create_package(
+            NewPackage {
+                format: Format::Pub,
+                name: "acme_core".to_owned(),
+                org_id: org.id,
+                visibility: Visibility::Public,
+            },
+            t0(),
+        )
+        .await
+        .expect("create package");
+    assert_eq!(package.name, "acme_core");
+    assert_eq!(package.visibility, Visibility::Public);
+    assert!(!package.discontinued && !package.unlisted);
+    assert_eq!(package.replaced_by, None);
+    assert_eq!((package.created_at, package.updated_at), (t0(), t0()));
+
+    let claim = repos.packages.lookup_claim(Format::Pub, "acme_core").await.expect("claim").expect("claimed");
+    assert_eq!(claim.org_id, org.id);
+    assert_eq!(claim.claimed_at, t0());
+
+    // Lookups: hit and miss.
+    assert_eq!(repos.packages.get_package(package.id).await.expect("get"), Some(package.clone()));
+    assert_eq!(repos.packages.get_package(pub_core::PackageId::new()).await.expect("miss"), None);
+    assert_eq!(repos.packages.get_by_name(Format::Pub, "acme_core").await.expect("by name"), Some(package.clone()));
+    assert_eq!(repos.packages.get_by_name(Format::Pub, "nope").await.expect("by name miss"), None);
+
+    // The name is taken instance-wide — even for another org (decision 01: names are flat).
+    let err = repos
+        .packages
+        .create_package(
+            NewPackage {
+                format: Format::Pub,
+                name: "acme_core".to_owned(),
+                org_id: other.id,
+                visibility: Visibility::Public,
+            },
+            t0(),
+        )
+        .await
+        .expect_err("name is claimed");
+    assert_eq!(err.code(), "conflict");
+
+    // claim_name: idempotent for the holder, conflict for anybody else.
+    let again = repos.packages.claim_name(Format::Pub, "acme_core", org.id, t0() + hours(1)).await.expect("re-claim");
+    assert_eq!(again.claimed_at, t0(), "re-claiming must not move the claim date");
+    let err = repos.packages.claim_name(Format::Pub, "acme_core", other.id, t0()).await.expect_err("foreign re-claim");
+    assert_eq!(err.code(), "conflict");
+    // A reserved-but-unpublished name has a claim and no package.
+    repos.packages.claim_name(Format::Pub, "acme_reserved", org.id, t0()).await.expect("reserve");
+    assert!(repos.packages.get_by_name(Format::Pub, "acme_reserved").await.expect("no package").is_none());
+
+    // set_options replaces the whole option set and bumps updated_at.
+    let updated = repos
+        .packages
+        .set_options(
+            package.id,
+            &PackageOptions {
+                visibility: Visibility::Private,
+                discontinued: true,
+                replaced_by: Some("acme_core2".to_owned()),
+                unlisted: true,
+            },
+            t0() + hours(2),
+        )
+        .await
+        .expect("set options");
+    assert_eq!(updated.visibility, Visibility::Private);
+    assert!(updated.discontinued && updated.unlisted);
+    assert_eq!(updated.replaced_by.as_deref(), Some("acme_core2"));
+    assert_eq!(updated.updated_at, t0() + hours(2));
+    assert_eq!(updated.created_at, t0());
+    // Clearing works through the same replace payload.
+    let cleared = repos
+        .packages
+        .set_options(package.id, &PackageOptions::from(&package), t0() + hours(3))
+        .await
+        .expect("clear options");
+    assert!(!cleared.discontinued && !cleared.unlisted);
+    assert_eq!(cleared.replaced_by, None);
+    let err = repos
+        .packages
+        .set_options(pub_core::PackageId::new(), &PackageOptions::from(&package), t0())
+        .await
+        .expect_err("unknown package");
+    assert_eq!(err.code(), "not_found");
+
+    // list_for_org: name order, keyset-paginated, unlisted/discontinued rows included.
+    for name in ["acme_ui", "acme_net", "acme_db"] {
+        repos
+            .packages
+            .create_package(
+                NewPackage {
+                    format: Format::Pub,
+                    name: name.to_owned(),
+                    org_id: org.id,
+                    visibility: Visibility::Private,
+                },
+                t0(),
+            )
+            .await
+            .expect("create");
+    }
+    let all = repos.packages.list_for_org(org.id, None, 100).await.expect("list");
+    let names: Vec<&str> = all.items.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["acme_core", "acme_db", "acme_net", "acme_ui"]);
+    assert!(!all.has_more);
+    assert_eq!(all.cursor, None);
+    // Another org's packages never appear.
+    assert!(repos.packages.list_for_org(other.id, None, 100).await.expect("empty").items.is_empty());
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let page = repos.packages.list_for_org(org.id, cursor.as_deref(), 2).await.expect("page");
+        assert!(page.items.len() <= 2);
+        assert_eq!(page.cursor.is_some(), page.has_more, "cursor is Some iff has_more");
+        seen.extend(page.items.iter().map(|p| p.name.clone()));
+        pages += 1;
+        if !page.has_more {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(pages, 2);
+    assert_eq!(seen, vec!["acme_core", "acme_db", "acme_net", "acme_ui"], "no skips or duplicates across pages");
+
+    let err = repos.packages.list_for_org(org.id, Some("not-a-cursor"), 10).await.expect_err("bad cursor");
+    assert_eq!(err.code(), "invalid_argument");
+    let one = repos.packages.list_for_org(org.id, None, 0).await.expect("clamped limit");
+    assert_eq!(one.items.len(), 1);
+    assert!(one.has_more);
+}
+
+/// `PackageRepo` version ordering: semver precedence (pre-releases included), retraction
+/// flags, and keyset pagination over the ordered listing.
+pub async fn version_ordering(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+
+    // Deliberately inserted out of order, and covering the spec's pre-release ladder.
+    //
+    // Three entries are adversarial on purpose: they fail loudly if the ordering column is
+    // ever compared under a locale collation rather than bytewise (`COLLATE "C"` on Postgres,
+    // BINARY on SQLite). `1.0.0-Beta` — ASCII puts uppercase before lowercase, ICU does not;
+    // the `a.b` / `a-b` pair — identifier-by-identifier comparison, which a
+    // punctuation-folding collation reverses.
+    let ordered = [
+        "0.9.9",
+        "1.0.0-Beta",
+        "1.0.0-a.b",
+        "1.0.0-a-b",
+        "1.0.0-alpha",
+        "1.0.0-alpha.1",
+        "1.0.0-alpha.beta",
+        "1.0.0-beta",
+        "1.0.0-beta.2",
+        "1.0.0-beta.11",
+        "1.0.0-rc.1",
+        "1.0.0",
+        "1.0.1",
+        "1.2.0",
+        "2.0.0",
+        "10.0.0",
+    ];
+    let insertion = [
+        "2.0.0",
+        "1.0.0-beta.11",
+        "10.0.0",
+        "1.0.0",
+        "1.0.0-alpha.1",
+        "0.9.9",
+        "1.0.0-rc.1",
+        "1.2.0",
+        "1.0.0-alpha",
+        "1.0.1",
+        "1.0.0-beta",
+        "1.0.0-alpha.beta",
+        "1.0.0-beta.2",
+        "1.0.0-a-b",
+        "1.0.0-Beta",
+        "1.0.0-a.b",
+    ];
+    let mut package_id = None;
+    for (index, version) in insertion.iter().enumerate() {
+        let published = repos
+            .packages
+            .create_version(
+                new_version(org.id, "acme_core", version, alice.id),
+                t0() + chrono::Duration::minutes(index as i64),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("publish {version}: {err}"));
+        assert_eq!(published.package_created, index == 0, "only the first publish creates the package");
+        package_id = Some(published.package.id);
+    }
+    let package_id = package_id.expect("package");
+
+    let listed = repos.packages.list_versions(package_id, None, 100).await.expect("list");
+    let versions: Vec<String> = listed.items.iter().map(|v| v.version.to_string()).collect();
+    assert_eq!(versions, ordered, "listing must be in semver precedence order, not string order");
+
+    // get_version finds an exact version, including pre-releases.
+    let beta = SemVer::parse("1.0.0-beta.11").expect("parse");
+    let found = repos.packages.get_version(package_id, &beta).await.expect("get").expect("exists");
+    assert_eq!(found.version, beta);
+    assert_eq!(found.pubspec["version"], "1.0.0-beta.11");
+    assert!(!found.is_retracted());
+    assert_eq!(repos.packages.get_version(package_id, &SemVer::parse("9.9.9").unwrap()).await.expect("miss"), None);
+
+    // Retracted versions stay listed and are flagged (docs/protocol.md sharp edge 9).
+    let retracted = repos.packages.set_retracted(found.id, true, t0() + days(1)).await.expect("retract");
+    assert_eq!(retracted.retracted_at, Some(t0() + days(1)));
+    let listed = repos.packages.list_versions(package_id, None, 100).await.expect("list");
+    assert_eq!(listed.items.len(), ordered.len(), "retraction must not remove the version from the listing");
+    let flagged: Vec<&str> =
+        listed.items.iter().filter(|v| v.is_retracted()).map(|v| v.version.to_string().leak() as &str).collect();
+    assert_eq!(flagged, vec!["1.0.0-beta.11"]);
+
+    // Keyset pagination walks the same order without gaps or repeats.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = repos.packages.list_versions(package_id, cursor.as_deref(), 3).await.expect("page");
+        assert!(page.items.len() <= 3);
+        assert_eq!(page.cursor.is_some(), page.has_more, "cursor is Some iff has_more");
+        seen.extend(page.items.iter().map(|v| v.version.to_string()));
+        if !page.has_more {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(seen, ordered, "paginated order must equal the full listing order");
+
+    let err = repos.packages.list_versions(package_id, Some("%%%"), 10).await.expect_err("bad cursor");
+    assert_eq!(err.code(), "invalid_argument");
+}
+
+/// `PackageRepo` publish invariants: claim ownership, duplicate rejection, tombstones burning
+/// a number forever, retract/unretract flags, and blob reference counting.
+pub async fn publish_invariants(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let mallory = seed_user(repos, "mallory@evil.com", "Mallory").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    let rival = seed_org(repos, "rival", mallory.id).await;
+
+    let published = repos
+        .packages
+        .create_version(new_version(org.id, "acme_core", "1.0.0", alice.id), t0())
+        .await
+        .expect("first publish");
+    assert!(published.package_created);
+    assert_eq!(published.package.org_id, org.id);
+    assert_eq!(published.version.archive_size, 1024);
+    assert_eq!(published.version.published_at, t0());
+
+    // Claim ownership: another org cannot publish under a claimed name.
+    let err = repos
+        .packages
+        .create_version(new_version(rival.id, "acme_core", "2.0.0", mallory.id), t0() + hours(1))
+        .await
+        .expect_err("foreign claim");
+    assert_eq!(err.code(), "forbidden");
+    // …and the failed attempt created nothing.
+    assert_eq!(
+        repos.packages.get_version(published.package.id, &SemVer::parse("2.0.0").unwrap()).await.expect("get"),
+        None
+    );
+
+    // Duplicate version — same content or different — is a conflict (S-18 immutability).
+    let err = repos
+        .packages
+        .create_version(new_version(org.id, "acme_core", "1.0.0", alice.id), t0() + hours(2))
+        .await
+        .expect_err("duplicate version");
+    assert_eq!(err.code(), "conflict");
+    let mut different = new_version(org.id, "acme_core", "1.0.0", alice.id);
+    different.archive_sha256 = "f".repeat(64);
+    let err = repos.packages.create_version(different, t0() + hours(2)).await.expect_err("duplicate version");
+    assert_eq!(err.code(), "conflict");
+
+    // Retract / unretract flags, idempotently.
+    let retracted = repos.packages.set_retracted(published.version.id, true, t0() + days(1)).await.expect("retract");
+    assert_eq!(retracted.retracted_at, Some(t0() + days(1)));
+    let again = repos.packages.set_retracted(published.version.id, true, t0() + days(2)).await.expect("re-retract");
+    assert_eq!(again.retracted_at, Some(t0() + days(1)), "re-retracting keeps the original instant");
+    let restored = repos.packages.set_retracted(published.version.id, false, t0() + days(3)).await.expect("restore");
+    assert_eq!(restored.retracted_at, None);
+    let err = repos.packages.set_retracted(pub_core::VersionId::new(), true, t0()).await.expect_err("unknown version");
+    assert_eq!(err.code(), "not_found");
+
+    // Blob reference counting: two versions may share one content hash.
+    let shared = published.version.archive_sha256.clone();
+    assert_eq!(repos.packages.count_versions_with_sha256(&shared).await.expect("count"), 1);
+    let mut twin = new_version(org.id, "acme_twin", "1.0.0", alice.id);
+    twin.archive_sha256 = shared.clone();
+    repos.packages.create_version(twin, t0() + hours(3)).await.expect("twin publish");
+    assert_eq!(repos.packages.count_versions_with_sha256(&shared).await.expect("count"), 2);
+    assert_eq!(repos.packages.count_versions_with_sha256(&"0".repeat(64)).await.expect("count"), 0);
+
+    // Hard delete: the row becomes a tombstone with its payload cleared…
+    let tombstone = repos.packages.hard_delete_version(published.version.id).await.expect("hard delete");
+    assert!(tombstone.tombstone);
+    assert_eq!(tombstone.pubspec, serde_json::json!({}));
+    assert_eq!(tombstone.readme_html, None);
+    assert_eq!(tombstone.archive_sha256, shared, "the hash survives for GC accounting");
+    // …the version leaves the listing…
+    let listed = repos.packages.list_versions(published.package.id, None, 50).await.expect("list");
+    assert!(listed.items.is_empty());
+    // …stops counting as a blob reference…
+    assert_eq!(repos.packages.count_versions_with_sha256(&shared).await.expect("count"), 1);
+    // …but remains findable by exact version, so callers can tell "burned" from "never was".
+    let found = repos
+        .packages
+        .get_version(published.package.id, &SemVer::parse("1.0.0").unwrap())
+        .await
+        .expect("get")
+        .expect("tombstone row");
+    assert!(found.tombstone);
+
+    // The number can never be republished (decision 06, S-18).
+    let err = repos
+        .packages
+        .create_version(new_version(org.id, "acme_core", "1.0.0", alice.id), t0() + days(5))
+        .await
+        .expect_err("tombstoned number");
+    assert_eq!(err.code(), "conflict");
+
+    // Tombstoned versions cannot be retracted or deleted again.
+    let err = repos.packages.set_retracted(published.version.id, true, t0() + days(5)).await.expect_err("tombstoned");
+    assert_eq!(err.code(), "conflict");
+    let err = repos.packages.hard_delete_version(published.version.id).await.expect_err("already deleted");
+    assert_eq!(err.code(), "conflict");
+    let err = repos.packages.hard_delete_version(pub_core::VersionId::new()).await.expect_err("unknown");
+    assert_eq!(err.code(), "not_found");
+
+    // A new, never-used version number still publishes fine after all of that.
+    repos
+        .packages
+        .create_version(new_version(org.id, "acme_core", "1.0.1", alice.id), t0() + days(6))
+        .await
+        .expect("publish after tombstone");
+}
+
+/// `PackageRepo::resolve` visibility matrix (decision 05 / S-04): public/private ×
+/// member/non-member/anonymous, plus claimed-but-unpublished and unclaimed names.
+pub async fn resolve_visibility(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    let outsider_org = seed_org(repos, "outside", bob.id).await;
+
+    let member = ActorContext::user(alice.id, BTreeMap::from([(org.id, RoleLevel::READ)]));
+    // A member of *another* org holds no role here.
+    let non_member = ActorContext::user(bob.id, BTreeMap::from([(outsider_org.id, RoleLevel::OWNER)]));
+    let anonymous = ActorContext::anonymous();
+
+    let public = repos
+        .packages
+        .create_package(
+            NewPackage {
+                format: Format::Pub,
+                name: "acme_public".to_owned(),
+                org_id: org.id,
+                visibility: Visibility::Public,
+            },
+            t0(),
+        )
+        .await
+        .expect("public package");
+    let private = repos
+        .packages
+        .create_package(
+            NewPackage {
+                format: Format::Pub,
+                name: "acme_private".to_owned(),
+                org_id: org.id,
+                visibility: Visibility::Private,
+            },
+            t0(),
+        )
+        .await
+        .expect("private package");
+
+    // Public packages are readable by everyone, including anonymous callers (decision 05).
+    for actor in [&member, &non_member, &anonymous] {
+        assert_eq!(
+            repos.packages.resolve(Format::Pub, "acme_public", actor).await.expect("resolve"),
+            Resolution::Readable(public.clone())
+        );
+    }
+
+    // Private packages: only members at Read level or above.
+    assert_eq!(
+        repos.packages.resolve(Format::Pub, "acme_private", &member).await.expect("resolve"),
+        Resolution::Readable(private.clone())
+    );
+    for actor in [&non_member, &anonymous] {
+        assert_eq!(
+            repos.packages.resolve(Format::Pub, "acme_private", actor).await.expect("resolve"),
+            Resolution::Restricted { owner: org.id },
+            "a private package must be invisible outside its org"
+        );
+    }
+    // Below Read the ladder denies (decision 19 boundary).
+    let too_low = ActorContext::user(bob.id, BTreeMap::from([(org.id, RoleLevel::new(49))]));
+    assert_eq!(
+        repos.packages.resolve(Format::Pub, "acme_private", &too_low).await.expect("resolve"),
+        Resolution::Restricted { owner: org.id }
+    );
+    // Write and above obviously read.
+    let writer = ActorContext::user(bob.id, BTreeMap::from([(org.id, RoleLevel::WRITE)]));
+    assert!(matches!(
+        repos.packages.resolve(Format::Pub, "acme_private", &writer).await.expect("resolve"),
+        Resolution::Readable(_)
+    ));
+
+    // A claimed-but-unpublished name is local and must never fall through to upstream (S-16).
+    repos.packages.claim_name(Format::Pub, "acme_reserved", org.id, t0()).await.expect("reserve");
+    assert_eq!(
+        repos.packages.resolve(Format::Pub, "acme_reserved", &member).await.expect("resolve"),
+        Resolution::Restricted { owner: org.id }
+    );
+
+    // An unclaimed name is the only proxy candidate.
+    assert_eq!(repos.packages.resolve(Format::Pub, "http", &member).await.expect("resolve"), Resolution::Unclaimed);
+    assert_eq!(repos.packages.resolve(Format::Pub, "http", &anonymous).await.expect("resolve"), Resolution::Unclaimed);
+
+    // Visibility follows the package: flipping it to public opens the door immediately.
+    repos
+        .packages
+        .set_options(
+            private.id,
+            &PackageOptions { visibility: Visibility::Public, ..PackageOptions::from(&private) },
+            t0() + hours(1),
+        )
+        .await
+        .expect("publish it");
+    assert!(matches!(
+        repos.packages.resolve(Format::Pub, "acme_private", &anonymous).await.expect("resolve"),
+        Resolution::Readable(_)
+    ));
+    // Unlisted is a discovery flag, not an access-control one: it stays resolvable by name.
+    repos
+        .packages
+        .set_options(
+            private.id,
+            &PackageOptions { visibility: Visibility::Public, unlisted: true, ..PackageOptions::from(&private) },
+            t0() + hours(2),
+        )
+        .await
+        .expect("unlist");
+    assert!(matches!(
+        repos.packages.resolve(Format::Pub, "acme_private", &anonymous).await.expect("resolve"),
+        Resolution::Readable(_)
+    ));
+}
+
+/// `PackageRepo::resolve_in_base` — decision 01's resolution order as seen from each virtual
+/// registry base, on both backends.
+///
+/// The two rows that make this more than a rerun of [`resolve_visibility`]:
+///
+/// - inside `/o/{org}/pub`, **another org's private package is invisible even to its own
+///   members** — the URL is the namespace, not the principal, so the same `PUB_HOSTED_URL`
+///   resolves to the same package set for everyone who can use it at all;
+/// - at the public root nothing private resolves, not even the caller's own package.
+pub async fn resolve_in_base_scope(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let acme = seed_org(repos, "acme", alice.id).await;
+    let other = seed_org(repos, "other", bob.id).await;
+
+    let mut packages = Vec::new();
+    for (name, org, visibility) in [
+        ("acme_private", acme.id, Visibility::Private),
+        ("acme_public", acme.id, Visibility::Public),
+        ("other_private", other.id, Visibility::Private),
+        ("other_public", other.id, Visibility::Public),
+    ] {
+        packages.push(
+            repos
+                .packages
+                .create_package(
+                    NewPackage { format: Format::Pub, name: name.to_owned(), org_id: org, visibility },
+                    t0(),
+                )
+                .await
+                .expect("seed package"),
+        );
+    }
+
+    // A principal who is a member of *both* orgs — the interesting case, because a
+    // principal-scoped policy would leak `other_private` into acme's base for them.
+    let both =
+        ActorContext::user(alice.id, BTreeMap::from([(acme.id, RoleLevel::OWNER), (other.id, RoleLevel::OWNER)]));
+    let anonymous = ActorContext::anonymous();
+
+    let readable = |resolution: &Resolution| matches!(resolution, Resolution::Readable(_));
+
+    // --- inside /o/acme/pub ---
+    let scope = BaseScope::Org(acme.id);
+    for (name, expected) in
+        [("acme_private", true), ("acme_public", true), ("other_public", true), ("other_private", false)]
+    {
+        let resolution = repos.packages.resolve_in_base(Format::Pub, name, scope, &both).await.expect("resolve");
+        assert_eq!(readable(&resolution), expected, "{name} in /o/acme/pub for a member of both orgs");
+    }
+    // Anonymous sees only what is public.
+    for (name, expected) in
+        [("acme_private", false), ("acme_public", true), ("other_public", true), ("other_private", false)]
+    {
+        let resolution = repos.packages.resolve_in_base(Format::Pub, name, scope, &anonymous).await.expect("resolve");
+        assert_eq!(readable(&resolution), expected, "{name} in /o/acme/pub for an anonymous caller");
+    }
+
+    // --- at the public root ---
+    for actor in [&both, &anonymous] {
+        for (name, expected) in
+            [("acme_private", false), ("acme_public", true), ("other_public", true), ("other_private", false)]
+        {
+            let resolution =
+                repos.packages.resolve_in_base(Format::Pub, name, BaseScope::PublicRoot, actor).await.expect("resolve");
+            assert_eq!(readable(&resolution), expected, "{name} at /pub");
+        }
+    }
+
+    // Local always wins (S-16): a claimed-but-unpublished name is `Restricted`, never a proxy
+    // candidate; only a name claimed nowhere is `Unclaimed`.
+    repos.packages.claim_name(Format::Pub, "acme_reserved", acme.id, t0()).await.expect("reserve");
+    assert_eq!(
+        repos.packages.resolve_in_base(Format::Pub, "acme_reserved", BaseScope::PublicRoot, &both).await.expect("r"),
+        Resolution::Restricted { owner: acme.id }
+    );
+    assert_eq!(
+        repos.packages.resolve_in_base(Format::Pub, "http", BaseScope::Org(acme.id), &both).await.expect("r"),
+        Resolution::Unclaimed
+    );
 }
