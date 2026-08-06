@@ -81,6 +81,13 @@ async fn credential_repo_contract() {
 }
 
 #[tokio::test]
+async fn second_factor_contract_s05() {
+    let Some(db) = TestDb::create("second_factor_contract_s05").await else { return };
+    pub_db_tests::contract::second_factor(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn org_repo_contract() {
     let Some(db) = TestDb::create("org_repo_contract").await else { return };
     pub_db_tests::contract::org_repo(&db.repos()).await;

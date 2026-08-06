@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use base64::Engine as _;
 use clap::{CommandFactory as _, FromArgMatches as _};
 use pub_api::AppState;
 use pub_auth::flows::{AuthPolicy, AuthService};
 use pub_auth::jwt::Keyring;
+use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::{OsRandom, RandomSource as _};
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, Settings, SmtpSecurityMode};
@@ -51,7 +53,12 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("failed to bind {listen}"))?;
     tracing::info!(%listen, "pubd listening");
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.context("server error")?;
+    // Connect info is what the rate limiter falls back to when forwarding headers are not
+    // trusted (S-24) — without it an untrusted deployment would have no per-IP identity at all.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
 
     tracing::info!("pubd stopped");
     drop(telemetry);
@@ -109,7 +116,7 @@ fn build_mailer(settings: &Settings) -> anyhow::Result<Arc<dyn Mailer>> {
                 username: settings.smtp.username.clone(),
                 // Env/boot-config only for now; moves into KEK-encrypted runtime settings
                 // later (S-26).
-                password: settings.smtp.password.clone(),
+                password: settings.smtp.password.as_ref().map(|secret| secret.expose().to_owned()),
                 from: settings.smtp.from.clone(),
                 security: match settings.smtp.security {
                     SmtpSecurityMode::Tls => SmtpSecurity::Tls,
@@ -144,9 +151,13 @@ fn build_auth(
 
     let keyring = match (&auth_cfg.jwt.kid, &auth_cfg.jwt.signing_key) {
         (Some(kid), Some(key)) => {
-            let verify: Vec<(String, String)> =
-                auth_cfg.jwt.verify_keys.iter().map(|entry| (entry.kid.clone(), entry.key.clone())).collect();
-            Keyring::from_base64(kid, key, &verify).map_err(|err| anyhow::anyhow!("{err}"))?
+            let verify: Vec<(String, String)> = auth_cfg
+                .jwt
+                .verify_keys
+                .iter()
+                .map(|entry| (entry.kid.clone(), entry.key.expose().to_owned()))
+                .collect();
+            Keyring::from_base64(kid, key.expose(), &verify).map_err(|err| anyhow::anyhow!("{err}"))?
         }
         _ => {
             tracing::warn!(
@@ -158,7 +169,7 @@ fn build_auth(
     };
 
     let otp_pepper = match &auth_cfg.otp_pepper {
-        Some(pepper) => pepper.clone().into_bytes(),
+        Some(pepper) => pepper.expose().as_bytes().to_vec(),
         None => {
             tracing::warn!(
                 "auth.otp_pepper is not configured — generated an EPHEMERAL dev pepper: \
@@ -169,6 +180,44 @@ fn build_auth(
             pepper.to_vec()
         }
     };
+
+    // The KEK seals TOTP seeds at rest (S-05). The config validator guarantees base64 of
+    // exactly 32 bytes whenever it is set, and requires it in production mode (S-25).
+    let kek = match &auth_cfg.kek {
+        Some(kek) => base64::engine::general_purpose::STANDARD
+            .decode(kek.expose())
+            .map_err(|_| anyhow::anyhow!("auth.kek is not valid base64"))?,
+        None => {
+            tracing::warn!(
+                "auth.kek is not configured — generated an EPHEMERAL dev KEK: \
+                 enrolled TOTP second factors become undecryptable when this process exits \
+                 (dev mode only, S-25)"
+            );
+            let mut kek = [0u8; 32];
+            rng.fill(&mut kek);
+            kek.to_vec()
+        }
+    };
+
+    let providers: Vec<ProviderConfig> = auth_cfg
+        .oidc
+        .iter()
+        .map(|provider| ProviderConfig {
+            id: provider.id.clone(),
+            display_name: provider.display_name.clone(),
+            issuer: provider.issuer.trim_end_matches('/').to_owned(),
+            client_id: provider.client_id.clone(),
+            client_secret: provider.client_secret.expose().to_owned(),
+            scopes: provider.scopes.clone(),
+        })
+        .collect();
+    if !providers.is_empty() {
+        tracing::info!(
+            providers = ?providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            "oidc sign-in enabled"
+        );
+    }
+    let oidc = OidcClient::new(providers, &settings.server.public_url).map_err(|err| anyhow::anyhow!("{err}"))?;
 
     let policy = AuthPolicy {
         access_ttl: Duration::from_secs(auth_cfg.access_ttl_minutes * 60),
@@ -182,8 +231,12 @@ fn build_auth(
         allowed_email_domains: auth_cfg.allowed_email_domains.iter().map(|d| d.to_ascii_lowercase()).collect(),
         otp_per_email_hour: auth_cfg.rate_limit.otp_per_email_hour,
         otp_per_ip_hour: auth_cfg.rate_limit.otp_per_ip_hour,
+        login_per_ip_minute: auth_cfg.rate_limit.login_per_ip_minute,
+        kek,
+        step_up_window: Duration::from_secs(auth_cfg.step_up_minutes * 60),
+        totp_issuer: "Pub".to_owned(),
     };
-    Ok(Arc::new(AuthService::new(repos, kv, mailer, keyring, policy, rng)))
+    Ok(Arc::new(AuthService::new(repos, kv, mailer, keyring, policy, rng, oidc)))
 }
 
 /// Resolves on SIGINT (Ctrl+C) or SIGTERM (orchestrator stop).

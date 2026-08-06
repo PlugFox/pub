@@ -31,7 +31,7 @@ use crate::session::{NewSession, Session, SessionLimits};
 use crate::settings::SettingEntry;
 use crate::token::{NewToken, Token};
 use crate::user::{NewUser, User, UserStatus};
-use crate::{Format, InvitationId, OrgId, PackageId, Result, RoleLevel, SessionId, TokenId, UserId};
+use crate::{CredentialId, Format, InvitationId, OrgId, PackageId, Result, RoleLevel, SessionId, TokenId, UserId};
 
 /// Stream of archive bytes, e.g. a package tarball body.
 pub type ByteStream = BoxStream<'static, Result<Bytes>>;
@@ -105,8 +105,8 @@ pub trait UserRepo: Send + Sync {
 
 /// Credential persistence — one polymorphic table over every identity proof (decision 12).
 ///
-/// Only the `oidc` and `email` types have methods in this phase; `totp` / `recovery` /
-/// `webauthn` rows arrive with their auth flows.
+/// `oidc`, `email`, `totp`, and `recovery` types have methods; `webauthn` rows arrive with
+/// their auth flows (v1.1).
 #[async_trait]
 pub trait CredentialRepo: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.
@@ -130,6 +130,45 @@ pub trait CredentialRepo: Send + Sync {
 
     /// Every credential of the user, oldest first (account security UI).
     async fn list_for_user(&self, user: UserId) -> Result<Vec<Credential>>;
+
+    /// Activates a TOTP enrollment (S-05): stores the KEK-sealed seed with the step the
+    /// confirmation code was accepted at (so that exact code can never be replayed at login).
+    /// A second active enrollment for the same user is [`crate::Error::Conflict`].
+    async fn create_totp(
+        &self,
+        user: UserId,
+        secret_enc: &[u8],
+        last_step: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Credential>;
+
+    /// The user's active TOTP enrollment with its sealed seed and replay floor; `None` when
+    /// the user has no TOTP second factor.
+    async fn find_totp(&self, user: UserId) -> Result<Option<crate::credential::TotpCredential>>;
+
+    /// **Atomically** advances the replay floor to `step`, returning whether it moved.
+    ///
+    /// `false` means `step` is not strictly greater than the stored floor — i.e. a replayed
+    /// or older code; the caller must treat that as a failed verification (S-05). The
+    /// compare-and-set semantics are the contract: two concurrent verifications of the same
+    /// step must not both succeed.
+    async fn commit_totp_step(&self, id: CredentialId, step: i64, now: DateTime<Utc>) -> Result<bool>;
+
+    /// Stores the freshly generated recovery-code hashes (argon2id PHC strings, S-05),
+    /// replacing any codes the user still had.
+    async fn replace_recovery_codes(&self, user: UserId, phc_hashes: &[String], now: DateTime<Utc>) -> Result<()>;
+
+    /// The user's unspent recovery-code hashes (verification iterates over them — ≤10 rows).
+    async fn list_recovery_codes(&self, user: UserId) -> Result<Vec<crate::credential::RecoveryCodeHash>>;
+
+    /// **Atomically** consumes one recovery code (single-use, S-05): deletes the row and
+    /// returns whether this call deleted it. `false` means someone else spent it first —
+    /// a failed verification for this caller.
+    async fn consume_recovery_code(&self, id: CredentialId) -> Result<bool>;
+
+    /// Removes the user's whole second factor: the TOTP enrollment plus every remaining
+    /// recovery code. Returns how many rows were deleted (0 = nothing was enrolled).
+    async fn delete_second_factor(&self, user: UserId) -> Result<u64>;
 }
 
 /// Organization, membership, and invitation persistence (decision 19).
@@ -367,6 +406,15 @@ pub trait Kv: Send + Sync {
 
     /// Sets `key` to `value` with a time-to-live; the entry expires after `ttl`.
     async fn set_ttl(&self, key: &str, value: &str, ttl: Duration) -> Result<()>;
+
+    /// **Atomically** increments the integer counter at `key` and returns the new value,
+    /// creating it at `1` when absent and (re-)arming its `ttl`.
+    ///
+    /// Atomicity is the contract, not an optimization: budget counters that gate
+    /// authentication attempts (S-03 ≤5 verifies per code) are decided by this return value,
+    /// so a read-modify-write built from [`Kv::get`] + [`Kv::set_ttl`] would let concurrent
+    /// requests share one increment and spend the budget many times over.
+    async fn incr(&self, key: &str, ttl: Duration) -> Result<u64>;
 
     /// Removes `key`; removing an absent key is not an error.
     async fn del(&self, key: &str) -> Result<()>;

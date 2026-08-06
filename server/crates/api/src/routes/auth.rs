@@ -2,12 +2,11 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderMap;
 
 use crate::dto::{LoginDto, OtpRequestBody, OtpVerifyBody, PendingDto, RefreshBody, RevokedDto};
 use crate::envelope::{ErrorEnvelope, OkEnvelope};
 use crate::error::ApiError;
-use crate::extract::{AuthContext, client_meta};
+use crate::extract::{AuthContext, RequestMeta};
 use crate::state::AppState;
 
 /// Requests an email OTP.
@@ -28,16 +27,16 @@ use crate::state::AppState;
 )]
 pub async fn otp_request(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    RequestMeta(meta): RequestMeta,
     Json(body): Json<OtpRequestBody>,
 ) -> Result<Json<OkEnvelope<PendingDto>>, ApiError> {
     let now = (state.clock)();
-    let meta = client_meta(&headers);
     let pending_id = state.auth.request_otp(&body.email, &meta, now).await?;
     Ok(Json(OkEnvelope::new(PendingDto { pending_id })))
 }
 
-/// Redeems an OTP for a session (access + refresh pair).
+/// Redeems an OTP for a session (access + refresh pair) — or, when the account has an
+/// active TOTP second factor, for a pending-MFA handle (`mfa_required = true`, S-05).
 ///
 /// Every failure — wrong code, expired record, unknown pending id — answers with the same
 /// `invalid_code` 401 (S-03/S-04); a code survives at most 5 wrong attempts.
@@ -47,17 +46,16 @@ pub async fn otp_request(
     tag = "auth",
     request_body = OtpVerifyBody,
     responses(
-        (status = OK, description = "Signed in", body = OkEnvelope<LoginDto>),
+        (status = OK, description = "Signed in, or pending MFA", body = OkEnvelope<LoginDto>),
         (status = UNAUTHORIZED, description = "invalid_code — uniform for every failure", body = ErrorEnvelope),
     )
 )]
 pub async fn otp_verify(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    RequestMeta(meta): RequestMeta,
     Json(body): Json<OtpVerifyBody>,
 ) -> Result<Json<OkEnvelope<LoginDto>>, ApiError> {
     let now = (state.clock)();
-    let meta = client_meta(&headers);
     let login = state.auth.verify_otp(&body.pending_id, &body.email, &body.code, &meta, now).await?;
     Ok(Json(OkEnvelope::new(LoginDto::from(login))))
 }
@@ -78,11 +76,10 @@ pub async fn otp_verify(
 )]
 pub async fn refresh(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    RequestMeta(meta): RequestMeta,
     Json(body): Json<RefreshBody>,
 ) -> Result<Json<OkEnvelope<LoginDto>>, ApiError> {
     let now = (state.clock)();
-    let meta = client_meta(&headers);
     let login = state.auth.refresh(&body.refresh_token, &meta, now).await?;
     Ok(Json(OkEnvelope::new(LoginDto::from(login))))
 }
@@ -101,10 +98,9 @@ pub async fn refresh(
 pub async fn logout(
     State(state): State<AppState>,
     auth: AuthContext,
-    headers: HeaderMap,
+    RequestMeta(meta): RequestMeta,
 ) -> Result<Json<OkEnvelope<RevokedDto>>, ApiError> {
     let now = (state.clock)();
-    let meta = client_meta(&headers);
     state.auth.logout(auth.claims.sub, auth.claims.sid, &meta, now).await?;
     Ok(Json(OkEnvelope::new(RevokedDto { revoked: 1 })))
 }

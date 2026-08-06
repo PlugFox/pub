@@ -34,14 +34,16 @@ pub const RESEND_INTERVAL: Duration = Duration::seconds(60);
 const PENDING_ID_BYTES: usize = 16;
 
 /// Server-side pending-auth record, stored as JSON in KV under `otp:pending:{id}`.
+///
+/// The wrong-attempt budget deliberately does **not** live here: it is an atomic KV counter
+/// under [`attempt_key`], because a read-modify-write of this record would let concurrent
+/// verifications share one increment and blow straight through [`MAX_ATTEMPTS`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingAuth {
     /// Normalized (lowercase) email the flow is bound to.
     pub email: String,
     /// `HMAC-SHA-256(code, pepper)` hex — the code itself is never stored (S-03).
     pub code_hmac: String,
-    /// Failed verify attempts so far; the record dies at [`MAX_ATTEMPTS`].
-    pub attempts: u32,
     /// Issue time (UTC); expiry is `created_at + PENDING_TTL`.
     pub created_at: DateTime<Utc>,
     /// Id of the record this one replaced, when the request was a resend.
@@ -87,6 +89,15 @@ pub fn verify_code(code: &str, pepper: &[u8], stored_hmac_hex: &str) -> bool {
 /// KV key of a pending-auth record.
 pub fn pending_key(pending_id: &str) -> String {
     format!("otp:pending:{pending_id}")
+}
+
+/// KV key of the atomic wrong-attempt counter for a pending record (S-03: ≤5 per code).
+///
+/// Separate from the record so the budget can be spent with a single atomic increment
+/// ([`pub_core::traits::Kv::incr`]) *before* the code is compared — parallel guesses each
+/// consume their own attempt instead of racing over one snapshot.
+pub fn attempt_key(pending_id: &str) -> String {
+    format!("otp:attempts:{pending_id}")
 }
 
 /// KV key tracking the latest pending record per email (resend throttle + invalidation).
@@ -158,12 +169,33 @@ mod tests {
         let record = PendingAuth {
             email: "dev@corp.com".to_owned(),
             code_hmac: code_hmac("00112233", b"p"),
-            attempts: 2,
             created_at: Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap(),
             resend_of: Some("aabbccdd".repeat(4)),
         };
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<PendingAuth>(&json).unwrap(), record);
+    }
+
+    #[test]
+    fn s03_pending_record_never_carries_the_code_or_the_budget() {
+        // The record is the only thing an attacker with KV read access sees: no plaintext
+        // code, and no attempt counter they could rewind by racing a write.
+        let record = PendingAuth {
+            email: "dev@corp.com".to_owned(),
+            code_hmac: code_hmac("31337000", b"pepper"),
+            created_at: Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap(),
+            resend_of: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("31337000"), "code leaked into the stored record: {json}");
+        assert!(!json.contains("attempts"), "the budget must live in the atomic counter: {json}");
+    }
+
+    #[test]
+    fn attempt_key_is_bound_to_one_pending_record() {
+        assert_eq!(attempt_key("abc"), "otp:attempts:abc");
+        assert_ne!(attempt_key("abc"), attempt_key("abd"));
+        assert_ne!(attempt_key("abc"), pending_key("abc"));
     }
 
     #[test]

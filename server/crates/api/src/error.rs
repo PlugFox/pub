@@ -33,7 +33,9 @@ impl ApiError {
             Error::Invalid { .. } => StatusCode::BAD_REQUEST,
             Error::NotFound { .. } => StatusCode::NOT_FOUND,
             Error::Conflict { .. } | Error::LastOwner { .. } => StatusCode::CONFLICT,
-            Error::Forbidden { .. } => StatusCode::FORBIDDEN,
+            // Distinct `step_up_required` code on the same 403 so the UI can prompt for a
+            // fresh second factor instead of a dead-end denial (S-06).
+            Error::Forbidden { .. } | Error::StepUpRequired => StatusCode::FORBIDDEN,
             // The auth failures: uniform 401s. `refresh_reused` keeps its distinct code so
             // the client can drop the whole session (S-08); `invalid_code` collapses every
             // OTP failure (S-03/S-04).
@@ -88,6 +90,7 @@ mod tests {
         assert_eq!(status_of(Error::NotFound { what: "w".into() }), StatusCode::NOT_FOUND);
         assert_eq!(status_of(Error::Conflict { message: "m".into() }), StatusCode::CONFLICT);
         assert_eq!(status_of(Error::Forbidden { message: "m".into() }), StatusCode::FORBIDDEN);
+        assert_eq!(status_of(Error::StepUpRequired), StatusCode::FORBIDDEN);
         assert_eq!(status_of(Error::Unauthorized { message: "m".into() }), StatusCode::UNAUTHORIZED);
         assert_eq!(status_of(Error::InvalidCode), StatusCode::UNAUTHORIZED);
         assert_eq!(status_of(Error::RefreshReused { session: pub_core::SessionId::new() }), StatusCode::UNAUTHORIZED);

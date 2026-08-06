@@ -24,6 +24,11 @@ async fn credential_repo_contract() {
 }
 
 #[tokio::test]
+async fn second_factor_contract_s05() {
+    pub_db_tests::contract::second_factor(&fresh_repos().await).await;
+}
+
+#[tokio::test]
 async fn org_repo_contract() {
     pub_db_tests::contract::org_repo(&fresh_repos().await).await;
 }

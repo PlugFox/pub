@@ -35,6 +35,10 @@ pub enum Error {
     /// indistinguishable by design (S-03 single-use policy + S-04 anti-enumeration).
     #[error("invalid or expired code")]
     InvalidCode,
+    /// The action requires a fresh second factor / re-authentication (S-06 "sudo mode").
+    /// Distinct code so the UI can prompt for step-up instead of showing a plain denial.
+    #[error("this action requires recent re-authentication (step-up)")]
+    StepUpRequired,
     /// A rate limit tripped (S-24); carries the client-facing `Retry-After` hint in seconds.
     #[error("rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
@@ -79,6 +83,7 @@ impl Error {
             Self::Forbidden { .. } => "forbidden",
             Self::Unauthorized { .. } => "unauthorized",
             Self::InvalidCode => "invalid_code",
+            Self::StepUpRequired => "step_up_required",
             Self::RateLimited { .. } => "rate_limited",
             Self::Expired { .. } => "expired",
             Self::LastOwner { .. } => "last_owner",
@@ -105,6 +110,7 @@ mod tests {
             Error::Forbidden { message: "m".into() },
             Error::Unauthorized { message: "m".into() },
             Error::InvalidCode,
+            Error::StepUpRequired,
             Error::RateLimited { retry_after_secs: 60 },
             Error::Expired { what: "w".into() },
             Error::LastOwner { org: crate::OrgId::new() },
@@ -130,6 +136,7 @@ mod tests {
                 "forbidden",
                 "unauthorized",
                 "invalid_code",
+                "step_up_required",
                 "rate_limited",
                 "expired",
                 "last_owner",

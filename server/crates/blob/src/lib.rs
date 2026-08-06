@@ -59,10 +59,10 @@ impl ObjectStoreBlob {
             builder = builder.with_endpoint(endpoint).with_allow_http(true);
         }
         if let Some(access_key) = &cfg.access_key {
-            builder = builder.with_access_key_id(access_key);
+            builder = builder.with_access_key_id(access_key.expose());
         }
         if let Some(secret_key) = &cfg.secret_key {
-            builder = builder.with_secret_access_key(secret_key);
+            builder = builder.with_secret_access_key(secret_key.expose());
         }
 
         let store = builder
@@ -159,8 +159,8 @@ mod tests {
             kind: BlobKind::S3,
             bucket: Some("pub-blobs".to_owned()),
             endpoint: Some("http://127.0.0.1:9000".to_owned()),
-            access_key: Some("minio".to_owned()),
-            secret_key: Some("minio123".to_owned()),
+            access_key: Some(pub_config::Secret::new("minio")),
+            secret_key: Some(pub_config::Secret::new("minio123")),
             ..BlobConfig::default()
         };
         let blob = ObjectStoreBlob::s3(&cfg).unwrap();

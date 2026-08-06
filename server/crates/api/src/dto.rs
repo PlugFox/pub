@@ -2,7 +2,8 @@
 //! `From` conversions. Ids travel as strings; role levels travel as names (decision 19).
 
 use chrono::{DateTime, Utc};
-use pub_auth::flows::LoginSuccess;
+use pub_auth::flows::{LoginOutcome, LoginSuccess};
+use pub_auth::oidc::{ProviderConfig, StartedFlow};
 use pub_core::org::{Org, OrgMembership};
 use pub_core::session::Session;
 use pub_core::token::Token;
@@ -21,7 +22,9 @@ pub struct OtpRequestBody {
 }
 
 /// Body of `POST /api/v1/auth/otp/verify`.
-#[derive(Debug, Deserialize, ToSchema)]
+///
+/// [`Debug`] is hand-written: the code is a live credential (S-25).
+#[derive(Deserialize, ToSchema)]
 pub struct OtpVerifyBody {
     /// Opaque pending-auth id from the request step (S-03 binding).
     pub pending_id: String,
@@ -31,11 +34,82 @@ pub struct OtpVerifyBody {
     pub code: String,
 }
 
+impl std::fmt::Debug for OtpVerifyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtpVerifyBody")
+            .field("pending_id", &self.pending_id)
+            .field("email", &self.email)
+            .field("code", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Body of `POST /api/v1/auth/refresh`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshBody {
     /// The refresh token issued by verify/refresh.
     pub refresh_token: String,
+}
+
+/// Body of `POST /api/v1/auth/oidc/{provider}/callback`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct OidcCallbackBody {
+    /// Flow handle from the start step (server-side state binding, S-01).
+    pub flow_id: String,
+    /// Authorization code from the IdP redirect.
+    pub code: String,
+    /// `state` from the IdP redirect — must match the server-side record exactly.
+    pub state: String,
+}
+
+/// Body of `POST /api/v1/auth/totp/confirm`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TotpConfirmBody {
+    /// A live 6-digit code from the just-enrolled authenticator.
+    pub code: String,
+}
+
+/// Body of `POST /api/v1/auth/totp/verify` — exactly one of the two fields.
+///
+/// [`Debug`] is hand-written: codes are live credentials (S-25).
+#[derive(Deserialize, ToSchema)]
+pub struct MfaVerifyBody {
+    /// The pending-MFA handle from the first-factor response.
+    pub mfa_token: String,
+    /// 6-digit TOTP code.
+    pub code: Option<String>,
+    /// Single-use recovery code.
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for MfaVerifyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfaVerifyBody")
+            .field("mfa_token", &self.mfa_token)
+            .field("code", &self.code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Body of `POST /api/v1/auth/step-up` — exactly one of the two fields.
+///
+/// [`Debug`] is hand-written: codes are live credentials (S-25).
+#[derive(Deserialize, ToSchema)]
+pub struct StepUpBody {
+    /// 6-digit TOTP code.
+    pub code: Option<String>,
+    /// Single-use recovery code.
+    pub recovery_code: Option<String>,
+}
+
+impl std::fmt::Debug for StepUpBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepUpBody")
+            .field("code", &self.code.as_ref().map(|_| "<redacted>"))
+            .field("recovery_code", &self.recovery_code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Body of `POST /api/v1/tokens`.
@@ -115,28 +189,119 @@ impl From<&User> for UserDto {
     }
 }
 
-/// Response of a successful sign-in or refresh: the token pair plus the profile.
+/// Response of a sign-in step or refresh.
+///
+/// Two shapes behind one schema: `mfa_required = false` carries the full pair;
+/// `mfa_required = true` carries only `mfa_token` — the client must redeem it at
+/// `POST /api/v1/auth/totp/verify` with a TOTP or recovery code (S-05).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LoginDto {
+    /// Whether a second factor is still outstanding.
+    pub mfa_required: bool,
+    /// Pending-MFA handle (present iff `mfa_required`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mfa_token: Option<String>,
     /// Short-lived access JWT (S-07).
-    pub access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
     /// Opaque refresh token — rotates on every refresh (S-08).
-    pub refresh_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
     /// Session id backing the pair.
-    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// The authenticated user.
-    pub user: UserDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<UserDto>,
 }
 
 impl From<LoginSuccess> for LoginDto {
     fn from(login: LoginSuccess) -> Self {
         Self {
-            access_token: login.access_token,
-            refresh_token: login.refresh_token,
-            session_id: login.session_id.to_string(),
-            user: UserDto::from(&login.user),
+            mfa_required: false,
+            mfa_token: None,
+            access_token: Some(login.access_token),
+            refresh_token: Some(login.refresh_token),
+            session_id: Some(login.session_id.to_string()),
+            user: Some(UserDto::from(&login.user)),
         }
     }
+}
+
+impl From<LoginOutcome> for LoginDto {
+    fn from(outcome: LoginOutcome) -> Self {
+        match outcome {
+            LoginOutcome::Complete(login) => Self::from(login),
+            LoginOutcome::MfaRequired { mfa_token } => Self {
+                mfa_required: true,
+                mfa_token: Some(mfa_token),
+                access_token: None,
+                refresh_token: None,
+                session_id: None,
+                user: None,
+            },
+        }
+    }
+}
+
+/// One configured OIDC provider for the login screen (public — no secrets).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderDto {
+    /// Slug used in the start/callback routes.
+    pub id: String,
+    /// Human label ("Sign in with …").
+    pub display_name: String,
+}
+
+impl From<&ProviderConfig> for ProviderDto {
+    fn from(provider: &ProviderConfig) -> Self {
+        Self { id: provider.id.clone(), display_name: provider.display_name.clone() }
+    }
+}
+
+/// Response of `GET /api/v1/auth/providers`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProvidersDto {
+    /// Configured providers, in config order; empty = email OTP only.
+    pub providers: Vec<ProviderDto>,
+}
+
+/// Response of `POST /api/v1/auth/oidc/{provider}/start`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OidcStartDto {
+    /// Where to send the browser.
+    pub authorize_url: String,
+    /// Flow handle to hold (e.g. sessionStorage) and present at the callback.
+    pub flow_id: String,
+}
+
+impl From<StartedFlow> for OidcStartDto {
+    fn from(flow: StartedFlow) -> Self {
+        Self { authorize_url: flow.authorize_url, flow_id: flow.flow_id }
+    }
+}
+
+/// Response of `POST /api/v1/auth/totp/enroll` (S-05).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotpEnrollDto {
+    /// Base32 seed for manual entry.
+    pub secret: String,
+    /// `otpauth://` provisioning URL (QR encoding is the client's job).
+    pub otpauth_url: String,
+}
+
+/// Response of `POST /api/v1/auth/totp/confirm`: the recovery codes, shown exactly once.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotpConfirmedDto {
+    /// Ten single-use recovery codes (S-05) — never retrievable again.
+    pub recovery_codes: Vec<String>,
+}
+
+/// Response of `POST /api/v1/auth/step-up` (S-06).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StepUpDto {
+    /// Until when the session counts as step-up-fresh.
+    pub valid_until: DateTime<Utc>,
 }
 
 /// One row of the session list UI (S-10).

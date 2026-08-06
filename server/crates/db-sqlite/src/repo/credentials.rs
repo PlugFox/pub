@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pub_core::credential::{Credential, CredentialType};
+use pub_core::credential::{Credential, CredentialType, RecoveryCodeHash, TotpCredential};
 use pub_core::traits::CredentialRepo;
 use pub_core::{CredentialId, Error, Result, UserId};
 use sqlx::SqlitePool;
@@ -141,5 +141,122 @@ impl CredentialRepo for SqliteCredentialRepo {
                 .await
                 .map_err(db_err)?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn create_totp(
+        &self,
+        user: UserId,
+        secret_enc: &[u8],
+        last_step: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Credential> {
+        let stamp = super::ts(now);
+        let row: CredentialRow = sqlx::query_as(q!(
+            "INSERT INTO credentials (id, user_id, type, secret_enc, totp_last_step, created_at, updated_at) \
+             VALUES (?, ?, 'totp', ?, ?, ?, ?) RETURNING {COLS}"
+        ))
+        .bind(CredentialId::new().to_string())
+        .bind(user.to_string())
+        .bind(secret_enc)
+        .bind(last_step)
+        .bind(&stamp)
+        .bind(&stamp)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| write_err(err, "totp is already enrolled for this user", "user"))?;
+        row.try_into()
+    }
+
+    async fn find_totp(&self, user: UserId) -> Result<Option<TotpCredential>> {
+        let row: Option<(String, Vec<u8>, Option<i64>)> = sqlx::query_as(
+            "SELECT id, secret_enc, totp_last_step FROM credentials WHERE user_id = ? AND type = 'totp'",
+        )
+        .bind(user.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|(id, secret_enc, last_step)| {
+            Ok(TotpCredential { id: parse_col(&id)?, user_id: user, secret_enc, last_step })
+        })
+        .transpose()
+    }
+
+    async fn commit_totp_step(&self, id: CredentialId, step: i64, now: DateTime<Utc>) -> Result<bool> {
+        // Single-statement compare-and-set: SQLite's single writer makes this atomic, and the
+        // WHERE clause is the replay gate (S-05) — no read-modify-write window exists.
+        let result = sqlx::query(
+            "UPDATE credentials SET totp_last_step = ?, updated_at = ? \
+             WHERE id = ? AND type = 'totp' AND (totp_last_step IS NULL OR totp_last_step < ?)",
+        )
+        .bind(step)
+        .bind(super::ts(now))
+        .bind(id.to_string())
+        .bind(step)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn replace_recovery_codes(&self, user: UserId, phc_hashes: &[String], now: DateTime<Utc>) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        sqlx::query("DELETE FROM credentials WHERE user_id = ? AND type = 'recovery'")
+            .bind(user.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let stamp = super::ts(now);
+        for phc in phc_hashes {
+            sqlx::query(
+                "INSERT INTO credentials (id, user_id, type, secret_enc, created_at, updated_at) \
+                 VALUES (?, ?, 'recovery', ?, ?, ?)",
+            )
+            .bind(CredentialId::new().to_string())
+            .bind(user.to_string())
+            .bind(phc.as_bytes())
+            .bind(&stamp)
+            .bind(&stamp)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| write_err(err, "duplicate recovery code row", "user"))?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn list_recovery_codes(&self, user: UserId) -> Result<Vec<RecoveryCodeHash>> {
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, secret_enc FROM credentials WHERE user_id = ? AND type = 'recovery' ORDER BY id",
+        )
+        .bind(user.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(id, phc)| {
+                let phc = String::from_utf8(phc)
+                    .map_err(|_| Error::Database { message: "corrupt recovery-code hash (not UTF-8)".to_owned() })?;
+                Ok(RecoveryCodeHash { id: parse_col(&id)?, phc })
+            })
+            .collect()
+    }
+
+    async fn consume_recovery_code(&self, id: CredentialId) -> Result<bool> {
+        // Single-use is decided by this DELETE's row count (S-05): of two racers, exactly one
+        // observes rows_affected = 1.
+        let result = sqlx::query("DELETE FROM credentials WHERE id = ? AND type = 'recovery'")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn delete_second_factor(&self, user: UserId) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM credentials WHERE user_id = ? AND type IN ('totp', 'recovery')")
+            .bind(user.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected())
     }
 }

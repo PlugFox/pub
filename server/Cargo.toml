@@ -71,11 +71,26 @@ deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1"] }
 # "fast" keeps the precomputed tables, "zeroize" wipes key material on drop.
 ed25519-dalek = { version = "2.1.1", default-features = false, features = ["std", "fast", "zeroize"] }
 hmac = "0.12.1"
+sha1 = "0.10.6"
 sha2 = "0.10.9"
 subtle = "2.6.1"
 crc32fast = "1.4.2"
 base64 = "0.22.1"
 getrandom = "0.3.3"
+# TOTP-seed sealing with the env KEK (S-05); default features (aes, alloc, getrandom) are all used.
+aes-gcm = "0.10.3"
+# Recovery-code hashes (S-05: argon2id).
+argon2 = "0.5.3"
+# RS256 id_token verification (S-01). The "sha2" feature re-exports sha2 with OID support for
+# the PKCS#1 v1.5 digest-info encoding; only public-key verification is used at runtime
+# (the RUSTSEC-2023-0071 Marvin timing channel concerns private-key operations).
+rsa = { version = "0.9.6", features = ["sha2"] }
+# ES256 id_token verification (S-01). default-features = false: no pem/pkcs8 parsing — keys
+# arrive as raw JWK coordinates.
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
+# OIDC discovery / JWKS / token exchange (S-01). default-features = false: rustls instead of
+# native-tls (no OpenSSL linkage), json bodies only.
+reqwest = { version = "0.12.8", default-features = false, features = ["json", "rustls-tls"] }
 
 # --- mail ---
 # default-features = false: rustls instead of native-tls (no OpenSSL linkage) and the async
@@ -116,3 +131,20 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 # --- bin / test utilities ---
 anyhow = "1.0.104"
 tempfile = "3.27.0"
+# Test-only: RSA keygen for the mock OIDC issuer needs a rand_core 0.6 RNG (rsa 0.9 API).
+rand = "0.8.5"
+
+# Debug builds of the big-integer and password-hash kernels are unusably slow (RSA keygen and
+# argon2id dominate test wall time); optimizing just these leaf crates keeps `cargo test` fast
+# without touching our own crates' debuggability.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

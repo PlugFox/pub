@@ -20,15 +20,27 @@ serde_json = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+# Origin comparison for the S-12 cross-site guard — parsing beats string prefixes here
+# (default ports, case, `null`, look-alike suffixes).
+url = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 base64 = { workspace = true }
+# The adversarial suite forges tokens the way an attacker would: raw Ed25519 key material
+# reused as an HMAC secret (algorithm confusion).
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
 http-body-util = { workspace = true }
 pub-blob = { workspace = true }
 pub-db-sqlite = { workspace = true }
 pub-kv = { workspace = true }
 pub-mail = { workspace = true }
+# The mock OIDC issuer signs real RS256 id_tokens with a throwaway RSA key (S-01 tests).
+rand = { workspace = true }
+rsa = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

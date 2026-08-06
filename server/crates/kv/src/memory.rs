@@ -77,6 +77,25 @@ impl Kv for MemoryKv {
         Ok(())
     }
 
+    async fn incr(&self, key: &str, ttl: Duration) -> Result<u64> {
+        // moka's entry API holds a per-key lock across the closure, so two concurrent tasks
+        // on the same key never observe the same "current" value (the S-03 budget contract).
+        let entry = self
+            .cache
+            .entry(key.to_owned())
+            .and_upsert_with(|current| {
+                let next =
+                    current.and_then(|entry| entry.into_value().0.parse::<u64>().ok()).unwrap_or(0).saturating_add(1);
+                std::future::ready((next.to_string(), ttl))
+            })
+            .await;
+        entry
+            .into_value()
+            .0
+            .parse::<u64>()
+            .map_err(|err| pub_core::Error::Kv { message: format!("counter at {key} is not an integer: {err}") })
+    }
+
     async fn del(&self, key: &str) -> Result<()> {
         self.cache.invalidate(key).await;
         Ok(())
@@ -132,6 +151,40 @@ mod tests {
         kv.set_ttl("k", "new", LONG).await.unwrap();
         tokio::time::sleep(SHORT * 2).await;
         assert_eq!(kv.get("k").await.unwrap().as_deref(), Some("new"), "update must reset the TTL");
+    }
+
+    #[tokio::test]
+    async fn incr_counts_from_one_and_expires() {
+        let kv = MemoryKv::new();
+        assert_eq!(kv.incr("c", LONG).await.unwrap(), 1);
+        assert_eq!(kv.incr("c", LONG).await.unwrap(), 2);
+        assert_eq!(kv.get("c").await.unwrap().as_deref(), Some("2"));
+        kv.set_ttl("short", "0", SHORT).await.unwrap();
+        assert_eq!(kv.incr("short", SHORT).await.unwrap(), 1);
+        tokio::time::sleep(SHORT * 2).await;
+        assert_eq!(kv.incr("short", SHORT).await.unwrap(), 1, "an expired counter restarts");
+    }
+
+    #[tokio::test]
+    async fn incr_is_atomic_under_concurrency() {
+        // The S-03 attempt budget is decided by this return value: 64 concurrent increments
+        // must yield the 64 distinct values 1..=64, never a shared one.
+        let kv = std::sync::Arc::new(MemoryKv::new());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let kv = std::sync::Arc::clone(&kv);
+            tasks.spawn(async move { kv.incr("burst", LONG).await.unwrap() });
+        }
+        let mut seen: Vec<u64> = tasks.join_all().await;
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=64).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn incr_over_a_corrupt_value_restarts_at_one() {
+        let kv = MemoryKv::new();
+        kv.set_ttl("junk", "not-a-number", LONG).await.unwrap();
+        assert_eq!(kv.incr("junk", LONG).await.unwrap(), 1);
     }
 
     #[tokio::test]

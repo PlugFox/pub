@@ -65,6 +65,52 @@ impl FromStr for CredentialType {
     }
 }
 
+/// The stored second-factor material of an active TOTP enrollment (S-05).
+///
+/// This is the one struct that carries `secret_enc` out of the repository — the seed sealed
+/// with the env KEK (AES-GCM), never plaintext. [`Debug`] is hand-written so even the
+/// ciphertext stays out of log lines (S-25: secret-bearing structs redact by type).
+#[derive(Clone, PartialEq, Eq)]
+pub struct TotpCredential {
+    /// Credential row id.
+    pub id: CredentialId,
+    /// Owning user.
+    pub user_id: UserId,
+    /// KEK-sealed TOTP seed (nonce-prefixed AES-256-GCM ciphertext).
+    pub secret_enc: Vec<u8>,
+    /// Highest time-step a code was ever accepted at — replay floor (S-05).
+    pub last_step: Option<i64>,
+}
+
+impl std::fmt::Debug for TotpCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpCredential")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("secret_enc", &"<redacted>")
+            .field("last_step", &self.last_step)
+            .finish()
+    }
+}
+
+/// One stored recovery-code hash (S-05): the argon2id PHC string plus the row id used to
+/// consume it atomically on successful use.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecoveryCodeHash {
+    /// Credential row id (deleted when the code is spent — single-use).
+    pub id: CredentialId,
+    /// argon2id PHC string of the plaintext code.
+    pub phc: String,
+}
+
+impl std::fmt::Debug for RecoveryCodeHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The PHC hash is not directly reversible, but it is still offline-attackable
+        // material — keep it out of logs like every other credential secret (S-25).
+        f.debug_struct("RecoveryCodeHash").field("id", &self.id).field("phc", &"<redacted>").finish()
+    }
+}
+
 /// A credential row. Which optional fields are set depends on [`Credential::credential_type`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {

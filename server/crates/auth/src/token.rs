@@ -28,7 +28,11 @@ pub const HINT_LEN: usize = 8;
 const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// A freshly minted token: the show-once secret plus everything the server persists.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// [`Debug`] is hand-written: `secret` is the live credential and show-once by contract, so it
+/// must not be reachable through a `{:?}` in a log line or a panic message (S-13/S-25). The
+/// display hint is safe — it is exactly what the token list already shows.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MintedToken {
     /// The full plaintext secret — returned to the user once, never stored (S-13).
     pub secret: String,
@@ -36,6 +40,16 @@ pub struct MintedToken {
     pub hash: String,
     /// First [`HINT_LEN`] characters of the plaintext, for the token list UI.
     pub display_hint: String,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedToken")
+            .field("secret", &"<redacted>")
+            .field("hash", &self.hash)
+            .field("display_hint", &self.display_hint)
+            .finish()
+    }
 }
 
 /// Mints a token under `prefix` (e.g. `pub_`) from the CSPRNG.

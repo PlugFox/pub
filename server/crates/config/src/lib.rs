@@ -32,6 +32,49 @@ impl From<ConfigError> for pub_core::Error {
     }
 }
 
+/// A configured secret (S-25): OTP pepper, JWT seed, SMTP password, object-store key.
+///
+/// The whole point of the newtype is that [`Debug`] is redacting and there is **no**
+/// [`std::fmt::Display`]: `{}`/`{:?}` on any structure containing a secret cannot leak it, so
+/// the "never logged" half of S-25 holds structurally instead of by reviewer vigilance.
+/// Reading the value is deliberately loud — [`Secret::expose`].
+///
+/// [`serde::Serialize`] does emit the plaintext: the defaults layer of [`load_from`] is built
+/// by serializing [`Settings::default`] into the config builder. That path only ever carries
+/// `None`s, and serialized settings are never written anywhere but that in-memory layer.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps a configured secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Reads the underlying secret. Every call site is a place to ask "does this reach a log?".
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the configured value is the empty string (treated as "unset" by validation).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl From<String> for Secret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Command-line flags — the highest-precedence configuration layer.
 #[derive(Debug, Clone, Default, clap::Parser)]
 #[command(name = "pubd", about = "Pub — self-hosted package registry", disable_version_flag = true)]
@@ -54,6 +97,12 @@ pub struct CliArgs {
 }
 
 /// Root of the effective boot configuration.
+///
+/// Note the deliberate absence of a derived [`Debug`] on every section that carries a secret
+/// ([`AuthConfig`], [`JwtConfig`], [`JwtVerifyKey`], [`SmtpConfig`], [`BlobConfig`],
+/// [`DatabaseConfig`]): S-25 requires secrets to be masked in the startup summary *and* never
+/// logged, and a derived `Debug` reachable from `Settings` is exactly how a pepper or signing
+/// key ends up in a log line. Use [`Settings::summary`] for human output.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -108,17 +157,26 @@ pub struct AuthConfig {
     pub refresh_absolute_days: u64,
     /// Server pepper for OTP HMACs (secret — S-25). Required in production mode; dev mode
     /// falls back to an ephemeral value with a loud warning.
-    pub otp_pepper: Option<String>,
+    pub otp_pepper: Option<Secret>,
+    /// Base64-encoded 32-byte key-encryption key sealing TOTP seeds and other data-at-rest
+    /// secrets (S-05/S-25/S-26). Required in production mode; dev mode falls back to an
+    /// ephemeral value with a loud warning (sealed secrets die with the process).
+    pub kek: Option<Secret>,
     /// CLI token prefix incl. the trailing underscore (decision 17 default: `pub_`).
     pub token_prefix: String,
     /// Whether a successful first OTP login may create an account.
     pub allow_registration: bool,
     /// Sign-in email-domain allowlist; empty = every domain allowed (S-31).
     pub allowed_email_domains: Vec<String>,
+    /// Step-up ("sudo mode") freshness window in minutes (S-06; default 15).
+    pub step_up_minutes: u64,
     /// Ed25519 signing/verify keyring (S-07/S-27).
     pub jwt: JwtConfig,
     /// Auth-plane rate limits (S-24 defaults).
     pub rate_limit: AuthRateLimitConfig,
+    /// OIDC providers (S-01, decision 12); empty = email OTP only. Providers realistically
+    /// arrive via the TOML file — the env layer cannot express arrays of tables.
+    pub oidc: Vec<OidcProviderConfig>,
 }
 
 impl Default for AuthConfig {
@@ -128,13 +186,35 @@ impl Default for AuthConfig {
             refresh_idle_days: 30,
             refresh_absolute_days: 90,
             otp_pepper: None,
+            kek: None,
             token_prefix: "pub_".to_owned(),
             allow_registration: true,
             allowed_email_domains: Vec::new(),
+            step_up_minutes: 15,
             jwt: JwtConfig::default(),
             rate_limit: AuthRateLimitConfig::default(),
+            oidc: Vec::new(),
         }
     }
+}
+
+/// One OIDC provider (decision 12: issuer + client id/secret + label; Google is a preset by
+/// convention — `id = "google"`, `issuer = "https://accounts.google.com"` — not by code).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcProviderConfig {
+    /// URL-safe slug used in `/api/v1/auth/oidc/{id}/…` routes: `[a-z0-9-]{1,32}`.
+    pub id: String,
+    /// Human label for the login screen.
+    pub display_name: String,
+    /// Issuer URL (discovery base). HTTPS required in production mode.
+    pub issuer: String,
+    /// OAuth client id.
+    pub client_id: String,
+    /// OAuth client secret (secret — S-25; confidential client per S-01).
+    pub client_secret: Secret,
+    /// Scopes to request; empty = `openid email profile`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 /// Ed25519 access-token keyring (S-07): one signing key, N verify keys, rotated by `kid`
@@ -146,7 +226,7 @@ pub struct JwtConfig {
     pub kid: Option<String>,
     /// Base64-encoded 32-byte Ed25519 seed used for signing (secret). Required in production
     /// mode; dev mode falls back to an ephemeral keyring with a loud warning.
-    pub signing_key: Option<String>,
+    pub signing_key: Option<Secret>,
     /// Previous-generation verify keys kept during rotation overlap.
     pub verify_keys: Vec<JwtVerifyKey>,
 }
@@ -157,7 +237,7 @@ pub struct JwtVerifyKey {
     /// Key id embedded in tokens signed by this key.
     pub kid: String,
     /// Base64-encoded 32-byte Ed25519 seed (secret).
-    pub key: String,
+    pub key: Secret,
 }
 
 /// Auth-plane rate limits (S-24). Only the OTP-request knobs exist in this slice.
@@ -168,11 +248,13 @@ pub struct AuthRateLimitConfig {
     pub otp_per_email_hour: u32,
     /// OTP requests per IP per hour (S-24: 20).
     pub otp_per_ip_hour: u32,
+    /// Credential-redemption attempts (OTP verify, refresh) per IP per minute (S-24: 10).
+    pub login_per_ip_minute: u32,
 }
 
 impl Default for AuthRateLimitConfig {
     fn default() -> Self {
-        Self { otp_per_email_hour: 5, otp_per_ip_hour: 20 }
+        Self { otp_per_email_hour: 5, otp_per_ip_hour: 20, login_per_ip_minute: 10 }
     }
 }
 
@@ -214,7 +296,7 @@ pub struct SmtpConfig {
     /// Optional login user.
     pub username: Option<String>,
     /// Password for `username` (secret — always masked in the startup summary).
-    pub password: Option<String>,
+    pub password: Option<Secret>,
     /// `From:` mailbox, e.g. `Pub <noreply@pub.example>`.
     pub from: String,
     /// Transport security: `tls` | `starttls` | `none`.
@@ -245,11 +327,23 @@ pub struct ServerConfig {
     /// Deployment mode: `dev` (default) allows ephemeral auth-secret fallbacks; `production`
     /// makes missing secrets a startup error (S-25).
     pub mode: RunMode,
+    /// Whether exactly one **trusted** reverse proxy sits in front of this listener.
+    ///
+    /// Off by default: on a directly exposed listener `X-Forwarded-For` is attacker-controlled,
+    /// so honouring it would hand out unlimited fresh per-IP rate-limit buckets and let a
+    /// caller exhaust another address's budget (S-24). Enable it only when a proxy you control
+    /// rewrites/appends the header; the server then reads the **rightmost** entry.
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { listen: "0.0.0.0:8080".to_owned(), public_url: "http://localhost:8080".to_owned(), mode: RunMode::Dev }
+        Self {
+            listen: "0.0.0.0:8080".to_owned(),
+            public_url: "http://localhost:8080".to_owned(),
+            mode: RunMode::Dev,
+            trust_proxy_headers: false,
+        }
     }
 }
 
@@ -274,7 +368,9 @@ impl DatabaseKind {
 }
 
 /// Database backend selection and connection settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`Debug`] masks the URL: `postgres://user:password@host/db` is a secret in disguise (S-25).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DatabaseConfig {
     /// Which database backend to use: `sqlite` | `postgres`.
@@ -283,6 +379,16 @@ pub struct DatabaseConfig {
     pub url: Option<String>,
     /// Database file path for `sqlite` (`:memory:` for an in-memory database).
     pub path: String,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("kind", &self.kind)
+            .field("url", &self.url.as_deref().map(mask_url))
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -329,9 +435,9 @@ pub struct BlobConfig {
     /// S3 region; defaults to `us-east-1` when unset.
     pub region: Option<String>,
     /// S3 access key id; falls back to the ambient AWS credential chain when unset.
-    pub access_key: Option<String>,
+    pub access_key: Option<Secret>,
     /// S3 secret access key (secret — always masked in the startup summary).
-    pub secret_key: Option<String>,
+    pub secret_key: Option<Secret>,
 }
 
 impl Default for BlobConfig {
@@ -369,13 +475,21 @@ impl KvKind {
 }
 
 /// Key-value store / broker backend selection and settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`Debug`] masks the URL: `redis://:password@host` is a secret in disguise (S-25).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KvConfig {
     /// Which KV backend to use: `memory` | `redis`.
     pub kind: KvKind,
     /// Connection URL — required for `redis` (e.g. `redis://host:6379`).
     pub url: Option<String>,
+}
+
+impl std::fmt::Debug for KvConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvConfig").field("kind", &self.kind).field("url", &self.url.as_deref().map(mask_url)).finish()
+    }
 }
 
 impl Default for KvConfig {
@@ -413,6 +527,43 @@ pub fn load(cli: &CliArgs) -> Result<Settings, ConfigError> {
     load_from(cli, None)
 }
 
+/// Expands `PUB_*_FILE` variables into their plain counterparts by reading the referenced
+/// file (S-25: "`_FILE`-suffixed env supported").
+///
+/// This is the Docker/Kubernetes secret-mount convention, and it is a real security feature,
+/// not sugar: an environment variable holding a pepper or signing seed is readable through
+/// `docker inspect`, `/proc/<pid>/environ`, and most crash reporters, whereas a mounted file
+/// is subject to filesystem permissions. Trailing whitespace/newlines are trimmed, because
+/// `echo secret > file` appends one and a pepper with a stray `\n` silently invalidates every
+/// outstanding OTP.
+///
+/// Setting both `X` and `X_FILE` is a startup error rather than a silent precedence rule —
+/// there is no safe guess about which one the operator meant.
+fn resolve_file_env(raw: config::Map<String, String>) -> Result<config::Map<String, String>, ConfigError> {
+    let mut resolved = config::Map::new();
+    let mut from_file = Vec::new();
+    for (key, value) in raw {
+        match key.strip_suffix("_FILE") {
+            Some(target) if key.starts_with("PUB_") && !target.is_empty() => {
+                let contents = std::fs::read_to_string(&value).map_err(|err| {
+                    ConfigError::Invalid(format!("{key} points at '{value}' which could not be read: {err}"))
+                })?;
+                from_file.push((target.to_owned(), contents.trim_end_matches(['\n', '\r']).to_owned()));
+            }
+            _ => {
+                resolved.insert(key, value);
+            }
+        }
+    }
+    for (key, value) in from_file {
+        if resolved.contains_key(&key) {
+            return Err(ConfigError::Invalid(format!("{key} and {key}_FILE are both set — pick one")));
+        }
+        resolved.insert(key, value);
+    }
+    Ok(resolved)
+}
+
 /// [`load`] with an explicit environment map instead of the process environment.
 ///
 /// Exists so tests (and embedders) can exercise the exact same layering without mutating
@@ -428,11 +579,13 @@ pub fn load_from(cli: &CliArgs, env_override: Option<config::Map<String, String>
     }
 
     // Layer 3: environment — `PUB_` prefix, `__` separates nesting: PUB_DATABASE__URL.
-    let mut env_source =
-        config::Environment::with_prefix("PUB").prefix_separator("_").separator("__").try_parsing(true);
-    if let Some(map) = env_override {
-        env_source = env_source.source(Some(map));
-    }
+    // `_FILE`-suffixed variables are resolved first (S-25 secret mounts).
+    let raw_env = env_override.unwrap_or_else(|| std::env::vars().collect());
+    let env_source = config::Environment::with_prefix("PUB")
+        .prefix_separator("_")
+        .separator("__")
+        .try_parsing(true)
+        .source(Some(resolve_file_env(raw_env)?));
     builder = builder.add_source(env_source);
 
     let mut settings: Settings = builder.build()?.try_deserialize()?;
@@ -459,6 +612,7 @@ impl Settings {
         let _ = writeln!(out, "  server.listen        = {}", self.server.listen);
         let _ = writeln!(out, "  server.public_url    = {}", self.server.public_url);
         let _ = writeln!(out, "  server.mode          = {}", self.server.mode.as_str());
+        let _ = writeln!(out, "  server.trust_proxy   = {}", self.server.trust_proxy_headers);
         let _ = writeln!(out, "  database.kind        = {}", self.database.kind.as_str());
         match self.database.kind {
             DatabaseKind::Sqlite => {
@@ -501,6 +655,8 @@ impl Settings {
             self.auth.refresh_idle_days, self.auth.refresh_absolute_days
         );
         let _ = writeln!(out, "  auth.otp_pepper      = {}", mask_opt(&self.auth.otp_pepper));
+        let _ = writeln!(out, "  auth.kek             = {}", mask_opt(&self.auth.kek));
+        let _ = writeln!(out, "  auth.step_up         = {} min", self.auth.step_up_minutes);
         let _ = writeln!(out, "  auth.token_prefix    = {}", self.auth.token_prefix);
         let _ = writeln!(out, "  auth.registration    = {}", self.auth.allow_registration);
         let domains = if self.auth.allowed_email_domains.is_empty() {
@@ -519,9 +675,23 @@ impl Settings {
         );
         let _ = writeln!(
             out,
-            "  auth.rate_limit      = otp {}/h/email, {}/h/ip",
-            self.auth.rate_limit.otp_per_email_hour, self.auth.rate_limit.otp_per_ip_hour
+            "  auth.rate_limit      = otp {}/h/email, {}/h/ip; login {}/min/ip",
+            self.auth.rate_limit.otp_per_email_hour,
+            self.auth.rate_limit.otp_per_ip_hour,
+            self.auth.rate_limit.login_per_ip_minute
         );
+        if self.auth.oidc.is_empty() {
+            let _ = writeln!(out, "  auth.oidc            = <none — email OTP only>");
+        } else {
+            for provider in &self.auth.oidc {
+                // Client secrets are never echoed (S-25); issuer/client_id are not secrets.
+                let _ = writeln!(
+                    out,
+                    "  auth.oidc.{:<10} = issuer {}, client_id {}, secret ***",
+                    provider.id, provider.issuer, provider.client_id
+                );
+            }
+        }
 
         match &self.smtp.host {
             Some(host) => {
@@ -544,7 +714,7 @@ fn opt(value: &Option<String>) -> String {
     value.clone().unwrap_or_else(|| "<unset>".to_owned())
 }
 
-fn mask_opt(value: &Option<String>) -> String {
+fn mask_opt(value: &Option<Secret>) -> String {
     match value {
         Some(_) => "***".to_owned(),
         None => "<unset>".to_owned(),

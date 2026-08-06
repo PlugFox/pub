@@ -47,4 +47,10 @@ impl AppState {
         self.clock = clock;
         self
     }
+
+    /// Whether `X-Forwarded-For` may be believed (S-24 trusted-proxy stance — see
+    /// [`crate::extract::client_ip`]).
+    pub fn trust_proxy_headers(&self) -> bool {
+        self.settings.server.trust_proxy_headers
+    }
 }

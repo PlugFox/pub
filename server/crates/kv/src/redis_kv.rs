@@ -77,6 +77,25 @@ impl Kv for RedisKv {
         Ok(())
     }
 
+    async fn incr(&self, key: &str, ttl: Duration) -> Result<u64> {
+        let mut conn = self.conn().await?;
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).max(1);
+        // INCR is atomic server-side; the pipeline re-arms the TTL in the same round trip so a
+        // crash between the two can never leave an immortal counter.
+        let (value,): (u64,) = redis::pipe()
+            .atomic()
+            .cmd("INCR")
+            .arg(key)
+            .cmd("PEXPIRE")
+            .arg(key)
+            .arg(ttl_ms)
+            .ignore()
+            .query_async(&mut conn)
+            .await
+            .map_err(kv_err)?;
+        Ok(value)
+    }
+
     async fn del(&self, key: &str) -> Result<()> {
         let mut conn = self.conn().await?;
         let _: () = redis::cmd("DEL").arg(key).query_async(&mut conn).await.map_err(kv_err)?;

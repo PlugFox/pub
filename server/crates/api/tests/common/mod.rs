@@ -4,6 +4,8 @@
 //! Not every test binary uses every helper — silence per-binary dead-code noise.
 #![allow(dead_code)]
 
+pub mod oidc;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
@@ -15,6 +17,7 @@ use http_body_util::BodyExt as _;
 use pub_api::AppState;
 use pub_auth::flows::{AuthPolicy, AuthService};
 use pub_auth::jwt::Keyring;
+use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::OsRandom;
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings};
@@ -39,18 +42,82 @@ pub const TEST_KID: &str = "test-kid";
 /// The OTP pepper of the test policy.
 pub const TEST_PEPPER: &[u8] = b"integration-test-pepper";
 
+/// The KEK of the test policy (S-05 sealing); tests unseal stored blobs with it.
+pub const TEST_KEK: [u8; 32] = [7u8; 32];
+
 /// Policy knobs a scenario can override.
 pub struct TestOptions {
     /// Whether first-login registration is allowed.
     pub allow_registration: bool,
     /// S-31 domain allowlist; empty = allow all.
     pub allowed_email_domains: Vec<String>,
+    /// S-24 credential-redemption cap per IP per minute.
+    pub login_per_ip_minute: u32,
+    /// Whether the instance believes `X-Forwarded-For` (S-24 trusted-proxy stance). The
+    /// harness defaults to `true` because the test transport has no socket peer to fall back
+    /// to; the attack tests flip it to prove the untrusted default ignores the header.
+    pub trust_proxy_headers: bool,
+    /// KV backend override — the attack suite injects failing stores to prove fail-closed.
+    pub kv: Option<Arc<dyn Kv>>,
+    /// OIDC providers (S-01); the oidc suite points these at an in-process mock issuer.
+    pub oidc_providers: Vec<ProviderConfig>,
+    /// S-06 step-up window in minutes.
+    pub step_up_minutes: u64,
 }
 
 impl Default for TestOptions {
     fn default() -> Self {
-        Self { allow_registration: true, allowed_email_domains: Vec::new() }
+        Self {
+            allow_registration: true,
+            allowed_email_domains: Vec::new(),
+            login_per_ip_minute: 10,
+            trust_proxy_headers: true,
+            kv: None,
+            oidc_providers: Vec::new(),
+            step_up_minutes: 15,
+        }
     }
+}
+
+/// A [`Kv`] that answers every operation with [`Error::Kv`], simulating a Redis outage.
+///
+/// Exists so the S-09/S-24 "fail closed" clauses are provable: with the in-memory KV nothing
+/// ever fails, so the fallback path would otherwise be dead code that no test ever reaches.
+pub struct FailingKv;
+
+#[async_trait::async_trait]
+impl Kv for FailingKv {
+    async fn ping(&self) -> pub_core::Result<()> {
+        Err(down())
+    }
+
+    async fn get(&self, _key: &str) -> pub_core::Result<Option<String>> {
+        Err(down())
+    }
+
+    async fn set_ttl(&self, _key: &str, _value: &str, _ttl: StdDuration) -> pub_core::Result<()> {
+        Err(down())
+    }
+
+    async fn incr(&self, _key: &str, _ttl: StdDuration) -> pub_core::Result<u64> {
+        Err(down())
+    }
+
+    async fn del(&self, _key: &str) -> pub_core::Result<()> {
+        Err(down())
+    }
+
+    async fn publish(&self, _topic: &str, _payload: &str) -> pub_core::Result<()> {
+        Err(down())
+    }
+
+    async fn subscribe(&self, _topic: &str) -> pub_core::Result<pub_core::traits::MessageStream> {
+        Err(down())
+    }
+}
+
+fn down() -> pub_core::Error {
+    pub_core::Error::Kv { message: "simulated kv outage".to_owned() }
 }
 
 /// Full in-memory application under test.
@@ -80,12 +147,15 @@ impl TestApp {
         };
         settings.blob.kind = BlobKind::Memory;
         settings.kv.kind = KvKind::Memory;
+        settings.server.trust_proxy_headers = options.trust_proxy_headers;
+        settings.server.public_url = INSTANCE_ORIGIN.to_owned();
 
         let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
         db.run_migrations().await.expect("migrate");
         let repos = db.repositories();
 
         let kv = Arc::new(MemoryKv::new());
+        let kv_handle: Arc<dyn Kv> = options.kv.clone().unwrap_or_else(|| Arc::clone(&kv) as Arc<dyn Kv>);
         let mailer = Arc::new(InMemoryMailer::new());
         let keyring = Keyring::new(TEST_KID, TEST_JWT_SEED, &[]).expect("test keyring");
         let policy = AuthPolicy {
@@ -97,19 +167,25 @@ impl TestApp {
             allowed_email_domains: options.allowed_email_domains,
             otp_per_email_hour: 5,
             otp_per_ip_hour: 20,
+            login_per_ip_minute: options.login_per_ip_minute,
+            kek: TEST_KEK.to_vec(),
+            step_up_window: StdDuration::from_secs(options.step_up_minutes * 60),
+            totp_issuer: "Pub".to_owned(),
         };
+        let oidc = OidcClient::new(options.oidc_providers, INSTANCE_ORIGIN).expect("oidc client");
         let auth = Arc::new(AuthService::new(
             repos.clone(),
-            Arc::clone(&kv) as Arc<dyn Kv>,
+            Arc::clone(&kv_handle),
             Arc::clone(&mailer) as Arc<dyn Mailer>,
             keyring,
             policy,
             Arc::new(OsRandom),
+            oidc,
         ));
 
         let clock = Arc::new(Mutex::new(t0()));
         let clock_handle = Arc::clone(&clock);
-        let state = AppState::new(settings, repos.clone(), Arc::new(ObjectStoreBlob::memory()), kv.clone(), auth)
+        let state = AppState::new(settings, repos.clone(), Arc::new(ObjectStoreBlob::memory()), kv_handle, auth)
             .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
         Self { router: pub_api::router(state), repos, kv, mailer, clock }
     }
@@ -135,6 +211,35 @@ impl TestApp {
             serde_json::from_slice(&bytes).expect("response body must be valid JSON")
         };
         ApiResponse { status: parts.status, headers: parts.headers, json }
+    }
+
+    /// Fires every request concurrently on the shared router and returns the responses in
+    /// completion-independent order (index = input order). Used by the race tests.
+    pub async fn send_concurrent(&self, requests: Vec<Request<Body>>) -> Vec<ApiResponse> {
+        let mut set = tokio::task::JoinSet::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            let router = self.router.clone();
+            set.spawn(async move {
+                let response = router.oneshot(request).await.expect("infallible router");
+                let (parts, body) = response.into_parts();
+                let bytes = body.collect().await.expect("read body").to_bytes();
+                let json = if bytes.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).expect("response body must be valid JSON")
+                };
+                (index, ApiResponse { status: parts.status, headers: parts.headers, json })
+            });
+        }
+        let mut done = set.join_all().await;
+        done.sort_by_key(|(index, _)| *index);
+        done.into_iter().map(|(_, response)| response).collect()
+    }
+
+    /// The raw KV value under `key` (attack tests inspect counters and pending records).
+    pub async fn kv_get(&self, key: &str) -> Option<String> {
+        use pub_core::traits::Kv as _;
+        self.kv.get(key).await.expect("in-memory kv never fails")
     }
 
     /// JSON request with the S-12 custom header, from the given client IP.
@@ -214,6 +319,9 @@ impl TestApp {
 
 /// Default client IP for requests (documentation range).
 pub const DEFAULT_IP: &str = "203.0.113.7";
+
+/// The instance's configured public origin — the S-12 cross-site guard compares against it.
+pub const INSTANCE_ORIGIN: &str = "https://pub.corp.test";
 
 /// Parsed response triple.
 pub struct ApiResponse {

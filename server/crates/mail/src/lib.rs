@@ -31,7 +31,10 @@ pub enum SmtpSecurity {
 }
 
 /// Connection settings for [`SmtpMailer`] (mirrors the config `smtp` section).
-#[derive(Clone, Debug)]
+///
+/// [`Debug`] is hand-written so the SMTP password can never reach a log line through a stray
+/// `{:?}` (S-25/S-26).
+#[derive(Clone)]
 pub struct SmtpSettings {
     /// SMTP server hostname.
     pub host: String,
@@ -48,6 +51,19 @@ pub struct SmtpSettings {
     pub from: String,
     /// Transport security mode.
     pub security: SmtpSecurity,
+}
+
+impl std::fmt::Debug for SmtpSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("from", &self.from)
+            .field("security", &self.security)
+            .finish()
+    }
 }
 
 /// Production mailer over lettre's async SMTP transport.
@@ -252,6 +268,22 @@ mod tests {
     }
 
     // Building the pooled async transport requires a tokio runtime, hence tokio::test.
+    #[test]
+    fn s25_smtp_settings_debug_redacts_the_password() {
+        let settings = SmtpSettings {
+            host: "smtp.corp.com".to_owned(),
+            port: 587,
+            username: Some("mailer".to_owned()),
+            password: Some("smtp-secret-value".to_owned()),
+            from: "Pub <noreply@corp.com>".to_owned(),
+            security: SmtpSecurity::Starttls,
+        };
+        let rendered = format!("{settings:?}");
+        assert!(!rendered.contains("smtp-secret-value"), "password leaked into Debug: {rendered}");
+        assert!(rendered.contains("<redacted>"), "redaction marker missing: {rendered}");
+        assert!(rendered.contains("smtp.corp.com"), "non-secret fields must stay debuggable: {rendered}");
+    }
+
     #[tokio::test]
     async fn smtp_mailer_rejects_bad_from_mailbox() {
         let settings = SmtpSettings {

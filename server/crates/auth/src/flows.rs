@@ -30,9 +30,12 @@ use pub_core::traits::{Kv, Mailer, Repositories};
 use pub_core::user::{NewUser, User, UserStatus};
 use pub_core::{Error, OrgId, Result, SessionId, TokenId, UserId};
 
+use serde::{Deserialize, Serialize};
+
 use crate::jwt::{Claims, Keyring};
+use crate::oidc::{OidcClient, ProviderConfig, StartedFlow};
 use crate::random::RandomSource;
-use crate::{otp, ratelimit, token};
+use crate::{otp, ratelimit, token, totp};
 
 /// Default CLI-token lifetime when the caller does not pick one (S-13).
 pub const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
@@ -43,7 +46,11 @@ pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
 /// Instance auth policy, resolved from boot config (and later from runtime settings — the
 /// registration/domain knobs are instance settings per S-31; they live here so the flows
 /// need no settings plumbing yet).
-#[derive(Clone, Debug)]
+///
+/// [`Debug`] is hand-written: this struct carries the OTP pepper, and a stray `{:?}` on it
+/// (config dump, `#[instrument]` field, panic message) would put that secret in a log line
+/// (S-25).
+#[derive(Clone)]
 pub struct AuthPolicy {
     /// Access-JWT TTL (S-07: ≤ 15 min); also the KV blocklist TTL (S-09).
     pub access_ttl: StdDuration,
@@ -61,6 +68,36 @@ pub struct AuthPolicy {
     pub otp_per_email_hour: u32,
     /// OTP requests per IP per hour (S-24: 20) — enforced by the API rate-limit layer.
     pub otp_per_ip_hour: u32,
+    /// Credential redemptions (OTP verify, refresh) per IP per minute (S-24: 10) — enforced
+    /// by the API rate-limit layer.
+    pub login_per_ip_minute: u32,
+    /// 32-byte key-encryption key sealing TOTP seeds at rest (S-05/S-25).
+    pub kek: Vec<u8>,
+    /// How long a step-up (fresh second factor / fresh login) stays valid (S-06; default
+    /// 15 minutes).
+    pub step_up_window: StdDuration,
+    /// Issuer label embedded in `otpauth://` provisioning URLs (instance branding).
+    pub totp_issuer: String,
+}
+
+impl std::fmt::Debug for AuthPolicy {
+    /// Everything except the pepper (S-25: secrets never reach a log line).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthPolicy")
+            .field("access_ttl", &self.access_ttl)
+            .field("session_limits", &self.session_limits)
+            .field("otp_pepper", &"<redacted>")
+            .field("token_prefix", &self.token_prefix)
+            .field("allow_registration", &self.allow_registration)
+            .field("allowed_email_domains", &self.allowed_email_domains)
+            .field("otp_per_email_hour", &self.otp_per_email_hour)
+            .field("otp_per_ip_hour", &self.otp_per_ip_hour)
+            .field("login_per_ip_minute", &self.login_per_ip_minute)
+            .field("kek", &"<redacted>")
+            .field("step_up_window", &self.step_up_window)
+            .field("totp_issuer", &self.totp_issuer)
+            .finish()
+    }
 }
 
 /// Request context captured by the API layer (audit + session metadata).
@@ -73,7 +110,10 @@ pub struct ClientMeta {
 }
 
 /// A completed sign-in or refresh: the token pair plus the authenticated identity.
-#[derive(Clone, Debug)]
+///
+/// [`Debug`] is hand-written: this is the one struct that holds *both* live credentials in
+/// plaintext, and the refresh token is the long-lived half (S-08). It must never be printable.
+#[derive(Clone)]
 pub struct LoginSuccess {
     /// The authenticated user.
     pub user: User,
@@ -85,7 +125,43 @@ pub struct LoginSuccess {
     pub refresh_token: String,
 }
 
-/// Auth orchestration facade: OTP sign-in, session lifecycle, CLI-token plane.
+impl std::fmt::Debug for LoginSuccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginSuccess")
+            .field("user", &self.user.id)
+            .field("session_id", &self.session_id)
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Outcome of a first-factor sign-in (OTP or OIDC): either a full session, or — when the
+/// account has an active TOTP second factor — a pending-MFA handle the client must redeem
+/// at `totp/verify` (S-05).
+#[derive(Debug)]
+pub enum LoginOutcome {
+    /// No second factor enrolled: the session pair is ready.
+    Complete(LoginSuccess),
+    /// TOTP is active: no tokens yet; present `mfa_token` + a TOTP or recovery code.
+    MfaRequired {
+        /// Opaque single-use handle of the half-finished login (short TTL).
+        mfa_token: String,
+    },
+}
+
+/// Server-side record of a half-finished login (first factor passed, TOTP outstanding),
+/// stored in KV under [`totp::mfa_pending_key`].
+#[derive(Serialize, Deserialize)]
+struct MfaPending {
+    user_id: UserId,
+    created_at: DateTime<Utc>,
+    /// First-factor method, recorded in the completion audit (`otp` / `oidc:{provider}`).
+    method: String,
+}
+
+/// Auth orchestration facade: OTP + OIDC sign-in, TOTP second factor, step-up, session
+/// lifecycle, CLI-token plane.
 pub struct AuthService {
     repos: Repositories,
     kv: Arc<dyn Kv>,
@@ -93,6 +169,7 @@ pub struct AuthService {
     keyring: Keyring,
     policy: AuthPolicy,
     rng: Arc<dyn RandomSource>,
+    oidc: OidcClient,
 }
 
 impl AuthService {
@@ -104,8 +181,9 @@ impl AuthService {
         keyring: Keyring,
         policy: AuthPolicy,
         rng: Arc<dyn RandomSource>,
+        oidc: OidcClient,
     ) -> Self {
-        Self { repos, kv, mailer, keyring, policy, rng }
+        Self { repos, kv, mailer, keyring, policy, rng, oidc }
     }
 
     /// The effective auth policy (the API layer reads rate-limit numbers from here).
@@ -158,7 +236,6 @@ impl AuthService {
         let record = otp::PendingAuth {
             email: email.clone(),
             code_hmac: otp::code_hmac(&code, &self.policy.otp_pepper),
-            attempts: 0,
             created_at: now,
             resend_of: resend_of.clone(),
         };
@@ -168,11 +245,15 @@ impl AuthService {
         self.kv.set_ttl(&otp::pending_key(&pending_id), &record_json, ttl).await?;
         self.kv.set_ttl(&last_key, &format!("{pending_id}:{}", now.timestamp()), ttl).await?;
 
-        // Silent policy gate (S-31): rejected emails still got the full flow above — they
-        // just never receive mail, so the code cannot be redeemed.
+        // Silent policy gate (S-31/S-04). Both the account lookup and the template render run
+        // for *every* address, known or not, allowed or not: branching on them would turn the
+        // response latency into an existence oracle. Only the SMTP hand-off is conditional —
+        // a blocked address must never actually receive a redeemable code.
+        let known_account = self.repos.users.find_by_email(&email).await?.is_some();
+        let rendered = pub_mail::render_otp_email(&code, meta.ip.as_deref(), otp::PENDING_TTL.num_minutes())?;
         let rejection = if !self.domain_allowed(&email) {
             Some("domain_blocked")
-        } else if !self.policy.allow_registration && self.repos.users.find_by_email(&email).await?.is_none() {
+        } else if !self.policy.allow_registration && !known_account {
             Some("registration_closed")
         } else {
             None
@@ -185,7 +266,6 @@ impl AuthService {
                 self.audit(&email, meta, "auth.otp.requested", AuditResult::Failure, metadata, now).await;
             }
             None => {
-                let rendered = pub_mail::render_otp_email(&code, meta.ip.as_deref(), otp::PENDING_TTL.num_minutes())?;
                 self.mailer.send_multipart(&email, &rendered.subject, &rendered.text, &rendered.html).await?;
                 self.audit(&email, meta, "auth.otp.requested", AuditResult::Success, metadata, now).await;
             }
@@ -193,7 +273,8 @@ impl AuthService {
         Ok(pending_id)
     }
 
-    /// Redeems an OTP against its pending-auth record and opens a session.
+    /// Redeems an OTP against its pending-auth record: opens a session, or hands back a
+    /// pending-MFA token when the account has an active TOTP second factor (S-05).
     ///
     /// Every failure — unknown pending id, expired record, wrong code, exhausted attempts,
     /// email mismatch, closed registration — surfaces as [`Error::InvalidCode`] (S-04).
@@ -204,16 +285,17 @@ impl AuthService {
         code: &str,
         meta: &ClientMeta,
         now: DateTime<Utc>,
-    ) -> Result<LoginSuccess> {
+    ) -> Result<LoginOutcome> {
         let Ok(email) = normalize_email(email) else {
             return Err(self.login_failure(email, meta, "malformed_email", now).await);
         };
 
         let key = otp::pending_key(pending_id);
+        let attempts = otp::attempt_key(pending_id);
         let Some(raw) = self.kv.get(&key).await? else {
             return Err(self.login_failure(&email, meta, "unknown_pending", now).await);
         };
-        let Ok(mut record) = serde_json::from_str::<otp::PendingAuth>(&raw) else {
+        let Ok(record) = serde_json::from_str::<otp::PendingAuth>(&raw) else {
             self.kv.del(&key).await?;
             return Err(self.login_failure(&email, meta, "corrupt_pending", now).await);
         };
@@ -222,9 +304,17 @@ impl AuthService {
         let expires_at = record.created_at + otp::PENDING_TTL;
         if now >= expires_at {
             self.kv.del(&key).await?;
+            self.kv.del(&attempts).await?;
             return Err(self.login_failure(&email, meta, "expired", now).await);
         }
-        if record.attempts >= otp::MAX_ATTEMPTS {
+
+        // S-03 budget: spend an attempt **atomically and before comparing**, so N parallel
+        // guesses cost N attempts. A read-modify-write here would let a burst of concurrent
+        // verifications all observe the same counter and share a single increment.
+        let remaining_ttl = StdDuration::from_secs((expires_at - now).num_seconds().max(1) as u64);
+        let spent = self.kv.incr(&attempts, remaining_ttl).await?;
+        if spent > u64::from(otp::MAX_ATTEMPTS) {
+            // The code dies, never the account (S-03).
             self.kv.del(&key).await?;
             return Err(self.login_failure(&email, meta, "attempts_exhausted", now).await);
         }
@@ -232,15 +322,8 @@ impl AuthService {
         let email_bound = record.email == email;
         let code_ok = otp::verify_code(code, &self.policy.otp_pepper, &record.code_hmac);
         if !email_bound || !code_ok {
-            record.attempts += 1;
-            if record.attempts >= otp::MAX_ATTEMPTS {
-                // The code dies, never the account (S-03).
+            if spent >= u64::from(otp::MAX_ATTEMPTS) {
                 self.kv.del(&key).await?;
-            } else {
-                let remaining = (expires_at - now).num_seconds().max(1) as u64;
-                let json = serde_json::to_string(&record)
-                    .map_err(|err| Error::Internal { message: format!("pending-auth update failed: {err}") })?;
-                self.kv.set_ttl(&key, &json, StdDuration::from_secs(remaining)).await?;
             }
             let reason = if email_bound { "wrong_code" } else { "email_mismatch" };
             return Err(self.login_failure(&email, meta, reason, now).await);
@@ -248,15 +331,22 @@ impl AuthService {
 
         // Single-use (S-03): destroy the record before any success side effects.
         self.kv.del(&key).await?;
+        self.kv.del(&attempts).await?;
         self.kv.del(&otp::last_request_key(&email)).await?;
+
+        // S-31 is evaluated at *sign-in*, not only at registration: an account whose domain
+        // left the allowlist can no longer authenticate, even holding a valid code.
+        if !self.domain_allowed(&email) {
+            return Err(self.login_failure(&email, meta, "domain_blocked", now).await);
+        }
 
         let mut registered = false;
         let user = match self.repos.users.find_by_email(&email).await? {
             Some(user) if user.status == UserStatus::Active => user,
             Some(_) => return Err(self.login_failure(&email, meta, "account_disabled", now).await),
             None => {
-                // First login creates the account — behind the instance policy gates (S-31).
-                if !self.policy.allow_registration || !self.domain_allowed(&email) {
+                // First login creates the account — behind the instance registration gate.
+                if !self.policy.allow_registration {
                     return Err(self.login_failure(&email, meta, "registration_denied", now).await);
                 }
                 let display_name = email.split('@').next().unwrap_or("user").to_owned();
@@ -275,18 +365,385 @@ impl AuthService {
             }
         };
 
+        self.finish_login(
+            user,
+            "otp",
+            "auth.login.success",
+            serde_json::json!({ "method": "otp", "registered": registered }),
+            meta,
+            now,
+        )
+        .await
+    }
+
+    // --- OIDC sign-in (S-01, S-02, S-31) ---
+
+    /// The configured OIDC providers for the login screen (may be empty — OIDC is optional).
+    pub fn oidc_providers(&self) -> &[ProviderConfig] {
+        self.oidc.providers()
+    }
+
+    /// Starts an OIDC flow: server-side state/nonce/PKCE under an opaque flow id (S-01).
+    /// Unknown providers are `NotFound` (404).
+    pub async fn oidc_start(&self, provider_id: &str, now: DateTime<Utc>) -> Result<StartedFlow> {
+        self.oidc.start(self.kv.as_ref(), self.rng.as_ref(), provider_id, now).await
+    }
+
+    /// Finishes an OIDC flow: validates state/code/id_token, resolves the account by
+    /// `(issuer, subject)`, applies the S-02 linking policy and the S-31 domain gate, and
+    /// opens a session (or hands back a pending-MFA token, S-05).
+    ///
+    /// Every authentication failure collapses into one uniform `Unauthorized`; the real
+    /// reason lives only in the audit trail (S-04). Unknown providers stay `NotFound`.
+    pub async fn oidc_login(
+        &self,
+        provider_id: &str,
+        flow_id: &str,
+        state: &str,
+        code: &str,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<LoginOutcome> {
+        let provider = self.oidc.provider(provider_id)?;
+        let provider_id = provider.id.clone();
+        let provider_label = provider.display_name.clone();
+
+        let identity = match self.oidc.callback(self.kv.as_ref(), &provider_id, flow_id, state, code, now).await {
+            Ok(identity) => identity,
+            Err(Error::Unauthorized { message }) => {
+                return Err(self.oidc_failure(&provider_id, None, meta, &message, now).await);
+            }
+            // Infrastructure failures (KV outage etc.) propagate — the API fails closed.
+            Err(other) => return Err(other),
+        };
+
+        let existing = self.repos.credentials.find_oidc(&identity.issuer, &identity.subject).await?;
+        let (user, linked, registered) = match existing {
+            Some(credential) => {
+                // Known identity: the every-sign-in path (S-01 key is (iss, sub)).
+                let Some(user) =
+                    self.repos.users.get(credential.user_id).await?.filter(|u| u.status == UserStatus::Active)
+                else {
+                    return Err(self
+                        .oidc_failure(&provider_id, identity.email, meta, "account_unavailable", now)
+                        .await);
+                };
+                // S-31 is a sign-in gate, not only a registration gate: an account whose
+                // domain left the allowlist stops authenticating.
+                if let Some(email) = &user.email
+                    && !self.domain_allowed(email)
+                {
+                    return Err(self.oidc_failure(&provider_id, user.email.clone(), meta, "domain_blocked", now).await);
+                }
+                self.repos.credentials.upsert_oidc(user.id, &identity.issuer, &identity.subject, now).await?;
+                (user, false, false)
+            }
+            None => {
+                // New identity. Linking or registering requires a **verified** email from
+                // the IdP (S-02) — without one there is nothing trustworthy to key on.
+                let verified_email = identity.email.clone().filter(|_| identity.email_verified);
+                let Some(email) = verified_email else {
+                    return Err(self.oidc_failure(&provider_id, identity.email, meta, "unverified_email", now).await);
+                };
+                if !self.domain_allowed(&email) {
+                    return Err(self.oidc_failure(&provider_id, Some(email), meta, "domain_blocked", now).await);
+                }
+                match self.repos.users.find_by_email(&email).await? {
+                    // find_by_email matches only *verified* local emails, so both sides of
+                    // the S-02 equation are verified here — auto-link.
+                    Some(user) if user.status == UserStatus::Active => {
+                        if self
+                            .repos
+                            .credentials
+                            .upsert_oidc(user.id, &identity.issuer, &identity.subject, now)
+                            .await
+                            .is_err()
+                        {
+                            // Raced against another link of the same identity — uniform failure.
+                            return Err(self.oidc_failure(&provider_id, Some(email), meta, "link_conflict", now).await);
+                        }
+                        self.audit_as(
+                            AuditActor::User(user.id),
+                            meta,
+                            "credential.linked",
+                            Some(email.clone()),
+                            AuditResult::Success,
+                            serde_json::json!({ "type": "oidc", "provider": provider_id }),
+                            now,
+                        )
+                        .await;
+                        // S-02: linking notifies the user by email. Delivery failures must
+                        // not undo an already-recorded link — log and continue.
+                        let body = format!(
+                            "A new sign-in method ({provider_label}) was just linked to your account.\n\n\
+                             If this was not you, revoke your sessions and contact your administrator.",
+                        );
+                        if let Err(err) = self.mailer.send(&email, "New sign-in method linked", &body).await {
+                            tracing::error!(error = %err, "linking notification mail failed");
+                        }
+                        (user, true, false)
+                    }
+                    Some(_) => {
+                        return Err(self.oidc_failure(&provider_id, Some(email), meta, "account_disabled", now).await);
+                    }
+                    None => {
+                        if !self.policy.allow_registration {
+                            return Err(self
+                                .oidc_failure(&provider_id, Some(email), meta, "registration_denied", now)
+                                .await);
+                        }
+                        let display_name = email.split('@').next().unwrap_or("user").to_owned();
+                        let new_user = NewUser { email: Some(email.clone()), email_verified: true, display_name };
+                        let user = match self.repos.users.create(new_user, now).await {
+                            Ok(user) => user,
+                            // An unverified local holder of this address exists: it can never
+                            // claim the account and the account can never claim it (S-02).
+                            Err(Error::Conflict { .. }) => {
+                                return Err(self
+                                    .oidc_failure(&provider_id, Some(email), meta, "email_conflict", now)
+                                    .await);
+                            }
+                            Err(other) => return Err(other),
+                        };
+                        self.repos.credentials.create_email_identity(user.id, &email, now).await?;
+                        self.repos.credentials.upsert_oidc(user.id, &identity.issuer, &identity.subject, now).await?;
+                        (user, false, true)
+                    }
+                }
+            }
+        };
+
+        self.finish_login(
+            user,
+            &format!("oidc:{provider_id}"),
+            "auth.oidc.login.success",
+            serde_json::json!({ "provider": provider_id, "registered": registered, "linked": linked }),
+            meta,
+            now,
+        )
+        .await
+    }
+
+    // --- TOTP second factor (S-05) ---
+
+    /// Starts a TOTP enrollment: fresh 160-bit seed, sealed with the KEK into a short-TTL
+    /// KV record; nothing touches the database until the code is confirmed. Returns the
+    /// base32 secret and the `otpauth://` URL. An active enrollment is a `Conflict`.
+    pub async fn enroll_totp(&self, user: UserId, _now: DateTime<Utc>) -> Result<(String, String)> {
+        if self.repos.credentials.find_totp(user).await?.is_some() {
+            return Err(Error::Conflict { message: "totp is already enrolled; disable it first".into() });
+        }
+        let account = self.repos.users.get(user).await?.and_then(|u| u.email).unwrap_or_else(|| user.to_string());
+        let seed = totp::generate_secret(self.rng.as_ref());
+        let sealed = totp::seal(&self.policy.kek, self.rng.as_ref(), &seed)?;
+        let ttl = totp::ENROLL_TTL.to_std().expect("ENROLL_TTL is positive");
+        self.kv.set_ttl(&totp::enroll_key(user), &B64URL.encode(&sealed), ttl).await?;
+        Ok((totp::base32_encode(&seed), totp::otpauth_url(&self.policy.totp_issuer, &account, &seed)))
+    }
+
+    /// Confirms a pending enrollment with a live code: activates the second factor and
+    /// returns the ten single-use recovery codes — shown exactly once (S-05).
+    pub async fn confirm_totp(
+        &self,
+        user: UserId,
+        code: &str,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let key = totp::enroll_key(user);
+        let Some(raw) = self.kv.get(&key).await? else {
+            return Err(Error::Invalid { message: "no totp enrollment in progress".into() });
+        };
+        let sealed =
+            B64URL.decode(&raw).map_err(|_| Error::Internal { message: "corrupt pending enrollment".into() })?;
+        let seed = totp::open(&self.policy.kek, &sealed)?;
+
+        let scope = format!("enroll:{user}");
+        self.mfa_backoff_gate(&scope, now).await?;
+        let Some(step) = totp::verify_at(&seed, code, now, None) else {
+            self.mfa_failure(&scope, meta, "totp_confirm", now).await;
+            return Err(Error::InvalidCode);
+        };
+
+        // Activate with the confirmation step as the replay floor: the code the user just
+        // typed can never be replayed at login (S-05).
+        self.repos.credentials.create_totp(user, &sealed, step, now).await?;
+        let codes: Vec<String> =
+            (0..totp::RECOVERY_CODES).map(|_| totp::generate_recovery_code(self.rng.as_ref())).collect();
+        let hashes =
+            codes.iter().map(|code| totp::hash_recovery_code(code, self.rng.as_ref())).collect::<Result<Vec<_>>>()?;
+        self.repos.credentials.replace_recovery_codes(user, &hashes, now).await?;
+
+        self.kv.del(&key).await?;
+        self.clear_mfa_counters(&scope).await?;
+        self.audit_as(
+            AuditActor::User(user),
+            meta,
+            "auth.totp.enrolled",
+            None,
+            AuditResult::Success,
+            serde_json::json!({ "recovery_codes": codes.len() }),
+            now,
+        )
+        .await;
+        Ok(codes)
+    }
+
+    /// Disables the second factor: removes the TOTP enrollment and every remaining recovery
+    /// code. Step-up enforcement happens at the API layer (S-06).
+    pub async fn disable_totp(&self, user: UserId, meta: &ClientMeta, now: DateTime<Utc>) -> Result<()> {
+        let removed = self.repos.credentials.delete_second_factor(user).await?;
+        if removed == 0 {
+            return Err(Error::NotFound { what: "totp enrollment".into() });
+        }
+        self.audit_as(
+            AuditActor::User(user),
+            meta,
+            "auth.totp.disabled",
+            None,
+            AuditResult::Success,
+            serde_json::json!({}),
+            now,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Whether the user has an active TOTP second factor.
+    pub async fn totp_enrolled(&self, user: UserId) -> Result<bool> {
+        Ok(self.repos.credentials.find_totp(user).await?.is_some())
+    }
+
+    /// Completes a pending-MFA login with a TOTP or recovery code (S-05).
+    ///
+    /// The pending handle survives failed attempts (the budget is the ≤5-then-backoff
+    /// counter, not the record), and is consumed on success.
+    pub async fn verify_mfa(
+        &self,
+        mfa_token: &str,
+        code: Option<&str>,
+        recovery_code: Option<&str>,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<LoginSuccess> {
+        let key = totp::mfa_pending_key(mfa_token);
+        let Some(raw) = self.kv.get(&key).await? else {
+            return Err(self.mfa_login_failure(None, meta, "unknown_mfa_token", now).await);
+        };
+        let Ok(pending) = serde_json::from_str::<MfaPending>(&raw) else {
+            self.kv.del(&key).await?;
+            return Err(self.mfa_login_failure(None, meta, "corrupt_mfa_pending", now).await);
+        };
+        // The record's own timestamp is the authority; the KV TTL only garbage-collects.
+        if now >= pending.created_at + totp::MFA_PENDING_TTL {
+            self.kv.del(&key).await?;
+            return Err(self.mfa_login_failure(Some(pending.user_id), meta, "mfa_expired", now).await);
+        }
+
+        let scope = format!("login:{mfa_token}");
+        self.mfa_backoff_gate(&scope, now).await?;
+
+        let Some(user) = self.repos.users.get(pending.user_id).await?.filter(|u| u.status == UserStatus::Active) else {
+            return Err(self.mfa_login_failure(Some(pending.user_id), meta, "account_unavailable", now).await);
+        };
+
+        let Some(second_factor) = self.verify_second_factor(user.id, code, recovery_code, now).await? else {
+            self.mfa_failure(&scope, meta, "mfa_login", now).await;
+            return Err(self.mfa_login_failure(Some(user.id), meta, "wrong_second_factor", now).await);
+        };
+
+        // Success: the pending handle is single-use.
+        self.kv.del(&key).await?;
+        self.clear_mfa_counters(&scope).await?;
         let login = self.open_session(user, meta, now).await?;
         self.audit_as(
             AuditActor::User(login.user.id),
             meta,
             "auth.login.success",
-            Some(email),
+            login.user.email.clone(),
             AuditResult::Success,
-            serde_json::json!({ "method": "otp", "registered": registered }),
+            serde_json::json!({ "method": pending.method, "second_factor": second_factor }),
             now,
         )
         .await;
         Ok(login)
+    }
+
+    // --- Step-up ("sudo mode", S-06) ---
+
+    /// Marks the caller's session step-up-fresh after a live TOTP/recovery verification.
+    /// Returns until when the mark holds. Accounts without an enrolled second factor cannot
+    /// use this endpoint — their re-auth path is a fresh login (see [`Self::step_up_satisfied`]).
+    pub async fn step_up(
+        &self,
+        user: UserId,
+        sid: SessionId,
+        code: Option<&str>,
+        recovery_code: Option<&str>,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>> {
+        if self.repos.credentials.find_totp(user).await?.is_none() {
+            return Err(Error::Invalid { message: "no second factor enrolled; sign in again instead".into() });
+        }
+        let scope = format!("stepup:{sid}");
+        self.mfa_backoff_gate(&scope, now).await?;
+        let Some(second_factor) = self.verify_second_factor(user, code, recovery_code, now).await? else {
+            self.mfa_failure(&scope, meta, "step_up", now).await;
+            self.audit_as(
+                AuditActor::User(user),
+                meta,
+                "auth.step_up.failure",
+                Some(sid.to_string()),
+                AuditResult::Failure,
+                serde_json::json!({}),
+                now,
+            )
+            .await;
+            return Err(Error::InvalidCode);
+        };
+        self.clear_mfa_counters(&scope).await?;
+        self.kv.set_ttl(&totp::step_up_key(sid), &now.timestamp().to_string(), self.policy.step_up_window).await?;
+        self.audit_as(
+            AuditActor::User(user),
+            meta,
+            "auth.step_up.success",
+            Some(sid.to_string()),
+            AuditResult::Success,
+            serde_json::json!({ "second_factor": second_factor }),
+            now,
+        )
+        .await;
+        let window = Duration::from_std(self.policy.step_up_window)
+            .map_err(|_| Error::Config { message: "auth.step_up_window is out of range".into() })?;
+        Ok(now + window)
+    }
+
+    /// Whether the session currently satisfies S-06 step-up:
+    ///
+    /// 1. a **fresh login** — the session was created within the step-up window (a login
+    ///    already ran the strongest factor chain the account has, TOTP included); or
+    /// 2. an explicit [`Self::step_up`] verification within the window.
+    ///
+    /// A KV failure propagates — the API layer fails closed (denies the gated action).
+    pub async fn step_up_satisfied(&self, user: UserId, sid: SessionId, now: DateTime<Utc>) -> Result<bool> {
+        let window = Duration::from_std(self.policy.step_up_window)
+            .map_err(|_| Error::Config { message: "auth.step_up_window is out of range".into() })?;
+        let fresh_login = self
+            .repos
+            .sessions
+            .list_for_user(user)
+            .await?
+            .iter()
+            .any(|session| session.id == sid && now < session.created_at + window);
+        if fresh_login {
+            return Ok(true);
+        }
+        let mark = self.kv.get(&totp::step_up_key(sid)).await?;
+        Ok(mark
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .and_then(|ts| DateTime::from_timestamp(ts, 0))
+            .is_some_and(|marked_at| now < marked_at + window))
     }
 
     // --- Session lifecycle (S-08, S-09) ---
@@ -533,6 +990,196 @@ impl AuthService {
     }
 
     // --- internals ---
+
+    /// Completes a passed first factor: either opens the session (auditing
+    /// `success_action`), or parks the login behind a pending-MFA handle when the account
+    /// has an active TOTP second factor (S-05).
+    async fn finish_login(
+        &self,
+        user: User,
+        method: &str,
+        success_action: &str,
+        metadata: serde_json::Value,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<LoginOutcome> {
+        if self.repos.credentials.find_totp(user.id).await?.is_some() {
+            let mfa_token = otp::generate_pending_id(self.rng.as_ref());
+            let pending = MfaPending { user_id: user.id, created_at: now, method: method.to_owned() };
+            let json = serde_json::to_string(&pending)
+                .map_err(|err| Error::Internal { message: format!("mfa-pending serialization failed: {err}") })?;
+            let ttl = totp::MFA_PENDING_TTL.to_std().expect("MFA_PENDING_TTL is positive");
+            self.kv.set_ttl(&totp::mfa_pending_key(&mfa_token), &json, ttl).await?;
+            self.audit_as(
+                AuditActor::User(user.id),
+                meta,
+                "auth.mfa.challenge",
+                user.email.clone(),
+                AuditResult::Success,
+                serde_json::json!({ "method": method }),
+                now,
+            )
+            .await;
+            return Ok(LoginOutcome::MfaRequired { mfa_token });
+        }
+        let login = self.open_session(user, meta, now).await?;
+        self.audit_as(
+            AuditActor::User(login.user.id),
+            meta,
+            success_action,
+            login.user.email.clone(),
+            AuditResult::Success,
+            metadata,
+            now,
+        )
+        .await;
+        Ok(LoginOutcome::Complete(login))
+    }
+
+    /// Verifies exactly one of TOTP code / recovery code for `user`.
+    ///
+    /// `Ok(Some("totp" | "recovery"))` on success; `Ok(None)` on any credential mismatch
+    /// (uniform for the caller); `Err(Invalid)` when the request shape is wrong. Successful
+    /// TOTP verification commits the replay floor atomically — a lost race is a failure.
+    async fn verify_second_factor(
+        &self,
+        user: UserId,
+        code: Option<&str>,
+        recovery_code: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<&'static str>> {
+        match (code, recovery_code) {
+            (Some(code), None) => {
+                let Some(credential) = self.repos.credentials.find_totp(user).await? else {
+                    return Ok(None);
+                };
+                let seed = totp::open(&self.policy.kek, &credential.secret_enc)?;
+                match totp::verify_at(&seed, code, now, credential.last_step) {
+                    Some(step) => {
+                        Ok(self.repos.credentials.commit_totp_step(credential.id, step, now).await?.then_some("totp"))
+                    }
+                    None => Ok(None),
+                }
+            }
+            (None, Some(recovery)) => {
+                // ≤10 stored hashes; every row is checked so timing does not reveal which
+                // (if any) code was close. Single-use is the atomic consume (S-05).
+                let mut matched = None;
+                for row in self.repos.credentials.list_recovery_codes(user).await? {
+                    if totp::verify_recovery_code(recovery, &row.phc) && matched.is_none() {
+                        matched = Some(row.id);
+                    }
+                }
+                match matched {
+                    Some(id) => Ok(self.repos.credentials.consume_recovery_code(id).await?.then_some("recovery")),
+                    None => Ok(None),
+                }
+            }
+            _ => Err(Error::Invalid { message: "provide exactly one of code or recovery_code".into() }),
+        }
+    }
+
+    /// Refuses MFA verifications while the scope is inside an exponential-backoff window
+    /// (S-05: ≤5 failures, then backoff on the MFA step only).
+    async fn mfa_backoff_gate(&self, scope: &str, now: DateTime<Utc>) -> Result<()> {
+        let Some(raw) = self.kv.get(&totp::mfa_backoff_key(scope)).await? else {
+            return Ok(());
+        };
+        let not_before = raw.parse::<i64>().ok().and_then(|ts| DateTime::from_timestamp(ts, 0));
+        match not_before {
+            Some(not_before) if now < not_before => {
+                let retry_after_secs = (not_before - now).num_seconds().max(1) as u64;
+                Err(Error::RateLimited { retry_after_secs })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Registers one failed MFA verification: spends the attempt atomically and arms the
+    /// exponential backoff once the budget is gone, audit-logging the throttle trip (S-24).
+    async fn mfa_failure(&self, scope: &str, meta: &ClientMeta, limit: &str, now: DateTime<Utc>) {
+        let result: Result<()> = async {
+            let failures = self.kv.incr(&totp::mfa_attempt_key(scope), StdDuration::from_secs(15 * 60)).await?;
+            if let Some(delay) = totp::backoff_after(failures) {
+                let not_before = now + Duration::seconds(delay as i64);
+                self.kv
+                    .set_ttl(
+                        &totp::mfa_backoff_key(scope),
+                        &not_before.timestamp().to_string(),
+                        StdDuration::from_secs(delay),
+                    )
+                    .await?;
+                self.audit_as(
+                    AuditActor::System,
+                    meta,
+                    "auth.throttled",
+                    None,
+                    AuditResult::Failure,
+                    serde_json::json!({ "limit": limit, "failures": failures, "backoff_secs": delay }),
+                    now,
+                )
+                .await;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            // Counter bookkeeping failed (KV outage): the verification itself already
+            // failed, so the caller still gets a denial — log the degraded throttle.
+            tracing::error!(error = %err, scope, "mfa failure accounting failed");
+        }
+    }
+
+    /// Clears the failed-attempt state of an MFA scope after a success.
+    async fn clear_mfa_counters(&self, scope: &str) -> Result<()> {
+        self.kv.del(&totp::mfa_attempt_key(scope)).await?;
+        self.kv.del(&totp::mfa_backoff_key(scope)).await
+    }
+
+    /// Audits a failed pending-MFA completion and returns the uniform error (S-04).
+    async fn mfa_login_failure(
+        &self,
+        user: Option<UserId>,
+        meta: &ClientMeta,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Error {
+        let actor = user.map(AuditActor::User).unwrap_or(AuditActor::System);
+        self.audit_as(
+            actor,
+            meta,
+            "auth.login.failure",
+            None,
+            AuditResult::Failure,
+            serde_json::json!({ "method": "mfa", "reason": reason }),
+            now,
+        )
+        .await;
+        Error::InvalidCode
+    }
+
+    /// Audits a failed OIDC sign-in and returns the uniform error (S-04): the reason —
+    /// including every internal id_token diagnostic — reaches the audit log only.
+    async fn oidc_failure(
+        &self,
+        provider: &str,
+        email: Option<String>,
+        meta: &ClientMeta,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Error {
+        self.audit_as(
+            AuditActor::System,
+            meta,
+            "auth.oidc.login.failure",
+            email,
+            AuditResult::Failure,
+            serde_json::json!({ "provider": provider, "reason": reason }),
+            now,
+        )
+        .await;
+        Error::Unauthorized { message: "sign-in failed".into() }
+    }
 
     /// Opens a session for `user`: refresh secret + row + access JWT.
     async fn open_session(&self, user: User, meta: &ClientMeta, now: DateTime<Utc>) -> Result<LoginSuccess> {

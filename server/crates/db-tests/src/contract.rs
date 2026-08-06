@@ -181,6 +181,64 @@ pub async fn credential_repo(repos: &Repositories) {
     assert_eq!(creds[2].id, email_cred.id);
 }
 
+/// `CredentialRepo` second factor (S-05): TOTP enrollment with an atomic monotonic replay
+/// floor, single-use recovery codes, and full second-factor removal.
+pub async fn second_factor(repos: &Repositories) {
+    let alice = seed_user(repos, "alice2fa@corp.com", "Alice").await;
+    let sealed = b"opaque-kek-sealed-seed".to_vec();
+
+    // No enrollment yet.
+    assert_eq!(repos.credentials.find_totp(alice.id).await.expect("find none"), None);
+
+    // Enroll: the sealed seed and the confirmation step round-trip.
+    let cred = repos.credentials.create_totp(alice.id, &sealed, 41, t0()).await.expect("create totp");
+    assert_eq!(cred.credential_type, CredentialType::Totp);
+    let stored = repos.credentials.find_totp(alice.id).await.expect("find").expect("enrolled");
+    assert_eq!(stored.id, cred.id);
+    assert_eq!(stored.secret_enc, sealed);
+    assert_eq!(stored.last_step, Some(41));
+
+    // Double enrollment conflicts (one active TOTP per user).
+    let err = repos.credentials.create_totp(alice.id, &sealed, 1, t0()).await.expect_err("double enroll");
+    assert_eq!(err.code(), "conflict");
+
+    // The replay floor only ever moves forward: same or older steps are rejected.
+    assert!(repos.credentials.commit_totp_step(cred.id, 42, t0()).await.expect("advance"));
+    assert!(!repos.credentials.commit_totp_step(cred.id, 42, t0()).await.expect("replay"), "same step must fail");
+    assert!(!repos.credentials.commit_totp_step(cred.id, 41, t0()).await.expect("older"), "older step must fail");
+    assert!(repos.credentials.commit_totp_step(cred.id, 44, t0()).await.expect("skip forward"));
+    assert_eq!(repos.credentials.find_totp(alice.id).await.expect("find").expect("row").last_step, Some(44));
+
+    // Recovery codes: replace, list, consume exactly once.
+    let hashes: Vec<String> = (0..3).map(|i| format!("$argon2id$fake-{i}")).collect();
+    repos.credentials.replace_recovery_codes(alice.id, &hashes, t0()).await.expect("store codes");
+    let listed = repos.credentials.list_recovery_codes(alice.id).await.expect("list codes");
+    assert_eq!(listed.len(), 3);
+    let mut phcs: Vec<&str> = listed.iter().map(|c| c.phc.as_str()).collect();
+    phcs.sort_unstable();
+    assert_eq!(phcs, ["$argon2id$fake-0", "$argon2id$fake-1", "$argon2id$fake-2"]);
+
+    let victim = listed[0].id;
+    assert!(repos.credentials.consume_recovery_code(victim).await.expect("consume"));
+    assert!(!repos.credentials.consume_recovery_code(victim).await.expect("re-consume"), "single-use (S-05)");
+    assert_eq!(repos.credentials.list_recovery_codes(alice.id).await.expect("list").len(), 2);
+
+    // Replacing wipes the remainder and installs the new set.
+    let fresh: Vec<String> = (0..2).map(|i| format!("$argon2id$new-{i}")).collect();
+    repos.credentials.replace_recovery_codes(alice.id, &fresh, t0() + hours(1)).await.expect("replace");
+    assert_eq!(repos.credentials.list_recovery_codes(alice.id).await.expect("list").len(), 2);
+
+    // Disable removes TOTP + recovery in one sweep, and is idempotent.
+    let removed = repos.credentials.delete_second_factor(alice.id).await.expect("disable");
+    assert_eq!(removed, 3, "one totp row + two recovery rows");
+    assert_eq!(repos.credentials.find_totp(alice.id).await.expect("find"), None);
+    assert!(repos.credentials.list_recovery_codes(alice.id).await.expect("list").is_empty());
+    assert_eq!(repos.credentials.delete_second_factor(alice.id).await.expect("again"), 0);
+
+    // A fresh enrollment works after disable.
+    repos.credentials.create_totp(alice.id, &sealed, 7, t0() + hours(2)).await.expect("re-enroll");
+}
+
 /// `OrgRepo` core: create (creator becomes Owner atomically), lookups, member ops, and the
 /// last-Owner invariant.
 pub async fn org_repo(repos: &Repositories) {

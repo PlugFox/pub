@@ -268,6 +268,55 @@ mod tests {
     }
 
     #[test]
+    fn s07_hs256_algorithm_confusion_with_the_public_key_is_rejected() {
+        // The classic JWT break: take the *public* Ed25519 key, use its raw bytes as an
+        // HMAC-SHA-256 secret, and claim `alg: HS256`. A verifier that picked the algorithm
+        // from the token instead of pinning it would accept this as authentic.
+        use hmac::{Hmac, Mac as _};
+        use sha2::Sha256;
+
+        let ring = keyring();
+        let public = ring.verify["k1"].to_bytes();
+        let body = B64URL.encode(serde_json::to_vec(&claims(t0())).unwrap());
+
+        for (alg, key) in [
+            ("HS256", public.to_vec()),
+            // Same attack with the key in its printable forms, which some libraries expose.
+            ("HS256", B64.encode(public).into_bytes()),
+            ("HS256", hex_of(&public).into_bytes()),
+            ("hs256", public.to_vec()),
+            ("EdDSA ", public.to_vec()),
+        ] {
+            let header = B64URL.encode(format!(r#"{{"alg":"{alg}","typ":"JWT","kid":"k1"}}"#));
+            let signing_input = format!("{header}.{body}");
+            let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+            mac.update(signing_input.as_bytes());
+            let forged = format!("{signing_input}.{}", B64URL.encode(mac.finalize().into_bytes()));
+            assert_eq!(
+                ring.verify(&forged, t0()).unwrap_err().code(),
+                "unauthorized",
+                "alg-confusion token with alg={alg:?} verified"
+            );
+        }
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn s07_claims_carry_nothing_beyond_the_permitted_set() {
+        // S-07 caps the claim set at sub/sid/org levels/timestamps — no email, no name, no
+        // scopes. A token is readable by anyone holding it, so extra claims are a PII leak.
+        let token = keyring().sign(&claims(t0())).unwrap();
+        let payload = B64URL.decode(token.split('.').nth(1).unwrap()).unwrap();
+        let claims: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&payload).unwrap();
+        let mut keys: Vec<&str> = claims.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["exp", "iat", "orgs", "sid", "sub"]);
+    }
+
+    #[test]
     fn unknown_and_missing_kid_are_rejected() {
         let ring = keyring();
         // Signed with a key the ring never had, under a foreign kid.

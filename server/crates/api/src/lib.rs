@@ -1,9 +1,10 @@
 //! HTTP surface of the Pub registry: axum routers, OpenAPI (utoipa), embedded static
 //! assets, and the tower middleware stack.
 //!
-//! Current scope: system endpoints, the email-OTP auth vertical (S-03/S-04), session and
-//! CLI-token management (S-08/S-09/S-13), and minimal orgs. Protocol routes (`/o/{org}/pub/…`,
-//! `/pub/…`) land in later roadmap steps.
+//! Current scope: system endpoints, the full v1 auth surface — email OTP (S-03/S-04),
+//! multi-provider OIDC (S-01/S-02), TOTP second factor + step-up (S-05/S-06) — session and
+//! CLI-token management (S-08/S-09/S-13), and minimal orgs. Protocol routes
+//! (`/o/{org}/pub/…`, `/pub/…`) land in later roadmap steps.
 //!
 //! Middleware order (docs/rules/api.md): request-id → tracing → security headers → rate
 //! limit → auth (typed extractors in handlers).
@@ -55,7 +56,7 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     tags(
         (name = "system", description = "Health and system endpoints"),
-        (name = "auth", description = "Email-OTP sign-in, refresh, logout"),
+        (name = "auth", description = "Sign-in (email OTP, OIDC), TOTP second factor, step-up, refresh, logout"),
         (name = "sessions", description = "Web session management"),
         (name = "tokens", description = "CLI/API tokens"),
         (name = "orgs", description = "Organizations"),
@@ -73,6 +74,14 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::auth::otp_verify))
         .routes(routes!(routes::auth::refresh))
         .routes(routes!(routes::auth::logout))
+        .routes(routes!(routes::oidc::providers))
+        .routes(routes!(routes::oidc::start))
+        .routes(routes!(routes::oidc::callback))
+        .routes(routes!(routes::mfa::totp_enroll))
+        .routes(routes!(routes::mfa::totp_confirm))
+        .routes(routes!(routes::mfa::totp_verify))
+        .routes(routes!(routes::mfa::totp_disable))
+        .routes(routes!(routes::mfa::step_up))
         .routes(routes!(routes::sessions::list))
         .routes(routes!(routes::sessions::revoke))
         .routes(routes!(routes::sessions::revoke_all))
@@ -107,8 +116,9 @@ pub fn router(state: AppState) -> Router {
                 // Auth rate limits (S-24) run after the header layers, before handlers; the
                 // guard scopes itself to auth paths internally.
                 .layer(axum::middleware::from_fn_with_state(state.clone(), guard::auth_rate_limit))
-                // S-12 mutation guard: custom header + JSON-only bodies on /api mutations.
-                .layer(axum::middleware::from_fn(guard::mutation_guard)),
+                // S-12 mutation guard: Origin/Sec-Fetch-Site + custom header + JSON-only
+                // bodies on /api mutations.
+                .layer(axum::middleware::from_fn_with_state(state.clone(), guard::mutation_guard)),
         )
         .with_state(state)
 }

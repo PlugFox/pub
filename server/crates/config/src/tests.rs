@@ -248,6 +248,7 @@ fn auth_defaults_match_security_doc() {
     assert!(settings.auth.allowed_email_domains.is_empty()); // S-31: empty = allow all
     assert_eq!(settings.auth.rate_limit.otp_per_email_hour, 5); // S-24
     assert_eq!(settings.auth.rate_limit.otp_per_ip_hour, 20); // S-24
+    assert_eq!(settings.auth.rate_limit.login_per_ip_minute, 10); // S-24
     assert_eq!(settings.smtp.port, 587);
     assert_eq!(settings.smtp.security, SmtpSecurityMode::Starttls);
 }
@@ -264,8 +265,8 @@ fn production_mode_requires_pepper_and_signing_key() {
     )
     .unwrap_err();
     assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("signing_key")), "unexpected: {err}");
-    // Everything present passes.
-    let settings = load_from(
+    // Pepper + key present, KEK still missing (S-05/S-25).
+    let err = load_from(
         &CliArgs::default(),
         env(&[
             ("PUB_SERVER__MODE", "production"),
@@ -274,9 +275,100 @@ fn production_mode_requires_pepper_and_signing_key() {
             ("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64()),
         ]),
     )
+    .unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("kek")), "unexpected: {err}");
+    // Everything present passes.
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_SERVER__MODE", "production"),
+            ("PUB_AUTH__OTP_PEPPER", "long-random-pepper"),
+            ("PUB_AUTH__JWT__KID", "2026-08"),
+            ("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64()),
+            ("PUB_AUTH__KEK", &seed_b64()),
+        ]),
+    )
     .unwrap();
     assert_eq!(settings.server.mode, RunMode::Production);
     assert_eq!(settings.auth.jwt.kid.as_deref(), Some("2026-08"));
+}
+
+#[test]
+fn kek_must_be_32_base64_bytes() {
+    // Not base64.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__KEK", "!!not-base64!!")])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("base64")), "unexpected: {err}");
+    // Wrong length.
+    use base64::Engine as _;
+    let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__KEK", &short)])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("32 bytes")), "unexpected: {err}");
+    // Valid value passes and is masked in the summary (S-25).
+    let good = seed_b64();
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_AUTH__KEK", &good)])).unwrap();
+    let summary = settings.summary();
+    assert!(!summary.contains(&good), "kek leaked:\n{summary}");
+    assert!(summary.contains("auth.kek             = ***"), "kek mask missing:\n{summary}");
+}
+
+#[test]
+fn s06_step_up_window_is_bounded() {
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__STEP_UP_MINUTES", "0")])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("S-06")), "unexpected: {err}");
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__STEP_UP_MINUTES", "999999")])).unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid(_)));
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.auth.step_up_minutes, 15, "S-06 default window");
+}
+
+#[test]
+fn oidc_providers_are_validated_and_secrets_masked() {
+    use crate::OidcProviderConfig;
+
+    let provider = |id: &str, issuer: &str| OidcProviderConfig {
+        id: id.to_owned(),
+        display_name: "Corp IdP".to_owned(),
+        issuer: issuer.to_owned(),
+        client_id: "client-1".to_owned(),
+        client_secret: Secret::new("oidc-secret-value"),
+        scopes: Vec::new(),
+    };
+
+    // A valid provider passes and its secret never reaches the summary (S-25).
+    let mut settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    settings.auth.oidc = vec![provider("google", "https://accounts.google.com")];
+    settings.validate().expect("valid provider");
+    let summary = settings.summary();
+    assert!(!summary.contains("oidc-secret-value"), "client secret leaked:\n{summary}");
+    assert!(summary.contains("accounts.google.com"), "issuer should be listed:\n{summary}");
+
+    // Bad slug.
+    settings.auth.oidc = vec![provider("Bad Slug!", "https://idp.corp.example")];
+    assert!(settings.validate().is_err());
+    // Duplicate ids.
+    settings.auth.oidc = vec![provider("corp", "https://idp.corp.example"), provider("corp", "https://other.example")];
+    assert!(settings.validate().is_err());
+    // Empty client secret (confidential client, S-01).
+    let mut anonymous = provider("corp", "https://idp.corp.example");
+    anonymous.client_secret = Secret::new("");
+    settings.auth.oidc = vec![anonymous];
+    assert!(settings.validate().is_err());
+    // http issuer is a dev convenience; production demands https (S-01).
+    settings.auth.oidc = vec![provider("corp", "http://idp.corp.example")];
+    settings.validate().expect("http allowed in dev");
+    settings.server.mode = RunMode::Production;
+    settings.auth.otp_pepper = Some(Secret::new("pepper"));
+    settings.auth.kek = Some(Secret::new(seed_b64()));
+    settings.auth.jwt.kid = Some("k1".to_owned());
+    settings.auth.jwt.signing_key = Some(Secret::new(seed_b64()));
+    assert!(settings.validate().is_err(), "http issuer must fail in production");
+    settings.auth.oidc = vec![provider("corp", "https://idp.corp.example")];
+    settings.validate().expect("https issuer passes in production");
+    // Explicit scopes must include openid.
+    let mut scoped = provider("corp", "https://idp.corp.example");
+    scoped.scopes = vec!["email".to_owned()];
+    settings.auth.oidc = vec![scoped];
+    assert!(settings.validate().is_err());
 }
 
 #[test]
@@ -395,6 +487,96 @@ fn smtp_full_config_is_accepted_and_summary_masks_password() {
     let summary = settings.summary();
     assert!(!summary.contains("smtp-secret-value"), "smtp password leaked:\n{summary}");
     assert!(summary.contains("smtp.password        = ***"));
+}
+
+#[test]
+fn s25_file_suffixed_env_reads_mounted_secrets() {
+    let mut pepper = tempfile::NamedTempFile::new().unwrap();
+    // Written the way `echo` would: the trailing newline must not become part of the pepper.
+    pepper.write_all(b"pepper-from-a-mounted-file\n").unwrap();
+    let settings =
+        load_from(&CliArgs::default(), env(&[("PUB_AUTH__OTP_PEPPER_FILE", pepper.path().to_str().unwrap())])).unwrap();
+    assert_eq!(settings.auth.otp_pepper.as_ref().map(Secret::expose), Some("pepper-from-a-mounted-file"));
+    // …and the mounted value never reaches the summary.
+    assert!(settings.summary().contains("auth.otp_pepper      = ***"));
+}
+
+#[test]
+fn s25_file_suffixed_env_fails_loudly() {
+    // Unreadable path: fail fast rather than boot with no pepper.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__OTP_PEPPER_FILE", "/nonexistent/pepper")])).unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("could not be read")), "unexpected: {err}");
+
+    // Both forms set: ambiguous, so refuse instead of guessing.
+    let mut pepper = tempfile::NamedTempFile::new().unwrap();
+    pepper.write_all(b"from-file").unwrap();
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_AUTH__OTP_PEPPER", "from-env"), ("PUB_AUTH__OTP_PEPPER_FILE", pepper.path().to_str().unwrap())]),
+    )
+    .unwrap_err();
+    assert!(matches!(&err, ConfigError::Invalid(m) if m.contains("pick one")), "unexpected: {err}");
+}
+
+#[test]
+fn s25_no_secret_survives_a_debug_dump_of_the_settings() {
+    // The summary is the *intended* human output and is already masked. This asserts the
+    // other half of S-25: a stray `{:?}` — a config dump, a `#[instrument]` field, a panic
+    // message — must not be able to print a pepper, a signing seed, or a password either.
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_DATABASE__KIND", "postgres"),
+            ("PUB_DATABASE__URL", "postgres://pub:db-secret-value@localhost/pub"),
+            ("PUB_KV__KIND", "redis"),
+            ("PUB_KV__URL", "redis://:kv-secret-value@localhost:6379"),
+            ("PUB_BLOB__KIND", "s3"),
+            ("PUB_BLOB__BUCKET", "pub-blobs"),
+            ("PUB_BLOB__ACCESS_KEY", "access-secret-value"),
+            ("PUB_BLOB__SECRET_KEY", "blob-secret-value"),
+            ("PUB_AUTH__OTP_PEPPER", "pepper-secret-value"),
+            ("PUB_AUTH__JWT__KID", "2026-08"),
+            ("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64()),
+            ("PUB_SMTP__HOST", "smtp.corp.com"),
+            ("PUB_SMTP__USERNAME", "mailer"),
+            ("PUB_SMTP__PASSWORD", "smtp-secret-value"),
+        ]),
+    )
+    .unwrap();
+
+    let dumped = format!("{settings:?}");
+    for secret in [
+        "db-secret-value",
+        "kv-secret-value",
+        "access-secret-value",
+        "blob-secret-value",
+        "pepper-secret-value",
+        "smtp-secret-value",
+        &seed_b64(),
+    ] {
+        assert!(!dumped.contains(secret), "secret {secret:?} leaked into Debug output:\n{dumped}");
+    }
+    // Non-secret context stays debuggable, otherwise the redaction is useless in practice.
+    assert!(dumped.contains("2026-08"), "kid is public metadata and must survive:\n{dumped}");
+    assert!(dumped.contains("smtp.corp.com"), "hostnames must survive:\n{dumped}");
+}
+
+#[test]
+fn s25_secret_newtype_has_no_display_and_a_redacting_debug() {
+    let secret = Secret::new("pepper-secret-value");
+    assert_eq!(format!("{secret:?}"), "Secret(<redacted>)");
+    assert_eq!(format!("{:?}", Some(secret.clone())), "Some(Secret(<redacted>))");
+    assert_eq!(secret.expose(), "pepper-secret-value");
+    assert!(Secret::new("").is_empty());
+}
+
+#[test]
+fn s24_trusted_proxy_is_off_by_default_and_configurable() {
+    // Default-deny: an operator must opt in before X-Forwarded-For is believed.
+    assert!(!load_from(&CliArgs::default(), no_env()).unwrap().server.trust_proxy_headers);
+    let behind_proxy = load_from(&CliArgs::default(), env(&[("PUB_SERVER__TRUST_PROXY_HEADERS", "true")])).unwrap();
+    assert!(behind_proxy.server.trust_proxy_headers);
+    assert!(behind_proxy.summary().contains("server.trust_proxy   = true"));
 }
 
 #[test]
