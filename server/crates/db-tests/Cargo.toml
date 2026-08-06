@@ -1,0 +1,20 @@
+[package]
+name = "pub-db-tests"
+description = "Shared repository contract suite — every backend must pass it through the core traits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+pub-core = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pub-config = { workspace = true }
+pub-db-postgres = { workspace = true }
+pub-db-sqlite = { workspace = true }
+# postgres: the env-gated contract run creates/drops throwaway databases on a live server.
+sqlx = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true }

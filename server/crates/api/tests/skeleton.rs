@@ -9,21 +9,30 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use pub_api::AppState;
 use pub_blob::ObjectStoreBlob;
-use pub_config::{BlobKind, KvKind, Settings};
+use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings};
+use pub_db_sqlite::SqliteDb;
 use pub_kv::MemoryKv;
 use tower::ServiceExt;
 
-fn test_router() -> Router {
-    let mut settings = Settings::default();
+async fn test_router() -> Router {
     // Report the kinds that are actually wired below.
+    let mut settings = Settings {
+        database: DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() },
+        ..Settings::default()
+    };
     settings.blob.kind = BlobKind::Memory;
     settings.kv.kind = KvKind::Memory;
-    let state = AppState::new(settings, Arc::new(ObjectStoreBlob::memory()), Arc::new(MemoryKv::new()));
+
+    let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
+    db.run_migrations().await.expect("migrate");
+    let state =
+        AppState::new(settings, db.repositories(), Arc::new(ObjectStoreBlob::memory()), Arc::new(MemoryKv::new()));
     pub_api::router(state)
 }
 
 async fn get(path: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
-    let response = test_router().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+    let response =
+        test_router().await.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
     let (parts, body) = response.into_parts();
     let bytes = body.collect().await.unwrap().to_bytes().to_vec();
     (parts.status, parts.headers, bytes)
@@ -45,6 +54,10 @@ async fn healthz_reports_status_version_and_backend_kinds() {
     assert_eq!(body["backends"]["database"], "sqlite");
     assert_eq!(body["backends"]["blob"], "memory");
     assert_eq!(body["backends"]["kv"], "memory");
+    // Live pings, not config echoes: the database check hits the migrated :memory: db.
+    assert_eq!(body["checks"]["database"], true);
+    assert_eq!(body["checks"]["blob"], true);
+    assert_eq!(body["checks"]["kv"], true);
 }
 
 #[tokio::test]

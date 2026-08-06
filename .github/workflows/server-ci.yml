@@ -67,6 +67,25 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Postgres leg of the backend matrix: the shared repository contract suite
+    # (crates/db-tests/tests/postgres.rs) is gated at runtime by PUB_TEST_POSTGRES_URL —
+    # exported below, so it runs here and skips cleanly on machines without the variable.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: pub
+          POSTGRES_PASSWORD: pub
+          POSTGRES_DB: pub
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U pub -d pub"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PUB_TEST_POSTGRES_URL: postgres://pub:pub@127.0.0.1:5432/pub
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

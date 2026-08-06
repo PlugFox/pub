@@ -1,18 +1,34 @@
 //! SQLite database backend (decision 02).
 //!
 //! Zero-infrastructure default: a single file (or `:memory:`) with SQLite's single-writer
-//! model. Repository trait implementations (`PackageRepo`, `UserRepo`, …) land in later
-//! roadmap steps; this skeleton provides the pool constructor, migrations, and a health ping.
+//! model. The identity & access repositories (`UserRepo`, `CredentialRepo`, `OrgRepo`,
+//! `SessionRepo`, `TokenRepo`, `AuditRepo`, `SettingsRepo`) are implemented in [`repo`] and
+//! bundled by [`SqliteDb::repositories`].
 //!
 //! Single-writer note: SQLite serializes writes; the pool is intentionally small and the
 //! `:memory:` variant is pinned to one connection so every handle sees the same database.
+//!
+//! # Query style — deliberate deviation from "sqlx compile-time macros where possible"
+//!
+//! Queries use **runtime `query`/`query_as` with explicit row structs**, not the `query!`
+//! macro family. The compile-time-checked workflow needs a per-crate `sqlx.toml` +
+//! `cargo sqlx prepare` against a migrated build-time database, with `.sqlx/` regenerated on
+//! every schema or query change **per backend crate** — and the prepare metadata is coupled
+//! to the exact sqlx version (workspace: 0.9). In this dual-backend workspace the ceremony
+//! outweighs the benefit right now (dynamic filter queries could not use macros anyway);
+//! correctness is carried by the shared contract test suite (`pub-db-tests`), which exercises
+//! every repository method against a real migrated database. Revisit once the sqlx 0.9 CLI
+//! workflow settles.
 
 use std::path::Path;
 
 use pub_config::{DatabaseConfig, DatabaseKind};
 use pub_core::Error;
+use pub_core::traits::Repositories;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+pub mod repo;
 
 /// Embedded migrations from `crates/db-sqlite/migrations/`, run at startup.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -46,7 +62,10 @@ impl SqliteDb {
                 })?;
             }
             SqliteConnectOptions::new().filename(&cfg.path).create_if_missing(true)
-        };
+        }
+        // Referential integrity is per-connection in SQLite — enforce it explicitly rather
+        // than relying on driver defaults.
+        .foreign_keys(true);
 
         let pool = SqlitePoolOptions::new()
             // :memory: databases are per-connection; a pool of one keeps a single database.
@@ -72,6 +91,12 @@ impl SqliteDb {
     /// The underlying pool, for repository implementations within this crate.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// The identity & access repositories over this database, as the shared bundle carried
+    /// in `AppState`. Cheap: repositories hold pool clones.
+    pub fn repositories(&self) -> Repositories {
+        repo::repositories(self.pool.clone())
     }
 }
 
@@ -119,8 +144,8 @@ mod tests {
     }
 
     #[test]
-    fn migrator_contains_the_initial_migration() {
-        assert_eq!(MIGRATOR.migrations.len(), 1);
-        assert_eq!(MIGRATOR.migrations[0].version, 1);
+    fn migrator_contains_the_expected_migrations() {
+        let versions: Vec<i64> = MIGRATOR.migrations.iter().map(|m| m.version).collect();
+        assert_eq!(versions, vec![1, 2]);
     }
 }

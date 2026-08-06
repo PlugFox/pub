@@ -1,15 +1,21 @@
 [package]
 name = "pub-db-postgres"
-description = "PostgreSQL backend: sqlx pool, migrations, and (later) core repository impls."
+description = "PostgreSQL backend: sqlx pool, migrations, and core repository impls."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
 pub-config = { workspace = true }
 pub-core = { workspace = true }
-sqlx = { workspace = true, features = ["postgres"] }
+serde_json = { workspace = true }
+# uuid/chrono: native UUID and TIMESTAMPTZ binds; INET and JSONB round-trip as text casts
+# instead of pulling further type features (see src/repo/mod.rs).
+sqlx = { workspace = true, features = ["postgres", "uuid", "chrono"] }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

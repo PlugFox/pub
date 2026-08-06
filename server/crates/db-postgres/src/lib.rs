@@ -1,14 +1,18 @@
 //! PostgreSQL database backend (decision 02).
 //!
-//! Repository trait implementations (`PackageRepo`, `UserRepo`, …) land in later roadmap
-//! steps; this skeleton provides the pool constructor, migrations, and a health ping.
-//! The CI backend matrix (Postgres via testcontainers) exercises this crate; local unit
-//! tests stay connection-free.
+//! Carries the full migration set (identical logical schema to `db-sqlite`) and the complete
+//! identity & access repository implementations ([`repo`]), bundled by
+//! [`PostgresDb::repositories`]. Local unit tests stay connection-free; the shared contract
+//! suite (`pub-db-tests`) exercises every repository against a live server, gated by the
+//! `PUB_TEST_POSTGRES_URL` environment variable (the CI backend matrix sets it).
 
 use pub_config::{DatabaseConfig, DatabaseKind};
 use pub_core::Error;
+use pub_core::traits::Repositories;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+
+pub mod repo;
 
 /// Embedded migrations from `crates/db-postgres/migrations/`, run at startup.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -61,6 +65,12 @@ impl PostgresDb {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// The identity & access repositories over this database, as the shared bundle carried
+    /// in `AppState`. Cheap: repositories hold pool clones.
+    pub fn repositories(&self) -> Repositories {
+        repo::repositories(self.pool.clone())
+    }
 }
 
 #[cfg(test)]
@@ -95,8 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn migrator_contains_the_initial_migration() {
-        assert_eq!(MIGRATOR.migrations.len(), 1);
-        assert_eq!(MIGRATOR.migrations[0].version, 1);
+    fn migrator_contains_the_expected_migrations() {
+        let versions: Vec<i64> = MIGRATOR.migrations.iter().map(|m| m.version).collect();
+        assert_eq!(versions, vec![1, 2]);
     }
 }

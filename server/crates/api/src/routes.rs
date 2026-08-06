@@ -19,6 +19,8 @@ pub struct Health {
     pub version: String,
     /// Which backend kinds this instance is configured with.
     pub backends: Backends,
+    /// Live connectivity per backend — each is an actual ping, not an echo of config.
+    pub checks: Checks,
 }
 
 /// Configured backend kinds, as selected by config (decision 09).
@@ -32,8 +34,19 @@ pub struct Backends {
     pub kv: String,
 }
 
+/// Live ping results per backend.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Checks {
+    /// The database answered a probe query.
+    pub database: bool,
+    /// The blob store answered a probe.
+    pub blob: bool,
+    /// The KV store answered a probe.
+    pub kv: bool,
+}
+
 /// Liveness/readiness probe. Always on, never authenticated (decision 23); orchestrators
-/// poll it, so it must stay cheap.
+/// poll it, so it must stay cheap — one trivial query per backend.
 #[utoipa::path(
     get,
     path = "/healthz",
@@ -41,9 +54,11 @@ pub struct Backends {
     responses((status = OK, description = "Service health and configured backends", body = Health))
 )]
 pub async fn healthz(State(state): State<AppState>) -> Json<Health> {
+    // The database check goes through a live repository handle over the selected backend.
+    let db_ok = state.repos.users.ping().await.is_ok();
     let blob_ok = state.blob.ping().await.is_ok();
     let kv_ok = state.kv.ping().await.is_ok();
-    let status = if blob_ok && kv_ok { "ok" } else { "degraded" };
+    let status = if db_ok && blob_ok && kv_ok { "ok" } else { "degraded" };
     Json(Health {
         status: status.to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -52,6 +67,7 @@ pub async fn healthz(State(state): State<AppState>) -> Json<Health> {
             blob: state.settings.blob.kind.as_str().to_owned(),
             kv: state.settings.kv.kind.as_str().to_owned(),
         },
+        checks: Checks { database: db_ok, blob: blob_ok, kv: kv_ok },
     })
 }
 

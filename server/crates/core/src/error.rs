@@ -19,6 +19,25 @@ pub enum Error {
     /// The requested resource does not exist (or is not visible to the caller — decision 05).
     #[error("not found: {what}")]
     NotFound { what: String },
+    /// State or unique-constraint conflict: duplicate email/slug/hash, double-accepted
+    /// invitation, membership that already exists.
+    #[error("conflict: {message}")]
+    Conflict { message: String },
+    /// The actor lacks the required role or scope on a resource it can see (decision 19).
+    /// The API layer decides whether this surfaces as 403 or 404 (decision 05 ladder).
+    #[error("forbidden: {message}")]
+    Forbidden { message: String },
+    /// The resource exists but its validity window has passed (invitation, session, token).
+    #[error("expired: {what}")]
+    Expired { what: String },
+    /// The operation would leave the org without any Owner — every org keeps at least one
+    /// Owner (decision 19 invariant, enforced repo-side).
+    #[error("operation would leave org {org} without an owner")]
+    LastOwner { org: crate::OrgId },
+    /// A rotated-out refresh hash was presented again — possible token theft (S-08).
+    /// The caller must revoke the whole session family.
+    #[error("refresh token reuse detected for session {session}")]
+    RefreshReused { session: crate::SessionId },
     /// Database backend failure.
     #[error("database error: {message}")]
     Database { message: String },
@@ -45,6 +64,11 @@ impl Error {
             Self::Config { .. } => "config_invalid",
             Self::Invalid { .. } => "invalid_argument",
             Self::NotFound { .. } => "not_found",
+            Self::Conflict { .. } => "conflict",
+            Self::Forbidden { .. } => "forbidden",
+            Self::Expired { .. } => "expired",
+            Self::LastOwner { .. } => "last_owner",
+            Self::RefreshReused { .. } => "refresh_reused",
             Self::Database { .. } => "database_error",
             Self::Blob { .. } => "blob_error",
             Self::Kv { .. } => "kv_error",
@@ -63,6 +87,11 @@ mod tests {
             Error::Config { message: "m".into() },
             Error::Invalid { message: "m".into() },
             Error::NotFound { what: "w".into() },
+            Error::Conflict { message: "m".into() },
+            Error::Forbidden { message: "m".into() },
+            Error::Expired { what: "w".into() },
+            Error::LastOwner { org: crate::OrgId::new() },
+            Error::RefreshReused { session: crate::SessionId::new() },
             Error::Database { message: "m".into() },
             Error::Blob { message: "m".into() },
             Error::Kv { message: "m".into() },
@@ -80,6 +109,11 @@ mod tests {
                 "config_invalid",
                 "invalid_argument",
                 "not_found",
+                "conflict",
+                "forbidden",
+                "expired",
+                "last_owner",
+                "refresh_reused",
                 "database_error",
                 "blob_error",
                 "kv_error",

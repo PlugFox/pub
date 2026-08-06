@@ -23,6 +23,7 @@ utoipa-axum = { workspace = true }
 [dev-dependencies]
 http-body-util = { workspace = true }
 pub-blob = { workspace = true }
+pub-db-sqlite = { workspace = true }
 pub-kv = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

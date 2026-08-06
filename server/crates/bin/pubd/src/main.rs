@@ -11,7 +11,7 @@ use clap::{CommandFactory as _, FromArgMatches as _};
 use pub_api::AppState;
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, Settings};
-use pub_core::traits::{BlobStore, Kv};
+use pub_core::traits::{BlobStore, Kv, Repositories};
 use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
 use pub_kv::{MemoryKv, RedisKv};
@@ -33,12 +33,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(version = VERSION, "starting pubd");
     tracing::info!("{}", settings.summary());
 
-    run_migrations(&settings).await?;
+    let repos = build_database(&settings).await?;
     let blob = build_blob(&settings)?;
     let kv = build_kv(&settings)?;
 
     let listen = settings.server.listen.clone();
-    let state = AppState::new(settings, blob, kv);
+    let state = AppState::new(settings, repos, blob, kv);
     let app = pub_api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("failed to bind {listen}"))?;
@@ -50,22 +50,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Connects the configured database and applies migrations (forward-only).
-async fn run_migrations(settings: &Settings) -> anyhow::Result<()> {
-    match settings.database.kind {
+/// Connects the configured database, applies migrations (forward-only), and returns the
+/// repository bundle over the live pool — the DB handle the whole app shares.
+async fn build_database(settings: &Settings) -> anyhow::Result<Repositories> {
+    let repos = match settings.database.kind {
         DatabaseKind::Sqlite => {
             let db = SqliteDb::connect(&settings.database).await.context("failed to open sqlite database")?;
             db.run_migrations().await.context("sqlite migrations failed")?;
             db.ping().await.context("sqlite ping failed")?;
+            db.repositories()
         }
         DatabaseKind::Postgres => {
             let db = PostgresDb::connect_lazy(&settings.database).context("failed to configure postgres pool")?;
             db.run_migrations().await.context("postgres migrations failed")?;
             db.ping().await.context("postgres ping failed")?;
+            db.repositories()
         }
-    }
+    };
     tracing::info!(kind = settings.database.kind.as_str(), "database ready, migrations applied");
-    Ok(())
+    Ok(repos)
 }
 
 /// Selects the blob backend by config kind (decision 09).

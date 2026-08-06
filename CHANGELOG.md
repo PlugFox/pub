@@ -2,6 +2,14 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-06 — Postgres identity backend
+
+### Added
+
+- (server) Complete PostgreSQL implementations of all seven identity & access repositories ([db-postgres/src/repo/](server/crates/db-postgres/src/repo/)), replacing the live-ping stubs: native `UUID`/`TIMESTAMPTZ` binds, `INET`/`JSONB` round-tripped as text casts, and `SELECT … FOR UPDATE` row locks serializing the ≥1-Owner invariant, single-use invitation acceptance, and refresh rotation under Postgres' concurrent writers (SQLite's single writer needs none).
+- (server) The shared repository contract suite now runs against Postgres ([db-tests/tests/postgres.rs](server/crates/db-tests/tests/postgres.rs)): gated at runtime by `PUB_TEST_POSTGRES_URL` (skip note on stderr when unset, no ignore attributes), one throwaway migrated database per test.
+- (infra) `server-ci.yml` test job carries a health-checked `postgres:17-alpine` service container and exports `PUB_TEST_POSTGRES_URL`, so the Postgres contract suite runs on every server CI build.
+
 ## 2026-08-06 — design system & UI kit
 
 ### Added
@@ -15,6 +23,19 @@ All notable changes to this project. Format: [Keep a Changelog](https://keepacha
 ### Fixed
 
 - (web) Contrast checker silently validated the light palette twice (selector lookup matched a header comment); the dark theme is now genuinely checked.
+
+## 2026-08-06 — identity & access data layer
+
+### Added
+
+- (server) Identity & access data layer: full repository trait sets in `core` ([UserRepo, CredentialRepo, OrgRepo, SessionRepo, TokenRepo, AuditRepo, SettingsRepo](server/crates/core/src/traits.rs)) with domain types for users, polymorphic credentials (`oidc|email|totp|recovery|webauthn`), orgs/memberships/invitations, rotating refresh sessions with reuse detection (S-08), scoped CLI tokens (S-13), ULID-keyed append-only audit events (S-22), and versioned settings; the single [`authorize()` chokepoint](server/crates/core/src/authorize.rs) with role-ladder boundary tests (decision 19).
+- (server) Migration `0002_identity` in both backends ([sqlite](server/crates/db-sqlite/migrations/0002_identity.sql), [postgres](server/crates/db-postgres/migrations/0002_identity.sql)): users, credentials, orgs, org_members, invitations, sessions, tokens, audit_log, settings — case-insensitive unique emails/slugs, partial indexes for active-token/active-session lookups, Postgres INSERT-only audit role template.
+- (server) Complete SQLite implementations of all seven repositories ([db-sqlite/src/repo/](server/crates/db-sqlite/src/repo/)); Postgres ships live-ping stubs until its query implementations land.
+- (server) Shared repository contract suite ([db-tests](server/crates/db-tests/)) run against SQLite `:memory:` — last-Owner invariant, invitation expiry/double-accept, refresh-reuse detection, cursor-pagination stability, and more.
+
+### Changed
+
+- (server) `/healthz` now live-pings the database (plus blob and KV) and reports per-backend `checks` instead of echoing only configured kinds; `AppState` carries the repository bundle.
 
 ## 2026-08-06 — design phase
 

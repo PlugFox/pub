@@ -6,15 +6,25 @@
 //! their own crates (`db-sqlite`, `db-postgres`, `blob`, `kv`, …) and are selected at
 //! runtime from configuration (decision 09).
 
+pub mod audit;
+pub mod authorize;
+pub mod credential;
 pub mod error;
 pub mod format;
 pub mod id;
+pub mod org;
+pub mod page;
 pub mod role;
+pub mod session;
+pub mod settings;
+pub mod token;
 pub mod traits;
+pub mod user;
 
 pub use error::Error;
 pub use format::Format;
-pub use id::{OrgId, PackageId, SessionId, TokenId, UserId, VersionId};
+pub use id::{CredentialId, InvitationId, OrgId, PackageId, SessionId, TokenId, UserId, VersionId};
+pub use page::Page;
 pub use role::RoleLevel;
 
 /// Crate-wide result alias defaulting to [`Error`].

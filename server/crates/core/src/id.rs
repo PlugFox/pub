@@ -83,6 +83,14 @@ define_id!(
     /// Identifier of a web refresh session.
     SessionId
 );
+define_id!(
+    /// Identifier of a credential row (polymorphic over [`crate::credential::CredentialType`]).
+    CredentialId
+);
+define_id!(
+    /// Identifier of an org invitation.
+    InvitationId
+);
 
 #[cfg(test)]
 mod tests {

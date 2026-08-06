@@ -4,16 +4,15 @@
 use std::sync::Arc;
 
 use pub_config::Settings;
-use pub_core::traits::{BlobStore, Kv};
+use pub_core::traits::{BlobStore, Kv, Repositories};
 
 /// State handed to every handler. Cloning is cheap (all fields are `Arc`s).
-///
-/// Repository handles (`Arc<dyn PackageRepo>`, …) join this struct as soon as the db crates
-/// implement the core traits in the next roadmap step.
 #[derive(Clone)]
 pub struct AppState {
     /// Effective boot configuration.
     pub settings: Arc<Settings>,
+    /// Identity & access repositories over the selected database backend.
+    pub repos: Repositories,
     /// Blob storage backend.
     pub blob: Arc<dyn BlobStore>,
     /// Key-value store / broker backend.
@@ -22,7 +21,7 @@ pub struct AppState {
 
 impl AppState {
     /// Bundles the configured backends into the shared state.
-    pub fn new(settings: Settings, blob: Arc<dyn BlobStore>, kv: Arc<dyn Kv>) -> Self {
-        Self { settings: Arc::new(settings), blob, kv }
+    pub fn new(settings: Settings, repos: Repositories, blob: Arc<dyn BlobStore>, kv: Arc<dyn Kv>) -> Self {
+        Self { settings: Arc::new(settings), repos, blob, kv }
     }
 }

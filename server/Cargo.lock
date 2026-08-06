@@ -1717,6 +1717,7 @@ dependencies = [
  "pub-blob",
  "pub-config",
  "pub-core",
+ "pub-db-sqlite",
  "pub-kv",
  "rust-embed",
  "serde",
@@ -1768,6 +1769,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "futures",
  "serde",
  "serde_json",
@@ -1780,18 +1782,39 @@ dependencies = [
 name = "pub-db-postgres"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
  "pub-config",
  "pub-core",
+ "serde_json",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
 name = "pub-db-sqlite"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
  "pub-config",
  "pub-core",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "pub-db-tests"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pub-config",
+ "pub-core",
+ "pub-db-postgres",
+ "pub-db-sqlite",
+ "serde_json",
  "sqlx",
  "tokio",
 ]
@@ -2589,6 +2612,7 @@ dependencies = [
  "base64",
  "bytes",
  "cfg-if",
+ "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -2612,6 +2636,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2644,6 +2669,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.119",
@@ -2661,6 +2687,7 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
+ "chrono",
  "crc",
  "digest 0.11.3",
  "dotenvy",
@@ -2676,6 +2703,7 @@ dependencies = [
  "sqlx-core",
  "thiserror",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2688,6 +2716,7 @@ dependencies = [
  "base64",
  "bitflags",
  "byteorder",
+ "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -2710,6 +2739,7 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -2720,6 +2750,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
+ "chrono",
  "flume",
  "form_urlencoded",
  "futures-channel",
@@ -2735,6 +2766,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
