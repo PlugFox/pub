@@ -63,7 +63,11 @@ export function ThemeToggle(props: ThemeToggleProps): JSX.Element {
       aria-label={t(common.themeToggle)}
       title={`${t(common.themeToggle)}: ${mode()}`}
       onClick={cycle}
-      class={cn(buttonVariants({ intent: "ghost", size: "sm" }), local.class)}
+      class={cn(
+        buttonVariants({ intent: "ghost", size: "sm" }),
+        "w-8 rounded-full px-0",
+        local.class,
+      )}
     >
       <span aria-hidden="true">{MODE_ICONS[mode()]}</span>
     </button>

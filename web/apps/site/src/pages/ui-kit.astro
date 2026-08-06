@@ -1,0 +1,11 @@
+---
+import BaseLayout from "../layouts/base-layout.astro";
+import { UiKitPage } from "../ui-kit/ui-kit-page";
+
+// Internal tool page (robots-disallowed, English-only). One Solid island;
+// client:only because Dialog/Tooltip portals have no useful SSR output.
+---
+
+<BaseLayout title="UI Kit — Pub">
+  <UiKitPage client:only="solid-js" />
+</BaseLayout>

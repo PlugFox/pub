@@ -6,7 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "check": "tsc --noEmit -p packages/i18n && tsc --noEmit -p packages/ui && tsc --noEmit -p packages/api && tsc --noEmit -p apps/site && biome check .",
+    "check": "tsc --noEmit -p packages/i18n && tsc --noEmit -p packages/ui && tsc --noEmit -p packages/api && tsc --noEmit -p packages/tokens && tsc --noEmit -p apps/site && biome check . && bun packages/tokens/scripts/contrast-check.ts",
     "build": "bun run --filter @pub/site build",
     "test": "bun test",
     "i18n:gen": "bun packages/i18n/scripts/i18n-gen.ts",

@@ -4,5 +4,8 @@
   "private": true,
   "exports": {
     "./theme.css": "./theme.css"
+  },
+  "scripts": {
+    "contrast": "bun scripts/contrast-check.ts"
   }
 }

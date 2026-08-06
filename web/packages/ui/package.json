@@ -6,6 +6,14 @@
   "exports": {
     "./cn": "./src/cn.ts",
     "./button": "./src/button.tsx",
+    "./input": "./src/input.tsx",
+    "./label": "./src/label.tsx",
+    "./card": "./src/card.tsx",
+    "./badge": "./src/badge.tsx",
+    "./skeleton": "./src/skeleton.tsx",
+    "./separator": "./src/separator.tsx",
+    "./dialog": "./src/dialog.tsx",
+    "./tooltip": "./src/tooltip.tsx",
     "./theme-toggle": "./src/theme-toggle.tsx"
   },
   "scripts": {

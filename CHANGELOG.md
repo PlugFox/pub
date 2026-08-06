@@ -2,6 +2,20 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-06 — design system & UI kit
+
+### Added
+
+- (web) Visual source of truth [web/DESIGN.md](web/DESIGN.md): product-SaaS mood, OKLCH token tables for light/dark, type scale (Inter + JetBrains Mono), 4px rhythm, radii/elevation rules, component specs, Do/Don't catalog, agent pre-commit checklist.
+- (web) Finalized design tokens: refined neutral ramp + indigo/violet accent, status colors (success/warning/danger), radius and font-family tokens; [contrast-check script](web/packages/tokens/scripts/contrast-check.ts) asserting WCAG AA 4.5:1 for 44 ink/surface pairs in both themes, wired into `bun run check`.
+- (web) Self-hosted fonts via fontsource: Inter Variable + JetBrains Mono (latin/latin-ext/cyrillic/cyrillic-ext woff2 subsets, critical subset preloaded, zero external requests in dist).
+- (web) UI kit first tranche in [packages/ui](web/packages/ui/): Button, Input, Label, Card, Badge, Skeleton, Separator, Kobalte-based Dialog and Tooltip, restyled ThemeToggle; `/ui-kit` showcase page (robots-disallowed).
+- (web) SaaS landing: gradient hero with CTA, 4-card feature grid, footer — fully i18n'd (new `landing` namespace with `desc` per key, real Russian translations; landing critical path ~82 KB gzip).
+
+### Fixed
+
+- (web) Contrast checker silently validated the light palette twice (selector lookup matched a header comment); the dark theme is now genuinely checked.
+
 ## 2026-08-06 — design phase
 
 ### Added

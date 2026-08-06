@@ -1,0 +1,17 @@
+{
+  "landing.heroTitle": "Реестр пакетов под контролем вашей команды",
+  "landing.heroSubtitle": "Публикуйте приватные пакеты Dart и Flutter, зеркалируйте pub.dev и управляйте доступом всей организации — из одного self-hosted бинарника.",
+  "landing.heroCta": "Начать",
+  "landing.heroCtaSecondary": "Открыть на GitHub",
+  "landing.featuresTitle": "Всё, что нужно приватному реестру",
+  "landing.featurePrivateTitle": "Приватные пакеты",
+  "landing.featurePrivateBody": "Публикуйте внутренние пакеты Dart и Flutter стандартным инструментом dart pub — без форков и обходных путей.",
+  "landing.featureProxyTitle": "Прокси и зеркало pub.dev",
+  "landing.featureProxyBody": "Сквозное кеширование делает сборки быстрыми и воспроизводимыми, а режим полного зеркала закрывает изолированные и региональные окружения.",
+  "landing.featureOrgsTitle": "Организации и токены",
+  "landing.featureOrgsBody": "CLI-токены с ограниченными правами, ролевой доступ и отдельные URL реестра для каждой организации держат публикацию и потребление под контролем.",
+  "landing.featureSelfHostTitle": "Self-hosted, один бинарник",
+  "landing.featureSelfHostBody": "Начните с одного бинарника, SQLite и файлового хранилища; при росте переключитесь на PostgreSQL, S3 и Redis.",
+  "landing.footerLicense": "Открытый код под лицензией MIT",
+  "landing.footerGitHub": "GitHub"
+}

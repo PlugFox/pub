@@ -39,6 +39,11 @@ language:
   ru: Язык
   desc: Label of the interface language picker.
 
+close:
+  en: Close
+  ru: Закрыть
+  desc: Accessible label of dismiss buttons (dialog close, toast dismiss).
+
 notFound:
   en: Page not found
   ru: Страница не найдена

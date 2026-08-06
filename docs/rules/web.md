@@ -1,5 +1,7 @@
 # Frontend Conventions (`web/`)
 
+**Any UI work starts with [`web/DESIGN.md`](../../web/DESIGN.md)** — the visual source of truth (mood, tokens, type scale, radii/elevation, component specs, agent checklist).
+
 Bun workspaces; TypeScript 7 strict; Biome (2-space, 100 cols, double quotes) for lint+format — no ESLint/Prettier.
 
 ## TypeScript

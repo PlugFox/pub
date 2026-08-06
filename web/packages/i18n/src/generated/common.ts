@@ -14,6 +14,8 @@ export const common = {
   themeToggle: { id: "common.themeToggle", en: "Toggle theme" },
   /** Label of the interface language picker. */
   language: { id: "common.language", en: "Language" },
+  /** Accessible label of dismiss buttons (dialog close, toast dismiss). */
+  close: { id: "common.close", en: "Close" },
   /** Heading of the 404 error page. */
   notFound: { id: "common.notFound", en: "Page not found" },
   /** Title of the app's placeholder dashboard route (/app). */

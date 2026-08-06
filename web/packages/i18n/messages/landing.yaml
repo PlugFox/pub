@@ -1,0 +1,105 @@
+# Namespace: landing — the marketing landing page (hero, feature grid, footer).
+#
+# Shape per key:
+#   <camelCaseKey>:
+#     en:   source-of-truth English text (string, or CLDR plural-form map)
+#     desc: mandatory context for translators and LLMs — what/where/constraints
+#     <locale>: optional translation (ru fr it de es pt ja ko zh-Hans)
+#
+# `bun run i18n:gen` regenerates src/generated/ and apps/site/public/locales/;
+# locales missing a translation fall back to English and get a __todo__ marker.
+
+heroTitle:
+  en: The package registry your team controls
+  ru: Реестр пакетов под контролем вашей команды
+  desc: Landing hero headline, one line, sentence case. Sells the self-hosted registry.
+
+heroSubtitle:
+  en: >-
+    Publish private Dart and Flutter packages, mirror pub.dev, and manage access
+    for your whole organization — from one self-hosted binary.
+  ru: >-
+    Публикуйте приватные пакеты Dart и Flutter, зеркалируйте pub.dev и управляйте
+    доступом всей организации — из одного self-hosted бинарника.
+  desc: Landing hero subline under the headline, 1-2 sentences summarizing the product.
+
+heroCta:
+  en: Get started
+  ru: Начать
+  desc: Primary call-to-action button in the hero, leads to the web app under /app.
+
+heroCtaSecondary:
+  en: View on GitHub
+  ru: Открыть на GitHub
+  desc: Secondary hero button linking to the project's GitHub repository. "GitHub" stays untranslated.
+
+featuresTitle:
+  en: Everything a private registry needs
+  ru: Всё, что нужно приватному реестру
+  desc: Heading above the feature card grid on the landing page.
+
+featurePrivateTitle:
+  en: Private packages
+  ru: Приватные пакеты
+  desc: Feature card title about hosting private packages.
+
+featurePrivateBody:
+  en: >-
+    Publish internal Dart and Flutter packages with the standard dart pub
+    tooling — no forks, no workarounds.
+  ru: >-
+    Публикуйте внутренние пакеты Dart и Flutter стандартным инструментом
+    dart pub — без форков и обходных путей.
+  desc: Feature card body about private packages. "dart pub" is a CLI command name, keep untranslated.
+
+featureProxyTitle:
+  en: pub.dev proxy & mirror
+  ru: Прокси и зеркало pub.dev
+  desc: Feature card title about upstream proxying. "pub.dev" is a product name, keep untranslated.
+
+featureProxyBody:
+  en: >-
+    Read-through caching keeps builds fast and reproducible; full mirror mode
+    covers air-gapped and regional setups.
+  ru: >-
+    Сквозное кеширование делает сборки быстрыми и воспроизводимыми, а режим
+    полного зеркала закрывает изолированные и региональные окружения.
+  desc: Feature card body about the pub.dev read-through cache and mirror sync mode.
+
+featureOrgsTitle:
+  en: Organizations & tokens
+  ru: Организации и токены
+  desc: Feature card title about access management.
+
+featureOrgsBody:
+  en: >-
+    Scoped CLI tokens, role-based access, and per-organization registry URLs
+    keep publishing and consumption under control.
+  ru: >-
+    CLI-токены с ограниченными правами, ролевой доступ и отдельные URL реестра
+    для каждой организации держат публикацию и потребление под контролем.
+  desc: Feature card body about organizations, roles, and scoped CLI tokens.
+
+featureSelfHostTitle:
+  en: Self-hosted, single binary
+  ru: Self-hosted, один бинарник
+  desc: Feature card title about deployment simplicity.
+
+featureSelfHostBody:
+  en: >-
+    Start with one binary, SQLite, and filesystem storage; switch to
+    PostgreSQL, S3, and Redis when you scale.
+  ru: >-
+    Начните с одного бинарника, SQLite и файлового хранилища; при росте
+    переключитесь на PostgreSQL, S3 и Redis.
+  desc: Feature card body about the deployment gradient. Database/tech names stay untranslated.
+
+footerLicense:
+  en: Open source under the MIT License
+  ru: Открытый код под лицензией MIT
+  desc: Footer note about the project license. "MIT License" is a proper name, may stay untranslated.
+
+footerGitHub:
+  en: GitHub
+  ru: GitHub
+  desc: Footer link label to the project's GitHub repository. Usually kept untranslated.
