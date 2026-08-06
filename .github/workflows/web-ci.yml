@@ -1,0 +1,65 @@
+# Web CI — check / build / test for the Bun workspace in web/.
+name: web-ci
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-ci.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-ci.yml"
+  workflow_dispatch:
+
+# One run per ref; superseded runs are cancelled.
+concurrency:
+  group: web-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal token surface: checkout only.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: web
+
+jobs:
+  check:
+    name: bun run check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # Plain `bun install` for now: the scaffold's lockfile still churns.
+      # Switch to `bun install --frozen-lockfile` once the lockfile stabilizes.
+      - run: bun install
+      - run: bun run check
+
+  build:
+    name: bun run build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # Plain `bun install` for now: the scaffold's lockfile still churns.
+      # Switch to `bun install --frozen-lockfile` once the lockfile stabilizes.
+      - run: bun install
+      - run: bun run build
+
+  test:
+    name: bun test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # Plain `bun install` for now: the scaffold's lockfile still churns.
+      # Switch to `bun install --frozen-lockfile` once the lockfile stabilizes.
+      - run: bun install
+      - run: bun test

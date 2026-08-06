@@ -1,0 +1,19 @@
+[package]
+name = "pub-blob"
+description = "BlobStore implementations over object_store: fs, in-memory, S3-compatible."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+pub-config = { workspace = true }
+pub-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "pub-registry"
+description = "Domain services: publish pipeline, resolution policy, proxy ingest, retraction."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pub-core = { workspace = true }

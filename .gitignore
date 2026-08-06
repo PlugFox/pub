@@ -1,0 +1,23 @@
+# Rust
+server/target/
+
+# Runtime data (default local paths: SQLite DB, fs blob store)
+server/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# JS / Bun
+node_modules/
+web/**/dist/
+web/**/.astro/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Logs & OS
+logs/
+*.log
+.DS_Store

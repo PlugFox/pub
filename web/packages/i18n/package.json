@@ -1,0 +1,14 @@
+{
+  "name": "@pub/i18n",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/runtime.ts",
+    "./generated/common": "./src/generated/common.ts"
+  },
+  "scripts": {
+    "i18n:gen": "bun scripts/i18n-gen.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}

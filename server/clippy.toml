@@ -1,0 +1,3 @@
+# Clippy configuration — the gate is `cargo clippy --all-targets -- -D warnings` (docs/rules/rust.md).
+too-many-arguments-threshold = 8
+allow-dbg-in-tests = true

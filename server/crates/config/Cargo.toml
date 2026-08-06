@@ -1,0 +1,18 @@
+[package]
+name = "pub-config"
+description = "Layered boot configuration: defaults -> TOML file -> PUB_ env -> CLI flags."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+config = { workspace = true }
+pub-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,15 @@
+{
+  "common.siteTitle": "Pub",
+  "common.tagline": "Self-hosted package registry for Dart and Flutter",
+  "common.navHome": "Home",
+  "common.navApp": "Open app",
+  "common.themeToggle": "Toggle theme",
+  "common.language": "Language",
+  "common.notFound": "Page not found",
+  "common.appDashboard": "Dashboard",
+  "common.appAbout": "About",
+  "common.packagesCount": {
+    "one": "{count} package",
+    "other": "{count} packages"
+  }
+}

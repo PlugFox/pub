@@ -1,0 +1,20 @@
+# Keeps the Docker build context small; build from the repo root with docker/Dockerfile.
+.git
+.github
+docs
+
+# Build artifacts (both are rebuilt inside the image)
+server/target
+web/**/dist
+web/**/.astro
+**/node_modules
+
+# Local state / secrets / noise
+.env
+.env.*
+**/*.log
+logs
+.DS_Store
+.claude
+.vscode
+.idea

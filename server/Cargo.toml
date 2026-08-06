@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/config",
+    "crates/db-sqlite",
+    "crates/db-postgres",
+    "crates/blob",
+    "crates/kv",
+    "crates/telemetry",
+    "crates/registry",
+    "crates/auth",
+    "crates/mail",
+    "crates/jobs",
+    "crates/api",
+    "crates/bin/pubd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# --- internal crates ---
+pub-core = { path = "crates/core" }
+pub-config = { path = "crates/config" }
+pub-db-sqlite = { path = "crates/db-sqlite" }
+pub-db-postgres = { path = "crates/db-postgres" }
+pub-blob = { path = "crates/blob" }
+pub-kv = { path = "crates/kv" }
+pub-telemetry = { path = "crates/telemetry" }
+pub-registry = { path = "crates/registry" }
+pub-auth = { path = "crates/auth" }
+pub-mail = { path = "crates/mail" }
+pub-jobs = { path = "crates/jobs" }
+pub-api = { path = "crates/api" }
+
+# --- async runtime & streams ---
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+futures = "0.3.33"
+async-trait = "0.1.91"
+bytes = "1.12.1"
+
+# --- http / web ---
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["trace", "request-id", "set-header"] }
+http = "1.5.0"
+http-body-util = "0.1.4"
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"] }
+utoipa-axum = "0.2.0"
+rust-embed = "8.12.0"
+mime_guess = "2.0.5"
+
+# --- data backends ---
+# default-features = false: no TLS backend and no query macros needed in the skeleton (leaner build);
+# member crates add "sqlite" / "postgres" on top.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "migrate", "macros"] }
+object_store = { version = "0.14.1", features = ["aws"] }
+moka = { version = "0.12.15", features = ["future"] }
+deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1"] }
+
+# --- config & cli ---
+# default-features = false: only TOML config files are supported (decision 09); drops yaml/json5/ron parsers.
+config = { version = "0.15.25", default-features = false, features = ["toml"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+
+# --- serde & core types ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+uuid = { version = "1.24.0", features = ["v7", "serde"] }
+url = { version = "2.5.8", features = ["serde"] }
+thiserror = "2.0.19"
+
+# --- telemetry ---
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+metrics = "0.24.6"
+# default-features = false: recorder + render handle only, no bundled HTTP listener —
+# /metrics stays config-gated and wired through the api crate later (decision 23).
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+
+# --- bin / test utilities ---
+anyhow = "1.0.104"
+tempfile = "3.27.0"

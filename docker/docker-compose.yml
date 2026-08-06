@@ -1,0 +1,116 @@
+# Optional dev infrastructure. The DEFAULT dev loop needs NO containers
+# (SQLite + fs blob + in-memory KV) — see docker/README.md.
+#
+# Profiles (combine freely):
+#   pg     — PostgreSQL 17          docker compose -f docker/docker-compose.yml --profile pg up -d
+#   s3     — MinIO (S3 + console)   docker compose -f docker/docker-compose.yml --profile s3 up -d
+#   redis  — Valkey 8               docker compose -f docker/docker-compose.yml --profile redis up -d
+#   full   — app + all of the above docker compose -f docker/docker-compose.yml --profile full up -d --build
+#
+# Every variable has a default (see .env.example) so a zero-config `up` works.
+
+name: pub
+
+networks:
+  pub:
+    driver: bridge
+
+volumes:
+  pg-data:
+  minio-data:
+  valkey-data:
+
+services:
+  pg:
+    image: postgres:17-alpine
+    profiles: [pg, full]
+    # Modest dev-box tuning; not production advice.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=100
+    environment:
+      POSTGRES_USER: ${PUB_PG_USER:-pub}
+      POSTGRES_PASSWORD: ${PUB_PG_PASSWORD:-pub_dev_password}
+      POSTGRES_DB: ${PUB_PG_DB:-pub}
+    ports:
+      - "${PUB_PG_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      # $$ so the vars resolve inside the container, not at compose interpolation time.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [pub]
+
+  s3:
+    # Consider pinning a RELEASE.* tag once the blob layer lands.
+    image: minio/minio:latest
+    profiles: [s3, full]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${PUB_S3_ACCESS_KEY:-pub-minio}
+      MINIO_ROOT_PASSWORD: ${PUB_S3_SECRET_KEY:-pub_dev_password}
+    ports:
+      - "${PUB_S3_PORT:-9000}:9000"          # S3 API
+      - "${PUB_S3_CONSOLE_PORT:-9001}:9001"  # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [pub]
+
+  redis:
+    image: valkey/valkey:8-alpine
+    profiles: [redis, full]
+    command: valkey-server --appendonly yes
+    ports:
+      - "${PUB_REDIS_PORT:-6379}:6379"
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [pub]
+
+  app:
+    profiles: [full]
+    build:
+      context: ..                 # repo root — the Dockerfile copies server/ and web/
+      dockerfile: docker/Dockerfile
+    depends_on:
+      pg:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # PUB_* names follow the config contract (prefix PUB_, nested separator __).
+    # Keep key names in sync with server/crates/config as it evolves.
+    environment:
+      PUB_SERVER__LISTEN: 0.0.0.0:8080
+      PUB_DATABASE__BACKEND: postgres
+      PUB_DATABASE__URL: postgres://${PUB_PG_USER:-pub}:${PUB_PG_PASSWORD:-pub_dev_password}@pg:5432/${PUB_PG_DB:-pub}
+      PUB_BLOB__BACKEND: s3
+      PUB_BLOB__S3__ENDPOINT: http://s3:9000
+      PUB_BLOB__S3__BUCKET: ${PUB_S3_BUCKET:-pub}
+      PUB_BLOB__S3__ACCESS_KEY: ${PUB_S3_ACCESS_KEY:-pub-minio}
+      PUB_BLOB__S3__SECRET_KEY: ${PUB_S3_SECRET_KEY:-pub_dev_password}
+      PUB_KV__BACKEND: redis
+      PUB_KV__URL: redis://redis:6379
+    ports:
+      - "${PUB_APP_PORT:-8080}:8080"
+    networks: [pub]

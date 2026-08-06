@@ -1,0 +1,8 @@
+@import "tailwindcss";
+@import "@pub/tokens/theme.css";
+
+/*
+ * Workspace packages live outside apps/site, so Tailwind's automatic source
+ * detection does not see their class names — register them explicitly.
+ */
+@source "../../../../packages/ui/src";

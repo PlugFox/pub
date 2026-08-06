@@ -1,0 +1,76 @@
+# Server CI — fmt / clippy / test for the Rust workspace in server/.
+# No release workflow yet: decision 18 (release model, image registry) is tbd.
+name: server-ci
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "server/**"
+      - "docker/Dockerfile"
+      - ".github/workflows/server-ci.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "server/**"
+      - "docker/Dockerfile"
+      - ".github/workflows/server-ci.yml"
+  workflow_dispatch:
+
+# One run per ref; superseded runs are cancelled.
+concurrency:
+  group: server-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal token surface: checkout only.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # docs/rules/rust.md: CI builds with SQLX_OFFLINE=true (committed .sqlx/ cache).
+  # Harmless before sqlx lands; load-bearing once it does.
+  SQLX_OFFLINE: "true"
+
+defaults:
+  run:
+    working-directory: server
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # No rust-cache here: fmt compiles nothing.
+      - run: cargo fmt --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+      - run: cargo test --workspace

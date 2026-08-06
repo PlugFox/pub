@@ -1,0 +1,17 @@
+---
+import { t } from "@pub/i18n";
+import { common } from "@pub/i18n/generated/common";
+import { App } from "../../app/App";
+import BaseLayout from "../../layouts/base-layout.astro";
+
+// Prerendered shell entry points only — once mounted, @solidjs/router owns
+// everything under /app in the browser (decision 14). The embedded-asset
+// service on the server will later serve this shell for unknown /app/* paths.
+export function getStaticPaths() {
+  return [{ params: { rest: undefined } }, { params: { rest: "about" } }];
+}
+---
+
+<BaseLayout title={t(common.siteTitle)}>
+  <App client:only="solid-js" />
+</BaseLayout>

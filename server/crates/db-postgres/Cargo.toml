@@ -1,0 +1,15 @@
+[package]
+name = "pub-db-postgres"
+description = "PostgreSQL backend: sqlx pool, migrations, and (later) core repository impls."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pub-config = { workspace = true }
+pub-core = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

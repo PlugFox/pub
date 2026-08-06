@@ -1,0 +1,5 @@
+# Formatting gate — `cargo fmt --check` must pass (docs/rules/rust.md).
+max_width = 120
+newline_style = "Unix"
+# Let expressions use the full line width instead of the tiny default sub-widths.
+use_small_heuristics = "Max"

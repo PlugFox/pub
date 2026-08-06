@@ -1,0 +1,10 @@
+[package]
+name = "pub-auth"
+description = "Authentication: email OTP, OIDC, TOTP 2FA, JWT keyring, token hashing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pub-core = { workspace = true }

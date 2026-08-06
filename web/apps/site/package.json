@@ -1,0 +1,24 @@
+{
+  "name": "@pub/site",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@astrojs/solid-js": "^7.0.2",
+    "@pub/api": "workspace:*",
+    "@pub/i18n": "workspace:*",
+    "@pub/tokens": "workspace:*",
+    "@pub/ui": "workspace:*",
+    "@solidjs/router": "^1.0.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "astro": "^7.2.0",
+    "solid-js": "^1.9.14",
+    "tailwindcss": "^4.3.3"
+  }
+}

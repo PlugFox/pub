@@ -1,0 +1,18 @@
+[package]
+name = "pub-jobs"
+description = "Interval scheduler with JobLock leader election for background jobs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+pub-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# test-util enables tokio::time::pause/advance for deterministic scheduler tests.
+tokio = { workspace = true, features = ["test-util"] }

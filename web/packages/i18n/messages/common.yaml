@@ -1,0 +1,66 @@
+# Namespace: common — shared chrome (layout, navigation, theme, language).
+#
+# Shape per key:
+#   <camelCaseKey>:
+#     en:   source-of-truth English text (string, or CLDR plural-form map)
+#     desc: mandatory context for translators and LLMs — what/where/constraints
+#     <locale>: optional translation (ru fr it de es pt ja ko zh-Hans)
+#
+# `bun run i18n:gen` regenerates src/generated/ and apps/site/public/locales/;
+# locales missing a translation fall back to English and get a __todo__ marker.
+
+siteTitle:
+  en: Pub
+  ru: Pub
+  desc: Product name shown in the header, hero, and browser title. Usually kept untranslated.
+
+tagline:
+  en: Self-hosted package registry for Dart and Flutter
+  ru: Собственный реестр пакетов для Dart и Flutter
+  desc: One-line product description under the title on the landing page.
+
+navHome:
+  en: Home
+  ru: Главная
+  desc: Navigation link leading back to the landing page.
+
+navApp:
+  en: Open app
+  ru: Открыть приложение
+  desc: Button/link on the landing page that opens the web application under /app.
+
+themeToggle:
+  en: Toggle theme
+  ru: Переключить тему
+  desc: Accessible label of the light/dark/system theme switcher button in the header.
+
+language:
+  en: Language
+  ru: Язык
+  desc: Label of the interface language picker.
+
+notFound:
+  en: Page not found
+  ru: Страница не найдена
+  desc: Heading of the 404 error page.
+
+appDashboard:
+  en: Dashboard
+  ru: Обзор
+  desc: Title of the app's placeholder dashboard route (/app).
+
+appAbout:
+  en: About
+  ru: О приложении
+  desc: Title of the app's placeholder about route (/app/about).
+
+packagesCount:
+  en:
+    one: "{count} package"
+    other: "{count} packages"
+  ru:
+    one: "{count} пакет"
+    few: "{count} пакета"
+    many: "{count} пакетов"
+    other: "{count} пакета"
+  desc: How many packages a listing contains. `{count}` is the number, already formatted.

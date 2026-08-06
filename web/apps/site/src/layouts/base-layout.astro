@@ -1,0 +1,52 @@
+---
+import "../styles/global.css";
+
+type Props = {
+  title?: string;
+  description?: string;
+};
+
+const { title = "Pub", description } = Astro.props;
+const locale = Astro.currentLocale ?? "en";
+---
+
+<!doctype html>
+<html lang={locale} data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    {description && <meta name="description" content={description} />}
+    <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script is:inline>
+      // Anti-FOUC: resolve the persisted theme (localStorage "pub_theme":
+      // light | dark | anything-else = system) and stamp data-theme on <html>
+      // before first paint. This is the ONLY inline script in the product —
+      // the server will carry its hash/nonce in the CSP (decisions 03/14).
+      (() => {
+        try {
+          const stored = localStorage.getItem("pub_theme");
+          const dark =
+            stored === "dark" ||
+            (stored !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+        } catch {
+          // No storage / no matchMedia: keep the server-rendered light default.
+        }
+      })();
+    </script>
+  </head>
+  <body class="min-h-dvh bg-canvas text-ink antialiased">
+    <slot />
+    <script>
+      // Service worker: production only, so dev never fights a stale cache.
+      // This is a bundled module script, not an inline one.
+      if (import.meta.env.PROD && "serviceWorker" in navigator) {
+        navigator.serviceWorker.register("/sw.js").catch(() => {
+          // Offline support is progressive enhancement — never block the page.
+        });
+      }
+    </script>
+  </body>
+</html>

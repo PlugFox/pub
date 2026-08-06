@@ -1,0 +1,26 @@
+[package]
+name = "pubd"
+description = "Pub registry server binary: config -> telemetry -> backends -> serve."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pubd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+pub-api = { workspace = true }
+pub-blob = { workspace = true }
+pub-config = { workspace = true }
+pub-core = { workspace = true }
+pub-db-postgres = { workspace = true }
+pub-db-sqlite = { workspace = true }
+pub-kv = { workspace = true }
+pub-telemetry = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

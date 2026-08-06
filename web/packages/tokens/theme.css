@@ -1,0 +1,67 @@
+/*
+ * Design tokens — the single source of truth for color (docs/rules/web.md).
+ *
+ * Structure, in three layers:
+ *
+ *  1. Raw palette: OKLCH custom properties on `:root` (light values) with a
+ *     `[data-theme="dark"]` override block. Components never reference these
+ *     `--pub-*` variables directly.
+ *  2. Semantic mapping: the `@theme` block maps Tailwind theme variables
+ *     (`--color-*`) onto the raw palette, producing utilities such as
+ *     `bg-canvas`, `text-ink`, `border-line`, `bg-accent`. The block is
+ *     deliberately NOT `@theme inline`: utilities compile to
+ *     `var(--color-canvas)`, whose value is `var(--pub-canvas)` — custom
+ *     properties resolve at the consuming element, so any element under a
+ *     `[data-theme="dark"]` ancestor picks up the dark palette automatically.
+ *  3. Dark variant: `@custom-variant dark` keys `dark:*` utilities off the
+ *     `data-theme` attribute (never `prefers-color-scheme` in CSS) — the
+ *     anti-FOUC inline script in the base layout stamps `data-theme` on
+ *     `<html>` before first paint, and ThemeToggle re-stamps it at runtime.
+ *
+ * Palette notes: a small neutral ramp with a barely-cool hue (hue 260 at very
+ * low chroma) plus a single indigo accent. Add new tokens here only when a
+ * screen actually needs them — never hex values inside components.
+ */
+
+/* Layer 1 — raw palette (light). */
+:root {
+  /* Neutrals. */
+  --pub-canvas: oklch(0.985 0.002 260); /* page background */
+  --pub-surface: oklch(1 0 0); /* cards, headers, raised blocks */
+  --pub-ink: oklch(0.22 0.012 260); /* primary text */
+  --pub-ink-muted: oklch(0.47 0.014 260); /* secondary text */
+  --pub-line: oklch(0.9 0.006 260); /* borders, separators */
+
+  /* Accent (indigo). */
+  --pub-accent: oklch(0.51 0.17 272); /* interactive fill / links */
+  --pub-accent-strong: oklch(0.44 0.18 272); /* hover / active fill */
+  --pub-on-accent: oklch(0.985 0.005 272); /* text on accent fill */
+}
+
+/* Layer 1 — dark overrides. Same token set, no new names. */
+[data-theme="dark"] {
+  --pub-canvas: oklch(0.17 0.01 260);
+  --pub-surface: oklch(0.22 0.012 260);
+  --pub-ink: oklch(0.93 0.006 260);
+  --pub-ink-muted: oklch(0.68 0.012 260);
+  --pub-line: oklch(0.31 0.014 260);
+
+  --pub-accent: oklch(0.72 0.14 272);
+  --pub-accent-strong: oklch(0.78 0.13 272);
+  --pub-on-accent: oklch(0.2 0.03 272);
+}
+
+/* Layer 2 — semantic mapping consumed by Tailwind utilities. */
+@theme {
+  --color-canvas: var(--pub-canvas);
+  --color-surface: var(--pub-surface);
+  --color-ink: var(--pub-ink);
+  --color-ink-muted: var(--pub-ink-muted);
+  --color-line: var(--pub-line);
+  --color-accent: var(--pub-accent);
+  --color-accent-strong: var(--pub-accent-strong);
+  --color-on-accent: var(--pub-on-accent);
+}
+
+/* Layer 3 — `dark:` utilities follow the stamped attribute, not the OS. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));

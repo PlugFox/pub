@@ -1,0 +1,20 @@
+[package]
+name = "pub-core"
+description = "Domain types, errors, and backend trait contracts for the Pub registry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# NOTE: zero infrastructure dependencies (no sqlx / object_store / redis / axum) — docs/rules/rust.md.
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
