@@ -23,7 +23,7 @@ pub mod instance;
 pub mod orgs;
 
 pub use instance::{AdminService, InstanceStats, SettingsPatch, SettingsView};
-pub use orgs::{AuthorityChange, InvitationCreated, OrgDeletion, OrgPolicy, OrgService};
+pub use orgs::{AuthorityChange, AuthorityRevocations, InvitationCreated, OrgDeletion, OrgPolicy, OrgService};
 
 /// Who is acting, and from where — shared with the registry services so one action carried out
 /// across both layers (a forced org archive flips package options) records one actor.

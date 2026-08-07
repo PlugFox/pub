@@ -746,6 +746,10 @@ pub struct MembershipChangedDto {
     /// How many of the affected user's sessions this change revoked (S-09). Always `0` for a
     /// pure grant, which cannot be spent by a token issued before it.
     pub sessions_revoked: u64,
+    /// How many of the affected user's CLI tokens **in this org** the change revoked
+    /// (decision 13 addendum, D37): those whose scopes exceed a lowered level, every one of
+    /// them on a removal, none on a grant or a raise.
+    pub tokens_revoked: u64,
 }
 
 /// One invitation row.
@@ -1443,9 +1447,11 @@ pub struct NotificationPreferencesBody {
     pub preferences: Vec<NotificationPreferenceDto>,
 }
 
-/// Wire name of a role level (decision 19: names on the wire, numbers in storage).
+/// Wire name of a role level (decision 19: names on the wire, numbers in storage) — the
+/// rendering lives on [`RoleLevel`]'s `Display` in core, shared with the service-layer
+/// denials, so no layer grows its own name table.
 pub fn role_name(role: RoleLevel) -> String {
-    role.name().map(str::to_owned).unwrap_or_else(|| role.level().to_string())
+    role.to_string()
 }
 
 /// Parses a role name from the wire, rejecting the two values that are not grantable roles.

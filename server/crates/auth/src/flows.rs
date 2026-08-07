@@ -23,7 +23,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chrono::{DateTime, Duration, Utc};
 use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
-use pub_core::authorize::{Action, ActorContext, Resource, authorize};
+use pub_core::authorize::{ActorContext, Resource, authorize};
 use pub_core::session::{NewSession, Session, SessionLimits};
 use pub_core::settings::{RegistrationMode, RuntimeSettings, SettingsCache};
 use pub_core::token::{NewToken, Token, TokenScope};
@@ -968,7 +968,7 @@ impl AuthService {
         };
         let actor = ActorContext::user(user, BTreeMap::from([(org, member.role)]));
         for scope in &scopes {
-            authorize(&actor, action_for_scope(*scope), &Resource::Org(org))?;
+            authorize(&actor, scope.required_action(), &Resource::Org(org))?;
         }
 
         let minted = token::mint(&self.policy.token_prefix, self.rng.as_ref());
@@ -1489,17 +1489,6 @@ impl AuthService {
     }
 }
 
-/// Maps a token scope onto the org-role action it requires (decision 19 chokepoint).
-fn action_for_scope(scope: TokenScope) -> Action {
-    match scope {
-        TokenScope::Read => Action::ReadPackages,
-        // Retract manages own versions — Write level, like publishing (S-06 step-up for the
-        // dangerous variants arrives with the TOTP slice).
-        TokenScope::Publish | TokenScope::Retract => Action::PublishPackages,
-        TokenScope::Admin => Action::ManageMembers,
-    }
-}
-
 /// Normalizes an email for lookups and KV keys: trim + lowercase, minimal shape check.
 fn normalize_email(raw: &str) -> Result<String> {
     let email = raw.trim().to_ascii_lowercase();
@@ -1533,8 +1522,6 @@ fn blocklist_key(sid: SessionId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use pub_core::RoleLevel;
-
     use super::*;
 
     #[test]
@@ -1556,13 +1543,5 @@ mod tests {
         assert_eq!(issued.timestamp(), 1_754_481_600);
         assert!(parse_last_request("garbage").is_none());
         assert!(parse_last_request("id:notanumber").is_none());
-    }
-
-    #[test]
-    fn scope_role_mapping_matches_decision_19() {
-        assert_eq!(action_for_scope(TokenScope::Read).required_level(), Some(RoleLevel::READ));
-        assert_eq!(action_for_scope(TokenScope::Publish).required_level(), Some(RoleLevel::WRITE));
-        assert_eq!(action_for_scope(TokenScope::Retract).required_level(), Some(RoleLevel::WRITE));
-        assert_eq!(action_for_scope(TokenScope::Admin).required_level(), Some(RoleLevel::ADMIN));
     }
 }

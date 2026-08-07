@@ -207,6 +207,8 @@ async fn no_response_schema_carries_a_credential_field() {
         ("TokenDto", "display_hint"),
         // A nested `TokenDto` (metadata), not the secret next to it.
         ("TokenCreatedDto", "token"),
+        // A count of credentials the D37 sweep revoked, not a credential (decision 13).
+        ("MembershipChangedDto", "tokens_revoked"),
     ];
 
     const SUSPICIOUS: &[&str] = &["secret", "token", "password", "hash", "pepper", "kek", "private_key"];

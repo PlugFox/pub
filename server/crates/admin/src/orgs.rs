@@ -7,6 +7,20 @@
 //! closed, and logging a person out of every device the instant they accept an invitation is a
 //! cost with no security benefit. That distinction is written down in
 //! [S-09.a](../../../../docs/security.md) and asserted by the tests.
+//!
+//! Two more rules ride the same chokepoints:
+//!
+//! - **The role-grant ceiling** (decision 19 addendum, D39): a non-Owner actor manages only
+//!   levels strictly below their own; an Owner manages every level. Checked by
+//!   [`check_role_ceiling`] inside each mutation, so every path — add, role change, removal,
+//!   invitation creation — inherits it and no route can forget it. Acceptance of an
+//!   invitation is deliberately *not* re-checked: the role was frozen into the row when the
+//!   ceiling was satisfied ("an invitation never lowers").
+//! - **Authority changes reach the token plane** (decision 13 addendum, D37): a lowered
+//!   redefinition revokes the member's org-bound CLI tokens whose scopes exceed the new
+//!   level, and a withdrawal revokes them all — inside [`AuthorityChange`]'s application,
+//!   **after** the S-09 session sweep and best-effort, so a token-plane failure can never
+//!   leave a session alive. A grant or a raise revokes nothing.
 
 use std::sync::Arc;
 
@@ -20,6 +34,7 @@ use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::event::{DomainEvent, EventSink};
 use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgProfile};
 use pub_core::package::PackageOptions;
+use pub_core::token::TokenScope;
 use pub_core::traits::{Mailer, Repositories};
 use pub_core::user::User;
 use pub_core::{Error, Format, InvitationId, OrgId, Result, RoleLevel, UserId};
@@ -59,8 +74,15 @@ impl Default for OrgPolicy {
 pub enum AuthorityChange {
     /// A user who was not a member became one.
     Granted,
-    /// An existing member's role changed (up or down).
-    Redefined,
+    /// An existing member's role changed (up or down). Carrying both levels here is what lets
+    /// the token sweep (D37) tell a demotion from a promotion without a second lookup — a
+    /// redefinition cannot be classified without saying what it redefined.
+    Redefined {
+        /// The level the member held before the change.
+        from: RoleLevel,
+        /// The level the member holds after it.
+        to: RoleLevel,
+    },
     /// A member was removed.
     Withdrawn,
 }
@@ -74,17 +96,96 @@ impl AuthorityChange {
     /// keep working for up to one access TTL — which is exactly the window S-09 exists to
     /// close.
     pub const fn revokes_sessions(self) -> bool {
-        matches!(self, Self::Redefined | Self::Withdrawn)
+        matches!(self, Self::Redefined { .. } | Self::Withdrawn)
+    }
+
+    /// The level the affected user's org-bound CLI tokens must fit under after this change,
+    /// or `None` when the token plane is untouched (decision 13 addendum, D37).
+    ///
+    /// A **grant** and a **raise** revoke nothing — mirroring S-09.a's grant row, nothing
+    /// stale outranks authority that only grew. A **lowered** redefinition returns the new
+    /// level; a **withdrawal** returns [`RoleLevel::NONE`], under which no token fits (an
+    /// empty scope set fails closed in [`scopes_exceed`]), which is how "removal revokes them
+    /// all" falls out of the same rule.
+    const fn token_ceiling(self) -> Option<RoleLevel> {
+        match self {
+            Self::Granted => None,
+            Self::Redefined { from, to } => {
+                if to.level() < from.level() {
+                    Some(to)
+                } else {
+                    None
+                }
+            }
+            Self::Withdrawn => Some(RoleLevel::NONE),
+        }
     }
 
     /// The reason string recorded on the revocation's audit event.
     const fn reason(self) -> &'static str {
         match self {
             Self::Granted => "role_granted",
-            Self::Redefined => "role_changed",
+            Self::Redefined { .. } => "role_changed",
             Self::Withdrawn => "membership_removed",
         }
     }
+}
+
+/// How much credential state an [`AuthorityChange`] swept alongside the membership write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthorityRevocations {
+    /// Sessions revoked (S-09 — always every live session of the affected user).
+    pub sessions: u64,
+    /// Org-bound CLI tokens revoked (D37 — those whose scopes exceed the new level; every one
+    /// of them on a withdrawal; none on a grant or a raise).
+    pub tokens: u64,
+}
+
+/// The role-grant ceiling (decision 19 addendum, D39).
+///
+/// A non-Owner actor manages only levels **strictly below** their own — both the level being
+/// granted and the level the target already holds — so an org Admin can neither appoint a
+/// fellow Admin nor demote, remove, or out-invite one. An **Owner is exempt** and manages
+/// every level, other Owners included (the ≥1-Owner invariant stays transactional in the
+/// repositories and is unaffected). Lives here in the service so every mutation path inherits
+/// it; the denial names role *names*, never numbers (decision 19's wire rule).
+fn check_role_ceiling(acting: RoleLevel, subject: RoleLevel) -> Result<()> {
+    if acting.satisfies(RoleLevel::OWNER) || subject < acting {
+        return Ok(());
+    }
+    Err(Error::Forbidden { message: format!("your role {acting} manages only roles below {acting}") })
+}
+
+/// The self-reduction carve-out from the D39 ceiling (decision 19 addendum): a mutation aimed
+/// at the actor **themselves** that does not *raise* their level bypasses [`check_role_ceiling`]
+/// entirely — self-demotion to any lower (or the same) level, and self-removal (`new` =
+/// [`RoleLevel::NONE`]), because lowering your own authority is never an escalation; it is how
+/// an Admin leaves an organization. A self-**raise** is not exempt: an Admin promoting
+/// themselves to Owner is exactly the escalation the ceiling exists to stop. The ≥1-Owner
+/// invariant is untouched — a sole Owner's self-removal or self-demotion still hits the
+/// repository's transactional `last_owner` conflict.
+fn is_self_reduction(actor: &ActorMeta, target: UserId, current: RoleLevel, new: RoleLevel) -> bool {
+    actor.user_id == target && new <= current
+}
+
+/// Whether any of the token's scopes demands a role level above `ceiling` — the D37 sweep
+/// predicate, evaluated over the mint gate's own scope→action mapping
+/// ([`TokenScope::required_action`]) so "what a scope is worth" has exactly one source.
+fn scopes_exceed(scopes: &[TokenScope], ceiling: RoleLevel) -> bool {
+    // An empty scope set proves nothing about fitting under any ceiling. The repository
+    // refuses to mint one, so this arm defends against a row that predates or bypassed that
+    // rule — and an unclassifiable credential is revoked rather than spared, the same
+    // failing-closed direction as the unmapped-scope arm below.
+    if scopes.is_empty() {
+        return true;
+    }
+    scopes.iter().any(|scope| match scope.required_action().required_level() {
+        Some(required) => !ceiling.satisfies(required),
+        // Every scope maps onto an org action, which always carries a level. Should that ever
+        // stop holding, an unclassifiable credential is revoked rather than spared — the
+        // failing-closed direction.
+        None => true,
+    })
 }
 
 /// A freshly created invitation plus its single-use token — shown exactly once.
@@ -235,14 +336,19 @@ impl OrgService {
     /// An address with no verified account is `NotFound`: an org admin adding somebody who has
     /// never signed in should be told to invite them, not handed a membership pointing at
     /// nobody. (The invitation path is what creates the account.)
+    ///
+    /// `acting_role` is the caller's own level in the org, checked against the D39 ceiling:
+    /// a non-Owner grants only levels below their own.
     pub async fn add_member(
         &self,
         org: &Org,
         email: &str,
         role: RoleLevel,
+        acting_role: RoleLevel,
         actor: &ActorMeta,
         now: DateTime<Utc>,
     ) -> Result<OrgMember> {
+        check_role_ceiling(acting_role, role)?;
         let user = self
             .repos
             .users
@@ -264,25 +370,36 @@ impl OrgService {
         Ok(member)
     }
 
-    /// Changes a member's role; returns the new membership and how many of that user's
-    /// sessions the change revoked (S-09 — always all of them).
+    /// Changes a member's role; returns the new membership and the credential sweep the
+    /// change triggered (S-09 sessions — always all of them; D37 tokens on a demotion).
     ///
-    /// The ≥1-Owner invariant is enforced in the repository, transactionally, and surfaces as
-    /// [`Error::LastOwner`].
+    /// The D39 ceiling covers **both** levels: the one the target currently holds and the one
+    /// being assigned — an Admin neither demotes a fellow Admin nor promotes anybody to one.
+    /// The one exemption is [`is_self_reduction`]: demoting *yourself* is always allowed,
+    /// promoting yourself never is. The ≥1-Owner invariant is enforced in the repository,
+    /// transactionally, and surfaces as [`Error::LastOwner`].
     pub async fn change_role(
         &self,
         org: &Org,
         user: UserId,
         role: RoleLevel,
+        acting_role: RoleLevel,
         actor: &ActorMeta,
         now: DateTime<Utc>,
-    ) -> Result<(OrgMember, u64)> {
+    ) -> Result<(OrgMember, AuthorityRevocations)> {
         let before = self
             .repos
             .orgs
             .get_member(org.id, user)
             .await?
             .ok_or_else(|| Error::NotFound { what: format!("membership of {user} in org {}", org.slug) })?;
+        // The ceiling governs what an actor does to others — and any raise, their own
+        // included. Lowering your own level is exempt (decision 19 addendum); the ≥1-Owner
+        // invariant in the repository still has the last word on a sole Owner.
+        if !is_self_reduction(actor, user, before.role, role) {
+            check_role_ceiling(acting_role, before.role)?;
+            check_role_ceiling(acting_role, role)?;
+        }
         let member = self.repos.orgs.update_member_role(org.id, user, role, now).await?;
         self.audit(
             actor,
@@ -294,19 +411,31 @@ impl OrgService {
             now,
         )
         .await;
-        let revoked =
-            self.apply_authority_change(org.id, user, Some(role), AuthorityChange::Redefined, actor, now).await?;
+        let change = AuthorityChange::Redefined { from: before.role, to: role };
+        let revoked = self.apply_authority_change(org.id, user, Some(role), change, actor, now).await?;
         Ok((member, revoked))
     }
 
-    /// Removes a member (≥1-Owner enforced in the repository).
-    pub async fn remove_member(&self, org: &Org, user: UserId, actor: &ActorMeta, now: DateTime<Utc>) -> Result<u64> {
+    /// Removes a member (≥1-Owner enforced in the repository; the D39 ceiling covers the
+    /// target's current level — an Admin does not remove a fellow Admin, but does remove
+    /// **themselves**: self-removal is a reduction and bypasses the ceiling).
+    pub async fn remove_member(
+        &self,
+        org: &Org,
+        user: UserId,
+        acting_role: RoleLevel,
+        actor: &ActorMeta,
+        now: DateTime<Utc>,
+    ) -> Result<AuthorityRevocations> {
         let before = self
             .repos
             .orgs
             .get_member(org.id, user)
             .await?
             .ok_or_else(|| Error::NotFound { what: format!("membership of {user} in org {}", org.slug) })?;
+        if !is_self_reduction(actor, user, before.role, RoleLevel::NONE) {
+            check_role_ceiling(acting_role, before.role)?;
+        }
         self.repos.orgs.remove_member(org.id, user).await?;
         self.audit(
             actor,
@@ -321,8 +450,16 @@ impl OrgService {
         self.apply_authority_change(org.id, user, None, AuthorityChange::Withdrawn, actor, now).await
     }
 
-    /// **The S-09 chokepoint.** Emits the membership event and, for a change that redefines or
-    /// withdraws authority, revokes every session of the affected user.
+    /// **The S-09/D37 chokepoint.** Emits the membership event; for a change that redefines
+    /// or withdraws authority, revokes every session of the affected user (S-09); and for a
+    /// change that *lowers* or withdraws it, revokes the member's org-bound CLI tokens the new
+    /// level could no longer mint (decision 13 addendum, D37).
+    ///
+    /// **Ordering is load-bearing.** The membership row is already committed by the caller, so
+    /// the S-09 session sweep runs **first** and fallibly — a demoted member's live sessions
+    /// are the one thing that must not survive this call. The D37 token sweep runs after and
+    /// is best-effort: a token-plane hiccup can neither block S-09 nor fail a mutation that
+    /// has already happened.
     ///
     /// Private and called by every membership mutation above; there is no other path to
     /// `OrgRepo`'s membership mutators in the codebase, which is what makes "no route can
@@ -335,7 +472,7 @@ impl OrgService {
         change: AuthorityChange,
         actor: &ActorMeta,
         now: DateTime<Utc>,
-    ) -> Result<u64> {
+    ) -> Result<AuthorityRevocations> {
         self.events
             .emit(DomainEvent::OrgMembershipChanged {
                 org_id: org,
@@ -344,27 +481,101 @@ impl OrgService {
                 at: now,
             })
             .await;
-        if !change.revokes_sessions() {
-            return Ok(0);
+        let mut revoked = AuthorityRevocations::default();
+        if change.revokes_sessions() {
+            let meta = ClientMeta { ip: actor.ip.clone(), user_agent: actor.user_agent.clone() };
+            revoked.sessions =
+                self.auth.revoke_sessions_after_authority_change(user, change.reason(), &meta, now).await?;
         }
-        let meta = ClientMeta { ip: actor.ip.clone(), user_agent: actor.user_agent.clone() };
-        self.auth.revoke_sessions_after_authority_change(user, change.reason(), &meta, now).await
+        if let Some(ceiling) = change.token_ceiling() {
+            revoked.tokens = self.revoke_outleveled_tokens(org, user, ceiling, change.reason(), actor, now).await;
+        }
+        Ok(revoked)
+    }
+
+    /// Revokes the member's CLI tokens in `org` whose scopes exceed `ceiling` (decision 13
+    /// addendum, D37): a demotion takes the credentials the new role could no longer mint, a
+    /// withdrawal (`ceiling` = [`RoleLevel::NONE`]) takes them all. Tokens in the user's
+    /// *other* orgs are untouched — authority changed in this org only — and a token scoped at
+    /// or below the new level survives, because the sweep compares the **token's scopes**, not
+    /// the holder. The comparison runs in Rust over `list` + `revoke`, never per-dialect SQL.
+    ///
+    /// **Best-effort, deliberately** — the same stance as the search-index write on the
+    /// publish path. By the time this runs the membership row is committed and the S-09
+    /// session sweep has already happened, so propagating a token-plane error would report a
+    /// completed demotion as failed while revoking nothing more. Instead the walk continues
+    /// past per-token failures (loud in the log), the audit row carries the count actually
+    /// revoked, and a token that slips through still *authorizes* nothing above the new level,
+    /// because the role is re-derived per request (decision 13) — the sweep removes the
+    /// credential, the chokepoint removes the authority. Returns the honest count.
+    async fn revoke_outleveled_tokens(
+        &self,
+        org: OrgId,
+        user: UserId,
+        ceiling: RoleLevel,
+        reason: &str,
+        actor: &ActorMeta,
+        now: DateTime<Utc>,
+    ) -> u64 {
+        let tokens = match self.repos.tokens.list_for_user(user).await {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                tracing::warn!(%user, %org, error = %err, "D37 token sweep could not list the member's tokens");
+                return 0;
+            }
+        };
+        let mut count = 0u64;
+        for token in tokens {
+            if token.org_id != org || !scopes_exceed(&token.scopes, ceiling) {
+                continue;
+            }
+            match self.repos.tokens.revoke(token.id, now).await {
+                Ok(()) => count += 1,
+                Err(err) => {
+                    tracing::warn!(token = %token.id, %user, %org, error = %err, "D37 token sweep failed to revoke a token; continuing with the rest");
+                }
+            }
+        }
+        if count > 0 {
+            // The **system** is the audit actor, like the S-09 session sweep: the person
+            // losing credentials is not the person who acted. Failures are logged, never
+            // propagated — same stance as `audit` below.
+            let event = NewAuditEvent {
+                actor: AuditActor::System,
+                ip: actor.ip.clone(),
+                user_agent: actor.user_agent.clone(),
+                org_id: Some(org),
+                action: "token.revoked".to_owned(),
+                target: Some(user.to_string()),
+                result: AuditResult::Success,
+                metadata: Some(serde_json::json!({ "reason": reason, "count": count })),
+            };
+            if let Err(err) = self.repos.audit.append(event, now).await {
+                tracing::error!(action = "token.revoked", error = %err, "audit append failed");
+            }
+        }
+        count
     }
 
     // -------------------------------------------------------------------------- invitations
 
     /// Creates an invitation (S-06: step-up gated at the API layer; default role Read).
     ///
-    /// The S-24 per-org budget (≤20/day) is spent here rather than in a middleware because it
-    /// is keyed on the org, which only exists once the route has resolved the slug.
+    /// The D39 ceiling applies at **creation**: the role is frozen into the row here, exactly
+    /// as it always was ("an invitation never lowers"), so acceptance never re-checks it and a
+    /// later demotion of the inviter does not retroactively invalidate an outstanding
+    /// invitation. The S-24 per-org budget (≤20/day) is spent here rather than in a middleware
+    /// because it is keyed on the org, which only exists once the route has resolved the slug.
     pub async fn invite(
         &self,
         org: &Org,
         email: &str,
         role: RoleLevel,
+        acting_role: RoleLevel,
         actor: &ActorMeta,
         now: DateTime<Utc>,
     ) -> Result<InvitationCreated> {
+        check_role_ceiling(acting_role, role)?;
         let email = email.trim().to_ascii_lowercase();
         if !email.contains('@') || email.len() > 320 {
             return Err(Error::Invalid { message: "invite email is not an address".to_owned() });
@@ -558,11 +769,16 @@ impl OrgService {
             self.repos.orgs.delete(org.id).await?;
         }
 
+        // Ordering matters for the token plane (D37): `archive` bulk-revokes and `delete`
+        // erases every org-bound token transactionally *above*, so the per-member Withdrawn
+        // sweep below finds none left — revoked tokens are excluded from `list_for_user` — and
+        // cannot double-revoke or double-audit. Pinned by the contract suite's archive walk.
         let mut sessions_revoked = 0;
         for member in &members {
             sessions_revoked += self
                 .apply_authority_change(org.id, member.user_id, None, AuthorityChange::Withdrawn, actor, now)
-                .await?;
+                .await?
+                .sessions;
         }
 
         self.audit(
@@ -645,23 +861,116 @@ impl OrgService {
 mod tests {
     use super::*;
 
+    /// A demotion, for the tests that only need "some redefinition".
+    const DEMOTION: AuthorityChange = AuthorityChange::Redefined { from: RoleLevel::ADMIN, to: RoleLevel::WRITE };
+
     #[test]
     fn s09_only_a_redefinition_or_a_withdrawal_revokes_sessions() {
         // The whole S-09 policy of this module, in one assertion. A grant cannot be spent by a
         // token minted before it (the claim is simply absent), while a demotion or a removal
         // would otherwise keep working for up to one access TTL.
         assert!(!AuthorityChange::Granted.revokes_sessions());
-        assert!(AuthorityChange::Redefined.revokes_sessions());
+        assert!(DEMOTION.revokes_sessions());
+        // A *raise* revokes sessions too: the stale claim carries the old, now-wrong level.
+        assert!(AuthorityChange::Redefined { from: RoleLevel::READ, to: RoleLevel::ADMIN }.revokes_sessions());
         assert!(AuthorityChange::Withdrawn.revokes_sessions());
     }
 
     #[test]
     fn every_authority_change_names_itself_in_the_audit_trail() {
-        let reasons: Vec<&str> = [AuthorityChange::Granted, AuthorityChange::Redefined, AuthorityChange::Withdrawn]
+        let reasons: Vec<&str> = [AuthorityChange::Granted, DEMOTION, AuthorityChange::Withdrawn]
             .into_iter()
             .map(AuthorityChange::reason)
             .collect();
         assert_eq!(reasons, vec!["role_granted", "role_changed", "membership_removed"]);
+    }
+
+    #[test]
+    fn s13_only_a_lowered_redefinition_or_a_withdrawal_touches_the_token_plane() {
+        // The whole D37 token policy (decision 13 addendum), in one assertion set. A grant and
+        // a raise revoke nothing — mirroring S-09.a's grant row; a demotion caps tokens at the
+        // new level; a withdrawal caps them at NONE, under which no token fits.
+        assert_eq!(AuthorityChange::Granted.token_ceiling(), None);
+        assert_eq!(AuthorityChange::Redefined { from: RoleLevel::READ, to: RoleLevel::ADMIN }.token_ceiling(), None);
+        assert_eq!(
+            AuthorityChange::Redefined { from: RoleLevel::WRITE, to: RoleLevel::WRITE }.token_ceiling(),
+            None,
+            "re-assigning the same level is not a demotion"
+        );
+        assert_eq!(DEMOTION.token_ceiling(), Some(RoleLevel::WRITE));
+        assert_eq!(AuthorityChange::Withdrawn.token_ceiling(), Some(RoleLevel::NONE));
+    }
+
+    #[test]
+    fn s13_the_sweep_compares_the_tokens_scopes_not_the_holder() {
+        // Per scope: the mint gate's mapping decides what each scope is worth.
+        assert!(!scopes_exceed(&[TokenScope::Read], RoleLevel::READ));
+        assert!(scopes_exceed(&[TokenScope::Read], RoleLevel::NONE), "a withdrawal takes even a read token");
+        assert!(scopes_exceed(&[TokenScope::Publish], RoleLevel::READ));
+        assert!(!scopes_exceed(&[TokenScope::Publish], RoleLevel::WRITE));
+        assert!(!scopes_exceed(&[TokenScope::Retract], RoleLevel::WRITE));
+        assert!(scopes_exceed(&[TokenScope::Admin], RoleLevel::WRITE));
+        assert!(!scopes_exceed(&[TokenScope::Admin], RoleLevel::ADMIN));
+        // One out-of-rank scope condemns the whole token: scopes are granted as a set.
+        assert!(scopes_exceed(&[TokenScope::Read, TokenScope::Publish], RoleLevel::READ));
+        // A token deliberately scoped below the holder's old role survives the demotion.
+        assert!(!scopes_exceed(&[TokenScope::Read], RoleLevel::WRITE));
+    }
+
+    #[test]
+    fn s13_an_empty_scope_set_fails_closed_under_every_ceiling() {
+        // The repository refuses to mint a scopeless token, so this is defense in depth: a row
+        // that predates or bypassed that rule is unclassifiable, and an unclassifiable
+        // credential is revoked, not spared — even under the most permissive ceiling.
+        assert!(scopes_exceed(&[], RoleLevel::OWNER), "an empty scope set must exceed even the owner ceiling");
+        assert!(scopes_exceed(&[], RoleLevel::ADMIN));
+        assert!(scopes_exceed(&[], RoleLevel::NONE));
+    }
+
+    #[test]
+    fn d39_self_reduction_is_exempt_from_the_ceiling_but_a_self_raise_is_not() {
+        let me = UserId::new();
+        let actor = ActorMeta::user(me);
+        // Demoting yourself — to any lower level, or all the way out — is a reduction.
+        assert!(is_self_reduction(&actor, me, RoleLevel::ADMIN, RoleLevel::WRITE));
+        assert!(is_self_reduction(&actor, me, RoleLevel::ADMIN, RoleLevel::NONE), "self-removal is a reduction");
+        assert!(
+            is_self_reduction(&actor, me, RoleLevel::OWNER, RoleLevel::NONE),
+            "even for an owner (the ≥1-Owner invariant is the repository's, not the ceiling's)"
+        );
+        // Re-assigning your own current level is not an escalation either.
+        assert!(is_self_reduction(&actor, me, RoleLevel::ADMIN, RoleLevel::ADMIN));
+        // Raising yourself is exactly what the ceiling exists to stop.
+        assert!(!is_self_reduction(&actor, me, RoleLevel::ADMIN, RoleLevel::OWNER));
+        assert!(!is_self_reduction(&actor, me, RoleLevel::WRITE, RoleLevel::ADMIN));
+        // Somebody else's membership is never a self-reduction, however low the new level.
+        assert!(!is_self_reduction(&actor, UserId::new(), RoleLevel::ADMIN, RoleLevel::NONE));
+    }
+
+    #[test]
+    fn d39_the_ceiling_stops_non_owners_at_their_own_level() {
+        // An Owner is exempt: they manage every level, other Owners included.
+        for subject in [RoleLevel::READ, RoleLevel::WRITE, RoleLevel::ADMIN, RoleLevel::OWNER] {
+            assert!(check_role_ceiling(RoleLevel::OWNER, subject).is_ok(), "owner must manage {subject}");
+        }
+        // An Admin manages strictly below admin — never a peer, never an Owner.
+        assert!(check_role_ceiling(RoleLevel::ADMIN, RoleLevel::READ).is_ok());
+        assert!(check_role_ceiling(RoleLevel::ADMIN, RoleLevel::WRITE).is_ok());
+        assert!(check_role_ceiling(RoleLevel::ADMIN, RoleLevel::ADMIN).is_err());
+        assert!(check_role_ceiling(RoleLevel::ADMIN, RoleLevel::OWNER).is_err());
+        // A future intermediate role inherits the rule rather than slipping under it.
+        assert!(check_role_ceiling(RoleLevel::new(150), RoleLevel::WRITE).is_ok());
+        assert!(check_role_ceiling(RoleLevel::new(150), RoleLevel::new(150)).is_err());
+        assert!(check_role_ceiling(RoleLevel::new(150), RoleLevel::ADMIN).is_err());
+    }
+
+    #[test]
+    fn d39_the_denial_names_role_names_not_numbers() {
+        let err = check_role_ceiling(RoleLevel::ADMIN, RoleLevel::OWNER).unwrap_err();
+        assert_eq!(err.code(), "forbidden");
+        let message = err.to_string();
+        assert!(message.contains("your role admin manages only roles below admin"), "unexpected message: {message}");
+        assert!(!message.contains("200") && !message.contains("250"), "numbers must not leak: {message}");
     }
 
     #[test]

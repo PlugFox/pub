@@ -15,10 +15,21 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
+
 use axum::http::StatusCode;
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use common::{TestApp, TestOptions, package_archive};
-use pub_core::{Format, RoleLevel};
+use pub_admin::{ActorMeta, OrgPolicy, OrgService};
+use pub_auth::random::OsRandom;
+use pub_auth::token::sha256_hex;
+use pub_core::event::EventSink;
+use pub_core::token::{NewToken, Token, TokenScope};
+use pub_core::traits::{JobLock, Mailer, TokenRepo};
+use pub_core::{Format, OrgId, RoleLevel, TokenId, UserId};
+use pub_jobs::InMemoryJobLock;
+use pub_registry::{RegistryPolicy, RegistryService};
 
 /// A signed-in principal with a fresh access token carrying its current org claims.
 struct Principal {
@@ -189,6 +200,241 @@ async fn s09_removal_revokes_sessions_but_a_grant_leaves_them_alone() {
     assert!(event.org_id.is_some(), "a membership change is org-scoped in the audit log");
 }
 
+/// Whether a CLI token secret still authenticates (the D37 sweep's observable effect).
+async fn token_alive(app: &TestApp, secret: &str) -> bool {
+    app.repos.tokens.find_active_by_hash(&sha256_hex(secret), app.now()).await.expect("lookup").is_some()
+}
+
+/// **D37 (decision 13 addendum).** A demotion revokes exactly the org tokens whose scopes
+/// exceed the new level — the comparison is the token's scopes, not the holder — and the
+/// response and audit log both say how many.
+#[tokio::test]
+async fn s13_a_demotion_revokes_the_org_tokens_the_new_role_could_no_longer_mint() {
+    let app = TestApp::new().await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    app.login("bob@corp.com").await;
+    add_member(&app, &owner, &slug, "bob@corp.com", "admin").await;
+    let bob_id = app.user_of("bob@corp.com").await;
+    let org_id = app.repos.orgs.get_by_slug(&slug).await.expect("lookup").expect("org").id;
+
+    let admin_tok = app.insert_token(bob_id, org_id, &[TokenScope::Admin], &[], None).await;
+    let publish_tok = app.insert_token(bob_id, org_id, &[TokenScope::Publish], &[], None).await;
+    let read_tok = app.insert_token(bob_id, org_id, &[TokenScope::Read], &[], None).await;
+    for secret in [&admin_tok, &publish_tok, &read_tok] {
+        assert!(token_alive(&app, secret).await, "freshly minted tokens authenticate");
+    }
+
+    // admin → write: the admin-scoped token dies; publish and read fit the new level and live.
+    let demoted = app
+        .patch(
+            &format!("/api/v1/orgs/{slug}/members/{bob_id}"),
+            Some(&owner.access),
+            serde_json::json!({ "role": "write" }),
+        )
+        .await;
+    assert_eq!(demoted.status, StatusCode::OK, "{:?}", demoted.json);
+    assert_eq!(demoted.json["data"]["tokens_revoked"], 1, "exactly the admin-scoped token: {:?}", demoted.json);
+    assert!(demoted.json["data"]["sessions_revoked"].as_u64().expect("count") >= 1, "S-09 rides along");
+    assert!(!token_alive(&app, &admin_tok).await, "an admin-scoped token must not outlive the demotion");
+    assert!(token_alive(&app, &publish_tok).await, "a publish token fits a write member");
+    assert!(token_alive(&app, &read_tok).await, "a read token fits a write member");
+
+    // The sweep audits itself: system actor, the authority-change reason, the count.
+    let event = app.audit_event("token.revoked").await.expect("token sweep audited");
+    assert_eq!(event.actor, pub_core::audit::AuditActor::System, "the system revokes, not the demoted user");
+    let metadata = event.metadata.expect("metadata");
+    assert_eq!(metadata["reason"], "role_changed");
+    assert_eq!(metadata["count"], 1);
+
+    // write → read: now the publish token is above the level too.
+    let owner_fresh = sign_in(&app, "owner@corp.com").await;
+    let demoted_again = app
+        .patch(
+            &format!("/api/v1/orgs/{slug}/members/{bob_id}"),
+            Some(&owner_fresh.access),
+            serde_json::json!({ "role": "read" }),
+        )
+        .await;
+    assert_eq!(demoted_again.status, StatusCode::OK, "{:?}", demoted_again.json);
+    assert_eq!(demoted_again.json["data"]["tokens_revoked"], 1, "{:?}", demoted_again.json);
+    assert!(!token_alive(&app, &publish_tok).await, "a publish token must not outlive the demotion to read");
+    assert!(token_alive(&app, &read_tok).await, "the read token survives every demotion down to read");
+}
+
+/// **D37 (decision 13 addendum).** A raise revokes no tokens (mirroring S-09.a's grant row),
+/// and a removal sweeps every token in *that* org while tokens in the user's other orgs keep
+/// working.
+#[tokio::test]
+async fn s13_a_raise_revokes_no_tokens_and_a_removal_sweeps_only_this_orgs_tokens() {
+    let app = TestApp::new().await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    let (other_owner, other_slug) = owner_org(&app, "other@corp.com", "other").await;
+    app.login("bob@corp.com").await;
+    add_member(&app, &owner, &slug, "bob@corp.com", "write").await;
+    add_member(&app, &other_owner, &other_slug, "bob@corp.com", "write").await;
+    let bob_id = app.user_of("bob@corp.com").await;
+    let org_id = app.repos.orgs.get_by_slug(&slug).await.expect("lookup").expect("org").id;
+    let other_id = app.repos.orgs.get_by_slug(&other_slug).await.expect("lookup").expect("org").id;
+
+    let publish_tok = app.insert_token(bob_id, org_id, &[TokenScope::Publish], &[], None).await;
+    let read_tok = app.insert_token(bob_id, org_id, &[TokenScope::Read], &[], None).await;
+    let foreign_tok = app.insert_token(bob_id, other_id, &[TokenScope::Publish], &[], None).await;
+
+    // A raise: sessions go (stale claim), tokens stay — nothing stale outranks a grant.
+    let raised = app
+        .patch(
+            &format!("/api/v1/orgs/{slug}/members/{bob_id}"),
+            Some(&owner.access),
+            serde_json::json!({ "role": "admin" }),
+        )
+        .await;
+    assert_eq!(raised.status, StatusCode::OK, "{:?}", raised.json);
+    assert_eq!(raised.json["data"]["tokens_revoked"], 0, "a raise revokes no tokens: {:?}", raised.json);
+    assert!(raised.json["data"]["sessions_revoked"].as_u64().expect("count") >= 1);
+    for secret in [&publish_tok, &read_tok, &foreign_tok] {
+        assert!(token_alive(&app, secret).await, "a raise must leave every token alone");
+    }
+
+    // Removal: every token in this org goes, the other org's token is untouched.
+    let owner_fresh = sign_in(&app, "owner@corp.com").await;
+    let removed = app.delete(&format!("/api/v1/orgs/{slug}/members/{bob_id}"), Some(&owner_fresh.access)).await;
+    assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.json);
+    assert_eq!(removed.json["data"]["tokens_revoked"], 2, "both acme tokens, read included: {:?}", removed.json);
+    assert!(!token_alive(&app, &publish_tok).await, "removal revokes the publish token");
+    assert!(!token_alive(&app, &read_tok).await, "removal revokes even a read token");
+    assert!(token_alive(&app, &foreign_tok).await, "authority changed in acme only — the other org's token lives");
+
+    let event = app.audit_event("token.revoked").await.expect("token sweep audited");
+    let metadata = event.metadata.expect("metadata");
+    assert_eq!(metadata["reason"], "membership_removed");
+    assert_eq!(metadata["count"], 2);
+}
+
+/// A [`TokenRepo`] that fails on command — the D37 sweep-resilience probe. Every `revoke`
+/// dies; `fail_list` additionally kills the listing query. Everything else delegates to the
+/// real repository.
+struct FailingTokens {
+    inner: Arc<dyn TokenRepo>,
+    fail_list: bool,
+}
+
+fn token_plane_down() -> pub_core::Error {
+    pub_core::Error::Database { message: "simulated token-plane outage".to_owned() }
+}
+
+#[async_trait::async_trait]
+impl TokenRepo for FailingTokens {
+    async fn ping(&self) -> pub_core::Result<()> {
+        self.inner.ping().await
+    }
+
+    async fn create(&self, new: NewToken, now: DateTime<Utc>) -> pub_core::Result<Token> {
+        self.inner.create(new, now).await
+    }
+
+    async fn find_active_by_hash(&self, token_hash: &str, now: DateTime<Utc>) -> pub_core::Result<Option<Token>> {
+        self.inner.find_active_by_hash(token_hash, now).await
+    }
+
+    async fn touch_last_used(
+        &self,
+        id: TokenId,
+        ip: Option<&str>,
+        throttle: StdDuration,
+        now: DateTime<Utc>,
+    ) -> pub_core::Result<bool> {
+        self.inner.touch_last_used(id, ip, throttle, now).await
+    }
+
+    async fn revoke(&self, _id: TokenId, _now: DateTime<Utc>) -> pub_core::Result<()> {
+        Err(token_plane_down())
+    }
+
+    async fn list_for_user(&self, user: UserId) -> pub_core::Result<Vec<Token>> {
+        if self.fail_list {
+            return Err(token_plane_down());
+        }
+        self.inner.list_for_user(user).await
+    }
+
+    async fn list_for_org(&self, org: OrgId) -> pub_core::Result<Vec<Token>> {
+        self.inner.list_for_org(org).await
+    }
+}
+
+/// The app's own [`OrgService`], rebuilt over the same backends with the token repository
+/// swapped out — how the resilience tests inject a token-plane failure into the D37 sweep.
+fn org_service_with_tokens(app: &TestApp, tokens: Arc<dyn TokenRepo>) -> OrgService {
+    let mut repos = app.repos.clone();
+    repos.tokens = tokens;
+    let registry = Arc::new(RegistryService::new(
+        repos.clone(),
+        Arc::clone(&app.state.blob),
+        Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
+        Arc::clone(&app.events) as Arc<dyn EventSink>,
+        RegistryPolicy::default(),
+    ));
+    OrgService::new(
+        repos,
+        Arc::clone(&app.state.auth),
+        registry,
+        Arc::clone(&app.mailer) as Arc<dyn Mailer>,
+        Arc::clone(&app.events) as Arc<dyn EventSink>,
+        Arc::new(OsRandom),
+        OrgPolicy::default(),
+    )
+}
+
+/// **S-09 over D37 (adversarial).** The session sweep is the load-bearing control and runs
+/// before the best-effort token sweep: with the token plane down mid-demotion, the call still
+/// succeeds, every session of the demoted member is revoked, and the reported token count is
+/// the honest zero — no audit row claims a revocation that never happened.
+#[tokio::test]
+async fn s09_a_token_sweep_failure_never_blocks_the_session_sweep() {
+    let app = TestApp::new().await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    app.login("bob@corp.com").await;
+    add_member(&app, &owner, &slug, "bob@corp.com", "admin").await;
+    let bob_id = app.user_of("bob@corp.com").await;
+    let owner_id = app.user_of("owner@corp.com").await;
+    let org = app.repos.orgs.get_by_slug(&slug).await.expect("lookup").expect("org");
+    let admin_tok = app.insert_token(bob_id, org.id, &[TokenScope::Admin], &[], None).await;
+    assert!(!app.repos.sessions.list_for_user(bob_id).await.expect("sessions").is_empty());
+
+    // Same backends, except every `TokenRepo::revoke` fails — a transient DB error inside the
+    // sweep, after the membership row is already committed.
+    let failing = FailingTokens { inner: Arc::clone(&app.repos.tokens), fail_list: false };
+    let orgs = org_service_with_tokens(&app, Arc::new(failing));
+    let (member, revoked) = orgs
+        .change_role(&org, bob_id, RoleLevel::WRITE, RoleLevel::OWNER, &ActorMeta::user(owner_id), app.now())
+        .await
+        .expect("a committed demotion must not fail on a token-plane error");
+    assert_eq!(member.role, RoleLevel::WRITE);
+    assert!(revoked.sessions >= 1, "S-09 must run before, and despite, the failing token sweep");
+    assert_eq!(revoked.tokens, 0, "the count is honest: nothing was actually revoked");
+    assert!(app.repos.sessions.list_for_user(bob_id).await.expect("sessions").is_empty(), "zero sessions survive");
+    // The credential survived the failed sweep — the authority did not: the role is re-derived
+    // per request (decision 13), so the stale token can no longer spend admin.
+    assert!(token_alive(&app, &admin_tok).await, "the un-revoked token is still there for a later sweep");
+    assert!(app.audit_event("token.revoked").await.is_none(), "no audit row may claim a revocation that failed");
+
+    // Same story when the *listing* dies before any revoke could even be attempted.
+    app.login("carol@corp.com").await;
+    add_member(&app, &owner, &slug, "carol@corp.com", "admin").await;
+    let carol_id = app.user_of("carol@corp.com").await;
+    let carol_tok = app.insert_token(carol_id, org.id, &[TokenScope::Admin], &[], None).await;
+    let failing = FailingTokens { inner: Arc::clone(&app.repos.tokens), fail_list: true };
+    let orgs = org_service_with_tokens(&app, Arc::new(failing));
+    let (_, revoked) = orgs
+        .change_role(&org, carol_id, RoleLevel::READ, RoleLevel::OWNER, &ActorMeta::user(owner_id), app.now())
+        .await
+        .expect("a dead token listing must not fail the demotion either");
+    assert!(revoked.sessions >= 1, "S-09 still ran");
+    assert_eq!(revoked.tokens, 0);
+    assert!(app.repos.sessions.list_for_user(carol_id).await.expect("sessions").is_empty());
+    assert!(token_alive(&app, &carol_tok).await);
+}
+
 /// The ≥1-Owner invariant surfaces as a clean `409 last_owner`, from both directions.
 #[tokio::test]
 async fn last_owner_protection_is_a_clean_conflict() {
@@ -222,6 +468,194 @@ async fn last_owner_protection_is_a_clean_conflict() {
         )
         .await;
     assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.json);
+}
+
+/// **D39 (decision 19 addendum).** The role-grant ceiling, walked as a matrix: an Admin
+/// manages only levels strictly below admin — granting, demoting, removing, and inviting at
+/// admin or owner are all a plain `403 forbidden` naming the role — while an Owner does every
+/// one of those, appointing a second Owner included. A denial mutates nothing.
+#[tokio::test]
+async fn d39_an_admin_manages_only_levels_below_admin_while_an_owner_manages_every_level() {
+    let app = TestApp::new().await;
+    let (mut owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    for (email, role) in [
+        ("actor@corp.com", "admin"),
+        ("peer@corp.com", "admin"),
+        ("writer@corp.com", "write"),
+        ("reader@corp.com", "read"),
+    ] {
+        app.login(email).await;
+        add_member(&app, &owner, &slug, email, role).await;
+    }
+    app.login("newbie@corp.com").await;
+    let admin = sign_in(&app, "actor@corp.com").await;
+    let org_id = app.repos.orgs.get_by_slug(&slug).await.expect("lookup").expect("org").id;
+    let actor_id = app.user_of("actor@corp.com").await;
+    let peer_id = app.user_of("peer@corp.com").await;
+    let writer_id = app.user_of("writer@corp.com").await;
+    let reader_id = app.user_of("reader@corp.com").await;
+    let owner_id = app.user_of("owner@corp.com").await;
+    let members = format!("/api/v1/orgs/{slug}/members");
+    let invitations = format!("/api/v1/orgs/{slug}/invitations");
+
+    // Below the ceiling an Admin manages freely: add at write, re-role to read, remove.
+    let added = app
+        .post(&members, Some(&admin.access), serde_json::json!({ "email": "newbie@corp.com", "role": "write" }))
+        .await;
+    assert_eq!(added.status, StatusCode::OK, "{:?}", added.json);
+    let newbie_id = app.user_of("newbie@corp.com").await;
+    let changed =
+        app.patch(&format!("{members}/{newbie_id}"), Some(&admin.access), serde_json::json!({ "role": "read" })).await;
+    assert_eq!(changed.status, StatusCode::OK, "{:?}", changed.json);
+    let removed = app.delete(&format!("{members}/{newbie_id}"), Some(&admin.access)).await;
+    assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.json);
+
+    // At or above it: every mutation path answers the same 403 whose message names the role.
+    let audit_before = app.audit_actions().await;
+    let denials: Vec<(&str, axum::http::Method, String, Option<serde_json::Value>)> = vec![
+        (
+            "granting admin",
+            axum::http::Method::POST,
+            members.clone(),
+            Some(serde_json::json!({ "email": "newbie@corp.com", "role": "admin" })),
+        ),
+        (
+            "granting owner",
+            axum::http::Method::POST,
+            members.clone(),
+            Some(serde_json::json!({ "email": "newbie@corp.com", "role": "owner" })),
+        ),
+        (
+            "demoting a fellow admin",
+            axum::http::Method::PATCH,
+            format!("{members}/{peer_id}"),
+            Some(serde_json::json!({ "role": "write" })),
+        ),
+        (
+            "demoting the owner",
+            axum::http::Method::PATCH,
+            format!("{members}/{owner_id}"),
+            Some(serde_json::json!({ "role": "write" })),
+        ),
+        ("removing a fellow admin", axum::http::Method::DELETE, format!("{members}/{peer_id}"), None),
+        ("removing the owner", axum::http::Method::DELETE, format!("{members}/{owner_id}"), None),
+        (
+            "inviting at admin",
+            axum::http::Method::POST,
+            invitations.clone(),
+            Some(serde_json::json!({ "email": "hire@corp.com", "role": "admin" })),
+        ),
+        (
+            "inviting at owner",
+            axum::http::Method::POST,
+            invitations.clone(),
+            Some(serde_json::json!({ "email": "hire@corp.com", "role": "owner" })),
+        ),
+    ];
+    for (label, method, path, body) in denials {
+        let response = app.send(app.request(method, &path, Some(&admin.access), body, common::DEFAULT_IP)).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN, "{label} must hit the ceiling: {:?}", response.json);
+        assert_eq!(response.error_code(), "forbidden", "{label} is the standard denial, not a new code");
+        let message = response.json["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("your role admin manages only roles below admin"),
+            "{label}: the denial must name role names, got {message:?}"
+        );
+    }
+
+    // Nothing moved behind those denials: same roles, same member count, no invitation rows,
+    // and not one membership mutation reached the audit log while they were refused.
+    for (user, role) in [
+        (peer_id, RoleLevel::ADMIN),
+        (owner_id, RoleLevel::OWNER),
+        (actor_id, RoleLevel::ADMIN),
+        (writer_id, RoleLevel::WRITE),
+        (reader_id, RoleLevel::READ),
+    ] {
+        let member = app.repos.orgs.get_member(org_id, user).await.expect("lookup").expect("still a member");
+        assert_eq!(member.role, role, "a denied mutation must not move {user}");
+    }
+    assert!(app.repos.orgs.get_member(org_id, newbie_id).await.expect("lookup").is_none(), "denied grant must not add");
+    assert!(app.repos.orgs.list_invitations(org_id).await.expect("invitations").is_empty());
+    assert_eq!(app.audit_actions().await, audit_before, "a denied mutation must leave no audit trace of success");
+
+    // The Owner is exempt from the ceiling and does every denied action.
+    owner.relogin(&app).await;
+    let promote =
+        app.patch(&format!("{members}/{writer_id}"), Some(&owner.access), serde_json::json!({ "role": "admin" })).await;
+    assert_eq!(promote.status, StatusCode::OK, "an owner grants admin: {:?}", promote.json);
+    let demote =
+        app.patch(&format!("{members}/{peer_id}"), Some(&owner.access), serde_json::json!({ "role": "write" })).await;
+    assert_eq!(demote.status, StatusCode::OK, "an owner demotes an admin: {:?}", demote.json);
+    let remove = app.delete(&format!("{members}/{actor_id}"), Some(&owner.access)).await;
+    assert_eq!(remove.status, StatusCode::OK, "an owner removes an admin: {:?}", remove.json);
+    let invite = app
+        .post(
+            &invitations,
+            Some(&owner.access),
+            serde_json::json!({ "email": "future.owner@corp.com", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(invite.status, StatusCode::OK, "an owner invites at owner: {:?}", invite.json);
+    // A second Owner — the existing last-owner test covers granting `owner` on the add path.
+    let second =
+        app.patch(&format!("{members}/{reader_id}"), Some(&owner.access), serde_json::json!({ "role": "owner" })).await;
+    assert_eq!(second.status, StatusCode::OK, "an owner appoints another owner: {:?}", second.json);
+}
+
+/// **D39 (decision 19 addendum).** Self-directed *reduction* bypasses the ceiling — an Admin
+/// demotes themselves or leaves the org, which the peer-blocking matrix above would otherwise
+/// forbid — while a self-*raise* stays blocked, and the ≥1-Owner invariant still keeps the
+/// last Owner in place.
+#[tokio::test]
+async fn d39_self_reduction_bypasses_the_ceiling_while_a_self_raise_stays_blocked() {
+    let app = TestApp::new().await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    for email in ["actor@corp.com", "leaver@corp.com"] {
+        app.login(email).await;
+        add_member(&app, &owner, &slug, email, "admin").await;
+    }
+    let org_id = app.repos.orgs.get_by_slug(&slug).await.expect("lookup").expect("org").id;
+    let members = format!("/api/v1/orgs/{slug}/members");
+    let admin = sign_in(&app, "actor@corp.com").await;
+    let actor_id = app.user_of("actor@corp.com").await;
+
+    // Self-raise: exactly the escalation the ceiling exists to stop — the standard denial,
+    // and the membership does not move.
+    let raise =
+        app.patch(&format!("{members}/{actor_id}"), Some(&admin.access), serde_json::json!({ "role": "owner" })).await;
+    assert_eq!(raise.status, StatusCode::FORBIDDEN, "an admin must not promote themselves: {:?}", raise.json);
+    assert_eq!(raise.error_code(), "forbidden");
+    let member = app.repos.orgs.get_member(org_id, actor_id).await.expect("lookup").expect("member");
+    assert_eq!(member.role, RoleLevel::ADMIN, "a denied self-raise must not move the role");
+
+    // Self-demotion: admin-touches-admin would hit the ceiling for anyone else; aimed at
+    // yourself it is a reduction and goes through — with the S-09 sweep riding along.
+    let demote =
+        app.patch(&format!("{members}/{actor_id}"), Some(&admin.access), serde_json::json!({ "role": "write" })).await;
+    assert_eq!(demote.status, StatusCode::OK, "self-demotion must bypass the ceiling: {:?}", demote.json);
+    assert_eq!(demote.json["data"]["role"], "write");
+    assert!(demote.json["data"]["sessions_revoked"].as_u64().expect("count") >= 1, "S-09 applies to self-demotion");
+    assert_eq!(app.get("/api/v1/sessions", Some(&admin.access)).await.status, StatusCode::UNAUTHORIZED);
+
+    // Self-removal: an Admin leaves the org.
+    let leaver = sign_in(&app, "leaver@corp.com").await;
+    let leaver_id = app.user_of("leaver@corp.com").await;
+    let removed = app.delete(&format!("{members}/{leaver_id}"), Some(&leaver.access)).await;
+    assert_eq!(removed.status, StatusCode::OK, "self-removal must bypass the ceiling: {:?}", removed.json);
+    assert!(app.repos.orgs.get_member(org_id, leaver_id).await.expect("lookup").is_none(), "the member is gone");
+
+    // The carve-out does not touch the ≥1-Owner invariant: a sole Owner still cannot leave…
+    let owner_id = app.user_of("owner@corp.com").await;
+    let refused = app.delete(&format!("{members}/{owner_id}"), Some(&owner.access)).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.error_code(), "last_owner");
+    // …until another Owner exists, after which self-removal is an ordinary reduction.
+    app.login("successor@corp.com").await;
+    add_member(&app, &owner, &slug, "successor@corp.com", "owner").await;
+    let departed = app.delete(&format!("{members}/{owner_id}"), Some(&owner.access)).await;
+    assert_eq!(departed.status, StatusCode::OK, "a non-sole owner removes themselves: {:?}", departed.json);
+    assert!(app.repos.orgs.get_member(org_id, owner_id).await.expect("lookup").is_none());
 }
 
 /// **S-06.** The step-up list, walked with a session that is authenticated but stale.

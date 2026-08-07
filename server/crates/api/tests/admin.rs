@@ -427,14 +427,23 @@ async fn the_upstream_switch_takes_effect_without_a_restart() {
 
 // ----------------------------------------------------------------------------- moderation
 
-/// Suspension blocks sign-in and revokes every live session (S-09).
+/// Suspension blocks sign-in, revokes every live session (S-09), and halts the account's CLI
+/// tokens on the pub plane (D37, decision 13 addendum) — all of it reversible: reinstatement
+/// restores sign-in and the tokens with no re-mint.
 #[tokio::test]
-async fn suspending_an_account_revokes_its_sessions_and_blocks_sign_in() {
+async fn s13_suspension_revokes_sessions_blocks_sign_in_and_gates_cli_tokens() {
     let app = TestApp::new().await;
     let access = admin_token(&app, "root@corp.com").await;
+    let (bob_access, org) = app.org_owner("bob@corp.com", "bobs").await;
     let victim = token(&app, "bob@corp.com").await;
     let bob = app.user_of("bob@corp.com").await;
     assert_eq!(app.get("/api/v1/sessions", Some(&victim)).await.status, StatusCode::OK);
+
+    // Bob's CLI credential works on the pub plane: his own private package resolves.
+    let cli = app.mint_token(&bob_access, org, &["read", "publish"]).await;
+    let published = app.publish("/o/bobs/pub", &cli, &package_archive("bobs_pkg", "1.0.0")).await;
+    assert_eq!(published.status, StatusCode::OK, "{:?}", published.json);
+    assert_eq!(app.pub_get("/o/bobs/pub/api/packages/bobs_pkg", Some(&cli)).await.status, StatusCode::OK);
 
     let suspended = app.post_empty(&format!("/api/v1/admin/users/{bob}/suspend"), Some(&access)).await;
     assert_eq!(suspended.status, StatusCode::OK, "{:?}", suspended.json);
@@ -442,6 +451,11 @@ async fn suspending_an_account_revokes_its_sessions_and_blocks_sign_in() {
 
     assert_eq!(app.get("/api/v1/sessions", Some(&victim)).await.status, StatusCode::UNAUTHORIZED);
     assert!(app.repos.sessions.list_for_user(bob).await.expect("sessions").is_empty());
+
+    // The CLI token stops authenticating too — uniform 401, indistinguishable from revoked
+    // (S-14): the credential plane is gated at the repository, within the S-13 ≤60 s bound.
+    let gated = app.pub_get("/o/bobs/pub/api/packages/bobs_pkg", Some(&cli)).await;
+    assert_eq!(gated.status, StatusCode::UNAUTHORIZED, "a suspended account's token must not authenticate");
 
     // Sign-in is refused, uniformly (S-04).
     let (pending, code) = app.request_otp("bob@corp.com").await;
@@ -455,11 +469,17 @@ async fn suspending_an_account_revokes_its_sessions_and_blocks_sign_in() {
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
     assert_eq!(denied.error_code(), "invalid_code");
 
-    // Reinstated, they can sign in again.
+    // Reinstated: sign-in works, and the untouched token row authenticates again — suspension
+    // is reversible on the token plane too, no re-mint required.
     let restored = app.post_empty(&format!("/api/v1/admin/users/{bob}/unsuspend"), Some(&access)).await;
     assert_eq!(restored.status, StatusCode::OK);
     assert_eq!(restored.json["data"]["status"], "active");
     app.login("bob@corp.com").await;
+    assert_eq!(
+        app.pub_get("/o/bobs/pub/api/packages/bobs_pkg", Some(&cli)).await.status,
+        StatusCode::OK,
+        "unsuspension must restore the CLI token automatically"
+    );
 
     // An administrator cannot lock themselves out.
     let root = app.user_of("root@corp.com").await;

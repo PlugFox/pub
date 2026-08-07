@@ -11,6 +11,7 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::authorize::Action;
 use crate::{Error, OrgId, TokenId, UserId};
 
 /// Token scope. Stored and serialized as a lowercase string.
@@ -35,6 +36,22 @@ impl TokenScope {
             Self::Publish => "publish",
             Self::Retract => "retract",
             Self::Admin => "admin",
+        }
+    }
+
+    /// The org-role action this scope is worth on the decision 19 ladder.
+    ///
+    /// The **single source** for "what a scope is worth": the token mint gate checks the
+    /// holder's role against it, and the D37 post-demotion token sweep (decision 13 addendum)
+    /// uses the same mapping to decide which tokens a lowered role can no longer hold. The
+    /// comparison always happens in Rust — never duplicated into per-dialect SQL.
+    pub const fn required_action(self) -> Action {
+        match self {
+            Self::Read => Action::ReadPackages,
+            // Retract manages own versions — Write level, like publishing (S-06 step-up for
+            // the dangerous variants arrives with the TOTP slice).
+            Self::Publish | Self::Retract => Action::PublishPackages,
+            Self::Admin => Action::ManageMembers,
         }
     }
 }
@@ -146,6 +163,20 @@ mod tests {
     #[test]
     fn unknown_scope_is_invalid() {
         assert_eq!("delete".parse::<TokenScope>().unwrap_err().code(), "invalid_argument");
+    }
+
+    #[test]
+    fn scope_role_mapping_matches_decision_19() {
+        use crate::RoleLevel;
+        assert_eq!(TokenScope::Read.required_action(), Action::ReadPackages);
+        assert_eq!(TokenScope::Publish.required_action(), Action::PublishPackages);
+        assert_eq!(TokenScope::Retract.required_action(), Action::PublishPackages);
+        assert_eq!(TokenScope::Admin.required_action(), Action::ManageMembers);
+        // The levels behind the actions — the numbers the mint gate and the D37 sweep compare.
+        assert_eq!(TokenScope::Read.required_action().required_level(), Some(RoleLevel::READ));
+        assert_eq!(TokenScope::Publish.required_action().required_level(), Some(RoleLevel::WRITE));
+        assert_eq!(TokenScope::Retract.required_action().required_level(), Some(RoleLevel::WRITE));
+        assert_eq!(TokenScope::Admin.required_action().required_level(), Some(RoleLevel::ADMIN));
     }
 
     #[test]

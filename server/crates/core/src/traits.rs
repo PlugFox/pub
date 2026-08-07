@@ -757,8 +757,11 @@ pub trait TokenRepo: Send + Sync {
     async fn create(&self, new: NewToken, now: DateTime<Utc>) -> Result<Token>;
 
     /// The token whose plaintext hashes to `token_hash`, iff it is active at `now`: not
-    /// revoked and not expired. `None` otherwise — the auth path cannot distinguish unknown,
-    /// revoked, and expired (uniform 401, S-14).
+    /// revoked, not expired, **and held by a user whose status is `active`** — suspension
+    /// gates the credential plane here at the repository (decision 13 addendum, D37), so a
+    /// suspended account's tokens stop authenticating within the S-13 bound and resume on
+    /// reinstatement with no re-mint. `None` otherwise — the auth path cannot distinguish
+    /// unknown, revoked, expired, and suspended (uniform 401, S-14).
     async fn find_active_by_hash(&self, token_hash: &str, now: DateTime<Utc>) -> Result<Option<Token>>;
 
     /// Write-throttled usage tracking (S-13): sets `last_used_at = now` (and the IP) only

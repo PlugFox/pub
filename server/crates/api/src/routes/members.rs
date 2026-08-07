@@ -12,6 +12,11 @@
 //!   about escalation, and forcing a re-auth to add a read-only teammate trains people to
 //!   treat the prompt as noise.
 //!
+//! The **role-grant ceiling** (decision 19 addendum, D39) is likewise enforced one layer down:
+//! every mutation passes the caller's own level (`auth.actor.role_in`) to the service, which
+//! refuses a non-Owner touching a level at or above their own with a plain `403 forbidden`
+//! naming the role. The handlers carry no ceiling logic of their own.
+//!
 //! The ≥1-Owner invariant is not checked here at all — it is transactional in the repository
 //! and surfaces as `409 last_owner`, which is the only place it can be race-free.
 
@@ -75,7 +80,8 @@ pub async fn list(
     Ok(Json(OkEnvelope::new(ListDto::single_page(items))))
 }
 
-/// Adds an existing account as a member (Admin+; step-up for Write and above).
+/// Adds an existing account as a member (Admin+; step-up for Write and above; the granted
+/// level must sit below the caller's own unless the caller is an Owner — D39).
 #[utoipa::path(
     post,
     path = "/api/v1/orgs/{slug}/members",
@@ -85,7 +91,7 @@ pub async fn list(
     request_body = MemberAddBody,
     responses(
         (status = OK, description = "Member added", body = OkEnvelope<MemberDto>),
-        (status = FORBIDDEN, description = "Below Admin, or step_up_required for a Write+ grant", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Below Admin, a grant at or above the caller's ceiling (D39), or step_up_required for a Write+ grant", body = ErrorEnvelope),
         (status = NOT_FOUND, description = "Unknown org, or no verified account with that email", body = ErrorEnvelope),
         (status = CONFLICT, description = "Already a member", body = ErrorEnvelope),
     )
@@ -104,7 +110,8 @@ pub async fn add(
         require_step_up(&state, &auth).await?;
     }
     let now = (state.clock)();
-    let member = state.orgs.add_member(&org, &body.email, role, &actor_meta(&auth, &meta), now).await?;
+    let acting_role = auth.actor.role_in(org.id);
+    let member = state.orgs.add_member(&org, &body.email, role, acting_role, &actor_meta(&auth, &meta), now).await?;
     let user = state.repos.users.get(member.user_id).await?;
     Ok(Json(OkEnvelope::new(MemberDto {
         user_id: member.user_id.to_string(),
@@ -116,7 +123,9 @@ pub async fn add(
     })))
 }
 
-/// Changes a member's role (Admin+; step-up when either the old or the new level is Write+).
+/// Changes a member's role (Admin+; step-up when either the old or the new level is Write+;
+/// both the target's current level and the new one must sit below a non-Owner caller's own —
+/// D39).
 ///
 /// The gate covers **demotions from** Write+ as well as promotions **to** it: taking somebody's
 /// publish rights away is exactly as consequential as granting them, and a stolen stale admin
@@ -132,9 +141,9 @@ pub async fn add(
     ),
     request_body = MemberRoleBody,
     responses(
-        (status = OK, description = "Role changed; the member's sessions were revoked (S-09)", body = OkEnvelope<MembershipChangedDto>),
+        (status = OK, description = "Role changed; the member's sessions were revoked (S-09) along with any org tokens the new level can no longer mint (D37)", body = OkEnvelope<MembershipChangedDto>),
         (status = CONFLICT, description = "last_owner — the org would be left without an Owner", body = ErrorEnvelope),
-        (status = FORBIDDEN, description = "Below Admin, or step_up_required", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Below Admin, a level at or above the caller's ceiling (D39), or step_up_required", body = ErrorEnvelope),
         (status = NOT_FOUND, description = "Unknown org or membership", body = ErrorEnvelope),
     )
 )]
@@ -158,11 +167,19 @@ pub async fn update_role(
         require_step_up(&state, &auth).await?;
     }
     let now = (state.clock)();
-    let (member, revoked) = state.orgs.change_role(&org, user, role, &actor_meta(&auth, &meta), now).await?;
-    Ok(Json(OkEnvelope::new(MembershipChangedDto { role: Some(role_name(member.role)), sessions_revoked: revoked })))
+    let acting_role = auth.actor.role_in(org.id);
+    let (member, revoked) =
+        state.orgs.change_role(&org, user, role, acting_role, &actor_meta(&auth, &meta), now).await?;
+    Ok(Json(OkEnvelope::new(MembershipChangedDto {
+        role: Some(role_name(member.role)),
+        sessions_revoked: revoked.sessions,
+        tokens_revoked: revoked.tokens,
+    })))
 }
 
-/// Removes a member (Admin+). Their sessions are revoked (S-09).
+/// Removes a member (Admin+; the target's level must sit below a non-Owner caller's own —
+/// D39). Their sessions are revoked (S-09) along with every CLI token they held in this org
+/// (D37).
 #[utoipa::path(
     delete,
     path = "/api/v1/orgs/{slug}/members/{user_id}",
@@ -173,9 +190,9 @@ pub async fn update_role(
         ("user_id" = String, Path, description = "Member's user id"),
     ),
     responses(
-        (status = OK, description = "Member removed; their sessions were revoked (S-09)", body = OkEnvelope<MembershipChangedDto>),
+        (status = OK, description = "Member removed; their sessions (S-09) and their CLI tokens in this org (D37) were revoked", body = OkEnvelope<MembershipChangedDto>),
         (status = CONFLICT, description = "last_owner — the org would be left without an Owner", body = ErrorEnvelope),
-        (status = FORBIDDEN, description = "Below Admin in this org", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Below Admin, or a target at or above the caller's ceiling (D39)", body = ErrorEnvelope),
         (status = NOT_FOUND, description = "Unknown org or membership", body = ErrorEnvelope),
     )
 )]
@@ -188,8 +205,13 @@ pub async fn remove(
     let org = org_for(&state, &auth, &slug, Action::ManageMembers).await?;
     let user = parse_user(&user_id)?;
     let now = (state.clock)();
-    let revoked = state.orgs.remove_member(&org, user, &actor_meta(&auth, &meta), now).await?;
-    Ok(Json(OkEnvelope::new(MembershipChangedDto { role: None, sessions_revoked: revoked })))
+    let acting_role = auth.actor.role_in(org.id);
+    let revoked = state.orgs.remove_member(&org, user, acting_role, &actor_meta(&auth, &meta), now).await?;
+    Ok(Json(OkEnvelope::new(MembershipChangedDto {
+        role: None,
+        sessions_revoked: revoked.sessions,
+        tokens_revoked: revoked.tokens,
+    })))
 }
 
 /// The org's invitations, newest first (Admin+).
@@ -238,7 +260,7 @@ pub async fn list_invitations(
     request_body = InvitationCreateBody,
     responses(
         (status = OK, description = "Invitation created; the token is shown once", body = OkEnvelope<InvitationCreatedDto>),
-        (status = FORBIDDEN, description = "Below Admin, step_up_required, or a domain the S-31 allowlist rejects", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Below Admin, a role at or above the caller's ceiling (D39), step_up_required, or a domain the S-31 allowlist rejects", body = ErrorEnvelope),
         (status = TOO_MANY_REQUESTS, description = "The org's daily invitation budget is spent (S-24)", body = ErrorEnvelope),
         (status = NOT_FOUND, description = "Unknown or archived org", body = ErrorEnvelope),
     )
@@ -254,7 +276,8 @@ pub async fn invite(
     require_step_up(&state, &auth).await?;
     let role = body.role.as_deref().map(parse_role).transpose()?.unwrap_or(RoleLevel::READ);
     let now = (state.clock)();
-    let created = state.orgs.invite(&org, &body.email, role, &actor_meta(&auth, &meta), now).await?;
+    let acting_role = auth.actor.role_in(org.id);
+    let created = state.orgs.invite(&org, &body.email, role, acting_role, &actor_meta(&auth, &meta), now).await?;
     Ok(Json(OkEnvelope::new(InvitationCreatedDto {
         invitation: InvitationDto::from_invitation(&created.invitation, now),
         token: created.token,

@@ -5,6 +5,8 @@
 //! `authorize()` chokepoint (implemented in a later roadmap step). Wire protocol and UI use
 //! role *names*; numbers are a storage/comparison detail.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// Ordered org role level.
@@ -51,6 +53,18 @@ impl RoleLevel {
             200 => Some("admin"),
             250 => Some("owner"),
             _ => None,
+        }
+    }
+}
+
+impl fmt::Display for RoleLevel {
+    /// The wire form (decision 19: names on the wire, numbers in storage): the role name for
+    /// known levels, the bare number for future intermediate ones. Error messages and DTOs
+    /// render through this so no layer invents its own name table.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "{}", self.0),
         }
     }
 }
@@ -106,6 +120,14 @@ mod tests {
         ] {
             assert_eq!(level.name(), Some(name));
         }
+    }
+
+    #[test]
+    fn display_renders_the_wire_name_and_falls_back_to_the_number() {
+        assert_eq!(RoleLevel::ADMIN.to_string(), "admin");
+        assert_eq!(RoleLevel::OWNER.to_string(), "owner");
+        // A future intermediate level has no name yet; the number is the honest fallback.
+        assert_eq!(RoleLevel::new(150).to_string(), "150");
     }
 
     #[test]

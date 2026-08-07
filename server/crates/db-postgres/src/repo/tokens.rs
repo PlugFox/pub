@@ -110,9 +110,14 @@ impl TokenRepo for PgTokenRepo {
     }
 
     async fn find_active_by_hash(&self, token_hash: &str, now: DateTime<Utc>) -> Result<Option<Token>> {
+        // The user-status subquery is the D37 suspension gate (decision 13 addendum): only an
+        // `active` account's tokens authenticate, so suspension halts the credential plane
+        // right here and reinstatement restores it with no re-mint. On the wire a suspended
+        // holder's token is indistinguishable from a revoked one (uniform 401, S-14).
         let row: Option<TokenRow> =
             sqlx::query_as(q!("SELECT {COLS} FROM tokens WHERE token_hash = $1 AND revoked_at IS NULL \
-             AND (expires_at IS NULL OR expires_at > $2)"))
+             AND (expires_at IS NULL OR expires_at > $2) \
+             AND EXISTS (SELECT 1 FROM users WHERE users.id = tokens.user_id AND users.status = 'active')"))
             .bind(token_hash)
             .bind(now)
             .fetch_optional(&self.pool)

@@ -617,8 +617,8 @@ pub async fn session_repo(repos: &Repositories) {
     assert_eq!(repos.sessions.revoke_all_for_user(alice.id, t0() + days(1)).await.expect("nothing left"), 0);
 }
 
-/// `TokenRepo`: active-by-hash semantics (expiry, revocation), throttled usage tracking,
-/// listings.
+/// `TokenRepo`: active-by-hash semantics (expiry, revocation, the D37 holder-status gate),
+/// throttled usage tracking, listings.
 pub async fn token_repo(repos: &Repositories) {
     repos.tokens.ping().await.expect("ping");
 
@@ -758,6 +758,56 @@ pub async fn token_repo(repos: &Repositories) {
     let for_org = repos.tokens.list_for_org(org.id).await.expect("list org");
     assert_eq!(for_org.len(), 1);
     assert_eq!(for_org[0].id, forever.id);
+
+    // D37 (decision 13 addendum): suspension gates the credential plane at this very lookup —
+    // a suspended holder's token authenticates nothing, while the row itself is untouched, so
+    // reinstatement restores it without a re-mint.
+    repos.users.update_status(alice.id, UserStatus::Suspended, t0() + days(2)).await.expect("suspend");
+    assert!(
+        repos.tokens.find_active_by_hash("tok-hash-2", t0() + days(2)).await.expect("suspended lookup").is_none(),
+        "a suspended user's token must not be found by find_active_by_hash"
+    );
+    assert_eq!(
+        repos.tokens.list_for_user(alice.id).await.expect("list survives").len(),
+        1,
+        "suspension gates authentication, not the token list — the row is not revoked"
+    );
+    repos.users.update_status(alice.id, UserStatus::Active, t0() + days(3)).await.expect("reinstate");
+    assert!(
+        repos.tokens.find_active_by_hash("tok-hash-2", t0() + days(3)).await.expect("reinstated lookup").is_some(),
+        "unsuspension must restore the token automatically"
+    );
+
+    // D37, the other half of the holder-status gate: it is `status = 'active'`, not "not
+    // suspended", so a *deleted* holder's token dies at this same lookup. A second user
+    // carries this leg — alice's rows above must stay exactly as asserted.
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    repos
+        .tokens
+        .create(
+            NewToken {
+                user_id: bob.id,
+                org_id: org.id,
+                name: "outlives nobody".to_owned(),
+                token_hash: "tok-hash-3".to_owned(),
+                display_hint: "pub_e5f6".to_owned(),
+                scopes: vec![TokenScope::Read],
+                package_patterns: vec![],
+                expires_at: None,
+            },
+            t0() + days(3),
+        )
+        .await
+        .expect("bob token");
+    assert!(
+        repos.tokens.find_active_by_hash("tok-hash-3", t0() + days(3)).await.expect("live holder").is_some(),
+        "the token authenticates while its holder is active"
+    );
+    repos.users.update_status(bob.id, UserStatus::Deleted, t0() + days(4)).await.expect("delete bob");
+    assert!(
+        repos.tokens.find_active_by_hash("tok-hash-3", t0() + days(4)).await.expect("deleted lookup").is_none(),
+        "a deleted holder's token must not be found by find_active_by_hash"
+    );
 }
 
 /// `AuditRepo`: append-only writes and filtered, cursor-stable listing.
