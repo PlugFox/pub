@@ -40,11 +40,33 @@ use pub_registry::{
 };
 use pub_telemetry::LogFormat;
 
+mod secrets;
+
 /// Version string surfaced by `pubd --version`: the release/crate version
 /// (`pub_core::version::VERSION`, decision 18 — the git tag's version in release builds,
 /// crate version + `+dev` otherwise) + git hash + build date.
 fn version_string() -> String {
     format!("{} ({}, {})", pub_core::version::VERSION, env!("PUBD_GIT_HASH"), env!("PUBD_BUILD_DATE"))
+}
+
+/// Full CLI: the shared config-layer flags plus binary-only subcommands.
+///
+/// [`CliArgs`] stays a plain flag struct in `pub_config` because it *is* the top
+/// configuration layer; subcommands are an executable concern and live here.
+#[derive(clap::Parser)]
+#[command(name = "pubd", about = "Pub — self-hosted package registry", disable_version_flag = true)]
+struct Cli {
+    #[command(flatten)]
+    config: CliArgs,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Generate production secret material: Ed25519 JWT keyring, OTP pepper, KEK (S-25).
+    GenerateSecrets(secrets::GenerateSecretsArgs),
 }
 
 #[tokio::main]
@@ -54,8 +76,15 @@ async fn main() -> anyhow::Result<()> {
     // One deliberate leak of a short string at startup: clap wants `&'static str` without
     // its `string` feature, and the version outlives the process anyway.
     let version: &'static str = Box::leak(version_string().into_boxed_str());
-    let matches = CliArgs::command().version(version).disable_version_flag(false).get_matches();
-    let cli = CliArgs::from_arg_matches(&matches).context("failed to parse command line")?;
+    let matches = Cli::command().version(version).disable_version_flag(false).get_matches();
+    let cli = Cli::from_arg_matches(&matches).context("failed to parse command line")?;
+
+    // Subcommands run BEFORE config load: `generate-secrets` exists precisely for machines
+    // that cannot pass validation yet (a production boot with no secrets configured).
+    if let Some(Command::GenerateSecrets(args)) = &cli.command {
+        return secrets::run(args);
+    }
+    let cli = cli.config;
 
     let settings = pub_config::load(&cli).context("failed to load configuration")?;
     let telemetry = pub_telemetry::init(LogFormat::Pretty, &settings.telemetry);

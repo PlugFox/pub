@@ -5,9 +5,14 @@
 #   pg     — PostgreSQL 17          docker compose -f docker/docker-compose.yml --profile pg up -d
 #   s3     — MinIO (S3 + console)   docker compose -f docker/docker-compose.yml --profile s3 up -d
 #   redis  — Valkey 8               docker compose -f docker/docker-compose.yml --profile redis up -d
+#   mail   — Mailpit dev mail sink  docker compose -f docker/docker-compose.yml --profile mail up -d
 #   full   — app + all of the above docker compose -f docker/docker-compose.yml --profile full up -d --build
 #
-# Every variable has a default (see .env.example) so a zero-config `up` works.
+# Every infra variable has a default (see .env.example), so a zero-config `up` works for
+# pg/s3/redis/mail. The ONE exception is the full profile's app: it runs in production
+# mode (S-25) and needs real secret material in docker/.env — generate it once with
+# `pubd generate-secrets` (flow documented in .env.example); until then the app container
+# fails fast with an error naming the missing keys.
 
 name: pub
 
@@ -71,6 +76,29 @@ services:
       retries: 10
     networks: [pub]
 
+  # One-shot bucket init: the S3 blob backend expects its bucket to exist, and MinIO
+  # creates none by default. Runs to completion and exits; `mc mb --ignore-existing`
+  # makes re-runs a no-op.
+  s3-init:
+    image: minio/mc:latest
+    profiles: [s3, full]
+    depends_on:
+      s3:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ceu"]
+    # A one-item list keeps the script a single `sh -c` argument (a bare string would be
+    # shell-lexed into separate args); $$ so the vars resolve inside the container, not at
+    # compose interpolation time.
+    command:
+      - |
+        mc alias set pub http://s3:9000 "$$MINIO_USER" "$$MINIO_PASSWORD"
+        mc mb --ignore-existing "pub/$$BUCKET"
+    environment:
+      MINIO_USER: ${PUB_S3_ACCESS_KEY:-pub-minio}
+      MINIO_PASSWORD: ${PUB_S3_SECRET_KEY:-pub_dev_password}
+      BUCKET: ${PUB_S3_BUCKET:-pub}
+    networks: [pub]
+
   redis:
     image: valkey/valkey:8-alpine
     profiles: [redis, full]
@@ -86,6 +114,22 @@ services:
       retries: 10
     networks: [pub]
 
+  # Mailpit — dev mail sink. Email OTP is the always-available sign-in factor, so a dev
+  # stack without an SMTP target is a registry nobody can sign in to (D5). OTP and
+  # notification mail land here: web UI + REST API on :8025 (GET /api/v1/messages).
+  mail:
+    image: axllent/mailpit:latest
+    profiles: [mail, full]
+    ports:
+      - "${PUB_MAIL_SMTP_PORT:-1025}:1025" # SMTP sink
+      - "${PUB_MAIL_UI_PORT:-8025}:8025"   # web UI + API
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:8025/livez"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [pub]
+
   app:
     profiles: [full]
     build:
@@ -96,21 +140,38 @@ services:
         condition: service_healthy
       s3:
         condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
-    # PUB_* names follow the config contract (prefix PUB_, nested separator __).
-    # Keep key names in sync with server/crates/config as it evolves.
+      mail:
+        condition: service_healthy
+    # PUB_* names follow the config contract: prefix PUB_, nested separator __, field
+    # names from server/crates/config (e.g. database.kind → PUB_DATABASE__KIND).
     environment:
       PUB_SERVER__LISTEN: 0.0.0.0:8080
-      PUB_DATABASE__BACKEND: postgres
+      # Production mode (S-25): the app refuses to boot until the PUB_AUTH__* values
+      # below hold real secret material. Generate it once into docker/.env — the flow is
+      # documented in .env.example. The empty-string defaults keep `docker compose config`
+      # working for the container-free profiles; empty counts as missing at validation.
+      PUB_SERVER__MODE: production
+      PUB_AUTH__JWT__KID: ${PUB_AUTH__JWT__KID:-}
+      PUB_AUTH__JWT__SIGNING_KEY: ${PUB_AUTH__JWT__SIGNING_KEY:-}
+      PUB_AUTH__OTP_PEPPER: ${PUB_AUTH__OTP_PEPPER:-}
+      PUB_AUTH__KEK: ${PUB_AUTH__KEK:-}
+      PUB_DATABASE__KIND: postgres
       PUB_DATABASE__URL: postgres://${PUB_PG_USER:-pub}:${PUB_PG_PASSWORD:-pub_dev_password}@pg:5432/${PUB_PG_DB:-pub}
-      PUB_BLOB__BACKEND: s3
-      PUB_BLOB__S3__ENDPOINT: http://s3:9000
-      PUB_BLOB__S3__BUCKET: ${PUB_S3_BUCKET:-pub}
-      PUB_BLOB__S3__ACCESS_KEY: ${PUB_S3_ACCESS_KEY:-pub-minio}
-      PUB_BLOB__S3__SECRET_KEY: ${PUB_S3_SECRET_KEY:-pub_dev_password}
-      PUB_KV__BACKEND: redis
+      PUB_BLOB__KIND: s3
+      PUB_BLOB__ENDPOINT: http://s3:9000
+      PUB_BLOB__BUCKET: ${PUB_S3_BUCKET:-pub}
+      PUB_BLOB__ACCESS_KEY: ${PUB_S3_ACCESS_KEY:-pub-minio}
+      PUB_BLOB__SECRET_KEY: ${PUB_S3_SECRET_KEY:-pub_dev_password}
+      PUB_KV__KIND: redis
       PUB_KV__URL: redis://redis:6379
+      # Sign-in mail lands in the mailpit sink (open http://localhost:8025).
+      PUB_SMTP__HOST: mail
+      PUB_SMTP__PORT: 1025
+      PUB_SMTP__SECURITY: none
     ports:
       - "${PUB_APP_PORT:-8080}:8080"
     networks: [pub]

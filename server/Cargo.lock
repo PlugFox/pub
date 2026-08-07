@@ -2829,6 +2829,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "config",
  "futures",
  "pub-admin",
  "pub-api",
@@ -2844,6 +2845,7 @@ dependencies = [
  "pub-mail",
  "pub-registry",
  "pub-telemetry",
+ "tempfile",
  "tokio",
  "tracing",
 ]

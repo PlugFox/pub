@@ -33,3 +33,9 @@ pub-registry = { workspace = true }
 pub-telemetry = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# `generate-secrets` tests feed the rendered fragments back through the real config
+# loader (env map / TOML file), proving the output boots production validation (S-25).
+config = { workspace = true }
+tempfile = { workspace = true }

@@ -100,8 +100,19 @@ COPY --from=server-build --chown=1000:1000 /app/server/target/release/pubd /usr/
 
 # Config via PUB_* env (nested separator __); TOML/CLI also supported by the binary.
 ENV PUB_SERVER__LISTEN=0.0.0.0:8080
+# Production posture by default (S-25, roadmap D5): without real secret material the
+# container fails fast at startup with an error naming the missing PUB_AUTH__* keys and
+# pointing at `pubd generate-secrets` (docker/README.md has the two-step quickstart).
+# Dev-mode ephemeral fallbacks are an explicit opt-in: -e PUB_SERVER__MODE=dev.
+ENV PUB_SERVER__MODE=production
 EXPOSE 8080
 USER pub
+
+# Everything durable lives under /data (SQLite DB + fs blob store at /data/data/…, per the
+# config defaults relative to the /data workdir). Declared as a volume so `docker rm` no
+# longer destroys the registry (D5); bind-mount users: the directory must be writable by
+# uid 1000.
+VOLUME /data
 
 # /healthz is always on (decision 23); busybox wget ships with Alpine.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \

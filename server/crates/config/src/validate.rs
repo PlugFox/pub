@@ -328,16 +328,27 @@ impl Settings {
         }
 
         // S-25: production boots refuse to run without real secrets; dev mode falls back to
-        // loud ephemeral values at startup instead.
+        // loud ephemeral values at startup instead. Every missing key is reported in ONE
+        // error, named in both spellings (config path + env var) and pointing at the fix —
+        // an operator discovering them one failed boot at a time is the D5 experience this
+        // message replaces.
         if self.server.mode == RunMode::Production {
+            let mut missing: Vec<&str> = Vec::new();
             if auth.otp_pepper.as_ref().is_none_or(Secret::is_empty) {
-                return Err(invalid("server.mode = production requires auth.otp_pepper (S-25)"));
+                missing.push("auth.otp_pepper (PUB_AUTH__OTP_PEPPER)");
             }
             if auth.jwt.signing_key.as_ref().is_none_or(Secret::is_empty) {
-                return Err(invalid("server.mode = production requires auth.jwt.signing_key (S-25)"));
+                missing.push("auth.jwt.kid + auth.jwt.signing_key (PUB_AUTH__JWT__KID, PUB_AUTH__JWT__SIGNING_KEY)");
             }
             if auth.kek.as_ref().is_none_or(Secret::is_empty) {
-                return Err(invalid("server.mode = production requires auth.kek (S-05/S-25)"));
+                missing.push("auth.kek (PUB_AUTH__KEK)");
+            }
+            if !missing.is_empty() {
+                return Err(invalid(format!(
+                    "server.mode = production requires configured secret material (S-25); missing: {} — \
+                     run `pubd generate-secrets` to create a ready-to-use .env/TOML fragment",
+                    missing.join(", ")
+                )));
             }
         }
 

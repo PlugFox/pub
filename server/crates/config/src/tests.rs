@@ -377,6 +377,53 @@ fn production_mode_requires_pepper_and_signing_key() {
 }
 
 #[test]
+fn s25_production_secret_error_names_every_missing_key_and_the_fix() {
+    // Nothing configured: one error listing all three secrets, each in both spellings
+    // (config path + env var), pointing at `pubd generate-secrets`.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_SERVER__MODE", "production")])).unwrap_err();
+    let ConfigError::Invalid(message) = &err else { panic!("unexpected error kind: {err}") };
+    for needle in [
+        "auth.otp_pepper",
+        "PUB_AUTH__OTP_PEPPER",
+        "auth.jwt.signing_key",
+        "PUB_AUTH__JWT__SIGNING_KEY",
+        "PUB_AUTH__JWT__KID",
+        "auth.kek",
+        "PUB_AUTH__KEK",
+        "pubd generate-secrets",
+        "S-25",
+    ] {
+        assert!(message.contains(needle), "'{needle}' missing from: {message}");
+    }
+
+    // A partially configured boot names only what is still missing.
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_SERVER__MODE", "production"), ("PUB_AUTH__OTP_PEPPER", "long-random-pepper")]),
+    )
+    .unwrap_err();
+    let ConfigError::Invalid(message) = &err else { panic!("unexpected error kind: {err}") };
+    assert!(!message.contains("otp_pepper"), "configured pepper reported as missing: {message}");
+    assert!(message.contains("signing_key") && message.contains("auth.kek"), "unexpected: {message}");
+
+    // Empty strings count as missing — this is exactly what a compose file with
+    // `${PUB_AUTH__KEK:-}` interpolation hands the container when docker/.env is absent.
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_SERVER__MODE", "production"),
+            ("PUB_AUTH__OTP_PEPPER", ""),
+            ("PUB_AUTH__JWT__KID", ""),
+            ("PUB_AUTH__JWT__SIGNING_KEY", ""),
+            ("PUB_AUTH__KEK", ""),
+        ]),
+    )
+    .unwrap_err();
+    let ConfigError::Invalid(message) = &err else { panic!("unexpected error kind: {err}") };
+    assert!(message.contains("otp_pepper") && message.contains("signing_key") && message.contains("auth.kek"));
+}
+
+#[test]
 fn kek_must_be_32_base64_bytes() {
     // Not base64.
     let err = load_from(&CliArgs::default(), env(&[("PUB_AUTH__KEK", "!!not-base64!!")])).unwrap_err();
