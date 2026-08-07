@@ -29,7 +29,7 @@ Edition 2024, stable toolchain. `rustfmt` (max_width 120) + `clippy --all-target
 ## Data
 
 - Ids: UUID v7 for entities; ULID for audit events. Timestamps UTC (`TIMESTAMPTZ` / RFC3339).
-- sqlx compile-time macros where possible; `.sqlx/` committed, CI builds with `SQLX_OFFLINE=true`.
+- Runtime `sqlx::query`/`query_as` with `TryFrom<Row>` mapping — **not** compile-time macros (decision 02 amendment: `COLS` dedup, sqlx-free `core`, and dialect idioms outweigh macro checking; the dual-backend contract suite carries correctness). Keep column lists in per-table `COLS` consts.
 - Cursor pagination only (`{items, cursor, has_more}`); no offset pagination.
 
 ## Tests
