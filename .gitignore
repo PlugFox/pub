@@ -21,3 +21,7 @@ web/**/.astro/
 logs/
 *.log
 .DS_Store
+
+# Claude Code local state
+.claude/worktrees/
+.claude/settings.local.json
