@@ -8,6 +8,7 @@ import type {
   AuditEventDto,
   JobRunDto,
   ListDto,
+  SmtpTestResultDto,
   UserStatus,
 } from "./types";
 
@@ -76,6 +77,17 @@ export function createAdminApi(client: ApiClient) {
     /** Each present section replaces the stored one wholesale. */
     updateSettings(body: AdminSettingsPatchBody): Promise<AdminSettingsDto> {
       return client.request<AdminSettingsDto>("/admin/settings", jsonBody("PATCH", body));
+    },
+
+    /**
+     * Sends a probe message to the caller's own verified address.
+     *
+     * There is no recipient parameter, and a refused delivery is a `200` with
+     * `delivered: false` — an SMTP misconfiguration is a diagnosis to render,
+     * not an error to throw. Only transport-level failures reject.
+     */
+    testSmtp(): Promise<SmtpTestResultDto> {
+      return client.request<SmtpTestResultDto>("/admin/settings/smtp/test", { method: "POST" });
     },
 
     users(filters: UserFilters = {}): Promise<ListDto<AdminUserDto>> {

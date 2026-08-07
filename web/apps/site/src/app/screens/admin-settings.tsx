@@ -1,7 +1,12 @@
-import { REGISTRATION_MODES, SMTP_SECURITY_MODES, UPSTREAM_POLICIES } from "@pub/api/types";
+import {
+  REGISTRATION_MODES,
+  SMTP_SECURITY_MODES,
+  type SmtpTestResultDto,
+  UPSTREAM_POLICIES,
+} from "@pub/api/types";
 import { t } from "@pub/i18n";
 import { app } from "@pub/i18n/generated/app";
-import { Alert } from "@pub/ui/alert";
+import { Alert, AlertTitle } from "@pub/ui/alert";
 import { Badge } from "@pub/ui/badge";
 import { Button } from "@pub/ui/button";
 import { Card, CardContent, CardHeader } from "@pub/ui/card";
@@ -37,8 +42,17 @@ import { pushToast } from "../state/toast-store";
  * it keeps the stored secret; `""` clears it — both reachable, neither by
  * accident.
  *
+ * WHICH IS WHY THERE IS A TEST-MAIL BUTTON. A write-only credential feeding a
+ * transport that is rebuilt lazily, per instance, on its next send (decision
+ * 09's mailer amendment) is otherwise undiagnosable from here: "saved" says
+ * nothing about "delivers". The action is diagnosis, not a save step — it
+ * exercises what the server has STORED, so an unsaved edit is not what it
+ * tests, and its recipient is fixed server-side to the acting administrator.
+ *
  * Validation mirrors `crates/admin/src/instance.rs` (see `admin-form.ts`) and
- * is a pre-flight only; the server re-checks everything.
+ * is a pre-flight only; the server re-checks everything. The require-a-token
+ * switch is likewise only a picture of a flag: the pub-protocol extractor
+ * reads it per request and is the thing that refuses anonymous callers.
  */
 
 const settingsQuery = query(() => api.admin.settings(), "admin-settings");
@@ -87,11 +101,55 @@ function LimitField(props: {
   );
 }
 
+/**
+ * The outcome of one probe send.
+ *
+ * `delivered: true` with no host is NOT a green tick: the server accepted the
+ * message into its in-memory outbox because no SMTP host is configured
+ * anywhere, so nothing left the process — that case gets its own warning, or
+ * the screen would report working mail on an instance that sends none.
+ *
+ * `detail` is the mail server's own text ("535 authentication failed"), which
+ * is the answer the operator came for. It is rendered verbatim and
+ * untranslated, as plain text — Solid escapes it, and nothing here ever builds
+ * markup from a server string.
+ */
+function TestMailResult(props: { readonly result: SmtpTestResultDto }): JSX.Element {
+  const host = (): string => props.result.host ?? "";
+  const nowhere = (): boolean => props.result.delivered && host() === "";
+  const intent = (): "success" | "warning" | "danger" => {
+    if (!props.result.delivered) return "danger";
+    return nowhere() ? "warning" : "success";
+  };
+  const heading = (): string => {
+    if (!props.result.delivered) return t(app.adminSmtpTestFailed);
+    return nowhere() ? t(app.adminSmtpTestNowhere) : t(app.adminSmtpTestOk);
+  };
+  return (
+    <Alert intent={intent()} class="flex-col gap-1">
+      <AlertTitle>{heading()}</AlertTitle>
+      <Show when={host() !== ""}>
+        <p>{t(app.adminSmtpTestVia, { host: host(), security: props.result.security })}</p>
+      </Show>
+      <p>
+        {props.result.credentialed
+          ? t(app.adminSmtpTestCredentialed)
+          : t(app.adminSmtpTestAnonymous)}
+      </p>
+      <Show when={props.result.detail}>
+        {(detail) => <p class="font-mono text-xs break-words">{detail()}</p>}
+      </Show>
+    </Alert>
+  );
+}
+
 export function AdminSettingsPanel(): JSX.Element {
   const settings = createAsync(() => settingsQuery());
   const [draft, setDraft] = createSignal<SettingsForm | null>(null);
   const [errors, setErrors] = createSignal<SettingsErrors>({});
   const [busy, setBusy] = createSignal(false);
+  const [testing, setTesting] = createSignal(false);
+  const [testResult, setTestResult] = createSignal<SmtpTestResultDto | null>(null);
 
   const form = (): SettingsForm | null => {
     const current = draft();
@@ -117,6 +175,10 @@ export function AdminSettingsPanel(): JSX.Element {
     try {
       const updated = await api.admin.updateSettings(formToPatch(current));
       setDraft(settingsToForm(updated));
+      // A previous diagnosis described the configuration that was just
+      // replaced; keeping it on screen would let it be read as a verdict on
+      // the new one.
+      setTestResult(null);
       pushToast(t(app.adminSettingsSaved, { version: updated.version }), "success");
       await revalidate("admin-settings");
       // The landing payload carries branding; a rename must not wait for a
@@ -126,6 +188,24 @@ export function AdminSettingsPanel(): JSX.Element {
       pushToast(describeError(error), "danger");
     } finally {
       setBusy(false);
+    }
+  };
+
+  /**
+   * A refused delivery is a `200` carrying the reason, so only a transport or
+   * authorization failure lands in `catch` — the SMTP diagnosis belongs in the
+   * card, not in a toast that scrolls away.
+   */
+  const sendTestMail = async (): Promise<void> => {
+    if (testing()) return;
+    setTesting(true);
+    try {
+      setTestResult(await api.admin.testSmtp());
+    } catch (error) {
+      setTestResult(null);
+      pushToast(describeError(error), "danger");
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -360,6 +440,15 @@ export function AdminSettingsPanel(): JSX.Element {
                   </div>
                 </Show>
               </div>
+              <div class="flex flex-col gap-3 border-t border-line pt-5 sm:col-span-2">
+                <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+                  <Button intent="outline" disabled={testing()} onClick={() => void sendTestMail()}>
+                    {testing() ? t(app.adminSmtpTestSending) : t(app.adminSmtpTest)}
+                  </Button>
+                  <p class="text-xs text-ink-muted">{t(app.adminSmtpTestHint)}</p>
+                </div>
+                <Show when={testResult()}>{(result) => <TestMailResult result={result()} />}</Show>
+              </div>
             </CardContent>
           </Card>
 
@@ -391,6 +480,27 @@ export function AdminSettingsPanel(): JSX.Element {
                   </For>
                 </select>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <h2 class="text-lg font-semibold text-ink">{t(app.adminRegistryTitle)}</h2>
+              <p class="text-sm text-ink-muted">{t(app.adminRegistryBody)}</p>
+            </CardHeader>
+            <CardContent class="flex flex-col gap-2">
+              <label class="flex cursor-pointer items-center gap-2 text-sm text-ink">
+                <input
+                  type="checkbox"
+                  checked={current().registryRequireAuthForRead}
+                  onChange={(event) =>
+                    patch({ registryRequireAuthForRead: event.currentTarget.checked })
+                  }
+                  class="size-4 accent-accent outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
+                />
+                <span>{t(app.adminRegistryRequireAuth)}</span>
+              </label>
+              <p class="text-xs text-ink-muted">{t(app.adminRegistryRequireAuthHint)}</p>
             </CardContent>
           </Card>
 

@@ -45,6 +45,7 @@ const SETTINGS: AdminSettingsDto = {
     password_set: true,
   },
   upstream: { enabled: true, default_org_policy: "allow" },
+  registry: { require_auth_for_read: true },
 };
 
 function form(overrides: Partial<SettingsForm> = {}): SettingsForm {
@@ -62,6 +63,14 @@ describe("settingsToForm", () => {
   test("never prefills the password — the API does not return one", () => {
     expect(settingsToForm(SETTINGS).smtpPassword).toBe("");
     expect(settingsToForm(SETTINGS).smtpSetPassword).toBe(false);
+  });
+
+  test("carries the registry flag through as a boolean, not a string", () => {
+    expect(settingsToForm(SETTINGS).registryRequireAuthForRead).toBe(true);
+    expect(
+      settingsToForm({ ...SETTINGS, registry: { require_auth_for_read: false } })
+        .registryRequireAuthForRead,
+    ).toBe(false);
   });
 
   test("a null host and username become empty strings, not the word null", () => {
@@ -178,6 +187,7 @@ describe("formToPatch", () => {
       "branding",
       "rate_limits",
       "registration",
+      "registry",
       "smtp",
       "upstream",
     ]);
@@ -217,5 +227,17 @@ describe("formToPatch", () => {
   test("rate limits come back as numbers, not strings", () => {
     const patch = formToPatch(form({ loginPerIpMinute: " 42 " }));
     expect(patch.rate_limits.login_per_ip_minute).toBe(42);
+  });
+
+  test("carries the registry flag both ways — editing anything else must not flip it", () => {
+    expect(formToPatch(form()).registry).toEqual({ require_auth_for_read: true });
+    expect(formToPatch(form({ registryRequireAuthForRead: false })).registry).toEqual({
+      require_auth_for_read: false,
+    });
+    // The section is written wholesale on every save, so a branding edit
+    // resubmits the loaded flag rather than an absent one that would reset it.
+    expect(formToPatch(form({ brandingName: "Renamed" })).registry.require_auth_for_read).toBe(
+      true,
+    );
   });
 });

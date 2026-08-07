@@ -3,6 +3,7 @@ import type {
   BrandingSettingsDto,
   RateLimitSettingsDto,
   RegistrationSettingsDto,
+  RegistrySettingsDto,
   SmtpSettingsPatchDto,
   UpstreamSettingsDto,
 } from "@pub/api/types";
@@ -20,6 +21,13 @@ import type {
  *   - `branding.name` non-empty;
  *   - each allowed email domain lowercased, no `@`, no whitespace, one dot at
  *     least — a typo'd allowlist is a lockout, not a filter.
+ *
+ * One server rule is deliberately NOT mirrored: `smtp.username` requires a
+ * password. Whether one is available depends on the boot `[smtp]` credential,
+ * which applies only when host, port and username all match the boot values —
+ * facts the credential-free document does not carry (`password_set` reports
+ * only the *stored* secret). A pre-flight guess here would red-flag a
+ * configuration the server accepts, so the 400 is left to speak for itself.
  *
  * PATCH SEMANTICS: each section is replaced WHOLESALE, so the form always
  * submits a complete section built from the loaded values, never a diff.
@@ -52,6 +60,7 @@ export type SettingsForm = {
   readonly smtpPassword: string;
   readonly upstreamEnabled: boolean;
   readonly upstreamDefaultPolicy: string;
+  readonly registryRequireAuthForRead: boolean;
 };
 
 /** Field keys the validator can flag; the screen maps them to i18n messages. */
@@ -93,6 +102,7 @@ export function settingsToForm(settings: AdminSettingsDto): SettingsForm {
     smtpPassword: "",
     upstreamEnabled: settings.upstream.enabled,
     upstreamDefaultPolicy: settings.upstream.default_org_policy,
+    registryRequireAuthForRead: settings.registry.require_auth_for_read,
   };
 }
 
@@ -148,6 +158,7 @@ export type SettingsPatch = {
   rate_limits: RateLimitSettingsDto;
   smtp: SmtpSettingsPatchDto;
   upstream: UpstreamSettingsDto;
+  registry: RegistrySettingsDto;
 };
 
 /**
@@ -191,6 +202,9 @@ export function formToPatch(form: SettingsForm): SettingsPatch {
     upstream: {
       enabled: form.upstreamEnabled,
       default_org_policy: form.upstreamDefaultPolicy,
+    },
+    registry: {
+      require_auth_for_read: form.registryRequireAuthForRead,
     },
   };
 }

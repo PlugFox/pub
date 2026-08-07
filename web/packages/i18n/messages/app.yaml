@@ -2066,6 +2066,51 @@ adminSmtpPasswordHint:
   ru: API никогда не возвращает пароль. Пустое поле удалит сохранённый пароль вместо замены.
   desc: Hint under the SMTP password field explaining the write-only contract.
 
+adminSmtpTest:
+  en: Send test mail
+  ru: Отправить тестовое письмо
+  desc: Button that asks the server to deliver a probe message through the stored SMTP configuration.
+
+adminSmtpTestSending:
+  en: Sending…
+  ru: Отправка…
+  desc: Label of the send-test-mail button while the request is in flight.
+
+adminSmtpTestHint:
+  en: Goes to your own verified address, through the configuration the server has stored — save first to test what you just typed.
+  ru: Письмо уйдёт на ваш подтверждённый адрес через сохранённые настройки — сначала сохраните изменения, чтобы проверить только что введённые.
+  desc: Hint under the send-test-mail button — the recipient is fixed to the acting administrator and unsaved edits are not used.
+
+adminSmtpTestOk:
+  en: The mail server accepted the message.
+  ru: Почтовый сервер принял сообщение.
+  desc: Result heading after a test message was delivered.
+
+adminSmtpTestNowhere:
+  en: No mail host is configured, so the message was delivered nowhere.
+  ru: Почтовый хост не настроен, поэтому сообщение никуда не доставлено.
+  desc: Result heading when the test message was accepted only by the in-memory outbox because no SMTP host is configured.
+
+adminSmtpTestFailed:
+  en: The mail server refused the message.
+  ru: Почтовый сервер отклонил сообщение.
+  desc: Result heading after a test message could not be delivered.
+
+adminSmtpTestVia:
+  en: Sent through {host} over {security}.
+  ru: Отправлено через {host}, защита соединения — {security}.
+  desc: Line under the test-mail result naming the effective SMTP host and transport security.
+
+adminSmtpTestCredentialed:
+  en: The connection presented the stored credentials.
+  ru: Соединение использовало сохранённые учётные данные.
+  desc: Line under the test-mail result stating that the transport authenticated.
+
+adminSmtpTestAnonymous:
+  en: The connection presented no credentials.
+  ru: Соединение не использовало учётные данные.
+  desc: Line under the test-mail result stating that the transport did not authenticate.
+
 adminUpstreamTitle:
   en: Upstream proxy
   ru: Прокси к upstream
@@ -2085,6 +2130,26 @@ adminUpstreamDefault:
   en: Default policy for new organizations
   ru: Политика по умолчанию для новых организаций
   desc: Label of the default upstream policy select.
+
+adminRegistryTitle:
+  en: Registry access
+  ru: Доступ к реестру
+  desc: Heading of the registry-plane section of the settings form.
+
+adminRegistryBody:
+  en: Who may read packages through the pub protocol without signing in.
+  ru: Кто может читать пакеты по протоколу pub без входа в систему.
+  desc: Subtitle of the registry settings section.
+
+adminRegistryRequireAuth:
+  en: Require a token for every package read
+  ru: Требовать токен для любого чтения пакетов
+  desc: Checkbox turning on instance-wide authentication for pub-protocol reads.
+
+adminRegistryRequireAuthHint:
+  en: Anonymous requests then answer 401 with the token setup instructions instead of package data. Applies from the next request here, and within a minute on the other instances.
+  ru: Анонимные запросы будут получать 401 с инструкцией по настройке токена вместо данных пакета. Действует со следующего запроса здесь и в течение минуты на остальных серверах.
+  desc: Hint under the require-a-token checkbox — what anonymous callers receive and when the change reaches other instances.
 
 adminUsersTitle:
   en: Accounts

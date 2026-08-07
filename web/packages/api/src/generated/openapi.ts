@@ -87,6 +87,29 @@ export interface paths {
         patch: operations["update_settings"];
         trace?: never;
     };
+    "/api/v1/admin/settings/smtp/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sends a test message to the acting administrator's own verified address.
+         * @description The recipient is not a parameter: pinning it to the caller removes the mail-bomb vector
+         *     instead of rate-limiting it. Not step-up gated (S-06) — it neither escalates authority nor
+         *     destroys anything — and it calls the mailer directly rather than riding the jobs queue,
+         *     because synchronous diagnosis is the whole purpose.
+         */
+        post: operations["test_smtp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/stats": {
         parameters: {
             query?: never;
@@ -1275,6 +1298,8 @@ export interface components {
             rate_limits: components["schemas"]["RateLimitSettingsDto"];
             /** @description Registration policy. */
             registration: components["schemas"]["RegistrationSettingsDto"];
+            /** @description Registry-plane policy. */
+            registry: components["schemas"]["RegistrySettingsDto"];
             /** @description SMTP, credential-free. */
             smtp: components["schemas"]["SmtpSettingsDto"];
             /** @description Upstream defaults. */
@@ -1291,6 +1316,7 @@ export interface components {
             branding?: null | components["schemas"]["BrandingSettingsDto"];
             rate_limits?: null | components["schemas"]["RateLimitSettingsDto"];
             registration?: null | components["schemas"]["RegistrationSettingsDto"];
+            registry?: null | components["schemas"]["RegistrySettingsDto"];
             smtp?: null | components["schemas"]["SmtpSettingsPatchDto"];
             upstream?: null | components["schemas"]["UpstreamSettingsDto"];
         };
@@ -1864,6 +1890,8 @@ export interface components {
                 rate_limits: components["schemas"]["RateLimitSettingsDto"];
                 /** @description Registration policy. */
                 registration: components["schemas"]["RegistrationSettingsDto"];
+                /** @description Registry-plane policy. */
+                registry: components["schemas"]["RegistrySettingsDto"];
                 /** @description SMTP, credential-free. */
                 smtp: components["schemas"]["SmtpSettingsDto"];
                 /** @description Upstream defaults. */
@@ -2704,6 +2732,29 @@ export interface components {
             status: string;
         };
         /** @description Successful app API response. */
+        OkEnvelope_SmtpTestResultDto: {
+            /**
+             * @description Response of `POST /api/v1/admin/settings/smtp/test`.
+             *
+             *     A refused delivery answers `200` with `delivered: false` and the reason: a wrong SMTP
+             *     configuration is the operator's problem to see, not a server fault to hide behind a 5xx.
+             */
+            data: {
+                /** @description Whether the transport presented credentials. */
+                credentialed: boolean;
+                /** @description Whether the mailer accepted the message. */
+                delivered: boolean;
+                /** @description The SMTP failure text, or the notice that no host is configured; `null` on a clean send. */
+                detail?: string | null;
+                /** @description Effective SMTP host; `null` = none configured, so nothing was delivered anywhere. */
+                host?: string | null;
+                /** @description Effective transport security: `tls` | `starttls` | `none`. */
+                security: string;
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
         OkEnvelope_StepUpDto: {
             /** @description Response of `POST /api/v1/auth/step-up` (S-06). */
             data: {
@@ -3135,6 +3186,14 @@ export interface components {
             /** @description `open` | `invite` | `closed`. */
             mode: string;
         };
+        /** @description Registry-plane policy (decision 05). */
+        RegistrySettingsDto: {
+            /**
+             * @description Whether every pub-protocol read demands a CLI token. `true` also closes the S-04.c proxy
+             *     timing oracle, since there is then no anonymous prober.
+             */
+            require_auth_for_read: boolean;
+        };
         /** @description Registry totals. */
         RegistryStatsDto: {
             /**
@@ -3292,6 +3351,24 @@ export interface components {
             security: string;
             /** @description Login user. */
             username?: string | null;
+        };
+        /**
+         * @description Response of `POST /api/v1/admin/settings/smtp/test`.
+         *
+         *     A refused delivery answers `200` with `delivered: false` and the reason: a wrong SMTP
+         *     configuration is the operator's problem to see, not a server fault to hide behind a 5xx.
+         */
+        SmtpTestResultDto: {
+            /** @description Whether the transport presented credentials. */
+            credentialed: boolean;
+            /** @description Whether the mailer accepted the message. */
+            delivered: boolean;
+            /** @description The SMTP failure text, or the notice that no host is configured; `null` on a clean send. */
+            detail?: string | null;
+            /** @description Effective SMTP host; `null` = none configured, so nothing was delivered anywhere. */
+            host?: string | null;
+            /** @description Effective transport security: `tls` | `starttls` | `none`. */
+            security: string;
         };
         /**
          * @description The spec's error body — `{"error":{"code","message"}}`.
@@ -3805,6 +3882,44 @@ export interface operations {
                 };
             };
             /** @description No sections supplied, or a value the validator refuses */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an instance administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    test_smtp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The delivery attempt's outcome — a refused delivery is reported here, not as a 5xx */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_SmtpTestResultDto"];
+                };
+            };
+            /** @description The acting administrator has no verified email address */
             400: {
                 headers: {
                     [name: string]: unknown;

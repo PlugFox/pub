@@ -790,6 +790,24 @@ export const app = {
   adminSmtpPassword: { id: "app.adminSmtpPassword", en: "New password" },
   /** Hint under the SMTP password field explaining the write-only contract. */
   adminSmtpPasswordHint: { id: "app.adminSmtpPasswordHint", en: "Never returned by the API. Leave the field empty to clear the stored password instead of replacing it." },
+  /** Button that asks the server to deliver a probe message through the stored SMTP configuration. */
+  adminSmtpTest: { id: "app.adminSmtpTest", en: "Send test mail" },
+  /** Label of the send-test-mail button while the request is in flight. */
+  adminSmtpTestSending: { id: "app.adminSmtpTestSending", en: "Sending…" },
+  /** Hint under the send-test-mail button — the recipient is fixed to the acting administrator and unsaved edits are not used. */
+  adminSmtpTestHint: { id: "app.adminSmtpTestHint", en: "Goes to your own verified address, through the configuration the server has stored — save first to test what you just typed." },
+  /** Result heading after a test message was delivered. */
+  adminSmtpTestOk: { id: "app.adminSmtpTestOk", en: "The mail server accepted the message." },
+  /** Result heading when the test message was accepted only by the in-memory outbox because no SMTP host is configured. */
+  adminSmtpTestNowhere: { id: "app.adminSmtpTestNowhere", en: "No mail host is configured, so the message was delivered nowhere." },
+  /** Result heading after a test message could not be delivered. */
+  adminSmtpTestFailed: { id: "app.adminSmtpTestFailed", en: "The mail server refused the message." },
+  /** Line under the test-mail result naming the effective SMTP host and transport security. */
+  adminSmtpTestVia: { id: "app.adminSmtpTestVia", en: "Sent through {host} over {security}." },
+  /** Line under the test-mail result stating that the transport authenticated. */
+  adminSmtpTestCredentialed: { id: "app.adminSmtpTestCredentialed", en: "The connection presented the stored credentials." },
+  /** Line under the test-mail result stating that the transport did not authenticate. */
+  adminSmtpTestAnonymous: { id: "app.adminSmtpTestAnonymous", en: "The connection presented no credentials." },
   /** Heading of the upstream section of the settings form. */
   adminUpstreamTitle: { id: "app.adminUpstreamTitle", en: "Upstream proxy" },
   /** Subtitle of the upstream settings section. */
@@ -798,6 +816,14 @@ export const app = {
   adminUpstreamEnabled: { id: "app.adminUpstreamEnabled", en: "Proxy enabled instance-wide" },
   /** Label of the default upstream policy select. */
   adminUpstreamDefault: { id: "app.adminUpstreamDefault", en: "Default policy for new organizations" },
+  /** Heading of the registry-plane section of the settings form. */
+  adminRegistryTitle: { id: "app.adminRegistryTitle", en: "Registry access" },
+  /** Subtitle of the registry settings section. */
+  adminRegistryBody: { id: "app.adminRegistryBody", en: "Who may read packages through the pub protocol without signing in." },
+  /** Checkbox turning on instance-wide authentication for pub-protocol reads. */
+  adminRegistryRequireAuth: { id: "app.adminRegistryRequireAuth", en: "Require a token for every package read" },
+  /** Hint under the require-a-token checkbox — what anonymous callers receive and when the change reaches other instances. */
+  adminRegistryRequireAuthHint: { id: "app.adminRegistryRequireAuthHint", en: "Anonymous requests then answer 401 with the token setup instructions instead of package data. Applies from the next request here, and within a minute on the other instances." },
   /** Accessible name of the admin user table. */
   adminUsersTitle: { id: "app.adminUsersTitle", en: "Accounts" },
   /** Empty state of the admin user table. */
