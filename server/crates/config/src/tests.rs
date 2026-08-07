@@ -172,6 +172,89 @@ fn invalid_listen_address_is_rejected() {
     assert!(matches!(load_from(&cli, no_env()), Err(ConfigError::Invalid(_))));
 }
 
+// --- database pool (roadmap D24) ---
+
+#[test]
+fn pool_defaults_match_sqlx_and_resolve_per_dialect() {
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    // The timeout defaults are sqlx's own, restated as config so they are visible and tunable.
+    assert_eq!(settings.database.pool.max_connections, None);
+    assert_eq!(settings.database.pool.acquire_timeout_secs, 30);
+    assert_eq!(settings.database.pool.idle_timeout_secs, 600);
+    assert_eq!(settings.database.pool.max_lifetime_secs, 1800);
+    assert_eq!(settings.database.pool_acquire_timeout(), std::time::Duration::from_secs(30));
+    assert_eq!(settings.database.pool_idle_timeout(), std::time::Duration::from_secs(600));
+    assert_eq!(settings.database.pool_max_lifetime(), std::time::Duration::from_secs(1800));
+    // An unset ceiling resolves per dialect: SQLite stays small (single writer)…
+    assert_eq!(settings.database.pool_max_connections(), 5);
+    // …while a real server multiplexes more connections by default.
+    let pg = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_DATABASE__KIND", "postgres"), ("PUB_DATABASE__URL", "postgres://pub@localhost/pub")]),
+    )
+    .unwrap();
+    assert_eq!(pg.database.pool_max_connections(), 10);
+    // The effective-config summary lists the resolved pool.
+    let summary = settings.summary();
+    assert!(summary.contains("database.pool        = max 5, acquire 30s, idle 600s, lifetime 1800s"), "{summary}");
+}
+
+#[test]
+fn pool_settings_are_configurable_from_the_environment() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_DATABASE__POOL__MAX_CONNECTIONS", "32"),
+            ("PUB_DATABASE__POOL__ACQUIRE_TIMEOUT_SECS", "5"),
+            ("PUB_DATABASE__POOL__IDLE_TIMEOUT_SECS", "120"),
+            ("PUB_DATABASE__POOL__MAX_LIFETIME_SECS", "600"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(settings.database.pool.max_connections, Some(32));
+    assert_eq!(settings.database.pool_max_connections(), 32, "an explicit ceiling beats the dialect default");
+    assert_eq!(settings.database.pool.acquire_timeout_secs, 5);
+    assert_eq!(settings.database.pool.idle_timeout_secs, 120);
+    assert_eq!(settings.database.pool.max_lifetime_secs, 600);
+    let summary = settings.summary();
+    assert!(summary.contains("database.pool        = max 32, acquire 5s, idle 120s, lifetime 600s"), "{summary}");
+}
+
+#[test]
+fn pool_settings_load_from_toml() {
+    let file = toml_file("[database.pool]\nmax_connections = 2\nacquire_timeout_secs = 3\n");
+    let cli = CliArgs { config: Some(file.path().to_path_buf()), ..CliArgs::default() };
+    let settings = load_from(&cli, no_env()).unwrap();
+    assert_eq!(settings.database.pool.max_connections, Some(2));
+    assert_eq!(settings.database.pool.acquire_timeout_secs, 3);
+    // Untouched knobs keep their defaults.
+    assert_eq!(settings.database.pool.idle_timeout_secs, 600);
+}
+
+#[test]
+fn nonsensical_pool_settings_are_startup_errors() {
+    let cases: &[(&str, &str)] = &[
+        ("PUB_DATABASE__POOL__MAX_CONNECTIONS", "0"),
+        ("PUB_DATABASE__POOL__ACQUIRE_TIMEOUT_SECS", "0"),
+        ("PUB_DATABASE__POOL__IDLE_TIMEOUT_SECS", "0"),
+        ("PUB_DATABASE__POOL__MAX_LIFETIME_SECS", "0"),
+        // A lifetime below the idle timeout means the idle reaper could never fire.
+        ("PUB_DATABASE__POOL__MAX_LIFETIME_SECS", "60"),
+    ];
+    for (key, value) in cases {
+        assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
+    }
+    // The zero-ceiling message must point at the fix, not just refuse the value.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_DATABASE__POOL__MAX_CONNECTIONS", "0")])).unwrap_err();
+    match err {
+        ConfigError::Invalid(message) => {
+            assert!(message.contains("database.pool.max_connections"), "message must name the key: {message}");
+            assert!(message.contains("unset"), "message must point at the dialect default: {message}");
+        }
+        other => panic!("expected Invalid, got: {other}"),
+    }
+}
+
 // --- summary & masking ---
 
 #[test]

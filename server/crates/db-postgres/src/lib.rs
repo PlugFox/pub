@@ -40,7 +40,10 @@ impl PostgresDb {
             .ok_or_else(|| Error::Config { message: "database.kind = postgres requires database.url".to_owned() })?;
 
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(cfg.pool_max_connections())
+            .acquire_timeout(cfg.pool_acquire_timeout())
+            .idle_timeout(Some(cfg.pool_idle_timeout()))
+            .max_lifetime(Some(cfg.pool_max_lifetime()))
             .connect_lazy(url)
             .map_err(|err| Error::Database { message: format!("invalid postgres url: {err}") })?;
 
@@ -77,29 +80,55 @@ impl PostgresDb {
 mod tests {
     use super::*;
 
+    fn lazy_cfg() -> DatabaseConfig {
+        DatabaseConfig {
+            kind: DatabaseKind::Postgres,
+            // Port 1 is never reachable — lazy construction must still succeed.
+            url: Some("postgres://pub:pub@127.0.0.1:1/pub".to_owned()),
+            path: String::new(),
+            ..Default::default()
+        }
+    }
+
     // Pool construction spawns sqlx's reaper task, so a runtime must be present — but no
     // network I/O happens.
     #[tokio::test]
     async fn connect_lazy_builds_pool_without_io() {
-        let cfg = DatabaseConfig {
-            kind: DatabaseKind::Postgres,
-            url: Some("postgres://pub:pub@127.0.0.1:1/pub".to_owned()),
-            path: String::new(),
-        };
-        // Port 1 is never reachable — lazy construction must still succeed.
-        PostgresDb::connect_lazy(&cfg).unwrap();
+        PostgresDb::connect_lazy(&lazy_cfg()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_settings_from_config_are_applied_without_io() {
+        let mut cfg = lazy_cfg();
+        cfg.pool.max_connections = Some(7);
+        cfg.pool.acquire_timeout_secs = 3;
+        cfg.pool.idle_timeout_secs = 60;
+        cfg.pool.max_lifetime_secs = 90;
+        let db = PostgresDb::connect_lazy(&cfg).unwrap();
+        let options = db.pool().options();
+        assert_eq!(options.get_max_connections(), 7);
+        assert_eq!(options.get_acquire_timeout(), std::time::Duration::from_secs(3));
+        assert_eq!(options.get_idle_timeout(), Some(std::time::Duration::from_secs(60)));
+        assert_eq!(options.get_max_lifetime(), Some(std::time::Duration::from_secs(90)));
+    }
+
+    #[tokio::test]
+    async fn unset_pool_ceiling_resolves_to_the_postgres_default() {
+        let db = PostgresDb::connect_lazy(&lazy_cfg()).unwrap();
+        assert_eq!(db.pool().options().get_max_connections(), DatabaseConfig::POSTGRES_DEFAULT_MAX_CONNECTIONS);
     }
 
     #[test]
     fn connect_lazy_requires_url() {
-        let cfg = DatabaseConfig { kind: DatabaseKind::Postgres, url: None, path: String::new() };
+        let cfg = DatabaseConfig { kind: DatabaseKind::Postgres, url: None, path: String::new(), ..Default::default() };
         let err = PostgresDb::connect_lazy(&cfg).unwrap_err();
         assert_eq!(err.code(), "config_invalid");
     }
 
     #[test]
     fn connect_lazy_rejects_wrong_kind() {
-        let cfg = DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() };
+        let cfg =
+            DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
         let err = PostgresDb::connect_lazy(&cfg).unwrap_err();
         assert_eq!(err.code(), "config_invalid");
     }

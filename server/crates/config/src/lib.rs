@@ -469,6 +469,8 @@ pub struct DatabaseConfig {
     pub url: Option<String>,
     /// Database file path for `sqlite` (`:memory:` for an in-memory database).
     pub path: String,
+    /// Connection-pool tuning, applied to whichever backend `kind` selects.
+    pub pool: DbPoolConfig,
 }
 
 impl std::fmt::Debug for DatabaseConfig {
@@ -477,13 +479,77 @@ impl std::fmt::Debug for DatabaseConfig {
             .field("kind", &self.kind)
             .field("url", &self.url.as_deref().map(mask_url))
             .field("path", &self.path)
+            .field("pool", &self.pool)
             .finish()
     }
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        Self { kind: DatabaseKind::Sqlite, url: None, path: "data/pub.sqlite3".to_owned() }
+        Self {
+            kind: DatabaseKind::Sqlite,
+            url: None,
+            path: "data/pub.sqlite3".to_owned(),
+            pool: DbPoolConfig::default(),
+        }
+    }
+}
+
+/// Connection-pool tuning shared by both database backends.
+///
+/// The timeout defaults are sqlx's own, restated here so they are visible, configurable, and
+/// validated instead of inherited silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DbPoolConfig {
+    /// Maximum open connections. Unset picks the dialect default — 5 for SQLite, where a
+    /// single writer serializes every write and connections beyond "the readers plus the
+    /// writer" only queue on the write lock, and 10 for PostgreSQL, which multiplexes
+    /// connections server-side. (`:memory:` SQLite is always pinned to one connection: each
+    /// connection would otherwise be its own private database.)
+    pub max_connections: Option<u32>,
+    /// Seconds a request waits for a free connection before the acquire fails.
+    pub acquire_timeout_secs: u64,
+    /// Seconds an idle connection is kept open before being closed.
+    pub idle_timeout_secs: u64,
+    /// Seconds a connection may live in total before being recycled.
+    pub max_lifetime_secs: u64,
+}
+
+impl Default for DbPoolConfig {
+    fn default() -> Self {
+        Self { max_connections: None, acquire_timeout_secs: 30, idle_timeout_secs: 600, max_lifetime_secs: 1800 }
+    }
+}
+
+impl DatabaseConfig {
+    /// Default pool ceiling for SQLite: one writer plus a few readers — anything larger only
+    /// queues on SQLite's single write lock while holding a page cache each.
+    pub const SQLITE_DEFAULT_MAX_CONNECTIONS: u32 = 5;
+    /// Default pool ceiling for PostgreSQL (sqlx's own default).
+    pub const POSTGRES_DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
+    /// Effective pool ceiling: the configured value, or the dialect default.
+    pub fn pool_max_connections(&self) -> u32 {
+        self.pool.max_connections.unwrap_or(match self.kind {
+            DatabaseKind::Sqlite => Self::SQLITE_DEFAULT_MAX_CONNECTIONS,
+            DatabaseKind::Postgres => Self::POSTGRES_DEFAULT_MAX_CONNECTIONS,
+        })
+    }
+
+    /// How long a request waits for a free connection before the acquire fails.
+    pub fn pool_acquire_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.pool.acquire_timeout_secs)
+    }
+
+    /// How long an idle connection is kept open before being closed.
+    pub fn pool_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.pool.idle_timeout_secs)
+    }
+
+    /// How long a connection may live in total before being recycled.
+    pub fn pool_max_lifetime(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.pool.max_lifetime_secs)
     }
 }
 
@@ -1104,6 +1170,14 @@ impl Settings {
                 let _ = writeln!(out, "  database.url         = {url}");
             }
         }
+        let _ = writeln!(
+            out,
+            "  database.pool        = max {}, acquire {}s, idle {}s, lifetime {}s",
+            self.database.pool_max_connections(),
+            self.database.pool.acquire_timeout_secs,
+            self.database.pool.idle_timeout_secs,
+            self.database.pool.max_lifetime_secs
+        );
         let _ = writeln!(out, "  blob.kind            = {}", self.blob.kind.as_str());
         match self.blob.kind {
             BlobKind::Fs => {

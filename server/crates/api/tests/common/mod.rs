@@ -215,7 +215,12 @@ impl TestApp {
     pub async fn with_options(mut options: TestOptions) -> Self {
         let job_factory = options.jobs.take();
         let mut settings = Settings {
-            database: DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() },
+            database: DatabaseConfig {
+                kind: DatabaseKind::Sqlite,
+                url: None,
+                path: ":memory:".to_owned(),
+                ..Default::default()
+            },
             ..Settings::default()
         };
         settings.blob.kind = BlobKind::Memory;

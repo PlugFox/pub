@@ -50,6 +50,7 @@ impl Harness {
             kind: pub_config::DatabaseKind::Sqlite,
             url: None,
             path: ":memory:".to_owned(),
+            ..Default::default()
         };
         let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
         db.run_migrations().await.expect("migrate");

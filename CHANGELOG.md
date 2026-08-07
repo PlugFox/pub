@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-08-07 — SQLite fit for the default deployment, configurable DB pools
+
+Roadmap Phase 1.4, closing debt items D4 and D24. The documented `docker run` minimum runs on a SQLite file, and that file now gets the write-concurrency posture a production default needs; both database backends stop hard-coding their pool.
+
+**WAL, `synchronous = NORMAL`, and an explicit busy timeout.** File-backed SQLite databases now open in WAL mode: readers stop blocking the writer (and vice versa), so concurrent write transactions queue on the WAL write lock and resolve within the 5 s busy timeout instead of surfacing `SQLITE_BUSY` as a 500 (D4). `synchronous` drops from FULL to NORMAL — in WAL mode NORMAL still guarantees a consistent database after a crash; FULL would only buy back the last-committed-transactions tail with an fsync per commit paid by the single writer. Foreign keys stay explicitly on. `:memory:` databases keep their single pinned connection and are now exempt from idle/lifetime reaping, because closing that sole connection would drop the database itself.
+
+**The pool is configuration, not a constant.** A new `[database.pool]` section (`PUB_DATABASE__POOL__*`) tunes both dialects: `max_connections` (unset = per-dialect default — 5 for SQLite, where connections beyond "readers + the writer" only queue on the write lock; 10 for PostgreSQL), `acquire_timeout_secs` (30), `idle_timeout_secs` (600), and `max_lifetime_secs` (1800) — the timeout defaults are sqlx's own, restated so they are visible, validated, and tunable (D24). Zero values and a lifetime below the idle timeout are startup errors with messages that name the key and the fix; the effective pool is listed in the startup summary.
+
+### Added
+
+- (server) **`[database.pool]` config section** ([config](server/crates/config/src/lib.rs)): `max_connections`, `acquire_timeout_secs`, `idle_timeout_secs`, `max_lifetime_secs`, applied to whichever backend `database.kind` selects, with per-dialect ceiling defaults, fail-fast validation, and a `database.pool` line in the effective-config summary.
+- (server) Concurrency tests over a real file-backed SQLite database ([db-sqlite](server/crates/db-sqlite/src/lib.rs)): four writers committing in parallel never see `SQLITE_BUSY`, and writers proceed while a read transaction stays open — the second one fails within the busy timeout if WAL is ever switched off.
+
+### Changed
+
+- (server) **File-backed SQLite runs WAL with `synchronous = NORMAL` and a 5 s busy timeout** ([db-sqlite](server/crates/db-sqlite/src/lib.rs)); `:memory:` keeps one pinned connection and is never reaped. Both [db-sqlite](server/crates/db-sqlite/src/lib.rs) and [db-postgres](server/crates/db-postgres/src/lib.rs) build their pools from `database.pool` instead of a hard-coded 5-connection pool — the PostgreSQL default ceiling rises to 10.
+
 ## 2026-08-07 — roadmap
 
 ### Added

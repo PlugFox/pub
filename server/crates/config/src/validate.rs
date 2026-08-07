@@ -18,6 +18,7 @@ impl Settings {
         if self.database.kind == DatabaseKind::Sqlite && self.database.path.is_empty() {
             return Err(invalid("database.kind = sqlite requires a non-empty database.path"));
         }
+        self.validate_database_pool()?;
 
         if self.blob.kind == BlobKind::S3 && self.blob.bucket.is_none() {
             return Err(invalid("blob.kind = s3 requires blob.bucket"));
@@ -49,6 +50,40 @@ impl Settings {
         self.validate_upstream()?;
         self.validate_jobs()?;
         self.validate_realtime()?;
+        Ok(())
+    }
+
+    /// Connection-pool invariants: every knob is a positive quantity, and the knobs must
+    /// compose into a pool that can actually serve requests.
+    fn validate_database_pool(&self) -> Result<(), ConfigError> {
+        let pool = &self.database.pool;
+        if pool.max_connections == Some(0) {
+            // A zero-connection pool would time out every single query while looking like a
+            // configured limit; "use the dialect default" is expressed by leaving it unset.
+            return Err(invalid(
+                "database.pool.max_connections must be at least 1; leave it unset for the dialect default \
+                 (5 for sqlite, 10 for postgres)",
+            ));
+        }
+        if pool.acquire_timeout_secs == 0 {
+            // Zero would fail every acquire the moment the pool is saturated instead of
+            // queueing — an outage dressed as a timeout setting.
+            return Err(invalid("database.pool.acquire_timeout_secs must be greater than 0"));
+        }
+        if pool.idle_timeout_secs == 0 || pool.max_lifetime_secs == 0 {
+            // Zero would close a connection the instant it goes idle / is created, turning
+            // every request into a fresh connect (and, for SQLite, a fresh page cache).
+            return Err(invalid(
+                "database.pool.idle_timeout_secs and database.pool.max_lifetime_secs must be greater than 0",
+            ));
+        }
+        if pool.max_lifetime_secs < pool.idle_timeout_secs {
+            return Err(invalid(format!(
+                "database.pool.max_lifetime_secs ({}) must be at least database.pool.idle_timeout_secs ({}): \
+                 connections are recycled at end-of-life, so a longer idle timeout could never fire",
+                pool.max_lifetime_secs, pool.idle_timeout_secs
+            )));
+        }
         Ok(())
     }
 

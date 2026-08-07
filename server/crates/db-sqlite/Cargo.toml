@@ -15,4 +15,5 @@ serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true }

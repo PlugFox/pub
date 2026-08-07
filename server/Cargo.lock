@@ -2648,6 +2648,7 @@ dependencies = [
  "pub-core",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
 ]
 

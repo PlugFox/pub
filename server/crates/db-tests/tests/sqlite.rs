@@ -7,7 +7,8 @@ use pub_core::traits::Repositories;
 use pub_db_sqlite::SqliteDb;
 
 async fn fresh_repos() -> Repositories {
-    let cfg = DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() };
+    let cfg =
+        DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
     let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
     db.run_migrations().await.expect("migrate");
     db.repositories()

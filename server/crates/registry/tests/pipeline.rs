@@ -117,7 +117,8 @@ impl Harness {
     }
 
     async fn with_policy(policy: RegistryPolicy) -> Self {
-        let cfg = DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() };
+        let cfg =
+            DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
         let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
         db.run_migrations().await.expect("migrate");
         let repos = db.repositories();
