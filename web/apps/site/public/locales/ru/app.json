@@ -317,12 +317,32 @@
     "many": "Роль обновлена, завершено {count} сеансов.",
     "other": "Роль обновлена, завершено {count} сеанса."
   },
+  "app.orgMemberTokensRevoked": {
+    "one": "{count} токен доступа перестал соответствовать новой роли и был отозван.",
+    "few": "{count} токена доступа перестали соответствовать новой роли и были отозваны.",
+    "many": "{count} токенов доступа перестали соответствовать новой роли и были отозваны.",
+    "other": "{count} токена доступа перестали соответствовать новой роли и были отозваны."
+  },
+  "app.orgMemberTokensRevokedRemoved": {
+    "one": "{count} токен доступа к организации был отозван, так как участник удалён.",
+    "few": "{count} токена доступа к организации были отозваны, так как участник удалён.",
+    "many": "{count} токенов доступа к организации были отозваны, так как участник удалён.",
+    "other": "{count} токена доступа к организации были отозваны, так как участник удалён."
+  },
+  "app.orgRoleChangeConfirmTitle": "Подтвердите смену роли",
+  "app.orgRoleChangeConfirmBody": "Роль участника {name} изменится с {from} на {to}.",
+  "app.orgRoleChangeConfirmAction": "Сменить роль",
+  "app.orgRoleGrantWarning": "Роли Admin и Owner управляют участниками, токенами и настройками организации — выдавайте их осознанно.",
+  "app.orgRoleDemoteWarning": "Понижение лишит участника прав управления и завершит все его сеансы.",
   "app.orgMemberRemoveTitle": "Удалить участника",
-  "app.orgMemberRemoveBody": "{name} потеряет доступ к пакетам организации, и её сеансы будут завершены.",
+  "app.orgMemberRemoveBody": "{name} потеряет доступ к пакетам организации, а все сеансы участника будут завершены.",
+  "app.orgMemberRemovePrivilegedWarning": "У этого участника роль {role} — вместе с ним будут удалены и его права управления.",
   "app.orgMemberRemoved": "Участник удалён.",
   "app.orgInvitationsTitle": "Приглашения",
   "app.orgInvitationsEmpty": "Приглашений нет",
   "app.orgInviteAction": "Пригласить",
+  "app.orgInviteConfirmTitle": "Подтвердите приглашение",
+  "app.orgInviteConfirmBody": "Приглашение для {email} с ролью {role} — роль вступит в силу сразу после его принятия.",
   "app.orgInviteStatus": "Статус",
   "app.orgInviteExpires": "Истекает",
   "app.orgInviteSent": "Приглашение создано.",

@@ -90,6 +90,18 @@ export type InvitationCreatedDto = Schemas["InvitationCreatedDto"];
 const ROLE_RANK: Record<string, number> = { read: 50, write: 100, admin: 200, owner: 250 };
 
 /**
+ * Numeric rank of a role name; unknown or absent names rank 0.
+ *
+ * A DISPLAY decision only, like `roleAtLeast` below: comparisons built on it
+ * hide affordances the server would refuse anyway, so an unknown future role
+ * ranking 0 costs a hidden control, never an escalation.
+ */
+export function roleRank(role: string | null | undefined): number {
+  if (role === null || role === undefined) return 0;
+  return ROLE_RANK[role] ?? 0;
+}
+
+/**
  * Whether `role` is at least `required`.
  *
  * A DISPLAY decision only: it hides management affordances the server would
@@ -98,8 +110,7 @@ const ROLE_RANK: Record<string, number> = { read: 50, write: 100, admin: 200, ow
  * button, never an escalation.
  */
 export function roleAtLeast(role: string | null | undefined, required: OrgRole): boolean {
-  if (role === null || role === undefined) return false;
-  return (ROLE_RANK[role] ?? 0) >= ROLE_RANK[required];
+  return roleRank(role) >= ROLE_RANK[required];
 }
 
 // --- packages: read model (decision 11) ---

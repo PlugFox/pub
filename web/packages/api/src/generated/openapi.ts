@@ -618,7 +618,10 @@ export interface paths {
         /** The org's members (Admin+). */
         get: operations["list_get_api_v1_orgs_slug_members"];
         put?: never;
-        /** Adds an existing account as a member (Admin+; step-up for Write and above). */
+        /**
+         * Adds an existing account as a member (Admin+; step-up for Write and above; the granted
+         *     level must sit below the caller's own unless the caller is an Owner — D39).
+         */
         post: operations["add"];
         delete?: never;
         options?: never;
@@ -636,12 +639,18 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Removes a member (Admin+). Their sessions are revoked (S-09). */
+        /**
+         * Removes a member (Admin+; the target's level must sit below a non-Owner caller's own —
+         *     D39). Their sessions are revoked (S-09) along with every CLI token they held in this org
+         *     (D37).
+         */
         delete: operations["remove"];
         options?: never;
         head?: never;
         /**
-         * Changes a member's role (Admin+; step-up when either the old or the new level is Write+).
+         * Changes a member's role (Admin+; step-up when either the old or the new level is Write+;
+         *     both the target's current level and the new one must sit below a non-Owner caller's own —
+         *     D39).
          * @description The gate covers **demotions from** Write+ as well as promotions **to** it: taking somebody's
          *     publish rights away is exactly as consequential as granting them, and a stolen stale admin
          *     session must not be able to lock the real owners out.
@@ -1497,7 +1506,11 @@ export interface components {
             checks: components["schemas"]["Checks"];
             /** @description `"ok"` when every configured backend responds, `"degraded"` otherwise. */
             status: string;
-            /** @description Server version (crate version; git metadata is in `pubd --version`). */
+            /**
+             * @description Server version: the release version injected from the git tag at build time
+             *     (decision 18), or the crate version marked `+dev` for non-release builds.
+             *     Git metadata is in `pubd --version`.
+             */
             version: string;
         };
         /** @description Response of `GET /api/v1/home`. */
@@ -1726,6 +1739,13 @@ export interface components {
              *     pure grant, which cannot be spent by a token issued before it.
              */
             sessions_revoked: number;
+            /**
+             * Format: int64
+             * @description How many of the affected user's CLI tokens **in this org** the change revoked
+             *     (decision 13 addendum, D37): those whose scopes exceed a lowered level, every one of
+             *     them on a removal, none on a grant or a raise.
+             */
+            tokens_revoked: number;
         };
         /**
          * @description Body of `POST /api/v1/auth/totp/verify` — exactly one of the two fields.
@@ -2418,6 +2438,13 @@ export interface components {
                  *     pure grant, which cannot be spent by a token issued before it.
                  */
                 sessions_revoked: number;
+                /**
+                 * Format: int64
+                 * @description How many of the affected user's CLI tokens **in this org** the change revoked
+                 *     (decision 13 addendum, D37): those whose scopes exceed a lowered level, every one of
+                 *     them on a removal, none on a grant or a raise.
+                 */
+                tokens_revoked: number;
             };
             /** @description Always `"ok"`. */
             status: string;
@@ -4971,7 +4998,7 @@ export interface operations {
                     "application/json": components["schemas"]["OkEnvelope_InvitationCreatedDto"];
                 };
             };
-            /** @description Below Admin, step_up_required, or a domain the S-31 allowlist rejects */
+            /** @description Below Admin, a role at or above the caller's ceiling (D39), step_up_required, or a domain the S-31 allowlist rejects */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5118,7 +5145,7 @@ export interface operations {
                     "application/json": components["schemas"]["OkEnvelope_MemberDto"];
                 };
             };
-            /** @description Below Admin, or step_up_required for a Write+ grant */
+            /** @description Below Admin, a grant at or above the caller's ceiling (D39), or step_up_required for a Write+ grant */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5161,7 +5188,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Member removed; their sessions were revoked (S-09) */
+            /** @description Member removed; their sessions (S-09) and their CLI tokens in this org (D37) were revoked */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5170,7 +5197,7 @@ export interface operations {
                     "application/json": components["schemas"]["OkEnvelope_MembershipChangedDto"];
                 };
             };
-            /** @description Below Admin in this org */
+            /** @description Below Admin, or a target at or above the caller's ceiling (D39) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5217,7 +5244,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Role changed; the member's sessions were revoked (S-09) */
+            /** @description Role changed; the member's sessions were revoked (S-09) along with any org tokens the new level can no longer mint (D37) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5226,7 +5253,7 @@ export interface operations {
                     "application/json": components["schemas"]["OkEnvelope_MembershipChangedDto"];
                 };
             };
-            /** @description Below Admin, or step_up_required */
+            /** @description Below Admin, a level at or above the caller's ceiling (D39), or step_up_required */
             403: {
                 headers: {
                     [name: string]: unknown;

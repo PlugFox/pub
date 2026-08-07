@@ -1,5 +1,5 @@
 import type { InvitationDto, MemberDto, OrgRole } from "@pub/api/types";
-import { ORG_ROLES, roleAtLeast, UPSTREAM_POLICIES } from "@pub/api/types";
+import { roleAtLeast, UPSTREAM_POLICIES } from "@pub/api/types";
 import { t, tp } from "@pub/i18n";
 import { app } from "@pub/i18n/generated/app";
 import { Alert } from "@pub/ui/alert";
@@ -15,13 +15,21 @@ import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } fro
 import { A, createAsync, query, revalidate, useParams } from "@solidjs/router";
 import { createSignal, For, type JSX, Show } from "solid-js";
 import { formatDate } from "../format";
+import {
+  assignableRoles,
+  canManageMember,
+  inviteNeedsWarning,
+  isPrivilegedDemotion,
+  removalNeedsWarning,
+  roleChangeNeedsWarning,
+} from "../org-roles";
 import { api, describeError, withStepUp } from "../state/api";
 import { pushToast } from "../state/toast-store";
 
 /*
  * Organization management: profile, members, invitations (Admin+).
  *
- * Three server rules this screen exists to make visible rather than to
+ * Four server rules this screen exists to make visible rather than to
  * discover through errors:
  *
  *   - **The slug is not editable.** It IS the virtual registry base
@@ -33,6 +41,13 @@ import { pushToast } from "../state/toast-store";
  *     REVOKES the affected user's sessions (S-09) — the response says how
  *     many, and the toast repeats it, because "why was I signed out" deserves
  *     an answer on both ends.
+ *   - **A non-Owner manages only levels strictly below their own** (decision
+ *     19's role-grant ceiling, D39): the pickers offer only roles the caller
+ *     may grant, and a member at or above the caller's level renders as a
+ *     read-only row — the select and the Remove button are gone, mirroring
+ *     the 403 the server would answer. On top of that, Admin/Owner
+ *     transitions (granting either, demoting or removing a holder of either)
+ *     confirm through a dialog before the mutation fires.
  *   - **An invitation token is shown once.** It is mailed too, but an instance
  *     with no SMTP configured has no other delivery channel, so the panel
  *     stays until dismissed.
@@ -129,11 +144,26 @@ function ProfileCard(props: { readonly slug: string }): JSX.Element {
   );
 }
 
-function MembersCard(props: { readonly slug: string }): JSX.Element {
+function MembersCard(props: {
+  readonly slug: string;
+  readonly role: string | null | undefined;
+}): JSX.Element {
   const members = createAsync(() => membersQuery(props.slug));
   const [busyId, setBusyId] = createSignal<string | null>(null);
   const [pendingRemove, setPendingRemove] = createSignal<MemberDto | null>(null);
+  const [pendingChange, setPendingChange] = createSignal<{
+    readonly member: MemberDto;
+    readonly to: OrgRole;
+  } | null>(null);
   const rows = (): readonly MemberDto[] => members()?.items ?? [];
+
+  // The current role joins the ceiling-limited options when it is outside them
+  // (a future role name this build does not know), so the select keeps telling
+  // the truth about what the member holds today.
+  const roleOptions = (member: MemberDto): readonly string[] => {
+    const grantable = assignableRoles(props.role);
+    return grantable.some((role) => role === member.role) ? grantable : [member.role, ...grantable];
+  };
 
   const changeRole = async (member: MemberDto, role: OrgRole): Promise<void> => {
     if (busyId() !== null || member.role === role) return;
@@ -148,9 +178,17 @@ function MembersCard(props: { readonly slug: string }): JSX.Element {
           : t(app.orgMemberRoleChanged),
         "success",
       );
+      if (result.tokens_revoked > 0) {
+        pushToast(tp(app.orgMemberTokensRevoked, result.tokens_revoked));
+      }
+      setPendingChange(null);
       await revalidate("org-manage-members");
     } catch (error) {
       pushToast(describeError(error), "danger");
+      // Resynchronize the row: Solid will not repaint a select whose bound
+      // member.role did not change, and the snap-back above may have raced a
+      // dialog-confirmed change that the server then refused.
+      await revalidate("org-manage-members");
     } finally {
       setBusyId(null);
     }
@@ -161,8 +199,11 @@ function MembersCard(props: { readonly slug: string }): JSX.Element {
     if (member === null || busyId() !== null) return;
     setBusyId(member.user_id);
     try {
-      await withStepUp(() => api.orgs.removeMember(props.slug, member.user_id));
+      const result = await withStepUp(() => api.orgs.removeMember(props.slug, member.user_id));
       pushToast(t(app.orgMemberRemoved), "success");
+      if (result.tokens_revoked > 0) {
+        pushToast(tp(app.orgMemberTokensRevokedRemoved, result.tokens_revoked));
+      }
       setPendingRemove(null);
       await revalidate("org-manage-members");
     } catch (error) {
@@ -197,27 +238,48 @@ function MembersCard(props: { readonly slug: string }): JSX.Element {
                     {member.email ?? "—"}
                   </TableCell>
                   <TableCell>
-                    <select
-                      value={member.role}
-                      aria-label={t(app.orgsRole)}
-                      disabled={busyId() === member.user_id}
-                      onChange={(event) =>
-                        void changeRole(member, event.currentTarget.value as OrgRole)
-                      }
-                      class="h-8 rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
+                    <Show
+                      when={canManageMember(props.role, member.role)}
+                      fallback={<span>{member.role}</span>}
                     >
-                      <For each={ORG_ROLES}>{(role) => <option value={role}>{role}</option>}</For>
-                    </select>
+                      <select
+                        value={member.role}
+                        aria-label={t(app.orgsRole)}
+                        disabled={busyId() === member.user_id}
+                        onChange={(event) => {
+                          const to = event.currentTarget.value as OrgRole;
+                          // The row shows server truth only. Snap the select back
+                          // BEFORE anything else: a successful change repaints the
+                          // real role via revalidate("org-manage-members"), while a
+                          // failed request, a busy-skipped pick, or a cancelled
+                          // dialog leaves no phantom role on screen.
+                          event.currentTarget.value = member.role;
+                          if (to === member.role) return;
+                          if (roleChangeNeedsWarning(member.role, to)) {
+                            setPendingChange({ member, to });
+                          } else {
+                            void changeRole(member, to);
+                          }
+                        }}
+                        class="h-8 rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
+                      >
+                        <For each={roleOptions(member)}>
+                          {(role) => <option value={role}>{role}</option>}
+                        </For>
+                      </select>
+                    </Show>
                   </TableCell>
                   <TableCell class="text-right">
-                    <Button
-                      intent="ghost"
-                      size="sm"
-                      disabled={busyId() === member.user_id}
-                      onClick={() => setPendingRemove(member)}
-                    >
-                      {t(app.remove)}
-                    </Button>
+                    <Show when={canManageMember(props.role, member.role)}>
+                      <Button
+                        intent="ghost"
+                        size="sm"
+                        disabled={busyId() === member.user_id}
+                        onClick={() => setPendingRemove(member)}
+                      >
+                        {t(app.remove)}
+                      </Button>
+                    </Show>
                   </TableCell>
                 </TableRow>
               )}
@@ -235,6 +297,11 @@ function MembersCard(props: { readonly slug: string }): JSX.Element {
           <DialogDescription>
             {t(app.orgMemberRemoveBody, { name: pendingRemove()?.display_name ?? "" })}
           </DialogDescription>
+          <Show when={removalNeedsWarning(pendingRemove()?.role)}>
+            <Alert intent="warning">
+              {t(app.orgMemberRemovePrivilegedWarning, { role: pendingRemove()?.role ?? "" })}
+            </Alert>
+          </Show>
           <div class="flex justify-end gap-3">
             <Button intent="ghost" onClick={() => setPendingRemove(null)}>
               {t(app.cancel)}
@@ -245,26 +312,70 @@ function MembersCard(props: { readonly slug: string }): JSX.Element {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* Opens only for the warn-worthy transitions of decision 19's ceiling
+          addendum: granting Admin/Owner, or demoting a holder of either. */}
+      <Dialog
+        open={pendingChange() !== null}
+        onOpenChange={(open) => !open && setPendingChange(null)}
+      >
+        <DialogContent>
+          <DialogTitle>{t(app.orgRoleChangeConfirmTitle)}</DialogTitle>
+          <DialogDescription>
+            {t(app.orgRoleChangeConfirmBody, {
+              name: pendingChange()?.member.display_name ?? "",
+              from: pendingChange()?.member.role ?? "",
+              to: pendingChange()?.to ?? "",
+            })}
+          </DialogDescription>
+          <Alert intent="warning">
+            {isPrivilegedDemotion(pendingChange()?.member.role, pendingChange()?.to)
+              ? t(app.orgRoleDemoteWarning)
+              : t(app.orgRoleGrantWarning)}
+          </Alert>
+          <div class="flex justify-end gap-3">
+            <Button intent="ghost" onClick={() => setPendingChange(null)}>
+              {t(app.cancel)}
+            </Button>
+            <Button
+              intent="danger"
+              onClick={() => {
+                const pending = pendingChange();
+                if (pending !== null) void changeRole(pending.member, pending.to);
+              }}
+            >
+              {t(app.orgRoleChangeConfirmAction)}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }
 
-function InvitationsCard(props: { readonly slug: string }): JSX.Element {
+function InvitationsCard(props: {
+  readonly slug: string;
+  readonly role: string | null | undefined;
+}): JSX.Element {
   const invitations = createAsync(() => invitationsQuery(props.slug));
   const [email, setEmail] = createSignal("");
   const [role, setRole] = createSignal<OrgRole>("read");
   const [busy, setBusy] = createSignal(false);
   const [token, setToken] = createSignal<string | null>(null);
+  const [pendingInvite, setPendingInvite] = createSignal<{
+    readonly email: string;
+    readonly role: OrgRole;
+  } | null>(null);
   const rows = (): readonly InvitationDto[] => invitations()?.items ?? [];
 
-  const invite = async (event: Event): Promise<void> => {
-    event.preventDefault();
-    if (busy() || email().trim() === "") return;
+  const sendInvite = async (address: string, invited: OrgRole): Promise<void> => {
+    if (busy()) return;
     setBusy(true);
     try {
-      const created = await withStepUp(() => api.orgs.invite(props.slug, email().trim(), role()));
+      const created = await withStepUp(() => api.orgs.invite(props.slug, address, invited));
       setToken(created.token);
       setEmail("");
+      setPendingInvite(null);
       pushToast(t(app.orgInviteSent), "success");
       await revalidate("org-invitations");
     } catch (error) {
@@ -274,13 +385,30 @@ function InvitationsCard(props: { readonly slug: string }): JSX.Element {
     }
   };
 
+  const invite = (event: Event): void => {
+    event.preventDefault();
+    const address = email().trim();
+    if (busy() || address === "") return;
+    // An Admin/Owner invitation grants the role the moment it is accepted, so
+    // it confirms through the same dialog tier as a direct grant (D39).
+    if (inviteNeedsWarning(role())) {
+      setPendingInvite({ email: address, role: role() });
+    } else {
+      void sendInvite(address, role());
+    }
+  };
+
   const revoke = async (invitation: InvitationDto): Promise<void> => {
+    if (busy()) return;
+    setBusy(true);
     try {
-      await api.orgs.revokeInvitation(props.slug, invitation.id);
+      await withStepUp(() => api.orgs.revokeInvitation(props.slug, invitation.id));
       pushToast(t(app.orgInviteRevoked), "success");
       await revalidate("org-invitations");
     } catch (error) {
       pushToast(describeError(error), "danger");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -310,7 +438,7 @@ function InvitationsCard(props: { readonly slug: string }): JSX.Element {
         )}
       </Show>
 
-      <form class="flex flex-wrap items-end gap-3" onSubmit={(event) => void invite(event)}>
+      <form class="flex flex-wrap items-end gap-3" onSubmit={invite}>
         <div class="grid min-w-56 flex-1 gap-1.5">
           <Label for="invite-email">{t(app.accountEmail)}</Label>
           <Input
@@ -328,13 +456,46 @@ function InvitationsCard(props: { readonly slug: string }): JSX.Element {
             onChange={(event) => setRole(event.currentTarget.value as OrgRole)}
             class="h-10 rounded-md border border-line bg-surface px-3 text-sm text-ink outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
           >
-            <For each={ORG_ROLES}>{(value) => <option value={value}>{value}</option>}</For>
+            <For each={assignableRoles(props.role)}>
+              {(value) => <option value={value}>{value}</option>}
+            </For>
           </select>
         </div>
         <Button type="submit" disabled={busy()}>
           {t(app.orgInviteAction)}
         </Button>
       </form>
+
+      {/* Same warning tier as a direct Admin/Owner grant (D39). */}
+      <Dialog
+        open={pendingInvite() !== null}
+        onOpenChange={(open) => !open && setPendingInvite(null)}
+      >
+        <DialogContent>
+          <DialogTitle>{t(app.orgInviteConfirmTitle)}</DialogTitle>
+          <DialogDescription>
+            {t(app.orgInviteConfirmBody, {
+              email: pendingInvite()?.email ?? "",
+              role: pendingInvite()?.role ?? "",
+            })}
+          </DialogDescription>
+          <Alert intent="warning">{t(app.orgRoleGrantWarning)}</Alert>
+          <div class="flex justify-end gap-3">
+            <Button intent="ghost" onClick={() => setPendingInvite(null)}>
+              {t(app.cancel)}
+            </Button>
+            <Button
+              intent="danger"
+              onClick={() => {
+                const pending = pendingInvite();
+                if (pending !== null) void sendInvite(pending.email, pending.role);
+              }}
+            >
+              {t(app.orgInviteAction)}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Show when={rows().length > 0} fallback={<EmptyState title={t(app.orgInvitationsEmpty)} />}>
         <Table label={t(app.orgInvitationsTitle)}>
@@ -365,7 +526,12 @@ function InvitationsCard(props: { readonly slug: string }): JSX.Element {
                   </TableCell>
                   <TableCell class="text-right">
                     <Show when={invitation.status === "pending"}>
-                      <Button intent="ghost" size="sm" onClick={() => void revoke(invitation)}>
+                      <Button
+                        intent="ghost"
+                        size="sm"
+                        disabled={busy()}
+                        onClick={() => void revoke(invitation)}
+                      >
                         {t(app.revoke)}
                       </Button>
                     </Show>
@@ -406,8 +572,8 @@ export function OrgManageScreen(): JSX.Element {
         fallback={<Alert intent="danger">{t(app.orgManageForbidden)}</Alert>}
       >
         <ProfileCard slug={params.slug} />
-        <MembersCard slug={params.slug} />
-        <InvitationsCard slug={params.slug} />
+        <MembersCard slug={params.slug} role={profile()?.role} />
+        <InvitationsCard slug={params.slug} role={profile()?.role} />
       </Show>
     </section>
   );

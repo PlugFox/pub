@@ -309,12 +309,28 @@
     "one": "Role updated; {count} session was ended.",
     "other": "Role updated; {count} sessions were ended."
   },
+  "app.orgMemberTokensRevoked": {
+    "one": "{count} access token no longer fit the new role and was revoked.",
+    "other": "{count} access tokens no longer fit the new role and were revoked."
+  },
+  "app.orgMemberTokensRevokedRemoved": {
+    "one": "{count} access token for this organization was revoked because the member was removed.",
+    "other": "{count} access tokens for this organization were revoked because the member was removed."
+  },
+  "app.orgRoleChangeConfirmTitle": "Confirm role change",
+  "app.orgRoleChangeConfirmBody": "This changes {name} from {from} to {to}.",
+  "app.orgRoleChangeConfirmAction": "Change role",
+  "app.orgRoleGrantWarning": "Admin and Owner manage this organization's members, tokens, and settings — grant them deliberately.",
+  "app.orgRoleDemoteWarning": "A demotion takes that management access away and signs the member out everywhere.",
   "app.orgMemberRemoveTitle": "Remove member",
   "app.orgMemberRemoveBody": "{name} loses access to this organization's packages and is signed out of it.",
+  "app.orgMemberRemovePrivilegedWarning": "This member holds the {role} role — removing them removes that management access too.",
   "app.orgMemberRemoved": "Member removed.",
   "app.orgInvitationsTitle": "Invitations",
   "app.orgInvitationsEmpty": "No invitations",
   "app.orgInviteAction": "Invite",
+  "app.orgInviteConfirmTitle": "Confirm invitation",
+  "app.orgInviteConfirmBody": "This invites {email} as {role}. The role takes effect the moment the invitation is accepted.",
   "app.orgInviteStatus": "Status",
   "app.orgInviteExpires": "Expires",
   "app.orgInviteSent": "Invitation created.",

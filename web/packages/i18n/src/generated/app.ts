@@ -598,18 +598,38 @@ export const app = {
   orgMemberRoleChanged: { id: "app.orgMemberRoleChanged", en: "Role updated." },
   /** Toast after a demotion that revoked sessions; {count} is how many sessions ended. */
   orgMemberRoleChangedRevoked: { id: "app.orgMemberRoleChangedRevoked", en: {"one":"Role updated; {count} session was ended.","other":"Role updated; {count} sessions were ended."} },
+  /** Follow-up toast after a role change that revoked CLI tokens which no longer fit the member's new role (decision 13's authority-change addendum); {count} is how many tokens were revoked. */
+  orgMemberTokensRevoked: { id: "app.orgMemberTokensRevoked", en: {"one":"{count} access token no longer fit the new role and was revoked.","other":"{count} access tokens no longer fit the new role and were revoked."} },
+  /** Follow-up toast after a member removal that revoked the member's CLI tokens scoped to this organization (decision 13's authority-change addendum); {count} is how many tokens were revoked. Unlike orgMemberTokensRevoked there is no new role — the member is gone. */
+  orgMemberTokensRevokedRemoved: { id: "app.orgMemberTokensRevokedRemoved", en: {"one":"{count} access token for this organization was revoked because the member was removed.","other":"{count} access tokens for this organization were revoked because the member was removed."} },
+  /** Title of the confirmation dialog shown before an Admin/Owner-level role change (decision 19's ceiling addendum). */
+  orgRoleChangeConfirmTitle: { id: "app.orgRoleChangeConfirmTitle", en: "Confirm role change" },
+  /** Body of the role-change confirmation dialog; {name} is the member's display name, {from} and {to} are role names. */
+  orgRoleChangeConfirmBody: { id: "app.orgRoleChangeConfirmBody", en: "This changes {name} from {from} to {to}." },
+  /** Confirming button of the role-change confirmation dialog. */
+  orgRoleChangeConfirmAction: { id: "app.orgRoleChangeConfirmAction", en: "Change role" },
+  /** Warning inside the role-change and invitation confirmation dialogs when Admin or Owner is being granted. */
+  orgRoleGrantWarning: { id: "app.orgRoleGrantWarning", en: "Admin and Owner manage this organization's members, tokens, and settings — grant them deliberately." },
+  /** Warning inside the role-change confirmation dialog when a current Admin or Owner is being demoted. */
+  orgRoleDemoteWarning: { id: "app.orgRoleDemoteWarning", en: "A demotion takes that management access away and signs the member out everywhere." },
   /** Title of the member removal confirmation dialog. */
   orgMemberRemoveTitle: { id: "app.orgMemberRemoveTitle", en: "Remove member" },
   /** Body of the member removal dialog; {name} is the member's display name. */
   orgMemberRemoveBody: { id: "app.orgMemberRemoveBody", en: "{name} loses access to this organization's packages and is signed out of it." },
+  /** Extra warning inside the member-removal dialog when the member holds Admin or Owner; {role} is the role name. */
+  orgMemberRemovePrivilegedWarning: { id: "app.orgMemberRemovePrivilegedWarning", en: "This member holds the {role} role — removing them removes that management access too." },
   /** Toast confirming that a member was removed. */
   orgMemberRemoved: { id: "app.orgMemberRemoved", en: "Member removed." },
   /** Heading of the invitation section on the organization management screen. */
   orgInvitationsTitle: { id: "app.orgInvitationsTitle", en: "Invitations" },
   /** Empty state of the invitation list. */
   orgInvitationsEmpty: { id: "app.orgInvitationsEmpty", en: "No invitations" },
-  /** Submit button of the invitation form. */
+  /** Submit button of the invitation form, and the confirming button of the invitation confirmation dialog. */
   orgInviteAction: { id: "app.orgInviteAction", en: "Invite" },
+  /** Title of the confirmation dialog shown before inviting somebody as Admin or Owner. */
+  orgInviteConfirmTitle: { id: "app.orgInviteConfirmTitle", en: "Confirm invitation" },
+  /** Body of the invitation confirmation dialog; {email} is the invitee address, {role} the role name. */
+  orgInviteConfirmBody: { id: "app.orgInviteConfirmBody", en: "This invites {email} as {role}. The role takes effect the moment the invitation is accepted." },
   /** Column header for an invitation's status. */
   orgInviteStatus: { id: "app.orgInviteStatus", en: "Status" },
   /** Column header for an invitation's expiry date. */
