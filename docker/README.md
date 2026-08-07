@@ -27,7 +27,10 @@ curl http://localhost:8080/healthz
 deployments, and `--out PATH` writes it `0600` (refusing to overwrite without `--force`).
 Dev-mode ephemeral fallbacks are an explicit opt-in: `-e PUB_SERVER__MODE=dev`. Bind
 mounts instead of a named volume: the directory must be writable by uid 1000. Full
-operator docs (reverse proxy, backup, key rotation) are a separate roadmap item.
+operator docs live in [docs/ops/](../docs/ops/README.md): [install](../docs/ops/install.md),
+[reverse proxy](../docs/ops/reverse-proxy.md), [backup/restore](../docs/ops/backup-restore.md),
+[upgrade](../docs/ops/upgrade.md), and the [security runbook](../docs/ops/security-runbook.md)
+(key rotation, break-glass, supply-chain alarms).
 
 ## Profiles
 

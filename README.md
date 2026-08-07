@@ -2,7 +2,7 @@
 
 Self-hosted, open-source package registry for Dart & Flutter — a private pub.dev with corporate-grade security. One binary for a laptop, a replicated cluster for an enterprise. *(Default product name: **Pub**; instances can rebrand via white-label settings.)*
 
-**Status: design phase.** Architecture and scope are documented; implementation follows the [roadmap](https://wiki.plugfox.dev/s/website-roadmap) (foundation first, registry features from step 8).
+**Status: pre-release.** The server, the embedded web app, and the operator docs exist and are verified against the real `dart pub` client; no release tag has been cut yet. State of the project and the plan forward: [docs/roadmap.md](docs/roadmap.md).
 
 ## Documentation
 
@@ -11,9 +11,10 @@ Self-hosted, open-source package registry for Dart & Flutter — a private pub.d
 | [docs/product.md](docs/product.md) | Vision, competitive landscape, feature triage (v1 / v1.1 / later) |
 | [docs/architecture.md](docs/architecture.md) | Workspaces, traits, data model, request planes, proxy pipeline, testing |
 | [docs/decisions.md](docs/decisions.md) | Architecture decision log with rationale |
-| [docs/security.md](docs/security.md) | Normative security requirements (S-01…S-30) |
+| [docs/security.md](docs/security.md) | Normative security requirements (S-01…S-33) |
 | [docs/protocol.md](docs/protocol.md) | Hosted Pub Repository Spec v2 — sharp edges we must honor |
 | [docs/roadmap.md](docs/roadmap.md) | State of the project, tech debt, and the plan forward |
+| [docs/ops/README.md](docs/ops/README.md) | Operator guide: install (Docker / compose / source), reverse proxy, backup & restore, upgrade, security runbook, token scanning |
 
 ## Shape of the thing
 
