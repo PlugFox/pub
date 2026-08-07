@@ -17,7 +17,7 @@ use pub_auth::jwt::Keyring;
 use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::{OsRandom, RandomSource as _};
 use pub_blob::ObjectStoreBlob;
-use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, MirrorModeConfig, Settings, SmtpSecurityMode};
+use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, MirrorModeConfig, Settings};
 use pub_core::Format;
 use pub_core::event::EventSink;
 use pub_core::session::SessionLimits;
@@ -32,7 +32,7 @@ use pub_jobs::{
     SchedulerHandle,
 };
 use pub_kv::{MemoryKv, RedisKv};
-use pub_mail::{InMemoryMailer, SmtpMailer, SmtpSecurity, SmtpSettings};
+use pub_mail::{BootSmtp, InMemoryMailer, RuntimeMailer, SmtpMailerBuilder};
 use pub_registry::upstream::http::{HttpUpstream, HttpUpstreamConfig};
 use pub_registry::{
     ArchiveLimits, DownloadRecorder, RegistryPolicy, RegistryService, UpstreamClient, UpstreamService,
@@ -94,7 +94,6 @@ async fn main() -> anyhow::Result<()> {
     let repos = build_database(&settings).await?;
     let blob = build_blob(&settings)?;
     let kv = build_kv(&settings)?;
-    let mailer = build_mailer(&settings)?;
 
     // Runtime settings (decision 09) before anything that reads them: the cache is seeded from
     // boot config, then loaded from the database so this process starts on the instance's
@@ -102,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(SettingsCache::new(settings.runtime_defaults()));
     let version = runtime.reload(repos.settings.as_ref()).await.context("failed to load runtime settings")?;
     tracing::info!(version, "runtime settings loaded");
+
+    // The mailer resolves from that cache on every send, so it must be built *after* it (D10).
+    let mailer = build_mailer(&settings, Arc::clone(&runtime))?;
 
     let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer), Arc::clone(&runtime))?;
     bootstrap_admins(&settings, &repos).await?;
@@ -145,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
         triggers,
         Arc::new(OsRandom),
         kek(&settings)?,
+        Arc::clone(&mailer),
+        settings.smtp.password.is_some(),
     ));
 
     // Cross-instance settings invalidation: the broker subscription is the fast path and the
@@ -507,36 +511,59 @@ fn build_kv(settings: &Settings) -> anyhow::Result<Arc<dyn Kv>> {
     Ok(kv)
 }
 
-/// SMTP configured → [`SmtpMailer`]; otherwise the in-memory mailer with a loud warning
-/// (dev convenience — OTP mails end up in memory, never delivered).
-fn build_mailer(settings: &Settings) -> anyhow::Result<Arc<dyn Mailer>> {
-    let mailer: Arc<dyn Mailer> = match &settings.smtp.host {
-        Some(host) => {
-            let smtp = SmtpSettings {
-                host: host.clone(),
-                port: settings.smtp.port,
-                username: settings.smtp.username.clone(),
-                // Env/boot-config only for now; moves into KEK-encrypted runtime settings
-                // later (S-26).
-                password: settings.smtp.password.as_ref().map(|secret| secret.expose().to_owned()),
-                from: settings.smtp.from.clone(),
-                security: match settings.smtp.security {
-                    SmtpSecurityMode::Tls => SmtpSecurity::Tls,
-                    SmtpSecurityMode::Starttls => SmtpSecurity::Starttls,
-                    SmtpSecurityMode::None => SmtpSecurity::None,
-                },
-            };
-            tracing::info!(host = %smtp.host, port = smtp.port, "smtp mailer configured");
-            Arc::new(SmtpMailer::new(&smtp).map_err(|err| anyhow::anyhow!("{err}"))?)
-        }
-        None => {
-            tracing::warn!(
-                "smtp.host is not configured — using the in-memory mailer: \
-                 OTP and notification emails are NOT delivered anywhere"
-            );
-            Arc::new(InMemoryMailer::new())
-        }
+/// The one mailer every sender holds: a [`RuntimeMailer`] over the settings cache (D10).
+///
+/// Built once, resolved per send. Boot `[smtp]` is the *default* of the runtime section, and its
+/// password is applied only while the effective section still names the boot endpoint — the
+/// clause that stops an instance administrator from repointing `smtp.host` and receiving the
+/// operator's credential (decision 09 amendment, S-26.a). With no host configured anywhere the
+/// fallback is the in-memory mailer, which delivers nothing.
+fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>) -> anyhow::Result<Arc<dyn Mailer>> {
+    match &settings.smtp.host {
+        Some(host) => tracing::info!(%host, port = settings.smtp.port, "smtp mailer configured from boot config"),
+        None => tracing::warn!(
+            "smtp.host is not configured — mail falls back to the in-memory mailer until an \
+             administrator configures SMTP at runtime: OTP and notification emails are NOT delivered"
+        ),
+    }
+    let kek = kek(settings)?;
+    // The KEK never enters `pub-mail`: `pub-auth` owns the single secretbox implementation and
+    // already depends on it, so unsealing there would be a dependency cycle (S-26).
+    let unsealer = pub_mail::unsealer(move |sealed_b64: &str| {
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(sealed_b64)
+            .map_err(|_| pub_core::Error::Internal { message: "stored smtp password is not base64".to_owned() })?;
+        let plaintext = pub_auth::secretbox::open(&kek, &sealed)?;
+        String::from_utf8(plaintext)
+            .map_err(|_| pub_core::Error::Internal { message: "stored smtp password is not utf-8".to_owned() })
+    });
+    let boot = BootSmtp {
+        host: settings.smtp.host.clone(),
+        port: settings.smtp.port,
+        username: settings.smtp.username.clone(),
+        password: settings.smtp.password.as_ref().map(|secret| secret.expose().to_owned()),
     };
+    let mailer = Arc::new(RuntimeMailer::new(
+        runtime,
+        Arc::new(SmtpMailerBuilder),
+        unsealer,
+        boot,
+        Arc::new(InMemoryMailer::new()),
+    ));
+
+    // Resolve once here so a section the transport cannot be built from is reported at startup
+    // rather than on somebody's first sign-in. A failure is deliberately **not** fatal: the
+    // effective section is runtime data now, and one bad admin edit must not stop every instance
+    // in the cluster from booting.
+    let _warmed = mailer.resolve();
+    let resolved = mailer.describe();
+    tracing::info!(
+        host = ?resolved.host,
+        port = resolved.port,
+        security = %resolved.security,
+        credentialed = resolved.credentialed,
+        "mailer resolved from the runtime settings"
+    );
     Ok(mailer)
 }
 

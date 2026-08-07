@@ -137,7 +137,11 @@ impl FromRequestParts<AppState> for Principal {
             // credential, not an absent one.
             Some(None) => return Err(ProtocolError::unauthorized(rejected_token(&base_url))),
             None => {
-                return if state.settings.registry.require_auth_for_read {
+                // The runtime cache, not boot config: the flag is a `registry` settings section
+                // an administrator flips without a restart (decision 05 amendment). Boot config
+                // remains its default, so an instance whose table was never written behaves
+                // exactly as its config file says.
+                return if state.runtime.current().registry.require_auth_for_read {
                     Err(ProtocolError::unauthorized(onboarding(&base_url)))
                 } else {
                     Ok(Self::Anonymous)

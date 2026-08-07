@@ -173,10 +173,11 @@ impl Default for RealtimeConfig {
 
 /// Instance identity — the white-label half of [decision 17](../../../docs/decisions.md#17).
 ///
-/// Boot config for now, exactly like `registry.require_auth_for_read`: decision 09 files
-/// branding under *runtime* settings, and it moves into the `settings` table when the
-/// `ArcSwap` settings cache lands. Its semantics do not depend on where it is read from, and
-/// `GET /api/v1/home` is the only consumer.
+/// This section is the **default** of the `branding` runtime setting, not a competing source
+/// ([decision 09](../../../docs/decisions.md#09)): an instance whose `settings` table was never
+/// written renders exactly what is configured here, and the moment an administrator writes the
+/// section the stored one wins. Consumers read the runtime cache, so a rename is visible on the
+/// next request rather than the next restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BrandingConfig {
@@ -417,10 +418,14 @@ impl SmtpSecurityMode {
     }
 }
 
-/// Outbound SMTP settings. `host` unset selects the in-memory mailer (dev/test).
+/// Outbound SMTP settings. `host` unset **and** no stored `smtp` section selects the in-memory
+/// mailer (dev/test), which delivers nothing.
 ///
-/// The password is boot-config/env only for now; it moves into runtime settings
-/// envelope-encrypted with the env KEK later (S-26).
+/// This section is the **default** of the `smtp` runtime setting
+/// ([decision 09](../../../docs/decisions.md#09)): the mailer reads the settings cache on every
+/// send, so an administrator who configures SMTP in the admin UI needs no restart, and clearing
+/// the stored section falls back to what is configured here. The password is the one exception
+/// to that symmetry — see the field below.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SmtpConfig {
@@ -431,6 +436,15 @@ pub struct SmtpConfig {
     /// Optional login user.
     pub username: Option<String>,
     /// Password for `username` (secret — always masked in the startup summary).
+    ///
+    /// Unlike every other key here, this one is **not** projected into the runtime defaults: it
+    /// would have to be sealed under the KEK to live there, and a credential with two possible
+    /// homes makes "which one is live" unanswerable. Instead it is used only when the effective
+    /// section still names *this* endpoint — same host, port, and username. An administrator who
+    /// repoints `smtp.host` and leaves the runtime password unset therefore sends nothing
+    /// authenticated, rather than presenting the operator's credential to a server of their own
+    /// choosing ([S-26.a](../../../docs/security.md#6-secrets--configuration)). Clearing the
+    /// runtime password falls back here subject to the same match.
     pub password: Option<Secret>,
     /// `From:` mailbox, e.g. `Pub <noreply@pub.example>`.
     pub from: String,
@@ -736,9 +750,12 @@ pub struct RegistryConfig {
     /// spec-mandated 401 + onboarding message — with nothing anonymous-readable there is
     /// nothing to enumerate, so the anti-enumeration 404 stops being load-bearing.
     ///
-    /// Boot config for now. Decision 09 files this under runtime settings; it moves into the
-    /// `settings` table when the `ArcSwap` settings cache lands, and the flag's *semantics*
-    /// are unaffected by where it is read from.
+    /// This value is the **default** of the `registry` runtime setting
+    /// ([decision 09](../../../docs/decisions.md#09)): an administrator can flip the flag
+    /// without a restart, and clearing the stored section falls back here. It is the named
+    /// mitigation for the proxy timing oracle of
+    /// [S-04.c](../../../docs/security.md#2-authorization--visibility), so deployments whose
+    /// private package *names* are sensitive set it here and leave it alone.
     pub require_auth_for_read: bool,
     /// Abuse limits on the registry write path (S-24).
     pub rate_limit: RegistryRateLimit,
@@ -1158,14 +1175,15 @@ impl Settings {
     /// been written, and that value is the operator's boot config. Once a section is written
     /// the stored one wins; a section that is cleared falls back here again.
     ///
-    /// Secrets are **not** projected: the SMTP password is boot config *or* a runtime setting,
-    /// and mixing the two would make "which one is live" unanswerable. Whatever
-    /// `[smtp].password` holds keeps configuring the boot-time mailer; the runtime field is
-    /// what a future mailer rebuild will read (S-25/S-26).
+    /// Secrets are **not** projected: `[smtp].password` would have to be sealed under the KEK to
+    /// sit in this document, and a credential with two homes makes "which one is live"
+    /// unanswerable. It stays boot-only and is applied by the mailer **only when the effective
+    /// SMTP section still names the boot endpoint** — host, port, and username — so repointing
+    /// the host at runtime cannot redirect the operator's credential (S-25/S-26).
     pub fn runtime_defaults(&self) -> pub_core::settings::RuntimeSettings {
         use pub_core::settings::{
-            BrandingSettings, RateLimitSettings, RegistrationMode, RegistrationSettings, RuntimeSettings, SmtpSettings,
-            UpstreamSettings,
+            BrandingSettings, RateLimitSettings, RegistrationMode, RegistrationSettings, RegistrySettings,
+            RuntimeSettings, SmtpSettings, UpstreamSettings,
         };
 
         RuntimeSettings {
@@ -1195,6 +1213,7 @@ impl Settings {
                 primary_color: self.branding.primary_color.clone(),
             },
             upstream: UpstreamSettings { enabled: self.upstream.enabled, default_org_policy: Default::default() },
+            registry: RegistrySettings { require_auth_for_read: self.registry.require_auth_for_read },
         }
     }
 

@@ -677,7 +677,8 @@ fn smtp_full_config_is_accepted_and_summary_masks_password() {
             ("PUB_SMTP__PORT", "465"),
             ("PUB_SMTP__SECURITY", "tls"),
             ("PUB_SMTP__USERNAME", "mailer"),
-            // May come via env only for now; becomes a KEK-encrypted runtime setting later (S-26).
+            // Boot-only (S-25/S-26): it is never projected into the runtime document, and the
+            // mailer presents it only while the effective section still names this endpoint.
             ("PUB_SMTP__PASSWORD", "smtp-secret-value"),
             ("PUB_SMTP__FROM", "Pub <noreply@corp.com>"),
         ]),
@@ -689,6 +690,40 @@ fn smtp_full_config_is_accepted_and_summary_masks_password() {
     let summary = settings.summary();
     assert!(!summary.contains("smtp-secret-value"), "smtp password leaked:\n{summary}");
     assert!(summary.contains("smtp.password        = ***"));
+}
+
+// --- the boot layer as the default of the runtime document (decision 09) ---
+
+#[test]
+fn runtime_defaults_project_the_boot_layer_and_never_the_smtp_password() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_SMTP__HOST", "smtp.corp.com"),
+            ("PUB_SMTP__USERNAME", "mailer"),
+            ("PUB_SMTP__PASSWORD", "smtp-secret-value"),
+            ("PUB_REGISTRY__REQUIRE_AUTH_FOR_READ", "true"),
+            ("PUB_BRANDING__NAME", "Acme Registry"),
+        ]),
+    )
+    .unwrap();
+    let defaults = settings.runtime_defaults();
+
+    // The sixth section: the flag an administrator can now flip without a restart.
+    assert!(defaults.registry.require_auth_for_read);
+    assert_eq!(defaults.branding.name, "Acme Registry");
+    assert_eq!(defaults.smtp.host.as_deref(), Some("smtp.corp.com"));
+    assert_eq!(defaults.smtp.username.as_deref(), Some("mailer"));
+    // S-26: the credential has exactly one home, and the runtime document is not it.
+    assert_eq!(defaults.smtp.password_sealed, None);
+    let rendered = format!("{defaults:?}");
+    assert!(!rendered.contains("smtp-secret-value"), "the boot password reached the runtime document: {rendered}");
+}
+
+#[test]
+fn a_default_instance_projects_a_permissive_registry_section() {
+    let defaults = load_from(&CliArgs::default(), no_env()).unwrap().runtime_defaults();
+    assert!(!defaults.registry.require_auth_for_read, "anonymous read stays the default (decision 05)");
 }
 
 #[test]

@@ -490,10 +490,14 @@ Scopes to request; empty = `openid email profile`.
 
 Outbound SMTP; unset host = the in-memory dev mailer.
 
-Outbound SMTP settings. `host` unset selects the in-memory mailer (dev/test).
+Outbound SMTP settings. `host` unset **and** no stored `smtp` section selects the in-memory
+mailer (dev/test), which delivers nothing.
 
-The password is boot-config/env only for now; it moves into runtime settings
-envelope-encrypted with the env KEK later (S-26).
+This section is the **default** of the `smtp` runtime setting
+([decision 09](../decisions.md#09)): the mailer reads the settings cache on every
+send, so an administrator who configures SMTP in the admin UI needs no restart, and clearing
+the stored section falls back to what is configured here. The password is the one exception
+to that symmetry — see the field below.
 
 ### `smtp.host`
 
@@ -518,6 +522,15 @@ Optional login user.
 secret · `PUB_SMTP__PASSWORD` · (secret — none by default)
 
 Password for `username` (secret — always masked in the startup summary).
+
+Unlike every other key here, this one is **not** projected into the runtime defaults: it
+would have to be sealed under the KEK to live there, and a credential with two possible
+homes makes "which one is live" unanswerable. Instead it is used only when the effective
+section still names *this* endpoint — same host, port, and username. An administrator who
+repoints `smtp.host` and leaves the runtime password unset therefore sends nothing
+authenticated, rather than presenting the operator's credential to a server of their own
+choosing ([S-26.a](../security.md#6-secrets--configuration)). Clearing the
+runtime password falls back here subject to the same match.
 
 ### `smtp.from`
 
@@ -594,9 +607,12 @@ Whether *reading* the registry requires a CLI token (decision 05).
 spec-mandated 401 + onboarding message — with nothing anonymous-readable there is
 nothing to enumerate, so the anti-enumeration 404 stops being load-bearing.
 
-Boot config for now. Decision 09 files this under runtime settings; it moves into the
-`settings` table when the `ArcSwap` settings cache lands, and the flag's *semantics*
-are unaffected by where it is read from.
+This value is the **default** of the `registry` runtime setting
+([decision 09](../decisions.md#09)): an administrator can flip the flag
+without a restart, and clearing the stored section falls back here. It is the named
+mitigation for the proxy timing oracle of
+[S-04.c](../security.md#2-authorization--visibility), so deployments whose
+private package *names* are sensitive set it here and leave it alone.
 
 ## `[registry.rate_limit]`
 
@@ -927,10 +943,11 @@ White-label instance identity shown on the landing dashboard (decision 17).
 
 Instance identity — the white-label half of [decision 17](../decisions.md#17).
 
-Boot config for now, exactly like `registry.require_auth_for_read`: decision 09 files
-branding under *runtime* settings, and it moves into the `settings` table when the
-`ArcSwap` settings cache lands. Its semantics do not depend on where it is read from, and
-`GET /api/v1/home` is the only consumer.
+This section is the **default** of the `branding` runtime setting, not a competing source
+([decision 09](../decisions.md#09)): an instance whose `settings` table was never
+written renders exactly what is configured here, and the moment an administrator writes the
+section the stored one wins. Consumers read the runtime cache, so a rename is visible on the
+next request rather than the next restart.
 
 ### `branding.name`
 

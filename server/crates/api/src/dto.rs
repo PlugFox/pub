@@ -1036,6 +1036,14 @@ pub struct UpstreamSettingsDto {
     pub default_org_policy: String,
 }
 
+/// Registry-plane policy (decision 05).
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct RegistrySettingsDto {
+    /// Whether every pub-protocol read demands a CLI token. `true` also closes the S-04.c proxy
+    /// timing oracle, since there is then no anonymous prober.
+    pub require_auth_for_read: bool,
+}
+
 /// Response of `GET`/`PATCH /api/v1/admin/settings`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AdminSettingsDto {
@@ -1052,6 +1060,8 @@ pub struct AdminSettingsDto {
     pub branding: BrandingSettingsDto,
     /// Upstream defaults.
     pub upstream: UpstreamSettingsDto,
+    /// Registry-plane policy.
+    pub registry: RegistrySettingsDto,
 }
 
 /// Body of `PATCH /api/v1/admin/settings`: any subset of sections, each replaced wholesale.
@@ -1067,6 +1077,26 @@ pub struct AdminSettingsPatchBody {
     pub branding: Option<BrandingSettingsDto>,
     /// Upstream defaults.
     pub upstream: Option<UpstreamSettingsDto>,
+    /// Registry-plane policy.
+    pub registry: Option<RegistrySettingsDto>,
+}
+
+/// Response of `POST /api/v1/admin/settings/smtp/test`.
+///
+/// A refused delivery answers `200` with `delivered: false` and the reason: a wrong SMTP
+/// configuration is the operator's problem to see, not a server fault to hide behind a 5xx.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SmtpTestResultDto {
+    /// Whether the mailer accepted the message.
+    pub delivered: bool,
+    /// Effective SMTP host; `null` = none configured, so nothing was delivered anywhere.
+    pub host: Option<String>,
+    /// Effective transport security: `tls` | `starttls` | `none`.
+    pub security: String,
+    /// Whether the transport presented credentials.
+    pub credentialed: bool,
+    /// The SMTP failure text, or the notice that no host is configured; `null` on a clean send.
+    pub detail: Option<String>,
 }
 
 /// One row of the admin user table.

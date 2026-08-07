@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use pub_admin::instance::{SettingsPatch, SmtpPatch};
 use pub_core::audit::{AuditActor, AuditFilter};
 use pub_core::settings::{
-    BrandingSettings, RateLimitSettings, RegistrationMode, RegistrationSettings, UpstreamSettings,
+    BrandingSettings, RateLimitSettings, RegistrationMode, RegistrationSettings, RegistrySettings, UpstreamSettings,
 };
 use pub_core::user::{UserFilter, UserStatus};
 use pub_core::{Error, OrgId, UserId};
@@ -26,7 +26,7 @@ use crate::dto::{
     BrandingSettingsDto, JobRunDto, JobStateDto, ListDto, OrgDto, QuarantineDto, RateLimitSettingsDto,
     RegistrationSettingsDto, ShadowingDto, SmtpSettingsDto, UpstreamCacheStatsDto, UpstreamSettingsDto, UserCountsDto,
 };
-use crate::dto::{RegistryStatsDto, SmtpSettingsPatchDto};
+use crate::dto::{RegistrySettingsDto, RegistryStatsDto, SmtpSettingsPatchDto, SmtpTestResultDto};
 use crate::envelope::{ErrorEnvelope, OkEnvelope};
 use crate::error::ApiError;
 use crate::extract::{InstanceAdmin, QueryParams, RequestMeta};
@@ -88,10 +88,46 @@ pub async fn update_settings(
             primary_color: branding.primary_color,
         }),
         upstream: body.upstream.map(upstream_from).transpose()?,
+        registry: body
+            .registry
+            .map(|registry| RegistrySettings { require_auth_for_read: registry.require_auth_for_read }),
     };
     let now = (state.clock)();
     let view = state.admin.update_settings(patch, &actor_meta(&auth, &meta), now).await?;
     Ok(Json(OkEnvelope::new(settings_dto(view))))
+}
+
+/// Sends a test message to the acting administrator's own verified address.
+///
+/// The recipient is not a parameter: pinning it to the caller removes the mail-bomb vector
+/// instead of rate-limiting it. Not step-up gated (S-06) — it neither escalates authority nor
+/// destroys anything — and it calls the mailer directly rather than riding the jobs queue,
+/// because synchronous diagnosis is the whole purpose.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/settings/smtp/test",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = OK, description = "The delivery attempt's outcome — a refused delivery is reported here, not as a 5xx", body = OkEnvelope<SmtpTestResultDto>),
+        (status = BAD_REQUEST, description = "The acting administrator has no verified email address", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Not an instance administrator", body = ErrorEnvelope),
+    )
+)]
+pub async fn test_smtp(
+    State(state): State<AppState>,
+    InstanceAdmin(auth): InstanceAdmin,
+    RequestMeta(meta): RequestMeta,
+) -> Result<Json<OkEnvelope<SmtpTestResultDto>>, ApiError> {
+    let now = (state.clock)();
+    let report = state.admin.send_test_email(&actor_meta(&auth, &meta), now).await?;
+    Ok(Json(OkEnvelope::new(SmtpTestResultDto {
+        delivered: report.delivered,
+        host: report.host,
+        security: report.security,
+        credentialed: report.credentialed,
+        detail: report.detail,
+    })))
 }
 
 /// Query parameters for the admin user listing.
@@ -448,6 +484,7 @@ fn settings_dto(view: pub_admin::SettingsView) -> AdminSettingsDto {
             enabled: view.upstream.enabled,
             default_org_policy: view.upstream.default_org_policy.as_str().to_owned(),
         },
+        registry: RegistrySettingsDto { require_auth_for_read: view.registry.require_auth_for_read },
     }
 }
 

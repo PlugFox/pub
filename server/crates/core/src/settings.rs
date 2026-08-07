@@ -4,7 +4,8 @@
 //! Three layers, each with one job:
 //!
 //! 1. [`SettingsRepo`](crate::traits::SettingsRepo) — durable truth, one row per **section**
-//!    (`registration`, `rate_limits`, `smtp`, `branding`, `upstream`) with a per-key version.
+//!    (`registration`, `rate_limits`, `smtp`, `branding`, `upstream`, `registry`) with a
+//!    per-key version.
 //!    Sections rather than one blob so a `PATCH` that touches SMTP cannot clobber a concurrent
 //!    branding change, and so an unknown future section is ignored instead of dropped.
 //! 2. [`SettingsCache`] — the `ArcSwap` snapshot every request reads. It is *always* readable:
@@ -49,9 +50,11 @@ pub mod keys {
     pub const BRANDING: &str = "branding";
     /// Upstream proxy defaults (decision 07).
     pub const UPSTREAM: &str = "upstream";
+    /// Registry-plane policy: anonymous-read gating (decision 05).
+    pub const REGISTRY: &str = "registry";
 
     /// Every known key, in a stable order.
-    pub const ALL: [&str; 5] = [REGISTRATION, RATE_LIMITS, SMTP, BRANDING, UPSTREAM];
+    pub const ALL: [&str; 6] = [REGISTRATION, RATE_LIMITS, SMTP, BRANDING, UPSTREAM, REGISTRY];
 }
 
 /// One entry of the durable settings table.
@@ -185,6 +188,25 @@ pub struct SmtpSettings {
     pub password_sealed: Option<String>,
 }
 
+impl SmtpSettings {
+    /// Whether this section points at exactly the endpoint described by `host`/`port`/
+    /// `username` — the host comparison is ASCII-case-insensitive because DNS is.
+    ///
+    /// This is the gate on the boot `[smtp]` password (decision 09 amendment, S-26.a). The boot
+    /// credential is the *default* of the runtime one, but a default that followed the section
+    /// wherever an administrator repointed it would hand the operator's SMTP password to a
+    /// server of the administrator's choosing. One rule, two compositions: the mailer pairs it
+    /// with the password itself, the admin surface pairs it with the password's mere presence.
+    pub fn same_endpoint(&self, host: Option<&str>, port: u16, username: Option<&str>) -> bool {
+        let same_host = match (self.host.as_deref(), host) {
+            (Some(mine), Some(theirs)) => mine.eq_ignore_ascii_case(theirs),
+            (None, None) => true,
+            _ => false,
+        };
+        same_host && self.port == port && self.username.as_deref() == username
+    }
+}
+
 /// White-label instance identity (decision 17).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -217,6 +239,20 @@ pub struct UpstreamSettings {
     pub default_org_policy: UpstreamPolicy,
 }
 
+/// Registry-plane policy (decision 05).
+///
+/// The first *security* flag to enter this always-readable cache, which changes what the
+/// module's fallback stance means here: a corrupt `registry` row restores the operator's boot
+/// value rather than the most restrictive one. That is defensible — the fallback is the
+/// operator's own configured intent — but it is the opposite of the "unknown ⇒ deny" instinct,
+/// so it is stated rather than left to be inferred.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegistrySettings {
+    /// Whether every pub-protocol read demands a CLI token (S-04.c's named mitigation).
+    pub require_auth_for_read: bool,
+}
+
 /// The whole runtime-settings document, as one immutable snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -231,6 +267,8 @@ pub struct RuntimeSettings {
     pub branding: BrandingSettings,
     /// Upstream proxy defaults.
     pub upstream: UpstreamSettings,
+    /// Registry-plane policy.
+    pub registry: RegistrySettings,
 }
 
 impl RuntimeSettings {
@@ -251,6 +289,7 @@ impl RuntimeSettings {
             keys::SMTP => parse(entry, &mut self.smtp),
             keys::BRANDING => parse(entry, &mut self.branding),
             keys::UPSTREAM => parse(entry, &mut self.upstream),
+            keys::REGISTRY => parse(entry, &mut self.registry),
             _ => {}
         }
     }
@@ -405,6 +444,65 @@ mod tests {
         }
         assert_eq!(RegistrationMode::from_str("maybe").unwrap_err().code(), "invalid_argument");
         assert_eq!(serde_json::to_string(&RegistrationMode::Invite).unwrap(), "\"invite\"");
+    }
+
+    #[test]
+    fn the_registry_section_falls_back_to_the_boot_flag_when_absent_or_corrupt() {
+        // Decision 05 amendment: boot config is the *default* of the flag, and this cache's
+        // always-readable stance means a mangled row restores that default rather than failing
+        // the read — the one place where "unknown" resolves to the operator's value and not to
+        // the most restrictive one.
+        let defaults = RuntimeSettings {
+            registry: RegistrySettings { require_auth_for_read: true },
+            ..RuntimeSettings::default()
+        };
+        let cache = SettingsCache::new(defaults);
+        assert!(cache.current().registry.require_auth_for_read, "an unwritten section serves the boot flag");
+
+        cache.apply(&[entry(keys::REGISTRY, serde_json::json!("not an object"))], 1);
+        assert!(cache.current().registry.require_auth_for_read, "a corrupt section keeps the boot flag");
+
+        cache.apply(&[entry(keys::REGISTRY, serde_json::json!({ "require_auth_for_read": false }))], 2);
+        assert!(!cache.current().registry.require_auth_for_read, "a stored section wins");
+    }
+
+    #[test]
+    fn an_older_build_ignores_the_registry_section() {
+        // The forward-compatibility half: this build ignores a key it does not know, which is
+        // exactly what an older replica does with `registry` during a rolling upgrade — it
+        // keeps enforcing its own boot flag.
+        let cache = SettingsCache::new(RuntimeSettings::default());
+        cache.apply(
+            &[
+                entry("registry_v2_from_a_newer_release", serde_json::json!({ "require_auth_for_read": true })),
+                entry(keys::REGISTRY, serde_json::json!({ "require_auth_for_read": true })),
+            ],
+            3,
+        );
+        assert!(cache.current().registry.require_auth_for_read);
+        assert_eq!(keys::ALL.len(), 6, "every known key is in ALL, or the admin surface cannot write it");
+    }
+
+    #[test]
+    fn the_boot_smtp_credential_only_matches_its_own_endpoint() {
+        // S-26.a: repointing the host must not carry the operator's boot password along.
+        let boot = SmtpSettings {
+            host: Some("smtp.corp.com".to_owned()),
+            port: 587,
+            username: Some("mailer".to_owned()),
+            ..SmtpSettings::default()
+        };
+        let same =
+            |section: &SmtpSettings| section.same_endpoint(boot.host.as_deref(), boot.port, boot.username.as_deref());
+        assert!(same(&boot));
+        // DNS is case-insensitive, so a case variant is the same server.
+        assert!(same(&SmtpSettings { host: Some("SMTP.Corp.COM".to_owned()), ..boot.clone() }));
+        assert!(!same(&SmtpSettings { host: Some("smtp.attacker.example".to_owned()), ..boot.clone() }));
+        assert!(!same(&SmtpSettings { port: 2525, ..boot.clone() }));
+        assert!(!same(&SmtpSettings { username: Some("someone-else".to_owned()), ..boot.clone() }));
+        assert!(!same(&SmtpSettings { host: None, ..boot.clone() }));
+        // Both unset is still "the same endpoint" — an instance with no SMTP at all.
+        assert!(SmtpSettings::default().same_endpoint(None, 0, None));
     }
 
     #[test]

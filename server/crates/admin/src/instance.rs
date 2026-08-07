@@ -30,10 +30,10 @@ use pub_core::jobs::JobState;
 use pub_core::org::OrgOverview;
 use pub_core::package::{QuarantineEntry, RegistryStats, ShadowingAlarm, UpstreamCacheStats};
 use pub_core::settings::{
-    BrandingSettings, RateLimitSettings, RegistrationSettings, RuntimeSettings, SETTINGS_TOPIC, SettingsCache,
-    UpstreamSettings, keys,
+    BrandingSettings, RateLimitSettings, RegistrationSettings, RegistrySettings, RuntimeSettings, SETTINGS_TOPIC,
+    SettingsCache, SmtpSettings, UpstreamSettings, keys,
 };
-use pub_core::traits::{JobTrigger, Kv, Repositories};
+use pub_core::traits::{JobTrigger, Kv, Mailer, Repositories};
 use pub_core::user::{User, UserCounts, UserFilter, UserStatus};
 use pub_core::{Error, Format, Page, Result, UserId};
 use pub_registry::ActorMeta;
@@ -81,6 +81,28 @@ pub struct SettingsView {
     pub branding: BrandingSettings,
     /// Upstream proxy defaults.
     pub upstream: UpstreamSettings,
+    /// Registry-plane policy.
+    pub registry: RegistrySettings,
+}
+
+/// The outcome of `POST /api/v1/admin/settings/smtp/test`.
+///
+/// Carries the diagnosis an operator needs and nothing else: a write-only credential behind a
+/// lazily-rebuilt transport is otherwise undiagnosable, and there is no field here a password
+/// could hide in (S-26.a).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestMailReport {
+    /// Whether the mailer accepted the message.
+    pub delivered: bool,
+    /// Effective SMTP host; `None` = none configured, so nothing was delivered anywhere.
+    pub host: Option<String>,
+    /// Effective transport security.
+    pub security: String,
+    /// Whether the transport presented credentials.
+    pub credentialed: bool,
+    /// The diagnosis, not a status: the SMTP failure text on a refusal, and on an instance with
+    /// no SMTP host the notice that the message went to the in-memory outbox.
+    pub detail: Option<String>,
 }
 
 /// The SMTP section on a write.
@@ -135,6 +157,8 @@ pub struct SettingsPatch {
     pub branding: Option<BrandingSettings>,
     /// Upstream proxy defaults.
     pub upstream: Option<UpstreamSettings>,
+    /// Registry-plane policy.
+    pub registry: Option<RegistrySettings>,
 }
 
 impl SettingsPatch {
@@ -145,6 +169,7 @@ impl SettingsPatch {
             && self.smtp.is_none()
             && self.branding.is_none()
             && self.upstream.is_none()
+            && self.registry.is_none()
     }
 }
 
@@ -184,6 +209,11 @@ pub struct AdminService {
     jobs: Arc<dyn JobTrigger>,
     rng: Arc<dyn RandomSource>,
     kek: Vec<u8>,
+    mailer: Arc<dyn Mailer>,
+    /// Whether boot config carries `[smtp].password`. The value itself never reaches this
+    /// service — the mailer holds it — but whether it exists decides two things here: whether a
+    /// runtime `username` is credentialed, and whether the pairing rule below is satisfied.
+    boot_smtp_password: bool,
 }
 
 impl std::fmt::Debug for AdminService {
@@ -205,8 +235,10 @@ impl AdminService {
         jobs: Arc<dyn JobTrigger>,
         rng: Arc<dyn RandomSource>,
         kek: Vec<u8>,
+        mailer: Arc<dyn Mailer>,
+        boot_smtp_password: bool,
     ) -> Self {
-        Self { repos, kv, cache, auth, events, jobs, rng, kek }
+        Self { repos, kv, cache, auth, events, jobs, rng, kek, mailer, boot_smtp_password }
     }
 
     // ----------------------------------------------------------------------------- settings
@@ -245,7 +277,7 @@ impl AdminService {
         }
         if let Some(smtp) = &patch.smtp {
             let sealed = self.seal_smtp_password(smtp, before.smtp.password_sealed.clone())?;
-            let section = pub_core::settings::SmtpSettings {
+            let section = SmtpSettings {
                 host: smtp.host.clone().map(|host| host.trim().to_owned()).filter(|host| !host.is_empty()),
                 port: smtp.port,
                 username: smtp.username.clone().filter(|user| !user.is_empty()),
@@ -256,6 +288,14 @@ impl AdminService {
             if section.port == 0 {
                 return Err(Error::Invalid { message: "smtp.port must be greater than 0".to_owned() });
             }
+            // The rest of the boot validator's SMTP rules, on the runtime plane. Both matter
+            // more here than at boot: a section the transport cannot be built from is not
+            // refused by the mailer, it is *ignored* — the previous transport keeps delivering
+            // and the surface reports settings that are not in force.
+            if section.host.is_some() && section.from.trim().is_empty() {
+                return Err(Error::Invalid { message: "smtp.from must be set when smtp.host is set".to_owned() });
+            }
+            validate_smtp_credentials(section.username.as_deref(), self.smtp_password_available(&section))?;
             self.write(keys::SMTP, &section, now).await?;
             written.push(keys::SMTP);
         }
@@ -269,6 +309,10 @@ impl AdminService {
         if let Some(upstream) = &patch.upstream {
             self.write(keys::UPSTREAM, upstream, now).await?;
             written.push(keys::UPSTREAM);
+        }
+        if let Some(registry) = &patch.registry {
+            self.write(keys::REGISTRY, registry, now).await?;
+            written.push(keys::REGISTRY);
         }
 
         // Reload from the durable rows rather than from the patch: whatever another instance
@@ -324,6 +368,80 @@ impl AdminService {
         }
     }
 
+    /// Whether the mailer will find a password for this section.
+    ///
+    /// The endpoint rule lives on [`SmtpSettings::same_endpoint`] and is shared with the mailer;
+    /// this composes it with the one fact the settings table never carries — whether boot config
+    /// has an `[smtp].password` at all (S-26.a).
+    fn smtp_password_available(&self, section: &SmtpSettings) -> bool {
+        if section.password_sealed.is_some() {
+            return true;
+        }
+        let boot = &self.cache.defaults().smtp;
+        self.boot_smtp_password && section.same_endpoint(boot.host.as_deref(), boot.port, boot.username.as_deref())
+    }
+
+    /// Sends a test message to the acting administrator's **own** verified address.
+    ///
+    /// No recipient field, deliberately: an operator-triggered mailer aimed at an arbitrary
+    /// address is a mail-bomb primitive, and pinning it to the caller removes the vector
+    /// entirely instead of rate-limiting it. A delivery failure is a successful diagnosis and
+    /// returns `Ok` with `delivered: false` — a wrong SMTP configuration is not a server fault,
+    /// and a 5xx would replace the operator's answer with a generic error. Audited on **both**
+    /// outcomes, never with a credential (S-22/S-26.a).
+    pub async fn send_test_email(&self, actor: &ActorMeta, now: DateTime<Utc>) -> Result<TestMailReport> {
+        let user = self
+            .repos
+            .users
+            .get(actor.user_id)
+            .await?
+            .ok_or_else(|| Error::NotFound { what: format!("user {}", actor.user_id) })?;
+        let to = user.email.filter(|_| user.email_verified).ok_or_else(|| Error::Invalid {
+            message: "the acting administrator has no verified email address to send a test to".to_owned(),
+        })?;
+
+        let current = self.cache.current();
+        let host = current.smtp.host.clone().filter(|host| !host.trim().is_empty());
+        let credentialed =
+            host.is_some() && current.smtp.username.is_some() && self.smtp_password_available(&current.smtp);
+        let subject = format!("{} SMTP test", current.branding.name);
+        let body = format!(
+            "This is a test message from {}.\n\nIf you are reading it, outbound mail works.\n",
+            current.branding.name
+        );
+
+        let (delivered, error_code, detail) = match self.mailer.send(&to, &subject, &body).await {
+            Ok(()) if host.is_none() => (
+                true,
+                None,
+                Some(
+                    "no smtp host is configured — the message was written to the in-memory outbox and delivered nowhere"
+                        .to_owned(),
+                ),
+            ),
+            Ok(()) => (true, None, None),
+            Err(err) => (false, Some(err.code()), Some(sanitize_detail(&err.to_string()))),
+        };
+        self.audit(
+            actor,
+            "admin.smtp.test",
+            Some(to.clone()),
+            if delivered { AuditResult::Success } else { AuditResult::Failure },
+            // Everything an operator needs to correlate the attempt, and nothing that could be
+            // a credential: `credentialed` is a boolean, never the password behind it.
+            serde_json::json!({
+                "to": to,
+                "host": host,
+                "security": current.smtp.security,
+                "credentialed": credentialed,
+                "error_code": error_code,
+            }),
+            now,
+        )
+        .await;
+        Ok(TestMailReport { delivered, host, security: current.smtp.security.clone(), credentialed, detail })
+    }
+
     /// Writes one settings section.
     async fn write<T: Serialize>(&self, key: &str, value: &T, now: DateTime<Utc>) -> Result<()> {
         let json = serde_json::to_value(value)
@@ -348,6 +466,7 @@ impl AdminService {
             },
             branding: current.branding.clone(),
             upstream: current.upstream,
+            registry: current.registry,
         }
     }
 
@@ -551,6 +670,34 @@ fn validate_rate_limits(limits: &RateLimitSettings) -> Result<()> {
     }
 }
 
+/// Mirrors the boot validator's SMTP pairing rule on the runtime plane.
+///
+/// Without it the settings table can hold a half-credential the transport silently drops, while
+/// the surface reports `password_set: false` next to a filled-in username — an instance that
+/// authenticates as nobody and says so nowhere. `password_available` accounts for the boot
+/// fallback, so an administrator who keeps the boot endpoint need not re-enter the password.
+fn validate_smtp_credentials(username: Option<&str>, password_available: bool) -> Result<()> {
+    if username.is_some() && !password_available {
+        return Err(Error::Invalid {
+            message: "smtp.username needs a password: supply smtp.password, or clear the username".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// How much of an SMTP error text reaches the operator.
+///
+/// The server's response is the whole point of the test action, so it is surfaced — but bounded
+/// and stripped of control characters, because it is attacker-influenced text (the remote end
+/// chooses it) that lands in a log line, an audit row, and a UI.
+fn sanitize_detail(raw: &str) -> String {
+    const MAX_DETAIL: usize = 400;
+
+    let cleaned: String =
+        raw.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).take(MAX_DETAIL).collect::<String>();
+    cleaned.trim().to_owned()
+}
+
 /// Accepts only the three transport modes the mailer knows.
 fn validate_security(raw: &str) -> Result<String> {
     match raw {
@@ -597,6 +744,34 @@ mod tests {
     fn smtp_security_is_an_enum_not_a_free_string() {
         assert_eq!(validate_security("starttls").unwrap(), "starttls");
         assert_eq!(validate_security("plaintext").unwrap_err().code(), "invalid_argument");
+    }
+
+    #[test]
+    fn a_username_without_a_password_is_refused_like_the_boot_validator_refuses_it() {
+        assert!(validate_smtp_credentials(None, false).is_ok(), "no username, no requirement");
+        assert!(validate_smtp_credentials(Some("mailer"), true).is_ok());
+        let err = validate_smtp_credentials(Some("mailer"), false).unwrap_err();
+        assert_eq!(err.code(), "invalid_argument");
+        assert!(err.to_string().contains("smtp.username"));
+    }
+
+    #[test]
+    fn an_smtp_error_detail_is_bounded_and_stripped_of_control_characters() {
+        // The remote end chooses this text, and it lands in a log line, an audit row, and a UI.
+        assert_eq!(sanitize_detail("535 auth\r\nfailed"), "535 auth  failed");
+        assert_eq!(sanitize_detail(&"x".repeat(1000)).len(), 400);
+    }
+
+    #[test]
+    fn the_view_reports_the_registry_section() {
+        let settings = RuntimeSettings {
+            registry: pub_core::settings::RegistrySettings { require_auth_for_read: true },
+            ..RuntimeSettings::default()
+        };
+        let view = AdminService::view(&settings, 9);
+        assert!(view.registry.require_auth_for_read);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["registry"]["require_auth_for_read"], true);
     }
 
     #[test]

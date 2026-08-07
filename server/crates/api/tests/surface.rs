@@ -75,6 +75,7 @@ const SURFACE: &[(&str, &str, bool)] = &[
     // instance administration
     ("get", "/api/v1/admin/settings", true),
     ("patch", "/api/v1/admin/settings", true),
+    ("post", "/api/v1/admin/settings/smtp/test", true),
     ("get", "/api/v1/admin/users", true),
     ("post", "/api/v1/admin/users/{id}/suspend", true),
     ("post", "/api/v1/admin/users/{id}/unsuspend", true),
@@ -285,6 +286,7 @@ fn mutations() -> Vec<(axum::http::Method, String, Option<serde_json::Value>)> {
             json(serde_json::json!({ "preferences": [{ "category": "org", "in_app": true, "email": true }] })),
         ),
         (Method::PATCH, "/api/v1/admin/settings".to_owned(), json(serde_json::json!({}))),
+        (Method::POST, "/api/v1/admin/settings/smtp/test".to_owned(), None),
         (Method::POST, "/api/v1/admin/users/00000000-0000-7000-8000-000000000000/suspend".to_owned(), None),
         (Method::POST, "/api/v1/admin/users/00000000-0000-7000-8000-000000000000/unsuspend".to_owned(), None),
         (Method::POST, "/api/v1/admin/jobs/reindex/run".to_owned(), None),

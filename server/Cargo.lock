@@ -2773,11 +2773,14 @@ dependencies = [
 name = "pub-mail"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "askama",
  "async-trait",
  "lettre",
  "pub-core",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

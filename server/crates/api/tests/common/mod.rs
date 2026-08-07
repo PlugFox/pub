@@ -33,7 +33,7 @@ use pub_db_sqlite::SqliteDb;
 use pub_events::{EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationPolicy};
 use pub_jobs::InMemoryJobLock;
 use pub_kv::MemoryKv;
-use pub_mail::InMemoryMailer;
+use pub_mail::{BootSmtp, InMemoryMailer, MailerBuilder, RuntimeMailer, SmtpSettings};
 use pub_registry::{RegistryPolicy, RegistryService, UpstreamClient, UpstreamService, UpstreamServicePolicy};
 use tower::ServiceExt as _;
 
@@ -120,6 +120,15 @@ pub struct TestOptions {
     pub concurrency_limit: usize,
     /// D8 global body cap in bytes.
     pub max_body_bytes: usize,
+    /// Boot `[smtp].host` — the endpoint the boot password belongs to (D10, S-26.a).
+    pub smtp_host: Option<String>,
+    /// Boot `[smtp].port`.
+    pub smtp_port: u16,
+    /// Boot `[smtp].username`.
+    pub smtp_username: Option<String>,
+    /// Boot `[smtp].password`. Never projected into the runtime document; the resolver presents
+    /// it only while the effective section still names the boot endpoint.
+    pub smtp_password: Option<String>,
 }
 
 impl Default for TestOptions {
@@ -151,6 +160,10 @@ impl Default for TestOptions {
             upload_timeout_secs: 300,
             concurrency_limit: 1024,
             max_body_bytes: 2 * 1024 * 1024,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
         }
     }
 }
@@ -199,6 +212,140 @@ fn down() -> pub_core::Error {
     pub_core::Error::Kv { message: "simulated kv outage".to_owned() }
 }
 
+/// The [`MailerBuilder`] the harness installs under the real [`RuntimeMailer`].
+///
+/// Not polish: once the mailer resolves from the settings cache, any test that patches
+/// `smtp.host` would otherwise open a real socket to whatever hostname it typed. Every built
+/// transport is recorded and every message still lands in the one shared outbox, so
+/// `app.mailer.sent()` keeps working whether or not a scenario configured SMTP.
+#[derive(Default)]
+pub struct RecordingMailerBuilder {
+    built: Mutex<Vec<BuiltTransport>>,
+    outbox: Arc<InMemoryMailer>,
+    deliveries_fail: Mutex<bool>,
+}
+
+/// One transport the resolver asked for, as the fake saw it.
+///
+/// [`Debug`] is hand-written even here: a resolved password is a live credential, and a
+/// `{:?}` inside an assertion message is exactly how one reaches CI output (S-25.a).
+#[derive(Clone, PartialEq, Eq)]
+pub struct BuiltTransport {
+    /// Resolved SMTP host.
+    pub host: String,
+    /// Resolved port.
+    pub port: u16,
+    /// Resolved login user.
+    pub username: Option<String>,
+    /// Resolved `From:` mailbox.
+    pub from: String,
+    /// Resolved transport security, as its lowercase config name.
+    pub security: String,
+    /// The password the resolver decided to present — the assertion subject of the boot-host
+    /// match, and the only place in the suite where an unsealed SMTP password is legible.
+    pub password: Option<String>,
+}
+
+impl BuiltTransport {
+    /// Whether this transport would authenticate.
+    pub fn credentialed(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
+    }
+}
+
+impl std::fmt::Debug for BuiltTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltTransport")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("from", &self.from)
+            .field("security", &self.security)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl RecordingMailerBuilder {
+    /// A builder that hands every resolved transport the same outbox.
+    pub fn new(outbox: Arc<InMemoryMailer>) -> Self {
+        Self { built: Mutex::new(Vec::new()), outbox, deliveries_fail: Mutex::new(false) }
+    }
+
+    /// Every transport the resolver built, oldest first.
+    pub fn built(&self) -> Vec<BuiltTransport> {
+        self.built.lock().expect("builder mutex").clone()
+    }
+
+    /// Makes every subsequent delivery fail, the way a wrong SMTP credential would.
+    pub fn fail_deliveries(&self, fail: bool) {
+        *self.deliveries_fail.lock().expect("builder mutex") = fail;
+    }
+}
+
+impl MailerBuilder for RecordingMailerBuilder {
+    fn build(&self, settings: &SmtpSettings) -> pub_core::Result<Arc<dyn Mailer>> {
+        self.built.lock().expect("builder mutex").push(BuiltTransport {
+            host: settings.host.clone(),
+            port: settings.port,
+            username: settings.username.clone(),
+            from: settings.from.clone(),
+            security: format!("{:?}", settings.security).to_lowercase(),
+            password: settings.password.clone(),
+        });
+        if *self.deliveries_fail.lock().expect("builder mutex") {
+            return Ok(Arc::new(RefusingMailer) as Arc<dyn Mailer>);
+        }
+        Ok(Arc::clone(&self.outbox) as Arc<dyn Mailer>)
+    }
+}
+
+/// The harness's KEK-backed unsealer, mirroring the one `pubd` builds (S-26).
+pub fn test_unsealer() -> Arc<dyn pub_mail::PasswordUnsealer> {
+    pub_mail::unsealer(|sealed_b64: &str| {
+        use base64::Engine as _;
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(sealed_b64)
+            .map_err(|_| pub_core::Error::Internal { message: "sealed smtp password is not base64".to_owned() })?;
+        let plaintext = pub_auth::secretbox::open(&TEST_KEK, &sealed)?;
+        String::from_utf8(plaintext)
+            .map_err(|_| pub_core::Error::Internal { message: "sealed smtp password is not utf-8".to_owned() })
+    })
+}
+
+/// A **second instance's** mailer over `cache` — its own resolver, its own outbox, no boot SMTP.
+///
+/// Propagation is lazy by design: a peer rebuilds on its first send *after* its reconciliation,
+/// never on the reconciliation itself, and this is what lets a test say so.
+pub fn peer_mailer(cache: Arc<SettingsCache>) -> (RuntimeMailer, Arc<RecordingMailerBuilder>) {
+    let outbox = Arc::new(InMemoryMailer::new());
+    let builder = Arc::new(RecordingMailerBuilder::new(Arc::clone(&outbox)));
+    let mailer = RuntimeMailer::new(
+        cache,
+        Arc::clone(&builder) as Arc<dyn MailerBuilder>,
+        test_unsealer(),
+        BootSmtp::default(),
+        outbox as Arc<dyn Mailer>,
+    );
+    (mailer, builder)
+}
+
+/// A transport whose server refuses everything — the failure half of the test-mail action.
+struct RefusingMailer;
+
+#[async_trait::async_trait]
+impl Mailer for RefusingMailer {
+    async fn ping(&self) -> pub_core::Result<()> {
+        Ok(())
+    }
+
+    async fn send(&self, _to: &str, _subject: &str, _body: &str) -> pub_core::Result<()> {
+        Err(pub_core::Error::Internal {
+            message: "smtp delivery failed: 535 5.7.8 authentication credentials invalid".to_owned(),
+        })
+    }
+}
+
 /// Full in-memory application under test.
 pub struct TestApp {
     /// The complete router (middleware included).
@@ -207,8 +354,11 @@ pub struct TestApp {
     pub repos: Repositories,
     /// The KV store backing blocklists and rate counters.
     pub kv: Arc<MemoryKv>,
-    /// The outbox — OTP codes are read from here.
+    /// The outbox — OTP codes are read from here, whether the scenario configured SMTP or not.
     pub mailer: Arc<InMemoryMailer>,
+    /// The transports the runtime mailer was asked to build (D10). Nothing in this suite ever
+    /// touches a socket; this log is what "the settings took effect" is asserted against.
+    pub smtp_builds: Arc<RecordingMailerBuilder>,
     /// The assembled state, so a scenario can rebuild the app over the same backends.
     pub state: AppState,
     /// The scripted upstream, when the scenario enabled the proxy.
@@ -251,6 +401,10 @@ impl TestApp {
         settings.http.max_body_bytes = options.max_body_bytes;
         settings.registry.require_auth_for_read = options.require_auth_for_read;
         settings.registry.rate_limit.publish_per_hour_org = options.publish_per_hour_org;
+        settings.smtp.host = options.smtp_host.clone();
+        settings.smtp.port = options.smtp_port;
+        settings.smtp.username = options.smtp_username.clone();
+        settings.smtp.password = options.smtp_password.clone().map(pub_config::Secret::new);
 
         let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
         db.run_migrations().await.expect("migrate");
@@ -270,6 +424,7 @@ impl TestApp {
         let kv_handle: Arc<dyn Kv> = options.kv.clone().unwrap_or_else(|| Arc::clone(&kv) as Arc<dyn Kv>);
         let mailer = Arc::new(InMemoryMailer::new());
         let keyring = Keyring::new(TEST_KID, TEST_JWT_SEED, &[]).expect("test keyring");
+        let boot_smtp_password = settings.smtp.password.is_some();
         let policy = AuthPolicy {
             access_ttl: StdDuration::from_secs(15 * 60),
             session_limits: SessionLimits::DEFAULT,
@@ -284,11 +439,28 @@ impl TestApp {
         // from the (empty) settings table — exactly the startup sequence of `pubd`.
         let runtime = Arc::new(SettingsCache::new(settings.runtime_defaults()));
         runtime.reload(repos.settings.as_ref()).await.expect("load runtime settings");
+
+        // The same `RuntimeMailer` the binary builds — over a recording builder, so a scenario
+        // that patches `smtp.host` exercises the whole resolve path without a socket (D10).
+        let smtp_builds = Arc::new(RecordingMailerBuilder::new(Arc::clone(&mailer)));
+        let runtime_mailer: Arc<dyn Mailer> = Arc::new(RuntimeMailer::new(
+            Arc::clone(&runtime),
+            Arc::clone(&smtp_builds) as Arc<dyn MailerBuilder>,
+            test_unsealer(),
+            BootSmtp {
+                host: settings.smtp.host.clone(),
+                port: settings.smtp.port,
+                username: settings.smtp.username.clone(),
+                password: settings.smtp.password.as_ref().map(|secret| secret.expose().to_owned()),
+            },
+            Arc::clone(&mailer) as Arc<dyn Mailer>,
+        ));
+
         let oidc = OidcClient::new(options.oidc_providers, INSTANCE_ORIGIN).expect("oidc client");
         let auth = Arc::new(AuthService::new(
             repos.clone(),
             Arc::clone(&kv_handle),
-            Arc::clone(&mailer) as Arc<dyn Mailer>,
+            Arc::clone(&runtime_mailer),
             keyring,
             policy,
             Arc::clone(&runtime),
@@ -303,7 +475,7 @@ impl TestApp {
 
         // One bus per app, exactly as `pubd` wires it: the notification center is a real
         // consumer, so the integration suite exercises the same fan-out production runs.
-        let events = build_bus(&settings, &repos, Arc::clone(&kv_handle), Arc::clone(&mailer));
+        let events = build_bus(&settings, &repos, Arc::clone(&kv_handle), Arc::clone(&runtime_mailer));
         let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
 
         let lock = Arc::new(InMemoryJobLock::new());
@@ -335,7 +507,7 @@ impl TestApp {
             repos.clone(),
             Arc::clone(&auth),
             Arc::clone(&registry),
-            Arc::clone(&mailer) as Arc<dyn Mailer>,
+            Arc::clone(&runtime_mailer),
             Arc::clone(&sink),
             Arc::new(OsRandom),
             OrgPolicy::default(),
@@ -352,6 +524,8 @@ impl TestApp {
             },
             Arc::new(OsRandom),
             TEST_KEK.to_vec(),
+            Arc::clone(&runtime_mailer),
+            boot_smtp_password,
         ));
 
         let state =
@@ -364,6 +538,7 @@ impl TestApp {
             repos,
             kv,
             mailer,
+            smtp_builds,
             state,
             upstream: mock_upstream,
             lock,
@@ -415,6 +590,7 @@ impl TestApp {
             repos: self.repos.clone(),
             kv: Arc::clone(&self.kv),
             mailer: Arc::clone(&self.mailer),
+            smtp_builds: Arc::clone(&self.smtp_builds),
             state,
             upstream: self.upstream.clone(),
             lock,
@@ -773,7 +949,7 @@ impl TestApp {
 }
 
 /// Builds the app's event bus with its real consumers, mirroring `pubd::build_events`.
-fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>, mailer: Arc<InMemoryMailer>) -> Arc<EventBus> {
+fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>, mailer: Arc<dyn Mailer>) -> Arc<EventBus> {
     let realtime = settings.realtime;
     let bus = Arc::new(
         EventBus::new(EventBusPolicy {
@@ -784,7 +960,7 @@ fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>, mailer:
     );
     bus.add_consumer(Arc::new(NotificationCenter::new(
         repos.clone(),
-        mailer as Arc<dyn Mailer>,
+        mailer,
         NotificationPolicy {
             max_recipients: realtime.max_notification_recipients,
             email_enabled: realtime.notification_email,
