@@ -22,7 +22,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 15 | i18n: YAML + codegen (foxic-style), no i18n framework dependency        | accepted |
 | 16 | Errors: `thiserror` domain enums, RFC-ish envelope; no anyhow matching  | proposed |
 | 17 | Branding: default name "Pub", token prefix `pub_`, white-label          | accepted |
-| 18 | Ops: release model, image registry, reference orchestrator             | tbd      |
+| 18 | Ops: release model, image registry, reference orchestrator             | accepted |
 | 19 | RBAC: cumulative role levels (0/50/100/200/250), one authorize() gate   | accepted |
 | 20 | Realtime: SSE event stream + notification center                        | accepted |
 | 21 | Multi-format artifact space: pub first; npm, cargo later                | accepted |
