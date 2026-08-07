@@ -191,7 +191,53 @@ Elevation has exactly three levels:
 
 **Gradients:** subtle accent-tinted only (`from-accent-soft/70` fading to
 `canvas`), and only on hero/marketing surfaces. Never inside the app's data UI
-— no gradient table headers, no gradient cards, no gradient buttons.
+— no gradient table headers, no gradient cards, no gradient buttons. The one
+sanctioned exception is the interaction-feedback layer below (§5a): its sheen
+is a dynamic `currentColor` gradient that exists only under the pointer, not
+palette decoration.
+
+### 5a. Interaction feedback — sheen + ripple
+
+The interaction layer ships exactly two dynamic effects
+([decision 25](../docs/decisions.md) — the owner's pick after testing a
+four-style prototype):
+
+- **Sheen** — a liquid-glass specular highlight that follows the pointer on
+  hover, on **every control**: buttons (and links styled via
+  `buttonVariants`), menu items, tab triggers, the ThemePicker trigger,
+  `interactive` cards and table rows. A radial gradient of `currentColor`
+  (radius 8 rem) painted at **10% opacity**, shown only under
+  `@media (hover: hover)` — on touch the sheen does not exist and the ripple
+  carries the feedback.
+- **Ripple** — a Material-style wave expanding from the press point and
+  fading on release; keyboard activation (Enter/Space) ripples from the
+  center. Only on **genuinely press-activated** elements: buttons, menu
+  items, tab triggers, `interactive` cards and rows — never on static
+  surfaces. `currentColor` at **15% opacity**.
+
+Rules that keep the exception an exception:
+
+- **Color derives from `currentColor`, never from palette utilities.** The
+  effect always paints the host's own text token at a bounded opacity carried
+  by the keyframes, so it reads on flat surfaces in every registered theme
+  with no new tokens — and the opacity ceiling (**15%**) bounds the contrast
+  impact: over the text the overlay is the text's own color (a no-op), and a
+  ≤15% wash over the fill cannot push a gate-checked AA pair under 4.5:1.
+- **Implementation is centralized:** the `fx-*` classes live in
+  [`packages/ui/src/feedback.css`](packages/ui/src/feedback.css) (component
+  layer) and the `use:sheen` / `use:ripple` directives in
+  [`feedback.ts`](packages/ui/src/feedback.ts) (~1.3 kB min, wired through
+  `ref` inside the kit). Recipes carry the classes; screens never hand-write
+  `fx-*` or add the effects to non-controls.
+- **Disabled elements get neither** (the existing `pointer-events-none`
+  styling plus a JS guard covering `aria-disabled`/`data-disabled` and the
+  keyboard path). Static badges, static cards, and plain table rows get
+  neither.
+- **No layout shift:** the sheen is an inset pseudo-element, the wave an
+  absolutely positioned child clipped by `overflow-hidden` (table rows: by
+  `clip-path`, which is why interactive rows use an inset focus ring).
+- **Both collapse fully under reduced motion** — see §7a for the mechanism.
+  The focus-visible ring is not part of this layer and never changes.
 
 ## 6. Component specs (`packages/ui`)
 
@@ -205,14 +251,19 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   `hover:bg-line/40`), `outline` (surface + line border, accent on hover),
   `danger` (danger fill, destructive confirmation actions only); sizes `sm`
   h-8, `md` h-10, `lg` h-12 (hero CTAs). `rounded-lg`, `font-medium`,
-  no shadow. Links reuse `buttonVariants` on `<a>`.
+  no shadow. Links reuse `buttonVariants` on `<a>`. Carries the full
+  interaction layer (§5a): hover sheen + press ripple (links get the
+  CSS-only, center-anchored sheen).
 - **Input & Label** — `rounded-md`, `bg-surface`, `border-line`; focus =
   accent border + soft accent ring; invalid state keys off `aria-invalid`
   (danger border/ring); sizes `sm` h-8 / `md` h-10. Label: `text-sm
   font-medium`, pairs via `for`/`id`, dims via `peer-disabled`.
 - **Card** — elevation level 2 static: `rounded-xl border border-line
   bg-surface`, no shadow. Slots: `CardHeader` (p-6, gap-1.5),
-  `CardContent` (p-6 pt-0), `CardFooter` (p-6 pt-0, flex gap-3).
+  `CardContent` (p-6 pt-0), `CardFooter` (p-6 pt-0, flex gap-3). An explicit
+  `interactive` variant opts a card into sheen + ripple (§5a) when its whole
+  surface is one press target; the card stays a `<div>` — the caller supplies
+  the real link/button semantics inside (click-bound divs stay banned).
 - **Badge** — pill (`rounded-full`), `text-xs font-medium`, soft tints only:
   `neutral` (line border + canvas), `accent`, `success`, `warning`, `danger`
   (each `*-soft` bg + `*-ink`/`accent` text). Version numbers inside get
@@ -229,9 +280,9 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   AA-checked pair in both themes), `rounded-md px-3 py-1.5 text-xs
   shadow-md`, 300 ms open delay, arrow included. Content is a short hint —
   never interactive controls.
-- **ThemePicker** — ghost pill trigger (`rounded-full`, 32 px square) opening
-  a Menu of radio items: **system** plus one entry per registered theme
-  (light, dark, amoled). Persists `pub_theme` ("system" or a theme name;
+- **ThemePicker** — ghost pill trigger (`rounded-full`, 32 px square,
+  sheen + ripple per §5a) opening a Menu of radio items: **system** plus one
+  entry per registered theme (light, dark, amoled). Persists `pub_theme` ("system" or a theme name;
   unknown counts as system); stamps the *resolved* `data-theme` (contract
   shared with the anti-FOUC script); follows OS changes live while in
   system mode. The registry itself (`THEMES`, `resolveTheme`) is the pure
@@ -250,14 +301,20 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   do not reflow; a scroll region a keyboard cannot reach is a WCAG 2.1.1
   failure). Slots `TableHead` (canvas, bottom hairline) / `TableBody`
   (`divide-y`) / `TableRow` / `TableHeaderCell` (`text-ink-muted`,
-  `scope="col"`) / `TableCell`; `px-4 py-3` cells, `text-sm`.
+  `scope="col"`) / `TableCell`; `px-4 py-3` cells, `text-sm`. `TableRow`
+  takes an opt-in `interactive` variant for clickable rows: sheen + ripple
+  (§5a) plus an **inset** focus ring — `overflow` does not apply to `<tr>`,
+  so the ripple clips via `clip-path`, which would eat an outward ring.
+  Activation semantics (row link, `tabindex` + key handling) belong to the
+  caller; buttons nested in cells keep their own feedback and do not ripple
+  the row.
 - **Tabs** (Kobalte) — underline skin: list is a bottom hairline, triggers are
   `text-ink-muted` going `text-ink` when `selected`, and an accent
   `TabsIndicator` slides under the active one. Kobalte owns roving focus and
-  arrow-key navigation.
+  arrow-key navigation. Triggers carry sheen + ripple (§5a).
 - **Menu** (Kobalte dropdown) — transient surface: `rounded-lg border bg-surface
   p-1 shadow-md`, items `rounded-md px-3 py-2 text-sm` highlighting to
-  `bg-accent-soft text-accent`. `MenuLabel` is a muted `text-xs` heading,
+  `bg-accent-soft text-accent`; items carry sheen + ripple (§5a). `MenuLabel` is a muted `text-xs` heading,
   `MenuSeparator` a hairline that carries its own `my-1` — the **one
   sanctioned root margin** in the kit, because a separator's whole job is the
   gap around it and `MenuContent` cannot use `gap-*` without also spacing the
@@ -341,7 +398,9 @@ state keys off the native `aria-disabled:`/`disabled:` variants.
   the ONLY authored inline script (CSP hash/nonce). Astro's island bootstrap
   scripts are framework-emitted and hashed server-side; never add
   `is:inline`, inline event handlers, or `javascript:` URLs.
-- ❌ No shadows on static surfaces; no gradients outside hero/marketing.
+- ❌ No shadows on static surfaces; no gradients outside hero/marketing —
+  except the §5a interaction layer (sheen + ripple), whose `currentColor`
+  effects are feedback, not decoration, and never appear on static surfaces.
 - ❌ No `dark:` overrides for plain colors — the tokens flip automatically.
   Reach for `dark:` only when the design genuinely differs structurally
   (it matches the whole dark family: dark and amoled).
@@ -351,21 +410,30 @@ state keys off the native `aria-disabled:`/`disabled:` variants.
 ## 7a. Motion
 
 Motion in this product is decorative without exception: the Skeleton pulse,
-the Spinner rotation, `transition-colors` on interactive surfaces, and the
-sliding Tabs indicator. None of it encodes state a user could not read from the
+the Spinner rotation, `transition-colors` on interactive surfaces, the
+sliding Tabs indicator, and the §5a interaction layer (hover sheen + press
+ripple). None of it encodes state a user could not read from the
 static frame, so `prefers-reduced-motion: reduce` switches **all** of it off in
 one place — [`apps/site/src/styles/global.css`](apps/site/src/styles/global.css)
 sets `animation: none; transition: none` on every element.
 
-Two consequences worth knowing before adding a component:
+Three consequences worth knowing before adding a component:
 
 - The block is **unlayered** on purpose. Tailwind 4 emits utilities inside
   `@layer utilities`, and an unlayered rule outranks every layered one whatever
   its specificity — that is what lets it beat `animate-spin` without the
-  `!important` §7 bans.
+  `!important` §7 bans. `feedback.css` sits in `@layer components` for the
+  same reason: layered, it can never outrank the reset.
 - Because the reset is global, a component never writes `motion-safe:` /
   `motion-reduce:` variants. If a future animation *does* carry meaning (a
   progress bar, a diff highlight), it must opt back in explicitly and say why.
+- The §5a effects are built to **die by that reset, not merely freeze**: the
+  base state of the sheen layer and of a ripple wave is invisible
+  (`opacity: 0` / `scale(0)`), and only an animation with a `forwards` fill
+  ever reveals them — `animation: none` therefore erases both outright. No
+  JS media checks exist; the one JS consequence is that a wave's removal
+  cannot rely on `animationend` (it never fires under the reset), so a timer
+  is the cleanup of last resort.
 
 ## 8. Responsive strategy
 

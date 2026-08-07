@@ -58,7 +58,7 @@ const BADGE_VARIANTS = ["neutral", "accent", "success", "warning", "danger"] as 
 const registry: readonly ShowcaseEntry[] = [
   {
     name: "Button",
-    note: "Intents primary / outline / ghost / danger; sizes sm / md / lg; disabled state.",
+    note: "Intents primary / outline / ghost / danger; sizes sm / md / lg; disabled state. Every button carries the interaction feedback layer: hover sheen + press ripple.",
     render: () => (
       <div class="flex flex-col gap-4">
         <For each={BUTTON_SIZES}>
@@ -82,6 +82,72 @@ const registry: readonly ShowcaseEntry[] = [
               </Button>
             )}
           </For>
+        </div>
+      </div>
+    ),
+  },
+  {
+    name: "Interaction feedback",
+    note: "The two sanctioned dynamic effects (DESIGN.md §5a, decision 25): a liquid-glass sheen tracks the pointer on hover on every control; press-activated controls also ripple from the press point. Keyboard activation (Enter / Space) ripples from the center; disabled controls get neither; prefers-reduced-motion collapses both; on touch the ripple alone carries the feedback.",
+    render: () => (
+      <div class="flex flex-col gap-6">
+        <div class="flex flex-col gap-2">
+          <p class="text-sm text-ink-muted">
+            Hover for the sheen, press for the ripple, or focus with the keyboard and press Enter.
+          </p>
+          <div class="flex flex-wrap items-center gap-3">
+            <For each={BUTTON_INTENTS}>{(intent) => <Button intent={intent}>{intent}</Button>}</For>
+            <Button disabled>disabled — no feedback</Button>
+          </div>
+        </div>
+        <div class="flex flex-col gap-2">
+          <p class="text-sm text-ink-muted">
+            Interactive card (explicit opt-in; the caller supplies the real link semantics):
+          </p>
+          <div class="flex flex-wrap gap-4">
+            <Card interactive class="w-64">
+              <CardHeader>
+                <h3 class="text-base font-semibold">acme_http</h3>
+                <p class="text-sm text-ink-muted">Presses like one big button.</p>
+              </CardHeader>
+            </Card>
+            <Card class="w-64">
+              <CardHeader>
+                <h3 class="text-base font-semibold">static card</h3>
+                <p class="text-sm text-ink-muted">No sheen, no ripple.</p>
+              </CardHeader>
+            </Card>
+          </div>
+        </div>
+        <div class="flex flex-col gap-2">
+          <p class="text-sm text-ink-muted">
+            Interactive table rows (opt-in variant; inset focus ring, nested buttons keep their own
+            ripple):
+          </p>
+          <Table label="Clickable rows example">
+            <TableHead>
+              <TableRow>
+                <TableHeaderCell>Package</TableHeaderCell>
+                <TableHeaderCell>Version</TableHeaderCell>
+                <TableHeaderCell>Action</TableHeaderCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              <For each={INTERACTIVE_ROWS}>
+                {(row) => (
+                  <TableRow interactive tabindex={0}>
+                    <TableCell>{row.name}</TableCell>
+                    <TableCell class="font-mono text-xs">{row.version}</TableCell>
+                    <TableCell>
+                      <Button intent="outline" size="sm">
+                        Details
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </For>
+            </TableBody>
+          </Table>
         </div>
       </div>
     ),
@@ -112,7 +178,7 @@ const registry: readonly ShowcaseEntry[] = [
   },
   {
     name: "Card",
-    note: "Header / content / footer slots; border, no shadow (static surface).",
+    note: "Header / content / footer slots; border, no shadow (static surface). An explicit `interactive` variant (shown under Interaction feedback) adds sheen + ripple.",
     render: () => (
       <Card class="w-full max-w-md">
         <CardHeader>
@@ -209,7 +275,7 @@ const registry: readonly ShowcaseEntry[] = [
   },
   {
     name: "ThemePicker",
-    note: "Theme menu over the registry: system + light + dark + AMOLED radio items; persists to localStorage (pub_theme), stamps the resolved data-theme.",
+    note: "Theme menu over the registry: system + light + dark + AMOLED radio items; persists to localStorage (pub_theme), stamps the resolved data-theme. Trigger and items carry the sheen + ripple feedback.",
     render: () => <ThemePicker />,
   },
   {
@@ -245,7 +311,7 @@ const registry: readonly ShowcaseEntry[] = [
   },
   {
     name: "Table",
-    note: "Dense data surface; scrolls horizontally inside its own keyboard-reachable container.",
+    note: "Dense data surface; scrolls horizontally inside its own keyboard-reachable container. Rows take an opt-in `interactive` variant (shown under Interaction feedback) with sheen + ripple and an inset focus ring.",
     render: () => (
       <Table label="Example tokens">
         <TableHead>
@@ -289,7 +355,7 @@ const registry: readonly ShowcaseEntry[] = [
   },
   {
     name: "Tabs",
-    note: "Kobalte-powered; roving focus, arrow-key navigation, animated underline indicator.",
+    note: "Kobalte-powered; roving focus, arrow-key navigation, animated underline indicator. Triggers carry the sheen + ripple feedback.",
     render: () => (
       <Tabs defaultValue="profile" class="w-full max-w-lg">
         <TabsList>
@@ -311,7 +377,7 @@ const registry: readonly ShowcaseEntry[] = [
   },
   {
     name: "Menu",
-    note: "Kobalte dropdown: typeahead, roving focus, outside/escape dismissal; transient surface (shadow). MenuRadioGroup/MenuRadioItem for single-choice groups (menuitemradio + check indicator).",
+    note: "Kobalte dropdown: typeahead, roving focus, outside/escape dismissal; transient surface (shadow). MenuRadioGroup/MenuRadioItem for single-choice groups (menuitemradio + check indicator). Items carry the sheen + ripple feedback; disabled items get neither.",
     render: () => {
       const [sort, setSort] = createSignal("relevance");
       return (
@@ -456,6 +522,10 @@ const TABLE_ROWS = [
     expires: "5 Nov 2026",
   },
   { name: "Local laptop", hint: "pub_2c26", scopes: ["read"], expires: "Never" },
+] as const;
+const INTERACTIVE_ROWS = [
+  { name: "acme_design_system", version: "2.4.1" },
+  { name: "acme_http", version: "1.0.3" },
 ] as const;
 
 /** Live ToastRegion so the fixed positioning and live region can be inspected. */

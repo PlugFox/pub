@@ -1,0 +1,112 @@
+/*
+ * Interaction feedback layer — the two sanctioned dynamic effects
+ * (web/DESIGN.md §5a, decision 25): a pointer-tracking specular sheen on
+ * hover ("liquid glass") and a pointer-origin ripple on press. The classes
+ * are attached by the recipes and the directives in feedback.ts; they are
+ * not meant to be hand-written in screen class strings.
+ *
+ * Reduced motion (web/DESIGN.md §7a). The base state of every layer here is
+ * INVISIBLE (`opacity: 0`, `transform: scale(0)`), and visibility is carried
+ * exclusively by animations with a `forwards` fill. The rules live in
+ * `@layer components`, so the global UNLAYERED `animation: none` reset in
+ * apps/site/src/styles/global.css outranks them regardless of specificity —
+ * under `prefers-reduced-motion: reduce` neither effect ever becomes visible.
+ * No motion media queries exist here or in feedback.ts.
+ *
+ * Color. Both effects paint plain `currentColor` — the host's own text
+ * token, which by construction contrasts with the host's fill in every
+ * registered theme and adds no new tokens — at a bounded opacity carried by
+ * the keyframes (sheen 10%, ripple 15%). That bounds the contrast impact:
+ * over the text itself the overlay is the text's own color (a no-op), and a
+ * ≤15% wash over the fill cannot push an AA pair under 4.5:1
+ * (web/DESIGN.md §5a records the ceiling).
+ */
+@layer components {
+  /* --- Sheen: soft specular highlight that follows the pointer. ---------- */
+  .fx-sheen {
+    position: relative;
+  }
+
+  .fx-sheen::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    opacity: 0;
+    background: radial-gradient(
+      circle 8rem at var(--fx-sheen-x, 50%) var(--fx-sheen-y, 50%),
+      currentColor,
+      transparent
+    );
+  }
+
+  /* Hover-only by media query: on touch there is no hover state to track,
+   * and the ripple carries the feedback instead. */
+  @media (hover: hover) {
+    .fx-sheen:hover::after {
+      animation: fx-sheen-in 150ms ease-out forwards;
+    }
+  }
+
+  /* The 0.1 IS the sheen's alpha ceiling — visibility and bound in one. */
+  @keyframes fx-sheen-in {
+    to {
+      opacity: 0.1;
+    }
+  }
+
+  /* --- Ripple: pointer-origin press wave. -------------------------------- */
+  .fx-ripple {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  /* `overflow` does not apply to table rows, so an interactive row clips by
+   * geometry instead. clip-path would eat an outward focus ring, which is
+   * why the interactive row variant uses an INSET ring (table.tsx). */
+  tr.fx-ripple {
+    clip-path: inset(0);
+  }
+
+  .fx-ripple-wave {
+    position: absolute;
+    border-radius: 9999px;
+    pointer-events: none;
+    opacity: 0;
+    transform: scale(0);
+    background: currentColor;
+    animation: fx-ripple-grow 350ms ease-out forwards;
+  }
+
+  /* Added on release (pointerup / keyup): the wave keeps growing while a
+   * fade takes over the opacity — the later animation in the list wins the
+   * property. feedback.ts removes the span on the fade's `animationend`,
+   * with a timer as the cleanup of last resort (under reduced motion
+   * `animation: none` means the event never fires). */
+  .fx-ripple-wave-out {
+    animation:
+      fx-ripple-grow 350ms ease-out forwards,
+      fx-ripple-fade 250ms linear forwards;
+  }
+
+  /* The 0.15 IS the ripple's alpha ceiling — visibility and bound in one. */
+  @keyframes fx-ripple-grow {
+    from {
+      opacity: 0.15;
+      transform: scale(0);
+    }
+
+    to {
+      opacity: 0.15;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes fx-ripple-fade {
+    to {
+      opacity: 0;
+    }
+  }
+}

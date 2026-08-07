@@ -5,6 +5,8 @@
   "type": "module",
   "exports": {
     "./cn": "./src/cn.ts",
+    "./feedback": "./src/feedback.ts",
+    "./feedback.css": "./src/feedback.css",
     "./button": "./src/button.tsx",
     "./input": "./src/input.tsx",
     "./label": "./src/label.tsx",
@@ -30,6 +32,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.0.11"
   },
   "dependencies": {
     "@kobalte/core": "^0.13.12",

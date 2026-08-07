@@ -2,6 +2,22 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-07 — interaction feedback: liquid-glass sheen + press ripple
+
+The UI kit gains its interaction-feedback layer — the owner's pick after a four-style prototype, recorded as [decision 25](docs/decisions.md#25--interaction-feedback-liquid-glass-sheen--ripple): a liquid-glass specular sheen follows the pointer on hover on **every** control, and a Material-style ripple answers the press on genuinely interactive elements.
+
+### Added
+
+- (web) **`@pub/ui/feedback`** — two Solid directives, [`use:sheen` and `use:ripple`](web/packages/ui/src/feedback.ts) (~1.3 kB minified together), plus the component-layer stylesheet [`feedback.css`](web/packages/ui/src/feedback.css). Both effects paint `currentColor` at a keyframe-bounded opacity (sheen 10%, ripple 15%) — the host's own text token, so they read in all three themes with **no new tokens** and cannot break a gate-checked AA pair. The ripple expands from the press point and fades on release; keyboard activation (Enter/Space) ripples from the center; disabled controls (`disabled`, `aria-disabled`, Kobalte `data-disabled`) get nothing; a press on a control nested in an interactive row ripples the control, not the row. 14 DOM-contract tests in [`feedback.test.ts`](web/packages/ui/test/feedback.test.ts) (happy-dom).
+- (web) **`Card` `interactive` variant** and **`TableRow` `interactive` variant** — explicit opt-ins for press-target cards and clickable rows (sheen + ripple; rows get an **inset** focus ring because a `<tr>` clips its ripple via `clip-path`, which would eat an outward ring). Recipes exported (`cardVariants`, `tableRowVariants`); activation semantics stay with the caller.
+- (web) ui-kit **"Interaction feedback"** showcase section — all four states (hover / press / keyboard / disabled) on buttons, interactive vs static cards, clickable rows with nested buttons.
+
+### Changed
+
+- (web) **Button, Menu items, Tabs triggers, ThemePicker trigger** now carry sheen + ripple; links reusing `buttonVariants` get the CSS-only, center-anchored sheen. Focus-visible rings are untouched everywhere.
+- (web) **Reduced motion collapses the new layer through the existing global reset** — the effects' base state is invisible and only `forwards`-fill animations reveal them, so the unlayered `animation: none` block erases both with zero motion media checks in JS ([`global.css`](web/apps/site/src/styles/global.css) comment updated; the one JS consequence is a timer standing in for `animationend` as the ripple's cleanup).
+- (docs) [`web/DESIGN.md`](web/DESIGN.md) — new §5a records the layer as the one sanctioned exception to the gradients ban, §6 notes on every affected component, §7/§7a updated with the erase-not-freeze mechanism; `docs/decisions.md` gains entry 25.
+
 ## 2026-08-07 — a deployable default: `pubd generate-secrets`, production-mode image, compose wired end to end
 
 Roadmap Phase 1.2, closing debt item D5 (`docker run` produced an instance nobody can sign in to) and the compose env-name drift. The documented minimum deployment is now a deployment: generate secrets → `docker run` with the env file and a volume → sign in.

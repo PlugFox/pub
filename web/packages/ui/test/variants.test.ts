@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { badgeVariants } from "@pub/ui/badge";
 import { buttonVariants } from "@pub/ui/button";
+import { cardVariants } from "@pub/ui/card";
 import { inputVariants } from "@pub/ui/input";
 import { separatorVariants } from "@pub/ui/separator";
+import { tableRowVariants } from "@pub/ui/table";
 
 describe("buttonVariants", () => {
   test("defaults to primary/md", () => {
@@ -31,6 +33,47 @@ describe("buttonVariants", () => {
     expect(classes).toContain("focus-visible:ring-2");
     expect(classes).toContain("disabled:pointer-events-none");
   });
+
+  test("every button carries the interaction feedback layer (DESIGN.md §5a)", () => {
+    const classes = buttonVariants().split(" ");
+    expect(classes).toContain("fx-sheen");
+    expect(classes).toContain("fx-ripple");
+  });
+});
+
+describe("cardVariants", () => {
+  test("defaults to the static surface — no feedback, no cursor", () => {
+    const classes = cardVariants().split(" ");
+    expect(classes).toContain("bg-surface");
+    expect(classes).not.toContain("fx-sheen");
+    expect(classes).not.toContain("fx-ripple");
+    expect(classes).not.toContain("cursor-pointer");
+  });
+
+  test("interactive is the explicit opt-in for sheen + ripple", () => {
+    const classes = cardVariants({ interactive: true }).split(" ");
+    expect(classes).toContain("fx-sheen");
+    expect(classes).toContain("fx-ripple");
+    expect(classes).toContain("cursor-pointer");
+  });
+});
+
+describe("tableRowVariants", () => {
+  test("defaults to a static surface row", () => {
+    const classes = tableRowVariants().split(" ");
+    expect(classes).toContain("bg-surface");
+    expect(classes).not.toContain("fx-sheen");
+    expect(classes).not.toContain("fx-ripple");
+  });
+
+  test("interactive rows add feedback and an INSET focus ring (clip-path would eat an outward one)", () => {
+    const classes = tableRowVariants({ interactive: true }).split(" ");
+    expect(classes).toContain("fx-sheen");
+    expect(classes).toContain("fx-ripple");
+    expect(classes).toContain("cursor-pointer");
+    expect(classes).toContain("focus-visible:ring-2");
+    expect(classes).toContain("focus-visible:ring-inset");
+  });
 });
 
 describe("badgeVariants", () => {
@@ -54,6 +97,14 @@ describe("badgeVariants", () => {
       const classes = badgeVariants({ variant }).split(" ");
       expect(classes).not.toContain("bg-accent");
       expect(classes).not.toContain(`bg-${variant}`);
+    }
+  });
+
+  test("static badges never carry interaction feedback (DESIGN.md §5a)", () => {
+    for (const variant of ["neutral", "accent", "success", "warning", "danger"] as const) {
+      const classes = badgeVariants({ variant }).split(" ");
+      expect(classes).not.toContain("fx-sheen");
+      expect(classes).not.toContain("fx-ripple");
     }
   });
 });

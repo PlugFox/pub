@@ -29,6 +29,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 22 | Domain event bus; webhooks + integrations on top                        | accepted |
 | 23 | Monitoring exports optional (Prometheus/OTLP off by default)            | accepted |
 | 24 | Theme registry, Patina palette, AMOLED variant, seed-theme seam         | accepted |
+| 25 | Interaction feedback: liquid-glass sheen + ripple                       | accepted |
 
 ---
 
@@ -317,3 +318,18 @@ Branding for the landing dashboard (`GET /api/v1/home`) ships as boot config `[b
 - **Themes are a registry, not a light/dark binary.** A theme is a named `[data-theme="<name>"]` block in `packages/tokens/theme.css` overriding the raw `--pub-*` token set; `:root` carries light, which is also the SSR default and the fallback for unknown names. The registry has three synchronized members: the CSS blocks, `THEMES` in `packages/ui/src/theme.ts` (picker + persistence), and the theme list in the anti-FOUC inline script. The contrast gate **discovers** theme blocks by parsing `theme.css` and asserts the same WCAG AA pairs for every theme — registering a theme in CSS is enough to put it under the gate. `localStorage.pub_theme` holds `"system"` or a theme name; anything unknown counts as system, so stale stored values from removed themes degrade gracefully.
 - **AMOLED is the third theme.** True-black canvas (`oklch(0 0 0)` — an OLED panel switches those pixels off), surfaces barely lifted, the same Patina accent/status families as dark. It is a darkness variant of dark, not a second brand; `system` resolves only to light/dark — amoled is always an explicit choice. The `dark:` Tailwind variant matches the whole dark family (dark + amoled).
 - **Seed-theme seam (documented, not implemented).** A future Material-You-style adaptive theme derives the same raw token set from one seed color at runtime and attaches it under a new `data-theme` scope. The `--pub-*` token *names* are the generation contract; the semantic `@theme` layer needs no changes; a generated set must pass the same contrast pairs the static gate asserts, evaluated at generation time. No generator ships now.
+
+## 25 — Interaction feedback: liquid-glass sheen + ripple
+
+> **Status: accepted.** Records the owner's explicit choice (2026-08-07), made after trying a four-style interactive prototype (no effects / sheen only / ripple only / both): *"ликвид гласс блик везде, риппл только там где есть интерактивность (кнопки, таблицы где строки кликабельны)"*.
+
+**Decision.** The UI kit ships exactly two dynamic interaction effects, with two different scopes:
+
+- **Sheen everywhere.** A liquid-glass specular highlight — a soft `currentColor` radial gradient that follows the pointer — appears on hover on **every control**: buttons (and links styled through `buttonVariants`), menu items, tab triggers, the ThemePicker trigger, and the opt-in `interactive` variants of Card and TableRow. Hover-only by media query (`hover: hover`): on touch the sheen does not exist and the ripple carries the feedback.
+- **Ripple only where pressing acts.** A Material-style wave expands from the press point and fades on release (keyboard activation ripples from the center) — on genuinely press-activated elements only: buttons, menu items, tab triggers, `interactive` cards and table rows. Static badges, static cards, and plain rows get neither effect; disabled elements get neither. An interactive Badge/chip variant is deliberately **not** built until a screen needs one.
+
+**Mechanics that keep it inside the design system** (full rules in `web/DESIGN.md` §5a/§7a):
+
+- **`currentColor`, bounded alpha, no new tokens.** Both effects paint the host's own text token at a keyframe-carried opacity ceiling (sheen 10%, ripple 15%), so they read on flat surfaces in all three registered themes, adapt to any future theme for free, and cannot push a gate-checked AA pair under 4.5:1. The §5 gradients ban stands for decoration; §5a records this as the one sanctioned exception.
+- **Reduced motion erases, not freezes.** The base state of both layers is invisible; only `forwards`-fill animations reveal them, so the existing global unlayered `animation: none` reset collapses the whole layer with zero motion media checks in JS (a timer replaces `animationend` as the wave's cleanup of last resort).
+- **Two Solid directives** (`use:sheen` / `use:ripple` in `packages/ui/src/feedback.ts`, ~1.3 kB minified, wired via `ref` in the kit) plus one component-layer stylesheet (`feedback.css`). Recipes carry the `fx-*` classes; screens never hand-write them. The focus-visible ring contract is untouched (interactive table rows use an inset ring because a `<tr>` clips its ripple via `clip-path`, which would eat an outward ring).

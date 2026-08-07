@@ -1,5 +1,7 @@
+import { cva, type VariantProps } from "class-variance-authority";
 import { type JSX, splitProps } from "solid-js";
 import { cn } from "./cn";
+import { feedback } from "./feedback";
 
 /*
  * Data table for the app's dense surfaces (sessions, tokens).
@@ -45,9 +47,42 @@ export function TableBody(props: JSX.HTMLAttributes<HTMLTableSectionElement>): J
   return <tbody {...rest} class={cn("divide-y divide-line", local.class)} />;
 }
 
-export function TableRow(props: JSX.HTMLAttributes<HTMLTableRowElement>): JSX.Element {
-  const [local, rest] = splitProps(props, ["class"]);
-  return <tr {...rest} class={cn("bg-surface", local.class)} />;
+/**
+ * `interactive` is the opt-in for rows whose whole surface is a press target
+ * (web/DESIGN.md §5a): hover sheen + press ripple, pointer cursor, and an
+ * INSET focus ring — `overflow` does not apply to table rows, so the ripple
+ * clips via `clip-path` (feedback.css), which would eat an outward ring.
+ * The row stays a plain `<tr>`; the caller owns the activation semantics
+ * (row link / `tabindex` + key handling), and buttons nested in cells keep
+ * their own feedback — a press that lands on them does not ripple the row.
+ */
+export const tableRowVariants = cva("bg-surface", {
+  variants: {
+    interactive: {
+      true: [
+        "fx-sheen fx-ripple cursor-pointer outline-none",
+        "focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset",
+      ],
+    },
+  },
+});
+
+export type TableRowProps = JSX.HTMLAttributes<HTMLTableRowElement> &
+  VariantProps<typeof tableRowVariants>;
+
+export function TableRow(props: TableRowProps): JSX.Element {
+  const [local, rest] = splitProps(props, ["class", "interactive", "ref"]);
+  return (
+    <tr
+      {...rest}
+      ref={(el) => {
+        // Read once at mount: an interactive row does not become static.
+        if (local.interactive === true) feedback(el);
+        if (typeof local.ref === "function") local.ref(el);
+      }}
+      class={cn(tableRowVariants({ interactive: local.interactive }), local.class)}
+    />
+  );
 }
 
 export type TableHeaderCellProps = JSX.ThHTMLAttributes<HTMLTableCellElement>;

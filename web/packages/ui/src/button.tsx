@@ -1,14 +1,21 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import { type JSX, splitProps } from "solid-js";
 import { cn } from "./cn";
+import { feedback } from "./feedback";
 
 /**
  * Button recipe, exported separately so links styled as buttons can reuse it
  * (`<a class={buttonVariants({ intent: "primary" })}>`). No margins on the
  * root — spacing belongs to the parent layout. Spec: web/DESIGN.md “Button”.
+ *
+ * The recipe carries the interaction-feedback classes (web/DESIGN.md §5a):
+ * every button-styled surface shows the hover sheen (center-anchored until
+ * the directive tracks the pointer), and `Button` itself attaches the
+ * directives for tracking + the press ripple.
  */
 export const buttonVariants = cva(
   [
+    "fx-sheen fx-ripple",
     "inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg font-medium",
     "transition-colors outline-none select-none whitespace-nowrap",
     "focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2",
@@ -41,11 +48,16 @@ export type ButtonProps = JSX.ButtonHTMLAttributes<HTMLButtonElement> &
 
 export function Button(props: ButtonProps): JSX.Element {
   // splitProps, never destructuring — destructuring breaks Solid reactivity.
-  const [local, rest] = splitProps(props, ["class", "intent", "size"]);
+  const [local, rest] = splitProps(props, ["class", "intent", "size", "ref"]);
   return (
     <button
       type="button"
       {...rest}
+      ref={(el) => {
+        feedback(el);
+        // Across a component boundary Solid always passes refs as functions.
+        if (typeof local.ref === "function") local.ref(el);
+      }}
       class={cn(buttonVariants({ intent: local.intent, size: local.size }), local.class)}
     />
   );

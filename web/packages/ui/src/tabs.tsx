@@ -1,6 +1,7 @@
 import * as TabsPrimitive from "@kobalte/core/tabs";
 import { type JSX, splitProps } from "solid-js";
 import { cn } from "./cn";
+import { feedback } from "./feedback";
 
 /**
  * Tabs — thin Kobalte wrapper (subpath import per docs/rules/web.md).
@@ -38,13 +39,18 @@ export type TabsTriggerProps = Omit<JSX.ButtonHTMLAttributes<HTMLButtonElement>,
 };
 
 export function TabsTrigger(props: TabsTriggerProps): JSX.Element {
-  const [local, rest] = splitProps(props, ["class"]);
+  const [local, rest] = splitProps(props, ["class", "ref"]);
   return (
     <TabsPrimitive.Trigger
       {...rest}
+      ref={(el: HTMLButtonElement) => {
+        feedback(el);
+        if (typeof local.ref === "function") local.ref(el);
+      }}
       class={cn(
-        "cursor-pointer rounded-t-md px-4 py-2 text-sm font-medium text-ink-muted outline-none",
-        "transition-colors hover:text-ink focus-visible:ring-2 focus-visible:ring-accent",
+        "fx-sheen fx-ripple cursor-pointer rounded-t-md px-4 py-2 text-sm font-medium",
+        "text-ink-muted transition-colors outline-none hover:text-ink",
+        "focus-visible:ring-2 focus-visible:ring-accent",
         "selected:text-ink disabled:pointer-events-none disabled:opacity-50",
         local.class,
       )}

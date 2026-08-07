@@ -3,6 +3,7 @@ import { common } from "@pub/i18n/generated/common";
 import { createSignal, For, type JSX, onCleanup, onMount, splitProps } from "solid-js";
 import { buttonVariants } from "./button";
 import { cn } from "./cn";
+import { feedback } from "./feedback";
 import { Menu, MenuContent, MenuRadioGroup, MenuRadioItem, MenuTrigger } from "./menu";
 import { normalizeMode, resolveTheme, THEME_STORAGE_KEY, THEMES, type ThemeMode } from "./theme";
 
@@ -38,7 +39,7 @@ function applyMode(mode: ThemeMode): void {
 export type ThemePickerProps = JSX.ButtonHTMLAttributes<HTMLButtonElement>;
 
 export function ThemePicker(props: ThemePickerProps): JSX.Element {
-  const [local, rest] = splitProps(props, ["class"]);
+  const [local, rest] = splitProps(props, ["class", "ref"]);
   const [mode, setMode] = createSignal<ThemeMode>("system");
 
   // All window/localStorage access lives in onMount: the island is
@@ -64,6 +65,10 @@ export function ThemePicker(props: ThemePickerProps): JSX.Element {
     <Menu>
       <MenuTrigger
         {...rest}
+        ref={(el: HTMLButtonElement) => {
+          feedback(el);
+          if (typeof local.ref === "function") local.ref(el);
+        }}
         aria-label={t(common.themePicker)}
         title={t(common.themePicker)}
         class={cn(

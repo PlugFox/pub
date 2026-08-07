@@ -1,6 +1,7 @@
 @import "./fonts.css";
 @import "tailwindcss";
 @import "@pub/tokens/theme.css";
+@import "@pub/ui/feedback.css";
 @import "./prose.css";
 
 /*
@@ -13,7 +14,10 @@
  * Reduced motion, once, globally.
  *
  * Every animation in the product is decorative — a pulsing Skeleton, a
- * spinning Spinner, colour transitions, the sliding Tabs indicator. None of it
+ * spinning Spinner, colour transitions, the sliding Tabs indicator, and the
+ * interaction-feedback layer (hover sheen + press ripple, @pub/ui feedback.css:
+ * their base state is invisible and only animations reveal them, so
+ * `animation: none` erases both without any JS media check). None of it
  * encodes information, so the honest response to `prefers-reduced-motion` is
  * to stop all of it rather than to sprinkle `motion-safe:` over component
  * recipes and forget one.

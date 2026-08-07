@@ -1,6 +1,7 @@
 import * as MenuPrimitive from "@kobalte/core/dropdown-menu";
 import { type JSX, splitProps } from "solid-js";
 import { cn } from "./cn";
+import { feedback } from "./feedback";
 
 /**
  * Dropdown menu — thin Kobalte wrapper (subpath import per docs/rules/web.md).
@@ -45,13 +46,18 @@ export type MenuItemProps = JSX.HTMLAttributes<HTMLDivElement> & {
 };
 
 export function MenuItem(props: MenuItemProps): JSX.Element {
-  const [local, rest] = splitProps(props, ["class"]);
+  const [local, rest] = splitProps(props, ["class", "ref"]);
   return (
     <MenuPrimitive.Item
       {...rest}
+      ref={(el: HTMLDivElement) => {
+        feedback(el);
+        if (typeof local.ref === "function") local.ref(el);
+      }}
       class={cn(
-        "flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-sm outline-none",
-        "transition-colors select-none highlighted:bg-accent-soft highlighted:text-accent",
+        "fx-sheen fx-ripple flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-sm",
+        "transition-colors outline-none select-none",
+        "highlighted:bg-accent-soft highlighted:text-accent",
         "aria-disabled:pointer-events-none aria-disabled:opacity-50",
         local.class,
       )}
@@ -74,13 +80,18 @@ export type MenuRadioItemProps = JSX.HTMLAttributes<HTMLDivElement> & {
 };
 
 export function MenuRadioItem(props: MenuRadioItemProps): JSX.Element {
-  const [local, rest] = splitProps(props, ["class", "children"]);
+  const [local, rest] = splitProps(props, ["class", "children", "ref"]);
   return (
     <MenuPrimitive.RadioItem
       {...rest}
+      ref={(el: HTMLDivElement) => {
+        feedback(el);
+        if (typeof local.ref === "function") local.ref(el);
+      }}
       class={cn(
-        "flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-sm outline-none",
-        "transition-colors select-none highlighted:bg-accent-soft highlighted:text-accent",
+        "fx-sheen fx-ripple flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-sm",
+        "transition-colors outline-none select-none",
+        "highlighted:bg-accent-soft highlighted:text-accent",
         "aria-disabled:pointer-events-none aria-disabled:opacity-50",
         local.class,
       )}
