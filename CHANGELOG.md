@@ -2,6 +2,20 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-07 — authority changes reach the token plane, and grants gain a ceiling (D37, D39)
+
+Two owner-decided authorization rules, each recorded in the decision log before a line of code and each hardened by an adversarial review (three lenses, every substantive finding re-verified; the one real defect — a token sweep that could abort the session revocation it should follow — fixed by reordering and making the sweep best-effort).
+
+### Added
+
+- (server) **Role-grant ceiling** ([decision 19 addendum](docs/decisions.md#19--rbac-cumulative-role-levels-with-a-single-authorize-chokepoint), closes D39): a non-Owner manages only role levels **strictly below their own** — both the level granted and the level the target currently holds — so an Admin can no longer appoint, promote to, demote, or remove an Owner or another Admin. Owners are exempt; **self-directed reduction** (demote or remove yourself) is always allowed, which is how an Admin leaves an org. The check lives in the org service, so add/change/remove/invite all inherit it; denials are a `403 forbidden` naming role names. The ≥1-Owner invariant is unchanged.
+- (server) **Authority changes reach the token plane** ([decision 13 addendum](docs/decisions.md#13--cliapi-token-format), [S-13.a](docs/security.md#3-cliapi-tokens), closes D37): a lowered role or a withdrawal now **revokes the member's org tokens whose scopes exceed the new level** (a removal takes all of them; a raise takes none), using the mint gate's scope→level map — moved into `core` as `TokenScope::required_action` so it has one home. **Suspension gates the credential plane**: `find_active_by_hash` answers only tokens of active users, so suspending an account stops its CLI tokens within ≤60 s and unsuspending restores them — reversible, and the reason the S-27 break-glass answer is now real. One `token.revoked` audit row per sweep, best-effort, ordered after the S-09 session revocation so it can never block it.
+- (web) **Warning UX for privileged transitions** (decision 19 addendum): role pickers offer only levels the caller may grant, members at or above the caller's level render read-only, and granting/ demoting/ removing an Admin or Owner confirms through a dialog first. The member-role select no longer fires a mutation straight from `onChange` — a warn-worthy pick opens the dialog and snaps back, and any failed change re-reads the row so the select never shows a role the server did not apply. A follow-up toast reports revoked CLI tokens.
+
+### Fixed
+
+- (web) **D32, in passing**: `revokeInvitation` is now wrapped in `withStepUp` (it silently failed the step-up prompt before), and gained the in-flight guard every other mutation on the screen already had.
+
 ## 2026-08-07 — the final Phase 1 wave: HTTP hygiene, supply-chain CI, operator docs
 
 Roadmap Phase 1 items 3, 5 and 6 — closing debt D7, D8, D13 and D15; the phase's exit now hangs on the first tag alone. Per the working agreements the wave ended in an adversarial review (six lenses, every substantive finding independently re-verified: 20 confirmed, 0 refuted, all fixed) — among the catches: an HTML 304 that would have clobbered the cached page's CSP with `default-src 'none'` and blanked the site from the second navigation on, a service worker killed by its own response's CSP, and an inverted subpath reverse-proxy procedure. Three new debt entries came out of it (D37–D39, see the roadmap).

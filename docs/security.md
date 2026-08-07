@@ -93,20 +93,24 @@ Corporate-grade posture. Self-assessment framework: **OWASP ASVS L2**; authentic
 > membership mutation is routed through it. `OrgRepo`'s membership mutators are called from that
 > module and nowhere else, so "no route can forget" is structural rather than a review item.
 >
-> | Change | Revokes | Why |
-> |--------|---------|-----|
-> | Role change (either direction) | **yes** | An access token minted a minute ago still carries the *old* level and would keep spending it for up to one access TTL. This is precisely the window S-09 exists to close. |
-> | Membership removal | **yes** | Same, with the old level being "anything at all". |
-> | Org archived (forced deletion) | **yes**, per removed member | Every membership is deleted, so every one of them is a withdrawal. |
-> | Account suspended | **yes** | The account's authority went to zero; the admin surface calls the same entry point. |
-> | Membership **created** (add member, invitation accepted) | **no** | Nothing stale can spend authority the grant just created: a token issued before it carries no claim for the org and fails closed. Logging somebody out of every device the instant they accept an invitation is a cost with no security benefit — and it would make the accept endpoint hand back a session it had just destroyed. |
+> | Change | Revokes sessions | Sweeps CLI tokens | Why |
+> |--------|---------|---------|-----|
+> | Role change **down** | **yes** | **yes** (S-13.a) | An access token minted a minute ago carries the *old* level; a still-live CLI token could still mint above the new role. Both are the window this rule closes. |
+> | Role change **up** | **yes** | **no** | Sessions revoke either direction for simplicity; a *raise* strands no over-scoped token (the new level is higher), so the token sweep is a no-op. |
+> | Membership removal | **yes** | **yes**, all of this org's | Old level was "anything at all"; every one of the member's tokens for this org is now over-scoped. |
+> | Org archived (forced deletion) | **yes**, per removed member | **yes**, in one bulk repo `UPDATE` *before* the per-member loop, so the sweep finds nothing left to do and does not double-audit. | Every membership is deleted, so every one is a withdrawal. |
+> | Account suspended | **yes** | **gated, not swept** | Authority went to zero *reversibly*; sessions are revoked and the credential plane is gated at `find_active_by_hash` (S-13.a), so unsuspension restores the tokens rather than forcing a re-mint. |
+> | Membership **created** (add member, invitation accepted) | **no** | **no** | Nothing stale can spend authority the grant just created: a token issued before it carries no claim for the org and fails closed. Logging somebody out the instant they accept an invitation is a cost with no security benefit — and it would make accept hand back a session it had just destroyed. |
 >
-> Revocation goes through `AuthService::revoke_sessions_after_authority_change`, so it is the
+> Session revocation goes through `AuthService::revoke_sessions_after_authority_change`, so it is the
 > same durable-then-KV-blocklist path logout uses, with the **system** as the audit actor (the
-> person losing their sessions is not the person who acted) and a `reason` naming the change.
+> person losing their sessions is not the person who acted) and a `reason` naming the change; the
+> token sweep (S-13.a) runs **after** it, best-effort, and never blocks it.
 > Asserted end to end against live tokens by
 > `manage.rs::s09_a_role_change_revokes_every_session_of_the_affected_member` and
 > `s09_removal_revokes_sessions_but_a_grant_leaves_them_alone`.
+>
+> **Accepted edge (2026-08-07):** accepting an invitation that *raises* an existing member's role is classified `Granted`, so it revokes no sessions — a deviation from the "either direction" row above, kept because a raise strands nothing stale (the old level is lower) and reclassifying it would need an extra membership read on the accept path for no security gain. A raise, however reached, is the one direction where not revoking is safe.
 
 **S-10** Session hygiene: session list UI (created, last-seen throttled, IP, coarse UA, current flag, revoke one/all); idle timeout and absolute cap configurable per instance.
 **S-11** XSS compensation for localStorage tokens: strict CSP (`script-src 'self'` + nonce for the single inline theme script, no `unsafe-inline`), backend-sanitized README HTML (ammonia whitelist; links `rel="nofollow ugc noopener"`; `img-src` restricted), publishing rights reserved to CLI tokens so a stolen web session cannot publish.
@@ -117,6 +121,11 @@ Corporate-grade posture. Self-assessment framework: **OWASP ASVS L2**; authentic
 ## 3. CLI/API tokens
 
 **S-13** Format `<prefix>_<base62×30><crc32-base62×6>` (default prefix `pub_`, instance-configurable per decision 17); SHA-256 at rest + first-8 display hint; show-once. Scopes `read`/`publish`/`retract`/`admin`, org-bound, optional package patterns; default expiry 90 days (unlimited allowed only for `read`); last-used/last-IP write-throttled tracking; revocation effective within ≤60 s (no server-side token caching beyond that); per-token rate limits.
+> **S-13.a — a token no longer outlives the authority it was minted under** (added 2026-08-07, closes roadmap D37). "Revocation effective within ≤60 s" used to mean only the explicit revoke action; a demotion or a suspension left the credential itself untouched, because the token plane re-derives the *role* per request but never re-examines the *token*. Two rules close that, and both are asserted against live tokens.
+>
+> - **A lowered role sweeps the tokens the new role could no longer mint.** When a member's role is redefined *downward* or their membership is withdrawn, their org-bound tokens whose scopes exceed the new level are revoked (a withdrawal → level `NONE` → all of them; a raise → none). "What a scope is worth" has one source — the same scope→action→level map the mint gate uses (`read`→50, `publish`/`retract`→100, `admin`→200), evaluated in Rust so it is never duplicated into per-dialect SQL — and the comparison is against the *token's* scopes, not the holder's, so a Read-scoped token survives a demotion to Read. An empty scope set fails **closed** (revoked). The sweep runs *after* the S-09 session revocation, cannot block it, and revokes best-effort with a logged warning on any per-token failure; it appends one `token.revoked` audit row (system actor, `{reason, count}`) only when it revoked something. Asserted by `manage.rs::s13_a_demotion_revokes_the_org_tokens_the_new_role_could_no_longer_mint` and `s13_a_raise_revokes_no_tokens_and_a_removal_sweeps_only_this_orgs_tokens`.
+> - **Suspension gates the credential plane at the repository.** `TokenRepo::find_active_by_hash` (both dialects, an `EXISTS status = 'active'` predicate — which also excludes `deleted`) returns nothing for a token whose owner is not active, so a suspended account's CLI tokens stop authenticating within the ≤60 s bound and resume on unsuspension — reversible, exactly like suspension. On the wire the token is indistinguishable from a revoked or unknown one (uniform 401 per S-14.a; the pub client drops its stored copy, costing one `dart pub token add` after reinstatement), and the failure still spends the S-24 budget. This is what makes the S-27 break-glass answer real: suspending a compromised account now neutralizes both its web sessions *and* its CLI tokens. Asserted by `admin.rs::s13_suspension_revokes_sessions_blocks_sign_in_and_gates_cli_tokens` and the `db-tests` token-repo contract walk on both backends.
+
 **S-14** 401 vs 403 discipline on pub routes: **both** statuses carry `WWW-Authenticate: Bearer realm="pub", message="<actionable text>"` — the client surfaces the message in the CLI on 401 *and* 403, and it is our only messaging channel there (how to get a token / how to request access). 401 **only** for absent/invalid tokens (the client deletes its stored token on 401); 403 only for valid-but-insufficient scope/role on a resource the principal can see; unreadable resources are 404 per S-04.
 
 > **S-14.a — the ladder as implemented, and the two things that must not be forgotten** (added 2026-08-07 with the pub protocol surface). The mapping lives in exactly one place (`api/src/protocol/error.rs`); handlers pick a constructor, never a status code.
