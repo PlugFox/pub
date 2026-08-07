@@ -8,13 +8,21 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 # The `metrics` facade is always compiled; whether anything records is decision 23's
 # config-gated exporter. Mirror lag and GC volume are the two numbers an operator watches
 # without reading logs.
 metrics = { workspace = true }
+# `secretbox` opens the KEK-sealed mail bodies the queue carries (S-26.b). The direction is
+# legal: pub-auth depends on core/mail only, so nothing here can close a cycle.
+pub-auth = { workspace = true }
 pub-core = { workspace = true }
+# The fan-out handler drives the *same* notification center the request path used to run
+# inline (decision 26): the audience policy is moved, not forked. pub-events depends on
+# pub-core alone, so jobs → events is legal and events → jobs would not be.
+pub-events = { workspace = true }
 # The mirror worker warms the *same* ingest pipeline the read-through path uses (decision 07):
 # it drives `UpstreamService`, it does not reimplement it.
 pub-registry = { workspace = true }
@@ -24,6 +32,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 # test-util enables tokio::time::pause/advance for deterministic scheduler tests.
 tokio = { workspace = true, features = ["test-util"] }
@@ -32,3 +41,6 @@ tokio = { workspace = true, features = ["test-util"] }
 pub-blob = { workspace = true }
 pub-config = { workspace = true }
 pub-db-sqlite = { workspace = true }
+# The queue tests drive the real notification center over real rows: a double there would be
+# proving that the double behaves, not that a fan-out files anybody's notification.
+pub-events = { workspace = true }

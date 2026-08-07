@@ -529,7 +529,9 @@ async fn s24_spoofed_forwarded_header_cannot_poison_another_address() {
     assert_eq!(app.send(request).await.status, StatusCode::OK);
 
     // The OTP mail renders the requester IP; the spoofed value must not appear there, which
-    // is the same resolution the rate-limit bucket and the audit trail use.
+    // is the same resolution the rate-limit bucket and the audit trail use. Delivery rides the
+    // queue now (decision 26), so the drain is what puts the message in the outbox.
+    app.drain_jobs().await;
     let mail = app.mailer.sent().pop().expect("one mail");
     assert!(!mail.text.contains(victim), "spoofed XFF became the recorded client identity:\n{}", mail.text);
     assert!(mail.text.contains("unknown"), "untrusted deployments have no client IP to report:\n{}", mail.text);

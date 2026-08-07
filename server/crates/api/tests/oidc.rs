@@ -311,6 +311,9 @@ async fn s02_links_to_existing_account_only_when_both_sides_verified() {
             && c.subject.as_deref() == Some("link-sub")),
         "oidc credential missing: {credentials:?}"
     );
+    // The notice is filed on the queue, not sent inline (decision 26), so the drain is what
+    // turns "a link happened" into "the account holder was told".
+    app.drain_jobs().await;
     let mails = app.mailer.sent();
     assert_eq!(mails.len(), mails_before + 1, "linking must notify the user");
     assert_eq!(mails.last().unwrap().to, "linked@corp.com");

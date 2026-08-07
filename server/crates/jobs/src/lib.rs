@@ -15,11 +15,16 @@
 //!   the publish path, so something has to close the gap; this is also how an existing instance
 //!   gets an index at all after migration 0007.
 //! - [`downloads`] — download-statistics rollup. Drains the in-process counter buffer into the
-//!   daily table and writes the totals back onto the search index. The only job that is **on**
-//!   by default: disabling it does not reduce statistics, it fills a buffer until it drops.
+//!   daily table and writes the totals back onto the search index. On by default: disabling it
+//!   does not reduce statistics, it fills a buffer until it drops.
+//! - [`queue`] — the durable work queue's drain (decision 26), with [`fanout`] and [`mail`] as
+//!   its two handlers. The only job with **no** `enabled` key at all: sign-in mail rides this
+//!   queue, so an operator who switched it off could not sign in to switch it back on.
 //!
-//! Still to come with their own roadmap steps: expired session/OTP/invitation purge, audit
-//! retention, webhook delivery.
+//! Still to come with their own roadmap steps: expired session/OTP/invitation purge and audit
+//! retention. Webhook delivery (S-33) is no longer an open mechanism question — it is one more
+//! [`pub_core::queue::JobKind`] and one more [`queue::JobHandler`], with the retry, backoff and
+//! dead-letter machinery already built and already tested.
 //!
 //! [`JobRegistry`] is the same set seen from the admin surface: it takes the scheduler's own
 //! [`JobLock`] before a manually triggered run, so an operator pressing "run now" can never
@@ -30,17 +35,23 @@
 //! [`pub_core::traits::JobRepo`] rather than from anything held in this process.
 
 pub mod downloads;
+pub mod fanout;
 pub mod gc;
 mod lock;
+pub mod mail;
 pub mod mirror;
+pub mod queue;
 pub mod registry;
 pub mod reindex;
 mod scheduler;
 
 pub use downloads::{DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, RollupReport};
+pub use fanout::FanoutHandler;
 pub use gc::{BLOB_GC_JOB, BlobGc, GcPolicy, GcReport};
 pub use lock::InMemoryJobLock;
+pub use mail::MailHandler;
 pub use mirror::{MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorReport, MirrorWorker};
+pub use queue::{HandlerReport, JobHandler, QUEUE_JOB, QueuePolicy, QueueReport, QueueWorker};
 pub use registry::JobRegistry;
 pub use reindex::{REINDEX_JOB, ReindexPolicy, ReindexReport, Reindexer};
 pub use scheduler::{Scheduler, SchedulerHandle};

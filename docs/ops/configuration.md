@@ -937,6 +937,74 @@ integer · `PUB_JOBS__DOWNLOADS__BUFFER_CAPACITY` · default: `50000`
 Distinct `(package, version, day)` buckets held between flushes; past this, counts for
 *new* buckets are dropped rather than growing the buffer without bound.
 
+## `[jobs.queue]`
+
+The durable work queue's drain (decision 26).
+
+Durable work-queue settings ([decision 26](../decisions.md#26)).
+
+The one job section with **no `enabled` key**, and that absence is the decision rather than
+an oversight: notification fan-out and every outbound message — including the sign-in code —
+ride this queue, so an operator who switched the drain off would file a table of undelivered
+mail and could not sign in to switch it back on. An instance that genuinely sends no mail is
+already expressed by leaving `[smtp]` unconfigured, which resolves to the in-memory mailer.
+
+### `jobs.queue.interval_secs`
+
+integer · `PUB_JOBS__QUEUE__INTERVAL_SECS` · default: `5`
+
+Seconds between drains — the latency floor on queued mail.
+
+### `jobs.queue.batch`
+
+integer · `PUB_JOBS__QUEUE__BATCH` · default: `50`
+
+Items leased per claim, and therefore the cost bound of one pass.
+
+### `jobs.queue.lease_secs`
+
+integer · `PUB_JOBS__QUEUE__LEASE_SECS` · default: `120`
+
+Seconds a claimed item stays leased. A worker that dies mid-run makes its items
+invisible for this long, so it is also how quickly a crashed drain's work resumes; it
+must exceed both the tick interval and one delivery deadline.
+
+### `jobs.queue.max_attempts`
+
+integer · `PUB_JOBS__QUEUE__MAX_ATTEMPTS` · default: `8`
+
+Attempts an item gets before it is dead-lettered and left for the operator.
+
+### `jobs.queue.backoff_base_secs`
+
+integer · `PUB_JOBS__QUEUE__BACKOFF_BASE_SECS` · default: `10`
+
+First retry delay; doubles per attempt, spread ±25%.
+
+### `jobs.queue.backoff_max_secs`
+
+integer · `PUB_JOBS__QUEUE__BACKOFF_MAX_SECS` · default: `3600`
+
+Ceiling on the retry delay.
+
+### `jobs.queue.retain_done_hours`
+
+integer · `PUB_JOBS__QUEUE__RETAIN_DONE_HOURS` · default: `24`
+
+Hours a completed item is kept before retention deletes it. Dead-lettered items are
+**never** purged — they are the operator's record of mail that never arrived.
+
+### `jobs.queue.send_timeout_secs`
+
+integer · `PUB_JOBS__QUEUE__SEND_TIMEOUT_SECS` · default: `30`
+
+Deadline on one delivery attempt.
+
+Not a nicety: it replaces the bound this design removes. The SMTP transport sets no
+deadline of its own, and off the request path there is no `[http]` timeout left to
+truncate a hung conversation — a relay that connects and then says nothing would hold
+its lease and starve every lease behind it.
+
 ## `[branding]`
 
 White-label instance identity shown on the landing dashboard (decision 17).

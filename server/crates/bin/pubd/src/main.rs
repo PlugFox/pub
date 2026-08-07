@@ -25,11 +25,13 @@ use pub_core::settings::{SETTINGS_TOPIC, SettingsCache};
 use pub_core::traits::{BlobStore, JobLock, JobTrigger, Kv, Mailer, Repositories};
 use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
-use pub_events::{EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationPolicy};
+use pub_events::{
+    EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationEnqueuer, NotificationPolicy,
+};
 use pub_jobs::{
-    BLOB_GC_JOB, BlobGc, DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, GcPolicy, InMemoryJobLock,
-    JobRegistry, MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorWorker, REINDEX_JOB, ReindexPolicy, Reindexer, Scheduler,
-    SchedulerHandle,
+    BLOB_GC_JOB, BlobGc, DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, FanoutHandler, GcPolicy,
+    InMemoryJobLock, JobRegistry, MIRROR_JOB, MailHandler, MirrorMode, MirrorPolicy, MirrorWorker, QUEUE_JOB,
+    QueuePolicy, REINDEX_JOB, ReindexPolicy, Reindexer, Scheduler, SchedulerHandle,
 };
 use pub_kv::{MemoryKv, RedisKv};
 use pub_mail::{BootSmtp, InMemoryMailer, RuntimeMailer, SmtpMailerBuilder};
@@ -102,16 +104,22 @@ async fn main() -> anyhow::Result<()> {
     let version = runtime.reload(repos.settings.as_ref()).await.context("failed to load runtime settings")?;
     tracing::info!(version, "runtime settings loaded");
 
-    // The mailer resolves from that cache on every send, so it must be built *after* it (D10).
-    let mailer = build_mailer(&settings, Arc::clone(&runtime))?;
+    // One KEK for the whole process, resolved once. Resolving it per consumer would be
+    // harmless with a configured key and quietly fatal without one: the dev fallback mints a
+    // *fresh* ephemeral key per call, so the sealer and the unsealer of a queued sign-in body
+    // would hold different keys and every OTP message would dead-letter (S-26.b).
+    let kek = kek(&settings)?;
 
-    let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer), Arc::clone(&runtime))?;
+    // The mailer resolves from that cache on every send, so it must be built *after* it (D10).
+    let mailer = build_mailer(&settings, Arc::clone(&runtime), kek.clone())?;
+
+    let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&runtime), kek.clone())?;
     bootstrap_admins(&settings, &repos).await?;
 
     // The domain event bus (decision 22) is built before every service that emits into it, so
     // there is exactly one bus per process: the SSE stream this instance serves and the
     // notification rows it writes come from the same fan-out.
-    let events = build_events(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer));
+    let events = build_events(&settings, repos.clone(), Arc::clone(&kv));
     events.spawn_broker_subscription();
     let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
 
@@ -126,14 +134,22 @@ async fn main() -> anyhow::Result<()> {
     // `serve` — a mirror sweep that stops the moment the binding is dropped would be a very
     // confusing bug. The registry it hands back is the same job set, reachable on demand from
     // the admin surface under the same leader lock.
-    let (_jobs, triggers) =
-        spawn_jobs(&settings, repos.clone(), Arc::clone(&blob), upstream.clone(), Arc::clone(&downloads));
+    let (_jobs, triggers) = spawn_jobs(
+        &settings,
+        repos.clone(),
+        Arc::clone(&blob),
+        upstream.clone(),
+        Arc::clone(&downloads),
+        Arc::clone(&events),
+        Arc::clone(&mailer),
+        kek.clone(),
+        Arc::clone(&runtime),
+    );
 
     let orgs = Arc::new(OrgService::new(
         repos.clone(),
         Arc::clone(&auth),
         Arc::clone(&registry),
-        Arc::clone(&mailer),
         Arc::clone(&sink),
         Arc::new(OsRandom),
         OrgPolicy::default(),
@@ -146,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&sink),
         triggers,
         Arc::new(OsRandom),
-        kek(&settings)?,
+        kek,
         Arc::clone(&mailer),
         settings.smtp.password.is_some(),
     ));
@@ -288,19 +304,29 @@ fn build_upstream(
 /// Registers the enabled background jobs and spawns the leader-locked scheduler
 /// (decision 03; docs/architecture.md "Background jobs").
 ///
-/// Both jobs are **off by default** and each is skipped entirely when it is: a job that is not
-/// registered cannot tick, which is a stronger guarantee than a job whose body returns early —
-/// and for the GC, which deletes bytes, that difference is the point.
+/// A job that is off is skipped entirely rather than registered with an early-returning body:
+/// a job that is not registered cannot tick, and for the GC, which deletes bytes, that
+/// difference is the point.
+///
+/// The **work queue's drain is the exception with no switch at all** (decision 26): it carries
+/// the sign-in mail, so an operator who could turn it off could not sign in to turn it back on.
 ///
 /// The lock is the in-process one for now (single instance); the Redis-backed implementation
 /// arrives with the multi-instance tier, and it is a one-line change here because the scheduler
-/// only ever sees `Arc<dyn JobLock>`.
+/// only ever sees `Arc<dyn JobLock>`. Note the interaction with D1 for the queue specifically:
+/// with the in-process lock two replicas would both drain, which the Postgres claim's
+/// `FOR UPDATE SKIP LOCKED` already makes safe, and SQLite is single-instance by construction.
+#[allow(clippy::too_many_arguments)]
 fn spawn_jobs(
     settings: &Settings,
     repos: Repositories,
     blob: Arc<dyn BlobStore>,
     upstream: Option<Arc<pub_registry::UpstreamService>>,
     downloads: Arc<DownloadRecorder>,
+    events: Arc<EventBus>,
+    mailer: Arc<dyn Mailer>,
+    kek: Vec<u8>,
+    runtime: Arc<SettingsCache>,
 ) -> (Option<SchedulerHandle>, Arc<dyn JobTrigger>) {
     let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
     let mut scheduler = Scheduler::new(Arc::clone(&lock));
@@ -308,6 +334,37 @@ fn spawn_jobs(
     // job's durable cursor.
     let mut triggers = JobRegistry::new(lock);
     let mut registered = Vec::new();
+
+    // The work queue's drain (decision 26). Unconditional and first in the list: it carries the
+    // sign-in mail, so there is no configuration under which this instance runs without it.
+    // The mailer handed in is the *same* `Arc` the request path holds, so an administrator's
+    // SMTP change reaches queued mail with no second transport (D10).
+    let queue_cfg = settings.jobs.queue;
+    let queue_policy = QueuePolicy {
+        interval: Duration::from_secs(queue_cfg.interval_secs),
+        batch: queue_cfg.batch,
+        lease: Duration::from_secs(queue_cfg.lease_secs),
+        max_attempts: queue_cfg.max_attempts,
+        backoff_base: Duration::from_secs(queue_cfg.backoff_base_secs),
+        backoff_max: Duration::from_secs(queue_cfg.backoff_max_secs),
+        retain_done: chrono::Duration::hours(queue_cfg.retain_done_hours),
+        send_timeout: Duration::from_secs(queue_cfg.send_timeout_secs),
+    };
+    let center = build_notification_center(settings, repos.clone(), runtime);
+    let queue_worker = Arc::new(
+        pub_jobs::QueueWorker::new(repos.clone(), events, queue_policy)
+            .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue))))
+            .with_handler(Arc::new(MailHandler::new(mailer, kek, queue_policy.send_timeout))),
+    );
+    triggers = triggers.with_queue(Arc::clone(&queue_worker));
+    scheduler.add(QUEUE_JOB, queue_policy.interval, move || {
+        let worker = Arc::clone(&queue_worker);
+        async move {
+            worker.run_once(chrono::Utc::now()).await?;
+            Ok(())
+        }
+    });
+    registered.push(QUEUE_JOB);
 
     let mirror_cfg = settings.upstream.mirror;
     if let Some(upstream) = upstream.filter(|_| mirror_cfg.mode.is_enabled()) {
@@ -401,10 +458,8 @@ fn spawn_jobs(
     }
 
     let triggers: Arc<dyn JobTrigger> = Arc::new(triggers);
-    if registered.is_empty() {
-        tracing::info!("no background jobs enabled");
-        return (None, triggers);
-    }
+    // There is no "nothing registered" case any more: the queue drain is unconditional, so the
+    // scheduler always has at least one job to run.
     tracing::info!(jobs = ?registered, "background jobs scheduled");
     (Some(scheduler.spawn()), triggers)
 }
@@ -480,7 +535,11 @@ fn spawn_settings_watch(cache: Arc<SettingsCache>, repos: Repositories, kv: Arc<
 /// no-op publish per event and a Redis deployment gets cross-instance fan-out with no
 /// configuration difference — the property decision 20 needs for "any instance can serve any
 /// client's stream".
-fn build_events(settings: &Settings, repos: Repositories, kv: Arc<dyn Kv>, mailer: Arc<dyn Mailer>) -> Arc<EventBus> {
+/// The one consumer registered here is the **enqueuer**, not the notification center: the
+/// emitting request files one durable job and returns, and the center is driven by the drain
+/// worker (decision 26). That is what makes a publish finalize's cost constant in the size of
+/// the audience.
+fn build_events(settings: &Settings, repos: Repositories, kv: Arc<dyn Kv>) -> Arc<EventBus> {
     let realtime = settings.realtime;
     let bus = Arc::new(
         EventBus::new(EventBusPolicy {
@@ -489,17 +548,28 @@ fn build_events(settings: &Settings, repos: Repositories, kv: Arc<dyn Kv>, maile
         })
         .with_broker(kv),
     );
-    let center = NotificationCenter::new(
+    bus.add_consumer(Arc::new(NotificationEnqueuer::new(Arc::clone(&repos.queue))) as Arc<dyn EventConsumer>);
+    bus
+}
+
+/// The notification center the queue's fan-out handler drives.
+///
+/// It reads the settings cache at send time rather than capturing the instance name, so a rename
+/// brands the very next notification email instead of the next restart's (decision 17, D31).
+fn build_notification_center(
+    settings: &Settings,
+    repos: Repositories,
+    runtime: Arc<SettingsCache>,
+) -> Arc<NotificationCenter> {
+    let realtime = settings.realtime;
+    Arc::new(NotificationCenter::new(
         repos,
-        mailer,
         NotificationPolicy {
             max_recipients: realtime.max_notification_recipients,
             email_enabled: realtime.notification_email,
         },
-        settings.branding.name.clone(),
-    );
-    bus.add_consumer(Arc::new(center) as Arc<dyn EventConsumer>);
-    bus
+        runtime,
+    ))
 }
 
 /// Selects the KV backend by config kind (decision 09; redis is mandatory for replicas > 1).
@@ -518,7 +588,7 @@ fn build_kv(settings: &Settings) -> anyhow::Result<Arc<dyn Kv>> {
 /// clause that stops an instance administrator from repointing `smtp.host` and receiving the
 /// operator's credential (decision 09 amendment, S-26.a). With no host configured anywhere the
 /// fallback is the in-memory mailer, which delivers nothing.
-fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>) -> anyhow::Result<Arc<dyn Mailer>> {
+fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>, kek: Vec<u8>) -> anyhow::Result<Arc<dyn Mailer>> {
     match &settings.smtp.host {
         Some(host) => tracing::info!(%host, port = settings.smtp.port, "smtp mailer configured from boot config"),
         None => tracing::warn!(
@@ -526,7 +596,6 @@ fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>) -> anyhow::Res
              administrator configures SMTP at runtime: OTP and notification emails are NOT delivered"
         ),
     }
-    let kek = kek(settings)?;
     // The KEK never enters `pub-mail`: `pub-auth` owns the single secretbox implementation and
     // already depends on it, so unsealing there would be a dependency cycle (S-26).
     let unsealer = pub_mail::unsealer(move |sealed_b64: &str| {
@@ -573,8 +642,8 @@ fn build_auth(
     settings: &Settings,
     repos: Repositories,
     kv: Arc<dyn Kv>,
-    mailer: Arc<dyn Mailer>,
     runtime: Arc<SettingsCache>,
+    kek: Vec<u8>,
 ) -> anyhow::Result<Arc<AuthService>> {
     let rng = Arc::new(OsRandom);
     let auth_cfg = &settings.auth;
@@ -611,8 +680,6 @@ fn build_auth(
         }
     };
 
-    let kek = kek(settings)?;
-
     let providers: Vec<ProviderConfig> = auth_cfg
         .oidc
         .iter()
@@ -646,7 +713,7 @@ fn build_auth(
         step_up_window: Duration::from_secs(auth_cfg.step_up_minutes * 60),
         totp_issuer: "Pub".to_owned(),
     };
-    Ok(Arc::new(AuthService::new(repos, kv, mailer, keyring, policy, runtime, rng, oidc)))
+    Ok(Arc::new(AuthService::new(repos, kv, keyring, policy, runtime, rng, oidc)))
 }
 
 /// The 32-byte key-encryption key sealing data at rest (S-05 TOTP seeds, S-26 SMTP password).

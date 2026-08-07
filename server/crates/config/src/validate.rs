@@ -259,6 +259,55 @@ impl Settings {
             // download instead of counting it.
             return Err(invalid("jobs.downloads.buffer_capacity must be greater than 0"));
         }
+
+        self.validate_queue()?;
+        Ok(())
+    }
+
+    /// Work-queue invariants (decision 26).
+    ///
+    /// There is no `enabled` to check, on purpose: sign-in mail rides this queue, so "off" is
+    /// not a state this section can express. What is checked is the set of relationships that
+    /// silently break delivery rather than failing loudly.
+    fn validate_queue(&self) -> Result<(), ConfigError> {
+        let queue = &self.jobs.queue;
+        if queue.interval_secs == 0 {
+            return Err(invalid("jobs.queue.interval_secs must be greater than 0"));
+        }
+        if queue.batch == 0 {
+            // A zero batch is a drain that claims nothing: a queue that fills up while the job
+            // ticks happily. Switching the drain off is not expressible here at all.
+            return Err(invalid("jobs.queue.batch must be greater than 0"));
+        }
+        if queue.max_attempts < 1 {
+            // Below one, an item is dead-lettered by the completion of its first and only
+            // attempt — every transient SMTP hiccup becomes permanent.
+            return Err(invalid("jobs.queue.max_attempts must be at least 1"));
+        }
+        if queue.backoff_base_secs == 0 || queue.backoff_max_secs < queue.backoff_base_secs {
+            return Err(invalid(format!(
+                "jobs.queue.backoff_max_secs = {} must be at least jobs.queue.backoff_base_secs = {} (and the base > 0)",
+                queue.backoff_max_secs, queue.backoff_base_secs
+            )));
+        }
+        if queue.retain_done_hours <= 0 {
+            return Err(invalid("jobs.queue.retain_done_hours must be greater than 0"));
+        }
+        if queue.send_timeout_secs == 0 {
+            // Zero would mean every delivery times out before it starts — mail would retry
+            // until the attempt budget ran out and then dead-letter, with SMTP never contacted.
+            return Err(invalid("jobs.queue.send_timeout_secs must be greater than 0"));
+        }
+        // The lease is what stops two workers from holding one item. A lease that expires while
+        // a tick is still running, or while one delivery is still on the wire, hands the item to
+        // the next claim and duplicates the message that is already being sent.
+        if queue.lease_secs <= queue.interval_secs || queue.lease_secs <= queue.send_timeout_secs {
+            return Err(invalid(format!(
+                "jobs.queue.lease_secs = {} must exceed both jobs.queue.interval_secs = {} and \
+                 jobs.queue.send_timeout_secs = {}: a lease that expires mid-delivery is a duplicate message",
+                queue.lease_secs, queue.interval_secs, queue.send_timeout_secs
+            )));
+        }
         Ok(())
     }
 
@@ -565,4 +614,54 @@ fn validate_seed(field: &str, value: &Secret) -> Result<(), ConfigError> {
 
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{QueueConfig, Settings};
+
+    fn with_queue(queue: QueueConfig) -> Settings {
+        let mut settings = Settings::default();
+        settings.jobs.queue = queue;
+        settings
+    }
+
+    #[test]
+    fn the_default_queue_section_validates_and_has_no_off_switch() {
+        // Decision 26: sign-in mail rides this queue, so "off" is not a state this section can
+        // express. The assertion is on the *shape* — a future `enabled` field would have to
+        // come with a decision, and this is where that conversation starts.
+        assert!(with_queue(QueueConfig::default()).validate().is_ok());
+        let rendered = format!("{:?}", QueueConfig::default());
+        assert!(!rendered.contains("enabled"), "the drain must have no enabled key: {rendered}");
+    }
+
+    #[test]
+    fn a_lease_that_expires_mid_delivery_is_refused() {
+        // The lease is what stops two workers from holding one item; one that runs out while a
+        // message is still on the wire hands that message to the next claim and sends it twice.
+        let short = QueueConfig { lease_secs: 30, send_timeout_secs: 30, ..QueueConfig::default() };
+        assert!(with_queue(short).validate().is_err(), "lease == send timeout must be refused");
+        let ticking = QueueConfig { lease_secs: 5, interval_secs: 5, ..QueueConfig::default() };
+        assert!(with_queue(ticking).validate().is_err(), "lease == interval must be refused");
+    }
+
+    #[test]
+    fn nonsensical_queue_settings_are_startup_errors() {
+        let cases: [(&str, QueueConfig); 6] = [
+            // A drain that claims nothing is a queue that fills while the job ticks happily.
+            ("batch", QueueConfig { batch: 0, ..QueueConfig::default() }),
+            ("interval", QueueConfig { interval_secs: 0, ..QueueConfig::default() }),
+            // Below one attempt every transient SMTP hiccup becomes a permanent dead letter.
+            ("max_attempts", QueueConfig { max_attempts: 0, ..QueueConfig::default() }),
+            ("backoff", QueueConfig { backoff_base_secs: 600, backoff_max_secs: 60, ..QueueConfig::default() }),
+            ("retention", QueueConfig { retain_done_hours: 0, ..QueueConfig::default() }),
+            // Zero would time out every delivery before it started: SMTP never contacted, every
+            // message dead-lettered after burning its whole budget.
+            ("send timeout", QueueConfig { send_timeout_secs: 0, ..QueueConfig::default() }),
+        ];
+        for (what, queue) in cases {
+            assert!(with_queue(queue).validate().is_err(), "accepted a nonsensical {what}");
+        }
+    }
 }

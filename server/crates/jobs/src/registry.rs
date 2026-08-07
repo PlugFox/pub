@@ -29,6 +29,7 @@ use pub_core::{Error, Result};
 use crate::downloads::{DOWNLOAD_ROLLUP_JOB, DownloadRollup};
 use crate::gc::{BLOB_GC_JOB, BlobGc};
 use crate::mirror::{MIRROR_JOB, MirrorWorker};
+use crate::queue::{QUEUE_JOB, QueueWorker};
 use crate::reindex::{REINDEX_JOB, Reindexer};
 
 /// How long a manually triggered run may hold the job lock.
@@ -117,6 +118,35 @@ impl JobRegistry {
                         "downloads": report.downloads,
                         "rows": report.rows,
                         "packages": report.packages,
+                    }))
+                }
+                .boxed()
+            }),
+        );
+        self
+    }
+
+    /// Registers the durable work queue's drain (decision 26).
+    ///
+    /// The report carries `dead_pending` — the standing dead-letter count, not just this run's
+    /// — because a dead-lettered sign-in message is an account lockout with no other visible
+    /// cause, and a per-run number would read as zero on every tick after the one that failed.
+    #[must_use]
+    pub fn with_queue(mut self, worker: Arc<QueueWorker>) -> Self {
+        self.runners.insert(
+            QUEUE_JOB.to_owned(),
+            Arc::new(move |now| {
+                let worker = Arc::clone(&worker);
+                async move {
+                    let report = worker.run_once(now).await?;
+                    Ok(serde_json::json!({
+                        "claimed": report.claimed,
+                        "delivered": report.delivered,
+                        "retried": report.retried,
+                        "dead": report.dead,
+                        "reaped": report.reaped,
+                        "purged": report.purged,
+                        "dead_pending": report.dead_pending,
                     }))
                 }
                 .boxed()

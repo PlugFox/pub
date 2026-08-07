@@ -30,8 +30,10 @@ use pub_core::token::{NewToken, TokenScope};
 use pub_core::traits::{BlobStore, JobLock, JobTrigger, Kv, Mailer, NoJobs, Repositories};
 use pub_core::{OrgId, UserId};
 use pub_db_sqlite::SqliteDb;
-use pub_events::{EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationPolicy};
-use pub_jobs::InMemoryJobLock;
+use pub_events::{
+    EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationEnqueuer, NotificationPolicy,
+};
+use pub_jobs::{FanoutHandler, InMemoryJobLock, MailHandler, QueuePolicy, QueueWorker};
 use pub_kv::MemoryKv;
 use pub_mail::{BootSmtp, InMemoryMailer, MailerBuilder, RuntimeMailer, SmtpSettings};
 use pub_registry::{RegistryPolicy, RegistryService, UpstreamClient, UpstreamService, UpstreamServicePolicy};
@@ -370,6 +372,8 @@ pub struct TestApp {
     pub runtime: Arc<SettingsCache>,
     /// The domain event bus every service in this app emits into (decision 22).
     pub events: Arc<EventBus>,
+    /// The real queue drain, run by [`TestApp::drain_jobs`] (decision 26).
+    pub queue_worker: Arc<QueueWorker>,
     clock: Arc<Mutex<DateTime<Utc>>>,
 }
 
@@ -460,7 +464,6 @@ impl TestApp {
         let auth = Arc::new(AuthService::new(
             repos.clone(),
             Arc::clone(&kv_handle),
-            Arc::clone(&runtime_mailer),
             keyring,
             policy,
             Arc::clone(&runtime),
@@ -473,10 +476,18 @@ impl TestApp {
         let blob: Arc<dyn BlobStore> =
             options.blob.clone().unwrap_or_else(|| Arc::new(ObjectStoreBlob::memory()) as Arc<dyn BlobStore>);
 
-        // One bus per app, exactly as `pubd` wires it: the notification center is a real
-        // consumer, so the integration suite exercises the same fan-out production runs.
-        let events = build_bus(&settings, &repos, Arc::clone(&kv_handle), Arc::clone(&runtime_mailer));
+        // One bus and one drain per app, exactly as `pubd` wires them: the enqueuer is a real
+        // consumer and the worker is the real worker, so the integration suite exercises the
+        // same fan-out production runs — one row filed in the request, everything else drained.
+        let events = build_bus(&settings, &repos, Arc::clone(&kv_handle));
         let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
+        let queue_worker = build_queue_worker(
+            &settings,
+            &repos,
+            Arc::clone(&events),
+            Arc::clone(&runtime_mailer),
+            Arc::clone(&runtime),
+        );
 
         let lock = Arc::new(InMemoryJobLock::new());
         let registry = Arc::new(RegistryService::new(
@@ -507,7 +518,6 @@ impl TestApp {
             repos.clone(),
             Arc::clone(&auth),
             Arc::clone(&registry),
-            Arc::clone(&runtime_mailer),
             Arc::clone(&sink),
             Arc::new(OsRandom),
             OrgPolicy::default(),
@@ -544,6 +554,7 @@ impl TestApp {
             lock,
             runtime,
             events,
+            queue_worker,
             clock,
         }
     }
@@ -596,6 +607,7 @@ impl TestApp {
             lock,
             runtime,
             events: Arc::clone(&self.state.events),
+            queue_worker: Arc::clone(&self.queue_worker),
             clock: Arc::clone(&self.clock),
         }
     }
@@ -707,6 +719,20 @@ impl TestApp {
         self.send(self.request(Method::DELETE, path, bearer, None, DEFAULT_IP)).await
     }
 
+    /// Runs the **real** queue drain to exhaustion over this app's own rows (decision 26).
+    ///
+    /// Delivery left the request path, so this is what replaces "the response returned, so the
+    /// mail was sent". It is deterministic rather than a poll: the worker claims everything
+    /// runnable at the injected clock, and a fan-out's cascade into per-recipient mail rows is
+    /// resolved inside the same call, so the queue is empty when it returns.
+    ///
+    /// Rows that a failure put behind a backoff are deliberately *not* re-run here — their
+    /// `run_after` is past the injected instant — so a test that wants a retry advances the
+    /// clock and drains again, which is exactly what the scheduler does.
+    pub async fn drain_jobs(&self) -> pub_jobs::QueueReport {
+        self.queue_worker.run_once(self.now()).await.expect("the queue drain must not fail")
+    }
+
     /// Requests an OTP and returns `(pending_id, code)`, where the code is `None` when no mail
     /// was sent.
     ///
@@ -714,10 +740,11 @@ impl TestApp {
     /// shape and the same server-side work, but never a redeemable code (S-04.a) — so "was a
     /// mail sent" is the observable a test has, and it is exactly the one the design promises.
     pub async fn request_otp_raw(&self, email: &str) -> (String, Option<String>) {
-        let sent_before = self.mailer.sent().len();
+        let sent_before = self.drained_outbox().await;
         let response = self.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": email })).await;
         assert_eq!(response.status, StatusCode::OK, "otp request failed: {:?}", response.json);
         let pending_id = response.json["data"]["pending_id"].as_str().expect("pending_id").to_owned();
+        self.drain_jobs().await;
         let sent = self.mailer.sent();
         let code = (sent.len() > sent_before).then(|| extract_code(&sent.last().expect("mail").text));
         (pending_id, code)
@@ -726,14 +753,25 @@ impl TestApp {
     /// Requests an OTP for `email` and returns `(pending_id, code)` — the code is read from
     /// the in-memory outbox like a user reading their inbox.
     pub async fn request_otp(&self, email: &str) -> (String, String) {
-        let sent_before = self.mailer.sent().len();
+        let sent_before = self.drained_outbox().await;
         let response = self.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": email })).await;
         assert_eq!(response.status, StatusCode::OK, "otp request failed: {:?}", response.json);
         let pending_id = response.json["data"]["pending_id"].as_str().expect("pending_id").to_owned();
+        self.drain_jobs().await;
         let sent = self.mailer.sent();
         assert_eq!(sent.len(), sent_before + 1, "exactly one mail must be sent");
         let code = extract_code(&sent.last().expect("mail").text);
         (pending_id, code)
+    }
+
+    /// Flushes whatever the *previous* steps queued, then reports the outbox size.
+    ///
+    /// Without this, "exactly one mail must be sent" would be measuring the notification mail an
+    /// earlier membership change left in the queue as well as this request's own code. The
+    /// drain happens before the baseline is taken, so the baseline is a settled number.
+    async fn drained_outbox(&self) -> usize {
+        self.drain_jobs().await;
+        self.mailer.sent().len()
     }
 
     /// Full OTP login; returns the login payload (`data` object).
@@ -949,7 +987,10 @@ impl TestApp {
 }
 
 /// Builds the app's event bus with its real consumers, mirroring `pubd::build_events`.
-fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>, mailer: Arc<dyn Mailer>) -> Arc<EventBus> {
+///
+/// The consumer is the **enqueuer**, exactly as in the binary: an emitting request files one
+/// durable job and returns, and the fan-out itself happens in [`TestApp::drain_jobs`].
+fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>) -> Arc<EventBus> {
     let realtime = settings.realtime;
     let bus = Arc::new(
         EventBus::new(EventBusPolicy {
@@ -958,16 +999,37 @@ fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>, mailer:
         })
         .with_broker(kv),
     );
-    bus.add_consumer(Arc::new(NotificationCenter::new(
+    bus.add_consumer(Arc::new(NotificationEnqueuer::new(Arc::clone(&repos.queue))) as Arc<dyn EventConsumer>);
+    bus
+}
+
+/// Builds the real drain worker over the app's own backends, mirroring `pubd::spawn_jobs`.
+///
+/// Deliberately the production `QueueWorker` with the production handlers rather than a double:
+/// the queue is on the sign-in path, so a fake there would be testing the wrong thing — "the
+/// message was enqueued and a worker would have sent it" is not the property the suite needs.
+fn build_queue_worker(
+    settings: &Settings,
+    repos: &Repositories,
+    events: Arc<EventBus>,
+    mailer: Arc<dyn Mailer>,
+    runtime: Arc<SettingsCache>,
+) -> Arc<QueueWorker> {
+    let realtime = settings.realtime;
+    let center = Arc::new(NotificationCenter::new(
         repos.clone(),
-        mailer,
         NotificationPolicy {
             max_recipients: realtime.max_notification_recipients,
             email_enabled: realtime.notification_email,
         },
-        settings.branding.name.clone(),
-    )) as Arc<dyn EventConsumer>);
-    bus
+        runtime,
+    ));
+    let policy = QueuePolicy::default();
+    Arc::new(
+        QueueWorker::new(repos.clone(), events, policy)
+            .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue))))
+            .with_handler(Arc::new(MailHandler::new(mailer, TEST_KEK.to_vec(), policy.send_timeout))),
+    )
 }
 
 /// An open Server-Sent-Events response: the head, plus a body that is still streaming.

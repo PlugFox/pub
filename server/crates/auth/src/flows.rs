@@ -20,14 +20,16 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64STD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chrono::{DateTime, Duration, Utc};
 use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::authorize::{ActorContext, Resource, authorize};
+use pub_core::queue::{MailJob, NewQueuedJob};
 use pub_core::session::{NewSession, Session, SessionLimits};
 use pub_core::settings::{RegistrationMode, RuntimeSettings, SettingsCache};
 use pub_core::token::{NewToken, Token, TokenScope};
-use pub_core::traits::{Kv, Mailer, Repositories};
+use pub_core::traits::{Kv, Repositories};
 use pub_core::user::{NewUser, User, UserStatus};
 use pub_core::{Error, OrgId, Result, RoleLevel, SessionId, TokenId, UserId};
 
@@ -43,6 +45,14 @@ pub const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
 
 /// Upper bound on a caller-chosen token lifetime (10 years — effectively "long", still finite).
 pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
+
+/// The body a **suppressed** mail row carries (S-04.a, S-31).
+///
+/// Fixed and content-free on purpose. A suppressed row exists only so that a policy-rejected
+/// address costs the request exactly what an accepted one costs; it is never claimable, and it
+/// must never be able to become a deliverable message — so it holds no rendered body at all,
+/// not even a sealed one. The rejection and its reason are already in the audit log.
+const SUPPRESSED_BODY: &str = "suppressed by sign-in policy; the audit log records the reason";
 
 /// How stale `tokens.last_used_at` may get before another write happens (S-13 "write-throttled").
 /// The pub client authenticates on every resolve and download; without a throttle a single
@@ -168,7 +178,6 @@ struct MfaPending {
 pub struct AuthService {
     repos: Repositories,
     kv: Arc<dyn Kv>,
-    mailer: Arc<dyn Mailer>,
     keyring: Keyring,
     policy: AuthPolicy,
     /// Runtime settings (decision 09): registration mode, S-31 domain allowlist, S-24 limits.
@@ -179,18 +188,21 @@ pub struct AuthService {
 
 impl AuthService {
     /// Bundles the dependencies. All backends arrive as trait handles (decision 09).
+    ///
+    /// There is no mailer here any more: every message this service produces is filed on the
+    /// durable queue and delivered by the drain worker (decision 26), which is what took the
+    /// SMTP round trip — and the 500 an SMTP outage produced — off the sign-in path.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repos: Repositories,
         kv: Arc<dyn Kv>,
-        mailer: Arc<dyn Mailer>,
         keyring: Keyring,
         policy: AuthPolicy,
         runtime: Arc<SettingsCache>,
         rng: Arc<dyn RandomSource>,
         oidc: OidcClient,
     ) -> Self {
-        Self { repos, kv, mailer, keyring, policy, runtime, rng, oidc }
+        Self { repos, kv, keyring, policy, runtime, rng, oidc }
     }
 
     /// The boot-only half of the auth policy (TTLs, pepper, KEK, token prefix).
@@ -274,18 +286,74 @@ impl AuthService {
             None
         };
 
+        // Both payloads are built here, above the branch, so the branch below is a choice
+        // between two ready values rather than two different amounts of work (S-04.a).
+        let deliverable = self.sealed_mail(&email, &rendered.subject, &rendered.text, Some(&rendered.html))?;
+        let placeholder = self.sealed_mail(&email, &rendered.subject, SUPPRESSED_BODY, None)?;
+
         let mut metadata = serde_json::json!({ "resend": resend_of.is_some() });
-        match rejection {
+        let (queued, result) = match rejection {
             Some(reason) => {
                 metadata["reason"] = reason.into();
-                self.audit(&email, meta, "auth.otp.requested", AuditResult::Failure, metadata, now).await;
+                // A row that is filed and never claimable: its only job is to make a rejected
+                // address cost this request exactly what an accepted one costs, and it carries
+                // no deliverable body so it can never become a message (S-04.a, S-31). The
+                // audit event below already records the rejection and its reason, so the row
+                // tells a database reader nothing new.
+                (NewQueuedJob::suppressed(MailJob::KIND, placeholder), AuditResult::Failure)
             }
-            None => {
-                self.mailer.send_multipart(&email, &rendered.subject, &rendered.text, &rendered.html).await?;
-                self.audit(&email, meta, "auth.otp.requested", AuditResult::Success, metadata, now).await;
-            }
-        }
+            None => (NewQueuedJob::pending(MailJob::KIND, deliverable), AuditResult::Success),
+        };
+        // The `?` that used to sit on an SMTP hand-off is gone with the hand-off (D20): both
+        // arms now perform one identical enqueue, so SMTP can no longer fail a sign-in request
+        // at all. What can still fail is the same database write in both arms — uniform, and
+        // therefore not an oracle.
+        self.repos.queue.enqueue(&queued, now).await?;
+        self.audit(&email, meta, "auth.otp.requested", result, metadata, now).await;
         Ok(pending_id)
+    }
+
+    /// A queued message whose body is sealed under the boot KEK ([S-26.b](../../../docs/security.md)).
+    ///
+    /// A rendered sign-in body is a live, redeemable credential, and the queue puts it in a
+    /// table for as long as it takes a worker to claim it — a class of value S-26 was not
+    /// written about. Same mechanism as the TOTP seed and the stored SMTP password, no second
+    /// construction. The recipient and the subject stay in the clear on purpose: a dead-lettered
+    /// message has to be identifiable on the admin surface, and neither of them is redeemable.
+    ///
+    /// With the ephemeral development KEK a restart makes yesterday's rows unopenable; these
+    /// rows live for minutes, so the cost is at most an undelivered code.
+    fn sealed_mail(&self, to: &str, subject: &str, text: &str, html: Option<&str>) -> Result<serde_json::Value> {
+        let job = MailJob {
+            to: to.to_owned(),
+            subject: subject.to_owned(),
+            text: self.seal(text)?,
+            html: html.map(|html| self.seal(html)).transpose()?,
+            sealed: true,
+        };
+        serde_json::to_value(&job)
+            .map_err(|err| Error::Internal { message: format!("failed to encode a queued message: {err}") })
+    }
+
+    fn seal(&self, plaintext: &str) -> Result<String> {
+        Ok(B64STD.encode(crate::secretbox::seal(&self.policy.kek, self.rng.as_ref(), plaintext.as_bytes())?))
+    }
+
+    /// Files one message on the queue, best-effort.
+    ///
+    /// Used where the work the message reports is already committed — an OIDC identity link —
+    /// and must not be undone because a row could not be written.
+    async fn queue_mail(&self, to: &str, subject: &str, text: &str, what: &str, now: DateTime<Utc>) {
+        let payload = match self.sealed_mail(to, subject, text, None) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, what, "sealing a queued message failed");
+                return;
+            }
+        };
+        if let Err(error) = self.repos.queue.enqueue(&NewQueuedJob::pending(MailJob::KIND, payload), now).await {
+            tracing::error!(%error, what, "queueing a message failed");
+        }
     }
 
     /// Redeems an OTP against its pending-auth record: opens a session, or hands back a
@@ -495,9 +563,7 @@ impl AuthService {
                             "A new sign-in method ({provider_label}) was just linked to your account.\n\n\
                              If this was not you, revoke your sessions and contact your administrator.",
                         );
-                        if let Err(err) = self.mailer.send(&email, "New sign-in method linked", &body).await {
-                            tracing::error!(error = %err, "linking notification mail failed");
-                        }
+                        self.queue_mail(&email, "New sign-in method linked", &body, "credential.linked", now).await;
                         (user, true, false)
                     }
                     Some(_) => {

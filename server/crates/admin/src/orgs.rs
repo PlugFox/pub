@@ -34,8 +34,9 @@ use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::event::{DomainEvent, EventSink};
 use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgProfile};
 use pub_core::package::PackageOptions;
+use pub_core::queue::{MailJob, NewQueuedJob};
 use pub_core::token::TokenScope;
-use pub_core::traits::{Mailer, Repositories};
+use pub_core::traits::Repositories;
 use pub_core::user::User;
 use pub_core::{Error, Format, InvitationId, OrgId, Result, RoleLevel, UserId};
 use pub_registry::{ActorMeta, RegistryService};
@@ -219,7 +220,6 @@ pub struct OrgService {
     repos: Repositories,
     auth: Arc<AuthService>,
     registry: Arc<RegistryService>,
-    mailer: Arc<dyn Mailer>,
     events: Arc<dyn EventSink>,
     rng: Arc<dyn RandomSource>,
     policy: OrgPolicy,
@@ -237,12 +237,11 @@ impl OrgService {
         repos: Repositories,
         auth: Arc<AuthService>,
         registry: Arc<RegistryService>,
-        mailer: Arc<dyn Mailer>,
         events: Arc<dyn EventSink>,
         rng: Arc<dyn RandomSource>,
         policy: OrgPolicy,
     ) -> Self {
-        Self { repos, auth, registry, mailer, events, rng, policy }
+        Self { repos, auth, registry, events, rng, policy }
     }
 
     /// The active policy.
@@ -624,6 +623,8 @@ impl OrgService {
 
         // Best-effort delivery: the token is also returned to the caller, so a mail outage
         // degrades the flow to "copy the link" instead of failing a committed invitation.
+        // The body carries the invitation token, which is a credential — so the queued payload
+        // is sealed under the boot KEK exactly like a sign-in code (S-26.b).
         let body = format!(
             "You have been invited to join the organization \"{}\" on this package registry.\n\n\
              Accept with this invitation code:\n\n  {token}\n\n\
@@ -631,9 +632,7 @@ impl OrgService {
             org.name,
             self.policy.invitation_ttl.num_days().max(1),
         );
-        if let Err(err) = self.mailer.send(&email, "You have been invited to an organization", &body).await {
-            tracing::error!(error = %err, "invitation mail delivery failed; the token was still issued");
-        }
+        self.queue_mail(&email, "You have been invited to an organization", &body, "org.invitation", now).await;
 
         self.audit(
             actor,
@@ -821,6 +820,43 @@ impl OrgService {
                 Some(next) => cursor = Some(next),
                 None => return Ok(()),
             }
+        }
+    }
+
+    /// Files one message on the durable queue, best-effort (decision 26).
+    ///
+    /// Sealed under the boot KEK ([S-26.b](../../../../docs/security.md)): the one message this
+    /// service sends carries an invitation token, which is a credential sitting in a table until
+    /// a worker claims it. The KEK is the auth policy's — the same one the TOTP seeds and the
+    /// stored SMTP password use, reached through the service that owns it rather than copied.
+    ///
+    /// Never fatal: the token is also returned to the caller, so an outage here degrades the
+    /// flow to "copy the code" instead of failing a committed invitation.
+    async fn queue_mail(&self, to: &str, subject: &str, body: &str, what: &str, now: DateTime<Utc>) {
+        let sealed = pub_auth::secretbox::seal(&self.auth.policy().kek, self.rng.as_ref(), body.as_bytes())
+            .map(|blob| base64::engine::general_purpose::STANDARD.encode(blob));
+        let payload = match sealed {
+            Ok(text) => serde_json::to_value(MailJob {
+                to: to.to_owned(),
+                subject: subject.to_owned(),
+                text,
+                html: None,
+                sealed: true,
+            }),
+            Err(error) => {
+                tracing::error!(%error, what, "sealing a queued message failed; the token was still issued");
+                return;
+            }
+        };
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, what, "encoding a queued message failed; the token was still issued");
+                return;
+            }
+        };
+        if let Err(error) = self.repos.queue.enqueue(&NewQueuedJob::pending(MailJob::KIND, payload), now).await {
+            tracing::error!(%error, what, "queueing a message failed; the token was still issued");
         }
     }
 

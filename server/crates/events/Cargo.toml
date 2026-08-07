@@ -10,6 +10,9 @@ publish.workspace = true
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+# A swallowed enqueue costs an entire event's fan-out plus every email it would have produced
+# (decision 22 amendment), so counting the failures is part of the contract, not instrumentation.
+metrics = { workspace = true }
 pub-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -26,7 +26,7 @@ use pub_auth::random::OsRandom;
 use pub_auth::token::sha256_hex;
 use pub_core::event::EventSink;
 use pub_core::token::{NewToken, Token, TokenScope};
-use pub_core::traits::{JobLock, Mailer, TokenRepo};
+use pub_core::traits::{JobLock, TokenRepo};
 use pub_core::{Format, OrgId, RoleLevel, TokenId, UserId};
 use pub_jobs::InMemoryJobLock;
 use pub_registry::{RegistryPolicy, RegistryService};
@@ -378,7 +378,6 @@ fn org_service_with_tokens(app: &TestApp, tokens: Arc<dyn TokenRepo>) -> OrgServ
         repos,
         Arc::clone(&app.state.auth),
         registry,
-        Arc::clone(&app.mailer) as Arc<dyn Mailer>,
         Arc::clone(&app.events) as Arc<dyn EventSink>,
         Arc::new(OsRandom),
         OrgPolicy::default(),
@@ -765,7 +764,12 @@ async fn invitation_lifecycle_from_send_to_accept() {
     // Normalized to lowercase, because that is what acceptance will compare against.
     assert_eq!(created.json["data"]["invitation"]["email"], "new.hire@corp.com");
     // The invitee is also mailed; the token is returned so an SMTP-less instance still works.
-    assert!(app.mailer.sent().iter().any(|mail| mail.to == "new.hire@corp.com"));
+    // The message is filed on the queue and its body sealed under the KEK (S-26.b — the token
+    // in it is a credential), so the drain is both the delivery and the proof it unseals.
+    app.drain_jobs().await;
+    let invite =
+        app.mailer.sent().into_iter().find(|mail| mail.to == "new.hire@corp.com").expect("the invitee must be mailed");
+    assert!(invite.text.contains(&token), "the delivered message must carry the redeemable token");
 
     let listed = app.get(&format!("/api/v1/orgs/{slug}/invitations"), Some(&owner.access)).await;
     assert_eq!(listed.json["data"]["items"].as_array().expect("items").len(), 1);

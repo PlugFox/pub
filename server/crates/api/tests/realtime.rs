@@ -127,8 +127,10 @@ async fn s32_last_event_id_replays_what_the_client_missed() {
 
     let mut stream = app.open_stream(&access, None).await;
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.0.0")).await;
-    // A publish produces two frames for a member — the event, and the notification the center
-    // files off it — so the client's "last seen" is whatever it read last, not the first frame.
+    // A publish produces two frames for a member — the event, and the notification the drain
+    // files off it one tick later (decision 26) — so the client's "last seen" is whatever it
+    // read last, not the first frame.
+    app.drain_jobs().await;
     let mut last_seen = String::new();
     while let Some(frame) = stream.next_event(NEVER).await {
         last_seen = frame.id.expect("every frame carries an id");
@@ -138,6 +140,7 @@ async fn s32_last_event_id_replays_what_the_client_missed() {
 
     // Offline: a second publish happens with nobody listening.
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "2.0.0")).await;
+    app.drain_jobs().await;
 
     let mut resumed = app.open_stream(&access, Some(&last_seen)).await;
     let mut replayed = Vec::new();
@@ -207,6 +210,19 @@ async fn the_notification_center_files_publishes_and_pages_them() {
 
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.0.0")).await;
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.1.0")).await;
+    // The publish request files one queue row and returns; the rows a reader pages through are
+    // written by the drain (decision 26).
+    assert!(
+        app.repos
+            .notifications
+            .list(app.user_of("owner@corp.com").await, false, None, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty(),
+        "no notification row may exist before the drain runs"
+    );
+    app.drain_jobs().await;
 
     let feed = app.get("/api/v1/notifications", Some(&access)).await;
     assert_eq!(feed.status, StatusCode::OK, "{:?}", feed.json);
@@ -239,6 +255,7 @@ async fn marking_notifications_read_moves_the_badge_and_is_scoped_to_the_caller(
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.0.0")).await;
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_ui", "1.0.0")).await;
     app.publish("/o/other/pub", &other_token, &package_archive("other_core", "1.0.0")).await;
+    app.drain_jobs().await;
 
     let feed = app.get("/api/v1/notifications", Some(&access)).await;
     let ids: Vec<String> =
@@ -298,6 +315,7 @@ async fn per_category_preferences_decide_what_is_filed_and_what_is_mailed() {
         .await;
     assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.json);
     app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.0.0")).await;
+    app.drain_jobs().await;
     assert_eq!(
         app.get("/api/v1/notifications", Some(&access)).await.json["data"]["items"].as_array().unwrap().len(),
         0,
@@ -337,6 +355,8 @@ async fn high_importance_categories_reach_a_mailbox() {
         )
         .await;
     assert_eq!(added.status, StatusCode::OK, "{:?}", added.json);
+    // Flush what adding the member queued, so the delta below is this promotion's own mail.
+    app.drain_jobs().await;
 
     let before = app.mailer.sent().len();
     let teammate = app.user_of("teammate@corp.com").await;
@@ -344,6 +364,7 @@ async fn high_importance_categories_reach_a_mailbox() {
         .patch(&format!("/api/v1/orgs/acme/members/{teammate}"), Some(&access), serde_json::json!({ "role": "read" }))
         .await;
     assert_eq!(promoted.status, StatusCode::OK, "{:?}", promoted.json);
+    app.drain_jobs().await;
 
     let sent = app.mailer.sent();
     let fresh: Vec<_> = sent[before..].iter().collect();
@@ -364,6 +385,7 @@ async fn high_importance_categories_reach_a_mailbox() {
     let before = app.mailer.sent().len();
     app.patch(&format!("/api/v1/orgs/acme/members/{teammate}"), Some(&access), serde_json::json!({ "role": "read" }))
         .await;
+    app.drain_jobs().await;
     let owner_mails: Vec<_> =
         app.mailer.sent()[before..].iter().filter(|mail| mail.to == "owner@corp.com").cloned().collect();
     assert!(owner_mails.is_empty(), "a muted category must not mail: {owner_mails:?}");
@@ -397,4 +419,106 @@ async fn the_notification_surface_rejects_anonymous_callers() {
         let response = app.send(app.request(method.clone(), path, None, body, common::DEFAULT_IP)).await;
         assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{method} {path} must demand a credential");
     }
+}
+
+// --- D2: the fan-out off the request path (decision 26) ---
+
+/// Every job-queue row this instance holds, whatever its kind or state.
+async fn queue_rows(app: &TestApp) -> i64 {
+    app.repos.queue.depth().await.expect("queue depth").into_iter().map(|(_, _, count)| count).sum()
+}
+
+/// Seeds `count` members straight into the org — the audience without the sign-in traffic.
+async fn seed_members(app: &TestApp, org: pub_core::OrgId, count: usize) {
+    for index in 0..count {
+        let user = app
+            .repos
+            .users
+            .create(
+                pub_core::user::NewUser {
+                    email: Some(format!("crowd{index}@corp.com")),
+                    email_verified: true,
+                    display_name: format!("Crowd {index}"),
+                },
+                app.now(),
+            )
+            .await
+            .expect("member")
+            .id;
+        app.repos.orgs.add_member(org, user, pub_core::RoleLevel::WRITE, app.now()).await.expect("membership");
+    }
+}
+
+/// **D2, and Phase 2's exit criterion for it.** A publish finalize writes one queue row and
+/// nothing else, whether the org has one member or a hundred and fifty — the pub client retries
+/// this request up to seven times, so its cost must not be a function of the audience.
+#[tokio::test]
+async fn d2_a_publish_finalize_does_constant_work_regardless_of_recipient_count() {
+    let app = TestApp::new().await;
+    let (_, lone_token) = owner(&app, "lone@corp.com", "lone").await;
+    let (crowd_access, crowd_token) = owner(&app, "crowd@corp.com", "crowd").await;
+    let crowd_org: pub_core::OrgId = app.repos.orgs.get_by_slug("crowd").await.expect("lookup").expect("org").id;
+    seed_members(&app, crowd_org, 150).await;
+    // Settle everything the sign-ins and the memberships queued, so the deltas below are the
+    // publishes' own cost.
+    app.drain_jobs().await;
+
+    let before = queue_rows(&app).await;
+    app.publish("/o/lone/pub", &lone_token, &package_archive("lone_core", "1.0.0")).await;
+    let one_member = queue_rows(&app).await - before;
+    assert_eq!(one_member, 1, "a publish files exactly one row");
+    assert_eq!(
+        app.get("/api/v1/notifications", Some(&crowd_access)).await.json["data"]["items"]
+            .as_array()
+            .expect("items")
+            .len(),
+        0,
+        "no recipient row may be written before the drain runs"
+    );
+    app.drain_jobs().await;
+
+    let before = queue_rows(&app).await;
+    app.publish("/o/crowd/pub", &crowd_token, &package_archive("crowd_core", "1.0.0")).await;
+    let many_members = queue_rows(&app).await - before;
+    assert_eq!(many_members, one_member, "151 members must cost the publish exactly what one member costs");
+
+    // And the work itself still happens — off the request, in one batch.
+    app.drain_jobs().await;
+    let feed = app.get("/api/v1/notifications", Some(&crowd_access)).await;
+    assert_eq!(feed.json["data"]["items"].as_array().expect("items").len(), 1);
+}
+
+/// **S-32.** The follow-up still reaches the stream, still carries the recipient's own badge
+/// number, and — the guarantee `pub_core::event` makes — names a row the client can already
+/// read by the time the frame arrives.
+#[tokio::test]
+async fn s32_a_notification_follow_up_still_reaches_the_stream_after_an_async_fanout() {
+    let app = app_with_fast_heartbeat().await;
+    let (access, publish_token) = owner(&app, "owner@corp.com", "acme").await;
+    let (outsider_access, _) = owner(&app, "outsider@corp.com", "other").await;
+    app.drain_jobs().await;
+
+    let mut member = app.open_stream(&access, None).await;
+    let mut outsider = app.open_stream(&outsider_access, None).await;
+    app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.0.0")).await;
+
+    let publish = member.next_event(SOON).await.expect("the publish frame");
+    assert_eq!(publish.event.as_deref(), Some("package.publish"));
+    assert_eq!(member.next_event(NEVER).await, None, "the notification is not part of the publish any more");
+
+    app.drain_jobs().await;
+    let notified = member.next_event(SOON).await.expect("the notification frame");
+    assert_eq!(notified.event.as_deref(), Some("notification.new"));
+    assert_eq!(notified.json()["data"]["unread"], 1, "the badge is this recipient's own count");
+    let notification_id = notified.json()["data"]["notification_id"].as_str().expect("id").to_owned();
+
+    // The row exists by the time the frame does — that is the whole reason the worker completes
+    // its item before it publishes.
+    let feed = app.get("/api/v1/notifications", Some(&access)).await;
+    let ids: Vec<&str> =
+        feed.json["data"]["items"].as_array().expect("items").iter().map(|n| n["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&notification_id.as_str()), "the frame named a row the reader cannot see: {ids:?}");
+
+    // A personal event is scoped to its own recipient (S-32): the outsider sees neither.
+    assert_eq!(outsider.next_event(NEVER).await, None);
 }

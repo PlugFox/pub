@@ -944,6 +944,59 @@ pub struct JobsConfig {
     pub reindex: ReindexConfig,
     /// Download-statistics rollup.
     pub downloads: DownloadsConfig,
+    /// The durable work queue's drain (decision 26).
+    pub queue: QueueConfig,
+}
+
+/// Durable work-queue settings ([decision 26](../../../docs/decisions.md#26)).
+///
+/// The one job section with **no `enabled` key**, and that absence is the decision rather than
+/// an oversight: notification fan-out and every outbound message — including the sign-in code —
+/// ride this queue, so an operator who switched the drain off would file a table of undelivered
+/// mail and could not sign in to switch it back on. An instance that genuinely sends no mail is
+/// already expressed by leaving `[smtp]` unconfigured, which resolves to the in-memory mailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueConfig {
+    /// Seconds between drains — the latency floor on queued mail.
+    pub interval_secs: u64,
+    /// Items leased per claim, and therefore the cost bound of one pass.
+    pub batch: u32,
+    /// Seconds a claimed item stays leased. A worker that dies mid-run makes its items
+    /// invisible for this long, so it is also how quickly a crashed drain's work resumes; it
+    /// must exceed both the tick interval and one delivery deadline.
+    pub lease_secs: u64,
+    /// Attempts an item gets before it is dead-lettered and left for the operator.
+    pub max_attempts: i64,
+    /// First retry delay; doubles per attempt, spread ±25%.
+    pub backoff_base_secs: u64,
+    /// Ceiling on the retry delay.
+    pub backoff_max_secs: u64,
+    /// Hours a completed item is kept before retention deletes it. Dead-lettered items are
+    /// **never** purged — they are the operator's record of mail that never arrived.
+    pub retain_done_hours: i64,
+    /// Deadline on one delivery attempt.
+    ///
+    /// Not a nicety: it replaces the bound this design removes. The SMTP transport sets no
+    /// deadline of its own, and off the request path there is no `[http]` timeout left to
+    /// truncate a hung conversation — a relay that connects and then says nothing would hold
+    /// its lease and starve every lease behind it.
+    pub send_timeout_secs: u64,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 5,
+            batch: 50,
+            lease_secs: 120,
+            max_attempts: 8,
+            backoff_base_secs: 10,
+            backoff_max_secs: 3600,
+            retain_done_hours: 24,
+            send_timeout_secs: 30,
+        }
+    }
 }
 
 /// Search-index rebuild settings (decision 11).

@@ -137,10 +137,16 @@ async fn s04_unknown_email_uniform_response() {
 
     let known = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": "known@corp.com" })).await;
     assert_eq!(known.status, StatusCode::OK);
+    // Delivery is off the request path now (decision 26), so the drain is where "was a mail
+    // sent" becomes observable — and the negative half below stays a real assertion because of
+    // it, rather than passing merely because nothing has been drained yet.
+    app.drain_jobs().await;
     assert_eq!(app.mailer.sent().len(), 1, "known account receives mail");
 
+    // S-03's 60 s resend floor is per address, so the second request needs no clock step.
     let unknown = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": "nobody@corp.com" })).await;
     assert_eq!(unknown.status, StatusCode::OK, "unknown email must not differ in status");
+    app.drain_jobs().await;
     assert_eq!(app.mailer.sent().len(), 1, "unknown email must not receive mail");
 
     // Shape equality: same envelope, same data keys, a well-formed pending id either way.
@@ -167,6 +173,9 @@ async fn s31_domain_allowlist_blocks_and_stays_uniform() {
     assert_eq!(blocked.status, StatusCode::OK, "rejection must stay uniform (S-04)");
     let blocked_pending = blocked.json["data"]["pending_id"].as_str().unwrap().to_owned();
     assert_eq!(blocked_pending.len(), 32);
+    // The row the blocked address filed is `suppressed`: the drain runs, claims nothing of it,
+    // and the outbox stays empty. That is S-31 surviving the move off the request path.
+    app.drain_jobs().await;
     assert!(app.mailer.sent().is_empty(), "blocked domain must never receive mail");
 
     // No code exists that redeems the blocked pending record.
@@ -542,4 +551,122 @@ async fn token_scopes_are_gated_by_org_role() {
         .await;
     assert_eq!(invisible.status, StatusCode::NOT_FOUND);
     let _ = owner_access;
+}
+
+// --- D20 / S-04.a: the SMTP oracle after delivery moved onto the queue (decision 26) ---
+
+/// **D20.** With the relay down, an accepted address used to answer **500** while a
+/// policy-blocked one answered 200 instantly — an existence oracle you could trigger by taking
+/// the mail server off the network, no timing needed. Delivery is not part of the response any
+/// more, so there is nothing left for SMTP to fail.
+#[tokio::test]
+async fn d20_otp_request_answers_200_when_the_mailer_is_down() {
+    let app =
+        TestApp::with_options(TestOptions { smtp_host: Some("smtp.corp.test".to_owned()), ..TestOptions::default() })
+            .await;
+    // Every transport this instance builds from now on refuses everything, the way a dead relay
+    // or a wrong credential does.
+    app.smtp_builds.fail_deliveries(true);
+
+    let response = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": EMAIL })).await;
+    assert_eq!(response.status, StatusCode::OK, "an SMTP outage must not fail a sign-in: {:?}", response.json);
+    assert_eq!(response.json["data"]["pending_id"].as_str().expect("pending_id").len(), 32);
+
+    // The message is filed rather than lost: the drain tries, fails, and re-arms it.
+    let report = app.drain_jobs().await;
+    assert_eq!(report.retried, 1, "a refused delivery is transient and stays in the queue");
+    assert_eq!(report.dead, 0);
+    assert!(app.mailer.sent().is_empty(), "nothing was delivered — but the caller never learned that");
+}
+
+/// **S-04.a.** Both branches file exactly one row, of the same kind, differing only in state:
+/// `pending` for an address that may receive a code, `suppressed` for one that may not.
+#[tokio::test]
+async fn s04a_accepted_and_rejected_addresses_do_identical_work() {
+    let app = TestApp::with_options(TestOptions {
+        allowed_email_domains: vec!["corp.com".to_owned()],
+        ..TestOptions::default()
+    })
+    .await;
+
+    let accepted = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": EMAIL })).await;
+    let rejected = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": "spy@evil.com" })).await;
+    assert_eq!(accepted.status, StatusCode::OK);
+    assert_eq!(rejected.status, StatusCode::OK);
+    let shape = |json: &serde_json::Value| {
+        (
+            json["status"].as_str().map(str::to_owned),
+            json["data"].as_object().map(|obj| obj.keys().cloned().collect::<Vec<_>>()),
+            json["data"]["pending_id"].as_str().map(str::len),
+        )
+    };
+    assert_eq!(shape(&accepted.json), shape(&rejected.json), "response shapes must be indistinguishable");
+
+    let mut depth = app.repos.queue.depth().await.expect("queue depth");
+    depth.sort();
+    assert_eq!(
+        depth,
+        vec![
+            (pub_core::queue::JobKind::MailSend, pub_core::queue::QueueState::Pending, 1),
+            (pub_core::queue::JobKind::MailSend, pub_core::queue::QueueState::Suppressed, 1),
+        ],
+        "one row each, same kind, differing only in state — nothing else about the two requests differs"
+    );
+}
+
+/// **S-31.** A suppressed row is a dead end: the drain never claims it, so a blocked address
+/// cannot be talked into a redeemable code by anything the worker does later.
+#[tokio::test]
+async fn s31_a_blocked_address_row_is_never_claimed() {
+    let app = TestApp::with_options(TestOptions {
+        allowed_email_domains: vec!["corp.com".to_owned()],
+        ..TestOptions::default()
+    })
+    .await;
+    app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": "spy@evil.com" })).await;
+
+    let report = app.drain_jobs().await;
+    assert_eq!(report.claimed, 0, "a suppressed row must never be handed to a worker");
+    assert!(app.mailer.sent().is_empty(), "and therefore must never produce a message");
+
+    // Days later, and after every retention tick in between, it is still exactly where it was.
+    app.advance(Duration::days(7));
+    app.drain_jobs().await;
+    assert_eq!(
+        app.repos.queue.depth().await.expect("queue depth"),
+        vec![(pub_core::queue::JobKind::MailSend, pub_core::queue::QueueState::Suppressed, 1)]
+    );
+    assert!(app.mailer.sent().is_empty());
+}
+
+/// **S-03.** The queue's latency cannot extend a code's life: the KV pending-auth record's own
+/// `created_at` is the authority on expiry, and single use is decided at redemption.
+#[tokio::test]
+async fn s03_a_queued_code_is_still_single_use_and_still_expires() {
+    let app = TestApp::new().await;
+    let (pending_id, code) = app.request_otp(EMAIL).await;
+    let verify = serde_json::json!({ "pending_id": pending_id, "email": EMAIL, "code": code });
+    assert_eq!(app.post("/api/v1/auth/otp/verify", None, verify.clone()).await.status, StatusCode::OK);
+    let replay = app.post("/api/v1/auth/otp/verify", None, verify).await;
+    assert_eq!(replay.status, StatusCode::UNAUTHORIZED, "a delivered code is still single use");
+    assert_eq!(replay.error_code(), "invalid_code");
+
+    // A message that sits in the queue past the code's life is delivered late and is already
+    // dead on arrival — the clock never restarted.
+    app.advance(Duration::seconds(61));
+    let late = "late@corp.com";
+    let response = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": late })).await;
+    let late_pending = response.json["data"]["pending_id"].as_str().expect("pending_id").to_owned();
+    app.advance(Duration::minutes(11));
+    app.drain_jobs().await;
+    let late_code = common::extract_code(&app.mailer.sent().pop().expect("the late message").text);
+    let expired = app
+        .post(
+            "/api/v1/auth/otp/verify",
+            None,
+            serde_json::json!({ "pending_id": late_pending, "email": late, "code": late_code }),
+        )
+        .await;
+    assert_eq!(expired.status, StatusCode::UNAUTHORIZED, "queue latency must not extend a code's life");
+    assert_eq!(expired.error_code(), "invalid_code");
 }

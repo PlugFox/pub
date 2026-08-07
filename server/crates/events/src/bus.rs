@@ -197,6 +197,18 @@ impl EventBus {
         let _ = self.local.send(envelope);
     }
 
+    /// Publishes a follow-up event: it reaches the stream, the replay ring and the broker, and
+    /// is **never** fed back through the consumer list.
+    ///
+    /// This is how the queue worker returns a fan-out's `UserNotified` events to the bus
+    /// (decision 26). Bypassing the consumers is the point: the fan-out's own output must not
+    /// be able to re-enter the fan-out, and making that a property of the *call* rather than a
+    /// category check inside a consumer means it survives somebody giving `UserNotified` a
+    /// notification category one day.
+    pub async fn publish_followup(&self, event: DomainEvent) {
+        self.publish(EventEnvelope::new(event)).await;
+    }
+
     /// Publishes one envelope everywhere: locally, then to peers.
     async fn publish(&self, envelope: EventEnvelope) {
         self.deliver(envelope.clone());
@@ -354,39 +366,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumer_followups_are_published_but_not_re_consumed() {
-        struct Echo {
+    async fn followups_reach_the_stream_and_never_re_enter_consumers() {
+        // The property that stops the fan-out from feeding itself, asserted on both routes a
+        // follow-up can take: returned by a consumer (the pre-decision-26 shape, still part of
+        // `EventConsumer`'s contract), and published by the queue worker after it completed a
+        // fan-out item (`publish_followup`, the shape production uses now).
+        struct Recorder {
             seen: Mutex<Vec<String>>,
+            echo: bool,
         }
 
         #[async_trait]
-        impl EventConsumer for Echo {
+        impl EventConsumer for Recorder {
             fn name(&self) -> &'static str {
-                "echo"
+                "recorder"
             }
 
             async fn handle(&self, envelope: &EventEnvelope) -> Result<Vec<DomainEvent>> {
                 self.seen.lock().unwrap().push(envelope.event.name().to_owned());
-                Ok(vec![DomainEvent::UserNotified {
-                    user_id: UserId::new(),
-                    notification_id: pub_core::NotificationId::new(),
-                    category: pub_core::notification::NotificationCategory::Package,
-                    title: "echo".to_owned(),
-                    unread: 1,
-                    at: Utc::now(),
-                }])
+                if !self.echo {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![notified()])
             }
         }
 
-        let echo = Arc::new(Echo { seen: Mutex::new(Vec::new()) });
+        fn notified() -> DomainEvent {
+            DomainEvent::UserNotified {
+                user_id: UserId::new(),
+                notification_id: pub_core::NotificationId::new(),
+                category: pub_core::notification::NotificationCategory::Package,
+                title: "echo".to_owned(),
+                unread: 1,
+                at: Utc::now(),
+            }
+        }
+
+        let echo = Arc::new(Recorder { seen: Mutex::new(Vec::new()), echo: true });
         let bus = Arc::new(EventBus::new(EventBusPolicy::default()));
         bus.add_consumer(Arc::clone(&echo) as Arc<dyn EventConsumer>);
         let mut rx = bus.subscribe();
         bus.emit(published(OrgId::new())).await;
-
         let names: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).map(|e| e.event.name().to_owned()).collect();
         assert_eq!(names, vec!["package.publish", "notification.new"], "the follow-up must reach the stream");
         assert_eq!(echo.seen.lock().unwrap().as_slice(), ["package.publish"], "follow-ups must not re-enter consumers");
+
+        // The enqueuer's shape: the consumer returns nothing, and the worker hands the
+        // follow-ups back one tick later.
+        let enqueuer = Arc::new(Recorder { seen: Mutex::new(Vec::new()), echo: false });
+        let bus = Arc::new(EventBus::new(EventBusPolicy::default()));
+        bus.add_consumer(Arc::clone(&enqueuer) as Arc<dyn EventConsumer>);
+        let mut rx = bus.subscribe();
+        bus.emit(published(OrgId::new())).await;
+        bus.publish_followup(notified()).await;
+        let names: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).map(|e| e.event.name().to_owned()).collect();
+        assert_eq!(names, vec!["package.publish", "notification.new"], "a worker follow-up still reaches the stream");
+        assert_eq!(
+            enqueuer.seen.lock().unwrap().as_slice(),
+            ["package.publish"],
+            "a worker follow-up must not re-enter the consumer that produced the fan-out"
+        );
+        assert_eq!(bus.ring.lock().unwrap().len(), 2, "a follow-up is replayable like any other event");
     }
 
     #[tokio::test]
