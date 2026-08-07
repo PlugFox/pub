@@ -43,7 +43,7 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 | `just server-check` / `web-check` / `check` | justfile → documented pipelines | validation before "done" |
 | `cargo nextest` (`just server-test`) | justfile | fast test iteration (no doctests) |
 | `bacon` | run manually in `server/` | live clippy/check loop while editing Rust |
-| `gitleaks` | pre-commit hook + `just secrets-scan` | secret scanning (S-15 CI job planned) |
+| `gitleaks` | pre-commit hook + `just secrets-scan` + `security-ci.yml` | secret scanning with the custom `pub_` token rule in `.gitleaks.toml` (S-15) |
 | `typos` (config `_typos.toml`) | pre-commit hook + `just spell` | spell-check; extend the config, don't ignore findings |
 | `taplo` | pre-commit hook + `just fmt` | Cargo.toml formatting/lint |
 | `actionlint` (+shellcheck) | pre-commit hook + `just lint-ci` | workflow linting after any `.github/` edit |

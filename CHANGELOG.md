@@ -2,6 +2,30 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-07 — the final Phase 1 wave: HTTP hygiene, supply-chain CI, operator docs
+
+Roadmap Phase 1 items 3, 5 and 6 — closing debt D7, D8, D13 and D15; the phase's exit now hangs on the first tag alone. Per the working agreements the wave ended in an adversarial review (six lenses, every substantive finding independently re-verified: 20 confirmed, 0 refuted, all fixed) — among the catches: an HTML 304 that would have clobbered the cached page's CSP with `default-src 'none'` and blanked the site from the second navigation on, a service worker killed by its own response's CSP, and an inverted subpath reverse-proxy procedure. Three new debt entries came out of it (D37–D39, see the roadmap).
+
+### Added
+
+- (server) **`[http]` config section + hygiene middleware** ([hygiene.rs](server/crates/api/src/hygiene.rs)) — request/upload deadlines (SSE exempt; publish *finalize* and cold-cache proxied archives ride larger budgets), semaphore load shedding (503 + `Retry-After`, `/healthz` exempt), and a global 2 MiB body cap that leaves the 100 MB upload override intact. Middleware statuses (408/413/503) answer the correct per-family error shape — the pub spec envelope on registry bases, the app envelope under `/api`.
+- (server) **Strict two-tier CSP and the S-28 transport headers** — API families answer `default-src 'none'`; HTML documents a `'self'`+sha256 policy whose hashes are computed at startup by scanning the embedded build's inline scripts/styles (self-adapting to any embedded dist; a defective scan refuses to boot). HSTS when `public_url` is https, `Referrer-Policy`, `Permissions-Policy`. 304s and `sw.js` carry their own policies — see the review notes above.
+- (server) **Cache tiers + strong ETags** — `_astro/*` immutable for a year, documents/`sw.js` `no-cache`, API `no-store`; ETags from rust-embed's sha256 with `If-None-Match`/304; archive downloads `private, immutable` with the content-hash ETag (S-18).
+- (server) **Explicit CORS locked to the instance origin** (S-12) — `CorsLayer` from the parsed `server.public_url` (now boot-validated: a mistyped scheme would have allow-listed the literal `null` origin), credentials off; the S-12.a server-side check stays the non-delegating layer.
+- (infra) **`security-ci.yml`** — full-history gitleaks with the shipped S-15 `pub_` token rule ([.gitleaks.toml](.gitleaks.toml)), actionlint, `cargo audit` / `cargo deny --locked` / `cargo machete`, and `bun audit` over the frontend lockfile (S-30); weekly cron, no path filters by design, every action SHA-pinned and every downloaded binary checksum-pinned.
+- (infra) **trivy image scan** in docker-ci (+ the same weekly cron), **Dependabot** over cargo/bun/actions/docker, `--locked`/`--frozen-lockfile` in CI **and** the production Dockerfile, [server/deny.toml](server/deny.toml) license/source policy and `audit.toml` with justified advisory ignores (S-30).
+- (docs) **Operator guide** in [docs/ops/](docs/ops/README.md) — install, reverse-proxy (nginx/Caddy/Traefik, rightmost-XFF per S-24.a/b, subpath = strip at the proxy), backup/restore, upgrade, the security runbook three S-xx requirements referenced (honest about the D27 KEK impossibility and the D37 token gap), and the S-15 token-scanning publication (regex + CRC32 spec). **[configuration.md](docs/ops/configuration.md) is generated from the config structs** and byte-compared by a drift test ([reference.rs](server/crates/config/tests/reference.rs)); `UPDATE_CONFIG_REFERENCE=1` rewrites, `just gen` runs it.
+
+### Changed
+
+- (server) A publish **finalize hitting the per-name lock now answers the structural code `busy`** (400, spec shape) and **no longer burns the staged upload session** — the retry the pub client sends can succeed instead of discovering its upload was discarded.
+- (docs) README status refreshed to pre-release; the docs table now lists the ops guide and the true S-01…S-33 range; `docker/README.md` links the ops pages instead of calling them "a separate roadmap item".
+
+### Fixed
+
+- (web) **js-yaml CVE-2026-59870** — the new bun-audit gate's first catch, minutes after it existed: `@redocly/openapi-core` pinned the vulnerable 4.3.0 exactly; a workspace override moves it to the patched line.
+- (infra) **The lefthook rustfmt hook had never worked** — `cargo fmt --manifest-path` against a virtual workspace manifest needs `--all`; no staged `.rs` file had ever exercised the hook until this wave's commit tripped it.
+
 ## 2026-08-07 — component tests in a real browser: vitest browser mode
 
 Closes the "specified in the rules but not installed" half of roadmap debt D36: [docs/rules/web.md](docs/rules/web.md) has promised "component tests via vitest browser mode" since the frontend conventions were written — the toolchain now exists, and its first suites already paid for themselves by catching a real Kobalte-default bug.
