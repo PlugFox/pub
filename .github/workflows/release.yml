@@ -1,0 +1,238 @@
+# Release — decision 18 (docs/decisions.md#18): the version derives from the git tag
+# `vX.Y.Z` and is injected as a build arg; CI never commits version bumps. Two native-arch
+# jobs (amd64 + arm64 — never a QEMU-emulated cargo build) each build the image, smoke-test
+# it (boot on the zero-config minimum and assert `/healthz` and `pubd --version` report the
+# tag's version), then push by digest with SBOM + provenance attestations
+# (`docker buildx imagetools inspect <img> --format '{{ json .SBOM.SPDX }}'` to read them).
+# A merge job stitches the digests into one multi-arch manifest tagged `vX.Y.Z` (+ `latest`
+# for stable versions), and a release job publishes a GitHub release carrying the newest
+# CHANGELOG.md section.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Never cancel a half-pushed release; a second tag queues behind the first.
+concurrency:
+  group: release-${{ github.ref }}
+
+# Jobs declare their own minimal permissions.
+permissions: {}
+
+env:
+  # Decision 18: GHCR, not Docker Hub — GITHUB_TOKEN auth, no pull rate limits.
+  IMAGE: ghcr.io/plugfox/pub
+
+jobs:
+  version:
+    name: derive version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      latest: ${{ steps.derive.outputs.latest }}
+    steps:
+      - name: Derive the version from the tag
+        id: derive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # vMAJOR.MINOR.PATCH with an optional pre-release; the image build arg and the
+          # /healthz assertion use the version without the leading `v`.
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH[-prerelease] (decision 18)"
+            exit 1
+          fi
+          version="${TAG#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Pre-releases never move `latest`.
+          case "$version" in
+            *-*) echo "latest=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "latest=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # First build loads into the local daemon for the smoke test (the docker exporter
+      # cannot carry attestations, hence two build steps; the second reuses this cache).
+      - name: Build for smoke testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: pub-smoke:${{ matrix.arch }}
+          build-args: |
+            PUB_VERSION=${{ needs.version.outputs.version }}
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+
+      # Native-arch smoke (the runner's arch matches the image's): boot on the documented
+      # zero-config minimum (SQLite + fs blobs + in-memory KV) and assert the version the
+      # binary reports is the tag's — end-to-end proof the build arg reached the binary.
+      - name: "Smoke: the image reports the tag's version"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          cli="$(docker run --rm "pub-smoke:$ARCH" --version)"
+          echo "pubd --version -> $cli"
+          case "$cli" in
+            *"$VERSION"*) ;;
+            *) echo "::error::--version output does not carry '$VERSION'"; exit 1 ;;
+          esac
+          docker run -d --name pub-smoke -p 8080:8080 "pub-smoke:$ARCH"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz > /dev/null 2>&1; then break; fi
+            if [ "$i" = 30 ]; then
+              echo "::error::/healthz never answered"
+              docker logs pub-smoke
+              exit 1
+            fi
+            sleep 2
+          done
+          health="$(curl -fsS http://127.0.0.1:8080/healthz)"
+          echo "healthz -> $health"
+          test "$(printf '%s' "$health" | jq -r .version)" = "$VERSION"
+          test "$(printf '%s' "$health" | jq -r .status)" = "ok"
+          docker rm -f pub-smoke
+
+      # Push by digest only — tags are minted once, by the merge job, after both arches
+      # exist. SBOM + provenance land as in-registry attestations (docker-multi-stage skill).
+      - name: Push by digest (SBOM + provenance)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            PUB_VERSION=${{ needs.version.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge multi-arch manifest
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the manifest (vX.Y.Z, plus latest for stable)
+        working-directory: /tmp/digests
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          LATEST: ${{ needs.version.outputs.latest }}
+        run: |
+          set -euo pipefail
+          tags=(-t "$IMAGE:v$VERSION")
+          if [ "$LATEST" = "true" ]; then
+            tags+=(-t "$IMAGE:latest")
+          fi
+          refs=()
+          for digest in *; do
+            refs+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Verify the manifest lists both architectures
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE:v$VERSION" | tee /tmp/inspect.txt
+          grep -q 'linux/amd64' /tmp/inspect.txt
+          grep -q 'linux/arm64' /tmp/inspect.txt
+
+  release:
+    name: github release
+    needs: [version, merge]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # CHANGELOG.md sections are dated, not versioned (release-notes skill), so "the
+      # matching section" is the newest one at the tagged commit — cut the tag with its
+      # section in place.
+      - name: Extract the newest changelog section
+        run: |
+          set -euo pipefail
+          awk '/^## /{ if (seen) exit; seen=1 } seen' CHANGELOG.md > /tmp/release-body.md
+          if ! [ -s /tmp/release-body.md ]; then
+            echo "::error::CHANGELOG.md has no '## ' section to use as the release body"
+            exit 1
+          fi
+          cat /tmp/release-body.md
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+          LATEST: ${{ needs.version.outputs.latest }}
+        run: |
+          set -euo pipefail
+          args=(--verify-tag --title "$TAG" --notes-file /tmp/release-body.md)
+          if [ "$LATEST" != "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"

@@ -70,6 +70,13 @@ RUN find crates -name '*.rs' -exec touch {} +
 # embeds the real dist.
 RUN rm -rf crates/api/embedded && mkdir -p crates/api/embedded
 COPY --from=web-build /app/web/apps/site/dist/ crates/api/embedded/
+# Release version (decision 18): git tag → --build-arg PUB_VERSION → compile-time env →
+# pub_core::version::VERSION → /healthz and `pubd --version`. Declared *after* the
+# dependency build on purpose: a version change must never invalidate the (expensive)
+# dependency-compile layer above. Unset/empty (local builds, PR CI) the binary falls back
+# to the crate version marked `+dev`.
+ARG PUB_VERSION=""
+ENV PUB_VERSION=${PUB_VERSION}
 RUN cargo build --release --bin pubd
 
 # ---------------------------------------------------------------------------
@@ -78,6 +85,14 @@ RUN cargo build --release --bin pubd
 # uid 1000 with /data as home — the writable default location for SQLite + fs blobs.
 # ---------------------------------------------------------------------------
 FROM alpine:3 AS runtime
+# OCI labels: `source` links the GHCR package to the repository; `version` carries the
+# release version (empty on untagged local builds — the binary itself reports `+dev`).
+ARG PUB_VERSION=""
+LABEL org.opencontainers.image.title="Pub" \
+      org.opencontainers.image.description="Self-hosted pub package registry" \
+      org.opencontainers.image.source="https://github.com/plugfox/pub" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${PUB_VERSION}"
 RUN apk add --no-cache ca-certificates \
  && adduser -D -u 1000 -h /data pub
 WORKDIR /data

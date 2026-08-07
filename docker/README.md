@@ -31,4 +31,20 @@ Configuration: defaults work with zero setup; to override, `cp docker/.env.examp
 and edit. In the `s3`/`full` profiles create the bucket (default `pub`) once via the MinIO
 console at <http://localhost:9001>.
 
-No release/publish pipeline yet — decision 18 (registry, release model) is tbd.
+## Releases
+
+Published images live on **`ghcr.io/plugfox/pub`** (decision 18): multi-arch
+`linux/amd64` + `linux/arm64`, tagged `vX.Y.Z` per release plus `latest` for the newest
+stable. The version derives from the git tag and reaches the binary through the
+`PUB_VERSION` build arg — `/healthz` and `pubd --version` report it:
+
+```sh
+docker build -f docker/Dockerfile --build-arg PUB_VERSION=1.2.3 -t pub .
+```
+
+Without the build arg (local builds, PR CI) the binary reports the crate version marked
+`+dev` — visibly not a release. Releases are cut by tagging `vX.Y.Z`; the workflow in
+[.github/workflows/release.yml](../.github/workflows/release.yml) builds both
+architectures natively, smoke-tests `/healthz` against the tag's version, attaches
+SBOM + provenance attestations, and publishes a GitHub release with the newest
+changelog section. CI never commits version bumps.

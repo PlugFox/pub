@@ -1,0 +1,53 @@
+# Docker CI — build-only check of the production image (decision 18: PR CI builds the
+# Dockerfile without pushing, so the image cannot rot on master between releases).
+# The release pipeline lives in release.yml; this job never pushes and never tags.
+name: docker-ci
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "server/**"
+      - "web/**"
+      - "docker/**"
+      - ".dockerignore"
+      - ".github/workflows/docker-ci.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "server/**"
+      - "web/**"
+      - "docker/**"
+      - ".dockerignore"
+      - ".github/workflows/docker-ci.yml"
+  workflow_dispatch:
+
+# One run per ref; superseded runs are cancelled.
+concurrency:
+  group: docker-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal token surface: checkout only (the GHA cache uses its own scoped token).
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: docker build (no push)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Build-only, no PUB_VERSION: same as a local `docker build`, the binary reports the
+      # crate version + `+dev`. The GHA cache backend keeps the dependency-compile layer
+      # warm across runs (the manifests-stage layer trick makes it effective — see
+      # .claude/skills/docker-multi-stage).
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

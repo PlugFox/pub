@@ -1,5 +1,6 @@
 # Server CI — fmt / clippy / test for the Rust workspace in server/.
-# No release workflow yet: decision 18 (release model, image registry) is tbd.
+# The production image is docker-ci.yml's concern (build-only) and release.yml's
+# (tagged releases) — decision 18.
 name: server-ci
 
 on:
@@ -7,13 +8,11 @@ on:
     branches: [master]
     paths:
       - "server/**"
-      - "docker/Dockerfile"
       - ".github/workflows/server-ci.yml"
   pull_request:
     branches: [master]
     paths:
       - "server/**"
-      - "docker/Dockerfile"
       - ".github/workflows/server-ci.yml"
   workflow_dispatch:
 

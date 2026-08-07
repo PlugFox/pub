@@ -15,7 +15,9 @@ use crate::envelope::OkEnvelope;
 pub struct Health {
     /// `"ok"` when every configured backend responds, `"degraded"` otherwise.
     pub status: String,
-    /// Server version (crate version; git metadata is in `pubd --version`).
+    /// Server version: the release version injected from the git tag at build time
+    /// (decision 18), or the crate version marked `+dev` for non-release builds.
+    /// Git metadata is in `pubd --version`.
     pub version: String,
     /// Which backend kinds this instance is configured with.
     pub backends: Backends,
@@ -61,7 +63,7 @@ pub async fn healthz(State(state): State<AppState>) -> Json<Health> {
     let status = if db_ok && blob_ok && kv_ok { "ok" } else { "degraded" };
     Json(Health {
         status: status.to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: pub_core::version::VERSION.to_owned(),
         backends: Backends {
             database: state.settings.database.kind.as_str().to_owned(),
             blob: state.settings.blob.kind.as_str().to_owned(),

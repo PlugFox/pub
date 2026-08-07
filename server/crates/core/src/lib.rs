@@ -27,6 +27,7 @@ pub mod stats;
 pub mod token;
 pub mod traits;
 pub mod user;
+pub mod version;
 
 pub use error::Error;
 pub use event::DomainEvent;

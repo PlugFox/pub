@@ -1,5 +1,28 @@
 # Changelog
 
+All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
+
+## 2026-08-07 — release engineering: the version derives from the tag, images land on GHCR
+
+[Decision 18](docs/decisions.md#18--ops-release-model-image-registry-reference-orchestrator) is decided and wired (closes roadmap debt D6). Releases never commit version bumps from CI: the version derives from the git tag `vX.Y.Z`, flows through the `PUB_VERSION` Docker build arg into the binary at compile time, and is asserted end to end by the release smoke test before anything is tagged on the registry.
+
+### Added
+
+- (server) **`pub_core::version::VERSION`** ([version.rs](server/crates/core/src/version.rs)) — the single source of the surfaced version: the `PUB_VERSION` compile-time env when injected (release builds), otherwise the crate version marked `+dev` — equal in semver precedence, visibly not a tagged release. [`/healthz`](server/crates/api/src/routes/system.rs) and [`pubd --version`](server/crates/bin/pubd/src/main.rs) both report it.
+- (infra) **Release workflow** ([release.yml](.github/workflows/release.yml)) on tag `v*`: two native-arch jobs (amd64 on `ubuntu-24.04`, arm64 on `ubuntu-24.04-arm` — never a QEMU-emulated cargo build) each build [docker/Dockerfile](docker/Dockerfile), boot it on the zero-config minimum and assert `/healthz` and `--version` report the tag's version, then push by digest to `ghcr.io/plugfox/pub` with SBOM + provenance attestations; a merge job stitches the digests into one multi-arch manifest tagged `vX.Y.Z` (+ `latest` for stable versions); a release job publishes a GitHub release carrying the newest changelog section. Pre-release tags never move `latest` and are marked pre-release.
+- (infra) **Docker build check in CI** ([docker-ci.yml](.github/workflows/docker-ci.yml)) — builds the production image on pull requests and master pushes touching `server/`, `web/`, or `docker/`; build-only, no push, GHA-backed buildx cache — the image cannot rot between releases.
+- (infra) **`PUB_VERSION` build arg** in [docker/Dockerfile](docker/Dockerfile), declared *after* the dependency-compile layer so a version change never invalidates the cargo cache; OCI labels (`org.opencontainers.image.version/source/title/…`) on the runtime image link the GHCR package to the repository.
+
+### Changed
+
+- (server) `/healthz` `version` reports the release version instead of the bare crate version; untagged builds (dev, CI) report `0.1.0+dev`.
+- (infra) [server-ci.yml](.github/workflows/server-ci.yml) no longer triggers on `docker/Dockerfile` — the image build is docker-ci's concern.
+- (docs) [docker/README.md](docker/README.md) documents the GHCR image, the `PUB_VERSION` build arg, and the `+dev` fallback.
+
+### Notes
+
+- Changelog sections are dated, not versioned; the release body is the **topmost** section at the tagged commit — cut the tag with its section in place.
+
 ## 2026-08-07 — SQLite fit for the default deployment, configurable DB pools
 
 Roadmap Phase 1.4, closing debt items D4 and D24. The documented `docker run` minimum runs on a SQLite file, and that file now gets the write-concurrency posture a production default needs; both database backends stop hard-coding their pool.
@@ -22,8 +45,6 @@ Roadmap Phase 1.4, closing debt items D4 and D24. The documented `docker run` mi
 ### Added
 
 - (docs) [docs/roadmap.md](docs/roadmap.md): audited state of the project (foundation, configured tooling, verified behaviour), a ranked tech-debt register of 36 items with file references, the status of all 33 security requirements, and a five-phase plan from "installable" through multi-instance to the enterprise tier.
-
-All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
 ## 2026-08-07 — the first end-to-end pass: one binary, a real browser, the real `dart pub` client
 

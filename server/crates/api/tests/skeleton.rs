@@ -33,7 +33,10 @@ async fn healthz_reports_status_version_and_backend_kinds() {
 
     let body = json(&body);
     assert_eq!(body["status"], "ok");
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    // The surfaced version is the single shared constant (decision 18): the release
+    // version when `PUB_VERSION` was injected at build time, the crate version + `+dev`
+    // otherwise — never the bare crate version of the api crate.
+    assert_eq!(body["version"], pub_core::version::VERSION);
     assert_eq!(body["backends"]["database"], "sqlite");
     assert_eq!(body["backends"]["blob"], "memory");
     assert_eq!(body["backends"]["kv"], "memory");

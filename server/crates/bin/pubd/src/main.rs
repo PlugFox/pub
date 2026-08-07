@@ -40,20 +40,26 @@ use pub_registry::{
 };
 use pub_telemetry::LogFormat;
 
-/// Version string surfaced by `pubd --version`: crate version + git hash + build date.
-const VERSION: &str =
-    concat!(env!("CARGO_PKG_VERSION"), " (", env!("PUBD_GIT_HASH"), ", ", env!("PUBD_BUILD_DATE"), ")");
+/// Version string surfaced by `pubd --version`: the release/crate version
+/// (`pub_core::version::VERSION`, decision 18 — the git tag's version in release builds,
+/// crate version + `+dev` otherwise) + git hash + build date.
+fn version_string() -> String {
+    format!("{} ({}, {})", pub_core::version::VERSION, env!("PUBD_GIT_HASH"), env!("PUBD_BUILD_DATE"))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Inject the git-stamped version so clap's --version prints it (the flag is disabled on
-    // the shared derive struct precisely so this binary can own the version string).
-    let matches = CliArgs::command().version(VERSION).disable_version_flag(false).get_matches();
+    // Inject the release/git-stamped version so clap's --version prints it (the flag is
+    // disabled on the shared derive struct precisely so this binary can own the version).
+    // One deliberate leak of a short string at startup: clap wants `&'static str` without
+    // its `string` feature, and the version outlives the process anyway.
+    let version: &'static str = Box::leak(version_string().into_boxed_str());
+    let matches = CliArgs::command().version(version).disable_version_flag(false).get_matches();
     let cli = CliArgs::from_arg_matches(&matches).context("failed to parse command line")?;
 
     let settings = pub_config::load(&cli).context("failed to load configuration")?;
     let telemetry = pub_telemetry::init(LogFormat::Pretty, &settings.telemetry);
-    tracing::info!(version = VERSION, "starting pubd");
+    tracing::info!(version, "starting pubd");
     tracing::info!("{}", settings.summary());
 
     let repos = build_database(&settings).await?;
