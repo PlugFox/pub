@@ -24,15 +24,15 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 
 ## Documentation map
 
-| File | Contents |
-|------|----------|
-| `docs/decisions.md` | 23 numbered decisions with rationale — normative |
-| `docs/product.md` | Vision, feature triage v1/v1.1/later, screens list |
+| File                   | Contents                                                        |
+| ---------------------- | --------------------------------------------------------------- |
+| `docs/decisions.md`    | 23 numbered decisions with rationale — normative                |
+| `docs/product.md`      | Vision, feature triage v1/v1.1/later, screens list              |
 | `docs/architecture.md` | Crate/workspace layout, data model, pipelines, testing strategy |
-| `docs/security.md` | S-01…S-33 normative security requirements |
-| `docs/protocol.md` | Pub spec v2 sharp edges + endpoint table |
-| `docs/rules/*.md` | Code conventions per area (read before writing) |
-| `CHANGELOG.md` | Keep-a-Changelog, entries tagged `(server)`/`(web)`/`(infra)` |
+| `docs/security.md`     | S-01…S-33 normative security requirements                       |
+| `docs/protocol.md`     | Pub spec v2 sharp edges + endpoint table                        |
+| `docs/rules/*.md`      | Code conventions per area (read before writing)                 |
+| `CHANGELOG.md`         | Keep-a-Changelog, entries tagged `(server)`/`(web)`/`(infra)`   |
 
 ## Mandatory rules
 

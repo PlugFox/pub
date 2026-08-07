@@ -4,15 +4,15 @@ Monorepo: Rust backend (`server/`), Bun/Astro/SolidJS frontend (`web/`), design 
 
 ## Read before working
 
-| When | Read |
-|------|------|
-| Any design/architecture question | `docs/decisions.md` (normative, 23 decisions), `docs/architecture.md` |
-| Touching pub protocol endpoints | `docs/protocol.md` — violating a sharp edge breaks `dart pub` clients |
-| Auth, tokens, sessions, limits, webhooks | `docs/security.md` — normative S-01…S-33, referenced from tests |
-| Writing Rust | `docs/rules/rust.md` |
-| Writing frontend code | `docs/rules/web.md` |
-| DB schema / migrations | `docs/rules/migrations.md` |
-| HTTP API surface | `docs/rules/api.md` |
+| When                                     | Read                                                                  |
+| ---------------------------------------- | --------------------------------------------------------------------- |
+| Any design/architecture question         | `docs/decisions.md` (normative, 23 decisions), `docs/architecture.md` |
+| Touching pub protocol endpoints          | `docs/protocol.md` — violating a sharp edge breaks `dart pub` clients |
+| Auth, tokens, sessions, limits, webhooks | `docs/security.md` — normative S-01…S-33, referenced from tests       |
+| Writing Rust                             | `docs/rules/rust.md`                                                  |
+| Writing frontend code                    | `docs/rules/web.md`                                                   |
+| DB schema / migrations                   | `docs/rules/migrations.md`                                            |
+| HTTP API surface                         | `docs/rules/api.md`                                                   |
 
 ## Commands
 
@@ -23,7 +23,7 @@ Monorepo: Rust backend (`server/`), Bun/Astro/SolidJS frontend (`web/`), design 
 
 ## Critical rules
 
-- Russian with the user; English in code, comments, docs, and commits.
+- English in code, comments, docs, and commits.
 - Conventional commits: `feat(server): …`, `fix(web): …`, `chore(infra): …`. Update `CHANGELOG.md` for any user-visible change.
 - `docs/decisions.md` is normative. If an implementation needs to contradict a decision — stop and discuss; never silently deviate. New agreements get recorded there.
 - Before writing code: challenge the approach, surface unknowns and edge cases, wait for confirmation on genuinely open choices.
