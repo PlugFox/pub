@@ -961,7 +961,17 @@ pub struct QueueConfig {
     /// Seconds between drains — the latency floor on queued mail.
     pub interval_secs: u64,
     /// Items leased per claim, and therefore the cost bound of one pass.
+    ///
+    /// An upper bound, not a target: a pass never leases more than the time left in the
+    /// drain's own budget can actually run (`lease_secs / 2`, in rounds of `concurrency`
+    /// deliveries of `send_timeout_secs`).
     pub batch: u32,
+    /// Deliveries in flight at once inside one claimed batch.
+    ///
+    /// One at a time is what let a single slow recipient gate every message behind it,
+    /// including the sign-in code. Bounded rather than unlimited because the other end is
+    /// somebody's relay, and two hundred simultaneous connections is an outage you caused.
+    pub concurrency: u32,
     /// Seconds a claimed item stays leased. A worker that dies mid-run makes its items
     /// invisible for this long, so it is also how quickly a crashed drain's work resumes; it
     /// must exceed both the tick interval and one delivery deadline.
@@ -972,9 +982,21 @@ pub struct QueueConfig {
     pub backoff_base_secs: u64,
     /// Ceiling on the retry delay.
     pub backoff_max_secs: u64,
-    /// Hours a completed item is kept before retention deletes it. Dead-lettered items are
-    /// **never** purged — they are the operator's record of mail that never arrived.
+    /// Hours a completed item is kept before retention deletes it.
     pub retain_done_hours: i64,
+    /// Hours a suppressed item (S-04.a: one row per policy-rejected sign-in attempt, so both
+    /// branches of the request cost the same) is kept.
+    ///
+    /// Short by default, and this is the security-relevant one: the rows are filed by an
+    /// **unauthenticated** endpoint, each carries the attempted address in the clear, and
+    /// nothing reads one after the request that filed it has returned.
+    pub retain_suppressed_hours: i64,
+    /// Days a dead-lettered item is kept for the operator before retention deletes it.
+    ///
+    /// Long, because a dead-lettered sign-in message is an account lockout with no other
+    /// visible cause — but bounded, because decision 26 promises the queue does not become the
+    /// next table that only grows. The drain logs a warning naming what it deleted.
+    pub retain_dead_days: i64,
     /// Deadline on one delivery attempt.
     ///
     /// Not a nicety: it replaces the bound this design removes. The SMTP transport sets no
@@ -989,11 +1011,14 @@ impl Default for QueueConfig {
         Self {
             interval_secs: 5,
             batch: 50,
+            concurrency: 4,
             lease_secs: 120,
             max_attempts: 8,
             backoff_base_secs: 10,
             backoff_max_secs: 3600,
             retain_done_hours: 24,
+            retain_suppressed_hours: 1,
+            retain_dead_days: 30,
             send_timeout_secs: 30,
         }
     }

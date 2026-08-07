@@ -56,11 +56,12 @@ impl Default for NotificationPolicy {
 /// One event's whole fan-out, computed by the worker.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Fanout {
-    /// One [`DomainEvent::UserNotified`] per filed row, in recipient order.
+    /// One [`DomainEvent::UserNotified`] per row **this run filed**, in recipient order.
     ///
     /// Published by the worker **after** the fan-out's own queue row is completed, never
     /// before: `pub_core::event` promises a client acting on one of these finds the row it
-    /// names.
+    /// names. A re-run of an event whose rows already exist therefore carries none of these —
+    /// see [`NotificationCenter::deliver`].
     pub followups: Vec<DomainEvent>,
     /// The per-recipient mail items to file — one row per message, so a single bad address
     /// gets its own retry and its own dead letter.
@@ -186,6 +187,9 @@ impl NotificationCenter {
             .map(|user| NewNotification {
                 user_id: *user,
                 category,
+                // The emission this row projects — the constraint that makes the fan-out
+                // exactly once, so a re-run files nobody a second copy (decision 26 amendment).
+                event_id: Some(envelope.id.clone()),
                 event: event.name().to_owned(),
                 title: title.clone(),
                 org_id: event.org_id(),
@@ -194,6 +198,13 @@ impl NotificationCenter {
             .collect();
         let stored_rows = self.repos.notifications.create_many(&rows, now).await?;
         let unread: BTreeMap<UserId, i64> = self.repos.notifications.unread_counts(&filed).await?.into_iter().collect();
+        // Only the rows this run actually filed produce a follow-up, because that is all
+        // `create_many` returns now that `(user_id, event_id)` is unique (decision 26's
+        // amendment). A re-run after a crash therefore announces nothing a second time — and
+        // announces nothing at all for the rows its predecessor wrote before dying. That is the
+        // deliberate side to take: `UserNotified` is a hint on a live stream, the REST feed is
+        // the source of truth, and a client that missed the hint reads the row on its next poll
+        // or reconnect. Re-announcing would instead need a read-back of somebody else's rows.
         let followups = stored_rows
             .iter()
             .map(|row| DomainEvent::UserNotified {
@@ -233,10 +244,15 @@ impl NotificationCenter {
                         sealed: false,
                     };
                     let payload = serde_json::to_value(&job).unwrap_or(serde_json::Value::Null);
+                    // `bulk`, not `pending`: this is up to two hundred rows filed on somebody
+                    // else's behalf, and at interactive priority they sit in front of the next
+                    // sign-in code — which is how unrelated publish traffic took sign-in down
+                    // instance-wide (decision 26's amendment). Nobody is watching the latency
+                    // of a notification email; somebody is watching the OTP.
+                    //
                     // `(event, recipient)` rather than a fresh id: if this fan-out is re-run
                     // after a crash, the recipients who were already mailed are not mailed twice.
-                    NewQueuedJob::pending(MailJob::KIND, payload)
-                        .with_dedupe_key(format!("mail:{}:{}", envelope.id, user))
+                    NewQueuedJob::bulk(MailJob::KIND, payload).with_dedupe_key(format!("mail:{}:{}", envelope.id, user))
                 })
                 .collect()
         } else {

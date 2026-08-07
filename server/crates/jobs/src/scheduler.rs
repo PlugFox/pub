@@ -76,15 +76,17 @@ async fn run_job_loop(job: Job, lock: Arc<dyn JobLock>, lock_ttl: Duration) {
     loop {
         interval.tick().await;
         match lock.try_acquire(job.name, lock_ttl).await {
-            Ok(true) => {
+            Ok(Some(token)) => {
                 if let Err(error) = (job.run)().await {
                     tracing::warn!(job = job.name, %error, "background job failed; will retry next tick");
                 }
-                if let Err(error) = lock.release(job.name).await {
+                // With the token, never bare: a run that outlived its TTL is releasing a lock
+                // somebody else now holds, and the implementation is what refuses that.
+                if let Err(error) = lock.release(job.name, token).await {
                     tracing::warn!(job = job.name, %error, "failed to release job lock; TTL will expire it");
                 }
             }
-            Ok(false) => {
+            Ok(None) => {
                 tracing::debug!(job = job.name, "job lock held elsewhere; skipping this tick");
             }
             Err(error) => {
@@ -148,7 +150,7 @@ mod tests {
     async fn job_respects_a_lock_held_elsewhere() {
         let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
         // Simulate another instance holding the leader lock for this job.
-        assert!(lock.try_acquire("guarded", Duration::from_secs(3600)).await.unwrap());
+        let token = lock.try_acquire("guarded", Duration::from_secs(3600)).await.unwrap().expect("free");
 
         let runs = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&runs);
@@ -166,7 +168,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 0, "job must not run while the lock is held elsewhere");
 
         // The other instance releases the lock — the job starts running on later ticks.
-        lock.release("guarded").await.unwrap();
+        lock.release("guarded", token).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         handle.shutdown();
         assert!(runs.load(Ordering::SeqCst) >= 1, "job must run after the lock is released");

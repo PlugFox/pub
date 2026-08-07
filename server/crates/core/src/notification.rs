@@ -12,6 +12,7 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::event::EventId;
 use crate::{Error, NotificationId, OrgId, UserId};
 
 /// The per-category subscription axis (decision 20 "preferences per category").
@@ -136,6 +137,14 @@ pub struct NewNotification {
     pub user_id: UserId,
     /// Subscription axis.
     pub category: NotificationCategory,
+    /// The id of the emission this row projects, when it came from one.
+    ///
+    /// This is what makes fan-out exactly once (decision 26's amendment): `(user_id,
+    /// event_id)` is unique, so a fan-out re-run after a crash — or any future path that
+    /// re-emits an event — converges on the same rows instead of filing a second copy of
+    /// everybody's feed item. `None` for a row that belongs to no emission, which is why the
+    /// constraint is a *partial* unique index rather than a plain one.
+    pub event_id: Option<EventId>,
     /// Originating event name.
     pub event: String,
     /// Rendered one-line summary.

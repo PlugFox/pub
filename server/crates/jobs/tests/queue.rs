@@ -9,12 +9,18 @@
 //! | A transient failure backs off, grows, and finally dead-letters | [`d2_a_failing_mailer_retries_with_growing_backoff_then_deadletters`] |
 //! | A worker that dies mid-run releases its item | [`d2_an_expired_lease_returns_the_item_to_the_queue`] |
 //! | A hung relay cannot hold a lease | [`d2_a_mail_send_that_hangs_is_bounded_by_its_timeout`] |
+//! | A hung relay cannot make a drain outlive its lease | [`d2_a_drain_stops_inside_its_own_lease_and_backs_off_from_the_present`] |
+//! | A pass claims against the clock the drain has reached | [`d2_a_later_pass_claims_against_the_clock_the_drain_has_reached`] |
+//! | A batch is dispatched with bounded concurrency | [`d2_a_claimed_batch_is_dispatched_with_bounded_concurrency`] |
+//! | A sign-in code is never starved by bulk mail | [`d2_a_sign_in_code_overtakes_a_backlog_of_notification_mail`] |
 //! | A permanent failure does not burn the budget | [`d2_a_malformed_recipient_deadletters_immediately`] |
 //! | One event, one batch, one mail item per recipient | [`d2_the_fanout_files_every_recipient_in_one_batch_and_queues_their_mail`] |
 //! | Re-enqueueing one event is a no-op | [`d2_a_duplicate_enqueue_of_one_event_is_a_no_op`] |
-//! | A re-run fan-out never re-sends a message | [`d2_a_fanout_retry_never_sends_a_second_copy_of_a_message`] |
+//! | A re-run fan-out re-sends no message and files no second row | [`d2_a_fanout_retry_never_sends_a_second_copy_of_a_message`] |
+//! | A notification email that cannot be queued is not lost | [`d44_a_notification_email_that_cannot_be_queued_is_not_lost_in_silence`] |
 //! | The item is completed before its follow-ups are published | [`d2_an_item_is_completed_before_its_followups_are_published`] |
 //! | Retention deletes done rows and keeps dead ones | [`d12_retention_purges_done_rows_and_keeps_the_operators_record`] |
+//! | Every terminal state has a retention window | [`d43_retention_bounds_every_terminal_state_not_only_the_completed_one`] |
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -54,16 +60,22 @@ enum MailMode {
     Reject,
     /// Never returns. The reason [`QueuePolicy::send_timeout`] exists.
     Hang,
+    /// Accepts everything, slowly — a relay that works and takes its time, which is what makes
+    /// the drain's own wall-clock observable.
+    Slow(StdDuration),
 }
 
 struct ScriptedMailer {
     mode: Mutex<MailMode>,
     sent: Mutex<Vec<(String, String, String)>>,
+    /// Sends currently inside `send`, and the most that were ever there at once — how the
+    /// dispatch's concurrency is asserted without measuring wall-clock.
+    in_flight: Mutex<(usize, usize)>,
 }
 
 impl ScriptedMailer {
     fn new(mode: MailMode) -> Arc<Self> {
-        Arc::new(Self { mode: Mutex::new(mode), sent: Mutex::new(Vec::new()) })
+        Arc::new(Self { mode: Mutex::new(mode), sent: Mutex::new(Vec::new()), in_flight: Mutex::new((0, 0)) })
     }
 
     fn set(&self, mode: MailMode) {
@@ -72,6 +84,20 @@ impl ScriptedMailer {
 
     fn sent(&self) -> Vec<(String, String, String)> {
         self.sent.lock().unwrap().clone()
+    }
+
+    fn peak_in_flight(&self) -> usize {
+        self.in_flight.lock().unwrap().1
+    }
+
+    fn enter(&self) {
+        let mut counts = self.in_flight.lock().unwrap();
+        counts.0 += 1;
+        counts.1 = counts.1.max(counts.0);
+    }
+
+    fn leave(&self) {
+        self.in_flight.lock().unwrap().0 -= 1;
     }
 }
 
@@ -83,6 +109,31 @@ impl Mailer for ScriptedMailer {
 
     async fn send(&self, to: &str, subject: &str, body: &str) -> Result<()> {
         let mode = *self.mode.lock().unwrap();
+        // A guard rather than a decrement after the await: a send that is cancelled by the
+        // handler's timeout never reaches the line after it.
+        let _in_flight = InFlight::enter(self);
+        self.deliver(mode, to, subject, body).await
+    }
+}
+
+/// Counts one send for as long as it is inside the transport, cancellation included.
+struct InFlight<'a>(&'a ScriptedMailer);
+
+impl<'a> InFlight<'a> {
+    fn enter(mailer: &'a ScriptedMailer) -> Self {
+        mailer.enter();
+        Self(mailer)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+impl ScriptedMailer {
+    async fn deliver(&self, mode: MailMode, to: &str, subject: &str, body: &str) -> Result<()> {
         match mode {
             MailMode::Deliver => {
                 self.sent.lock().unwrap().push((to.to_owned(), subject.to_owned(), body.to_owned()));
@@ -94,6 +145,11 @@ impl Mailer for ScriptedMailer {
                 // Deliberately longer than any timeout under test: the assertion is that the
                 // handler gives up, not that this future eventually resolves.
                 tokio::time::sleep(StdDuration::from_secs(3600)).await;
+                Ok(())
+            }
+            MailMode::Slow(delay) => {
+                tokio::time::sleep(delay).await;
+                self.sent.lock().unwrap().push((to.to_owned(), subject.to_owned(), body.to_owned()));
                 Ok(())
             }
         }
@@ -225,6 +281,10 @@ impl Harness {
     }
 
     async fn enqueue_mail(&self, to: &str) -> QueuedJobId {
+        self.enqueue_mail_at(to, t0()).await
+    }
+
+    async fn enqueue_mail_at(&self, to: &str, at: DateTime<Utc>) -> QueuedJobId {
         let job = MailJob {
             to: to.to_owned(),
             subject: "Your sign-in code".to_owned(),
@@ -235,7 +295,7 @@ impl Harness {
         let payload = serde_json::to_value(&job).unwrap();
         self.repos
             .queue
-            .enqueue(&NewQueuedJob::pending(MailJob::KIND, payload), t0())
+            .enqueue(&NewQueuedJob::pending(MailJob::KIND, payload).with_run_after(at), at)
             .await
             .expect("enqueue")
             .expect("a fresh row")
@@ -374,6 +434,129 @@ async fn d2_a_mail_send_that_hangs_is_bounded_by_its_timeout() {
 }
 
 #[tokio::test]
+async fn d2_a_drain_stops_inside_its_own_lease_and_backs_off_from_the_present() {
+    // The bound decision 26's amendment adds: a per-send timeout is not a bound on a *drain*.
+    // With a relay that connects and says nothing, this tick used to claim the whole batch and
+    // pay the timeout for every item — fifty items at thirty seconds is twenty-five minutes of
+    // work leased for two — so it ran past its own lease, past the scheduler's lock TTL, and a
+    // second drain reaped its in-flight items and sent them again. Two properties here:
+    // the drain never spends more than half a lease, and the retry backoffs it writes are
+    // measured from the real present rather than from the tick's start (with the tick's start
+    // they land in the past, and the whole ten-second-to-an-hour ladder becomes "retry now").
+    // Real time, deliberately: the `:memory:` database is pinned to a single connection and
+    // sqlx validates it on every acquire, so a paused clock jumps straight to the pool's own
+    // acquire timeout and the test would be measuring sqlx rather than the drain. The
+    // durations are therefore small — the ratios are what matter, not the units.
+    let harness = Harness::new(MailMode::Hang).await;
+    let policy = QueuePolicy {
+        send_timeout: StdDuration::from_millis(60),
+        lease: StdDuration::from_millis(400),
+        // One at a time here on purpose: this test is about the clock, not the dispatch.
+        concurrency: 1,
+        batch: 50,
+        ..QueuePolicy::default()
+    };
+    let worker = harness.worker(policy);
+    let mut filed = Vec::new();
+    for index in 0..20 {
+        filed.push(harness.enqueue_mail(&format!("member{index}@corp.com")).await);
+    }
+
+    let started = std::time::Instant::now();
+    let report = worker.run_once(t0()).await.expect("drain");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed <= policy.lease,
+        "one drain outlived the lease it holds its items under: {elapsed:?} of {:?}",
+        policy.lease
+    );
+    assert!(
+        (1..=5).contains(&report.claimed),
+        "a pass leased more work than its budget could run — twenty hung sends is twenty timeouts: {}",
+        report.claimed
+    );
+    assert_eq!(report.retried, report.claimed, "a hung relay is transient");
+    assert_eq!(
+        harness.queued(JobKind::MailSend, QueueState::Pending).await,
+        20,
+        "everything is runnable again: what was never claimed, plus what came back behind a backoff"
+    );
+
+    let retried = harness.row(filed[0]).await;
+    assert_eq!(retried.attempts, 1, "an item is never leased twice in one drain");
+    // `updated_at` is the instant the completion was written with, and it is the same instant
+    // the retry's `run_after = now + backoff` is measured from. With the tick's instant it is
+    // `t0()` exactly however long the drain ran — which is how the backoff ladder collapsed to
+    // "runnable immediately" in precisely the outage it exists for.
+    assert!(
+        retried.updated_at >= t0() + Duration::milliseconds(50),
+        "the completion was stamped with the tick's start, not with the present: {} vs {}",
+        retried.updated_at,
+        t0()
+    );
+    assert!(retried.run_after > retried.updated_at, "and the backoff runs from there");
+    assert!(harness.mailer.sent().is_empty(), "nothing was delivered by a relay that never answered");
+}
+
+#[tokio::test]
+async fn d2_a_claimed_batch_is_dispatched_with_bounded_concurrency() {
+    // The other half of the fairness fix (decision 26's amendment): one message at a time makes
+    // the queue's throughput 1/send-latency, so one slow recipient gates every message behind
+    // it — including the sign-in code. Counted rather than timed: under the serial loop the
+    // in-flight count is exactly one, whatever the machine's mood.
+    let harness = Harness::new(MailMode::Slow(StdDuration::from_millis(20))).await;
+    let policy = QueuePolicy { concurrency: 4, ..QueuePolicy::default() };
+    let worker = harness.worker(policy);
+    for index in 0..4 {
+        harness.enqueue_mail(&format!("member{index}@corp.com")).await;
+    }
+
+    let report = worker.run_once(t0()).await.expect("drain");
+    assert_eq!(report.delivered, 4);
+    let peak = harness.mailer.peak_in_flight();
+    assert!(peak > 1, "the batch was dispatched one message at a time: peak in flight {peak}");
+    assert!(peak <= 4, "concurrency is bounded — the other end is somebody's relay: peak in flight {peak}");
+}
+
+#[tokio::test]
+async fn d2_a_later_pass_claims_against_the_clock_the_drain_has_reached() {
+    // The other half of the same amendment: the claim's `now` decides which rows are runnable
+    // and how far into the future their leases reach. A drain that keeps using the instant it
+    // started at mints leases that are already expired — reapable the moment they are taken —
+    // and cannot see work that became runnable while it was running. Here the fourth message is
+    // deliberately not runnable at the tick's instant, and is runnable by the time three
+    // fifty-millisecond deliveries have gone by. Real time for the same reason as the drain
+    // budget test above; a sleep only ever overshoots, so the ordering below cannot invert.
+    let harness = Harness::new(MailMode::Slow(StdDuration::from_millis(50))).await;
+    let policy = QueuePolicy {
+        send_timeout: StdDuration::from_millis(200),
+        lease: StdDuration::from_secs(2),
+        concurrency: 1,
+        batch: 50,
+        ..QueuePolicy::default()
+    };
+    let worker = harness.worker(policy);
+    for index in 0..3 {
+        harness.enqueue_mail(&format!("now{index}@corp.com")).await;
+    }
+    let delayed = harness.enqueue_mail_at("delayed@corp.com", t0() + Duration::milliseconds(120)).await;
+
+    let report = worker.run_once(t0()).await.expect("drain");
+
+    assert_eq!(report.claimed, 4, "the row that became runnable mid-drain was claimed by the pass that reached it");
+    assert_eq!(report.delivered, 4);
+    let row = harness.row(delayed).await;
+    assert_eq!(row.state, QueueState::Done);
+    assert!(
+        row.updated_at >= t0() + Duration::milliseconds(150),
+        "its completion is stamped with the drain's real present, not with the tick's start: {}",
+        row.updated_at
+    );
+    assert_eq!(harness.mailer.sent().len(), 4);
+}
+
+#[tokio::test]
 async fn d2_a_malformed_recipient_deadletters_immediately() {
     // An address the message builder rejects will never become valid, so spending eight
     // attempts on it only delays the dead letter that says so.
@@ -433,6 +616,117 @@ async fn d2_the_fanout_files_every_recipient_in_one_batch_and_queues_their_mail(
 }
 
 #[tokio::test]
+async fn d2_a_sign_in_code_overtakes_a_backlog_of_notification_mail() {
+    // The starvation decision 26's amendment names: one FIFO across kinds means a CI pipeline
+    // publishing into a large org files thousands of per-recipient broadcast rows, and the next
+    // sign-in code is claimed after every one of them — at a realistic SMTP pace, long after
+    // the ten-minute OTP TTL has expired. Sign-in is then down instance-wide because of
+    // unrelated traffic, with nothing dead-lettered and nothing on the admin surface.
+    let harness = Harness::new(MailMode::Deliver).await;
+    let members = harness.members(5).await;
+
+    // Phase one: the fan-out files the broadcast. Only the fan-out handler is registered, so
+    // the mail it files stays in the table instead of being drained in the same tick.
+    let filer = QueueWorker::new(harness.repos.clone(), Arc::clone(&harness.bus), QueuePolicy::default())
+        .with_handler(Arc::new(FanoutHandler::new(harness.center(), Arc::clone(&harness.repos.queue))));
+    let envelope = EventEnvelope::new(membership(harness.org, members[0]));
+    let payload = serde_json::to_value(FanoutJob { envelope }).unwrap();
+    harness
+        .repos
+        .queue
+        .enqueue(&NewQueuedJob::pending(FanoutJob::KIND, payload), t0())
+        .await
+        .expect("enqueue")
+        .expect("a fresh row");
+    filer.run_once(t0()).await.expect("fan-out");
+    // A second later, because the fan-out stamps the rows it files with the drain's own
+    // present, which is a few milliseconds past the tick's instant.
+    let inspect = t0() + Duration::seconds(1);
+    let queued =
+        harness.repos.queue.claim(&[JobKind::MailSend], 50, StdDuration::from_secs(1), inspect).await.expect("claim");
+    assert_eq!(queued.len(), 6, "one message per recipient — five members plus the owner");
+    assert!(
+        queued.iter().all(|job| job.priority == NewQueuedJob::BULK),
+        "notification mail must be filed as bulk, or it sits in front of the next sign-in code"
+    );
+    // Put the batch back the way the lease reaper would, so the drain below starts from a
+    // backlog of runnable bulk mail.
+    assert_eq!(harness.repos.queue.reap_expired_leases(inspect + Duration::seconds(2)).await.expect("reap"), 6);
+
+    // Phase two: a sign-in code arrives *after* the whole backlog and is still delivered first.
+    let code = harness.enqueue_mail_at("late@corp.com", t0() + Duration::seconds(3)).await;
+    let worker = harness.worker(QueuePolicy { concurrency: 1, ..QueuePolicy::default() });
+    worker.run_once(t0() + Duration::seconds(4)).await.expect("drain");
+
+    let sent = harness.mailer.sent();
+    assert_eq!(sent.len(), 7);
+    assert_eq!(
+        sent[0].0,
+        "late@corp.com",
+        "the sign-in code was delivered after {} broadcast messages filed before it",
+        sent.iter().take_while(|message| message.0 != "late@corp.com").count()
+    );
+    assert_eq!(harness.row(code).await.state, QueueState::Done);
+}
+
+#[tokio::test]
+async fn d43_retention_bounds_every_terminal_state_not_only_the_completed_one() {
+    // Decision 26 promises the queue "does not become the next unbounded table", and retention
+    // covered exactly one of the three states a row settles in. The two it missed are the ones
+    // that matter: a suppressed row is filed by an *unauthenticated* endpoint, one per
+    // policy-rejected sign-in attempt, each carrying the attempted address in the clear and
+    // with no reader once the request that filed it returned; dead letters accumulate one per
+    // message that never arrived.
+    let harness = Harness::new(MailMode::Deliver).await;
+    let policy = QueuePolicy {
+        retain_suppressed: Duration::hours(1),
+        retain_done: Duration::hours(24),
+        retain_dead: Duration::days(30),
+        max_attempts: 1,
+        ..QueuePolicy::default()
+    };
+    let worker = harness.worker(policy);
+
+    let suppressed = harness
+        .repos
+        .queue
+        .enqueue(&NewQueuedJob::suppressed(MailJob::KIND, serde_json::json!({ "to": "blocked@evil.test" })), t0())
+        .await
+        .expect("enqueue")
+        .expect("row")
+        .id;
+    harness.enqueue_mail("alice@corp.com").await;
+    worker.run_once(t0()).await.expect("drain");
+    harness.mailer.set(MailMode::Reject);
+    harness.enqueue_mail("not an address").await;
+    worker.run_once(t0()).await.expect("drain");
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Suppressed).await, 1);
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Done).await, 1);
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
+
+    // Two hours on: the suppressed row is gone and nothing else is.
+    let report = worker.run_once(t0() + Duration::hours(2)).await.expect("drain");
+    assert_eq!(report.purged, 1);
+    assert_eq!(report.purged_dead, 0);
+    assert_eq!(harness.repos.queue.get(suppressed).await.expect("get"), None, "a suppressed row is not kept for a day");
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Done).await, 1);
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
+
+    // A day on: the completed row goes, the dead letter stays for the operator.
+    let report = worker.run_once(t0() + Duration::hours(25)).await.expect("drain");
+    assert_eq!(report.purged, 1);
+    assert_eq!(report.purged_dead, 0);
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
+
+    // A month on: the record is bounded too, and the drain reports what it destroyed.
+    let report = worker.run_once(t0() + Duration::days(31)).await.expect("drain");
+    assert_eq!(report.purged, 1);
+    assert_eq!(report.purged_dead, 1, "an operator has to be able to see that a dead letter was deleted");
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 0);
+    assert_eq!(report.dead_pending, 0);
+}
+
+#[tokio::test]
 async fn d2_a_duplicate_enqueue_of_one_event_is_a_no_op() {
     // The bus swallows consumer errors, so a retried emission of the same envelope is a real
     // shape — and it must not become a second copy of everybody's notification.
@@ -469,6 +763,7 @@ async fn d2_a_fanout_retry_never_sends_a_second_copy_of_a_message() {
     let job = QueuedJob {
         id: QueuedJobId::new(),
         kind: JobKind::NotificationFanout,
+        priority: NewQueuedJob::INTERACTIVE,
         payload,
         state: QueueState::Running,
         attempts: 1,
@@ -480,20 +775,134 @@ async fn d2_a_fanout_retry_never_sends_a_second_copy_of_a_message() {
         updated_at: t0(),
     };
 
-    handler.run(&job, t0()).await;
+    let first = handler.run(&job, t0()).await;
     let after_first = harness.queued(JobKind::MailSend, QueueState::Pending).await;
     assert_eq!(after_first, 4, "one message per recipient (three members plus the owner)");
+    assert_eq!(first.followups.len(), 4, "one `UserNotified` per row the run filed");
 
-    handler.run(&job, t0()).await;
+    let second = handler.run(&job, t0()).await;
     assert_eq!(
         harness.queued(JobKind::MailSend, QueueState::Pending).await,
         after_first,
         "a re-run fan-out must not file a second copy of anybody's message"
     );
+    // And — the half the dedupe key could never cover — no second *notification row* either.
+    // Decision 26's amendment moved that guarantee from a cross-table transaction the
+    // repositories cannot express to a uniqueness constraint on `(user_id, event_id)`, which
+    // also holds against any future path that re-emits an event.
+    for member in &members {
+        let feed = harness.repos.notifications.list(*member, false, None, 10).await.expect("feed");
+        assert_eq!(feed.items.len(), 1, "a re-run fan-out filed a second copy of somebody's notification");
+    }
+    assert!(
+        second.followups.is_empty(),
+        "a re-run announces only the rows it filed, and it filed none: {:?}",
+        second.followups.len()
+    );
 
     let worker = harness.worker(QueuePolicy::default());
     worker.run_once(t0()).await.expect("drain");
     assert_eq!(harness.mailer.sent().len(), 4, "and therefore must not send one either");
+}
+
+#[tokio::test]
+async fn d44_a_notification_email_that_cannot_be_queued_is_not_lost_in_silence() {
+    // The fan-out logged a failed per-recipient enqueue and reported `Done` anyway, so one
+    // recipient's email disappeared with no metric, no dead letter and nothing on the admin
+    // surface — while the same failure one layer up increments `notification_enqueue_failed_total`
+    // (decision 22's amendment makes that observability contractual). The item now asks to be
+    // run again, which is safe because both halves of a fan-out are idempotent.
+    struct RefusingQueue {
+        inner: Arc<dyn pub_core::traits::JobQueueRepo>,
+        refuse: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl pub_core::traits::JobQueueRepo for RefusingQueue {
+        async fn ping(&self) -> Result<()> {
+            self.inner.ping().await
+        }
+
+        async fn enqueue(&self, new: &NewQueuedJob, now: DateTime<Utc>) -> Result<Option<QueuedJob>> {
+            if *self.refuse.lock().unwrap() {
+                return Err(Error::Database { message: "the queue is unavailable".to_owned() });
+            }
+            self.inner.enqueue(new, now).await
+        }
+
+        async fn get(&self, id: QueuedJobId) -> Result<Option<QueuedJob>> {
+            self.inner.get(id).await
+        }
+
+        async fn claim(
+            &self,
+            kinds: &[JobKind],
+            limit: u32,
+            lease: StdDuration,
+            now: DateTime<Utc>,
+        ) -> Result<Vec<QueuedJob>> {
+            self.inner.claim(kinds, limit, lease, now).await
+        }
+
+        async fn complete(
+            &self,
+            id: QueuedJobId,
+            outcome: QueueOutcome,
+            backoff: StdDuration,
+            now: DateTime<Utc>,
+        ) -> Result<()> {
+            self.inner.complete(id, outcome, backoff, now).await
+        }
+
+        async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64> {
+            self.inner.reap_expired_leases(now).await
+        }
+
+        async fn purge(&self, retention: &pub_core::queue::QueueRetention) -> Result<pub_core::queue::QueuePurged> {
+            self.inner.purge(retention).await
+        }
+
+        async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>> {
+            self.inner.depth().await
+        }
+    }
+
+    let harness = Harness::new(MailMode::Deliver).await;
+    let members = harness.members(2).await;
+    let refusing = Arc::new(RefusingQueue { inner: Arc::clone(&harness.repos.queue), refuse: Mutex::new(true) });
+    let handler =
+        FanoutHandler::new(harness.center(), Arc::clone(&refusing) as Arc<dyn pub_core::traits::JobQueueRepo>);
+    let envelope = EventEnvelope::new(membership(harness.org, members[0]));
+    let job = QueuedJob {
+        id: QueuedJobId::new(),
+        kind: JobKind::NotificationFanout,
+        priority: NewQueuedJob::INTERACTIVE,
+        payload: serde_json::to_value(FanoutJob { envelope }).unwrap(),
+        state: QueueState::Running,
+        attempts: 1,
+        run_after: t0(),
+        locked_until: None,
+        dedupe_key: None,
+        last_error: None,
+        created_at: t0(),
+        updated_at: t0(),
+    };
+
+    let report = handler.run(&job, t0()).await;
+    match report.outcome {
+        QueueOutcome::Retry(message) => assert!(message.contains("could not be queued"), "{message}"),
+        other => panic!("a lost notification email must not report success: {other:?}"),
+    }
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Pending).await, 0, "nothing was queued");
+
+    // The retry recovers the messages rather than duplicating the rows the first run filed.
+    *refusing.refuse.lock().unwrap() = false;
+    let second = handler.run(&job, t0()).await;
+    assert_eq!(second.outcome, QueueOutcome::Done);
+    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Pending).await, 3, "every recipient's mail is filed now");
+    for member in &members {
+        assert_eq!(harness.repos.notifications.list(*member, false, None, 10).await.expect("feed").items.len(), 1);
+    }
 }
 
 #[tokio::test]

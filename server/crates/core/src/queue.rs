@@ -19,6 +19,12 @@
 //!   so that an address rejected by policy costs the request exactly the same work as an
 //!   accepted one ([S-04.a](../../../docs/security.md), [S-31](../../../docs/security.md))
 //!   without ever producing a deliverable message.
+//! - **Arrival order is claim order *within one priority*.** One FIFO across kinds lets a
+//!   two-hundred-recipient broadcast file thousands of rows ahead of the next sign-in code and
+//!   starve it past `otp::PENDING_TTL` — unrelated traffic taking sign-in down instance-wide
+//!   (decision 26's 2026-08-07 amendment). [`NewQueuedJob::priority`] is the dimension that
+//!   fixes it: interactive work at [`NewQueuedJob::INTERACTIVE`], work filed on somebody
+//!   else's behalf at [`NewQueuedJob::BULK`], and the claim orders by it before the id.
 //! - **A queued mail body is a live credential.** A rendered OTP body sitting in a table is
 //!   the thing [S-26.b](../../../docs/security.md) is about: the payload is sealed under the
 //!   boot KEK before the row is written, and every type here that can hold a rendered body
@@ -201,10 +207,12 @@ impl FromStr for QueueState {
 /// One stored work item.
 #[derive(Clone, PartialEq, Eq)]
 pub struct QueuedJob {
-    /// Item id — also the claim order (UUID v7, time-ordered).
+    /// Item id — the claim order **within one priority** (UUID v7, time-ordered).
     pub id: QueuedJobId,
     /// Which handler runs this.
     pub kind: JobKind,
+    /// Claim order ahead of the id: lower runs first (see [`NewQueuedJob::priority`]).
+    pub priority: i32,
     /// The handler's own document ([`MailJob`], [`FanoutJob`]), opaque to the repository.
     pub payload: serde_json::Value,
     /// Where the item is in its life.
@@ -234,6 +242,7 @@ impl fmt::Debug for QueuedJob {
         f.debug_struct("QueuedJob")
             .field("id", &self.id)
             .field("kind", &self.kind)
+            .field("priority", &self.priority)
             .field("payload", &"<redacted>")
             .field("state", &self.state)
             .field("attempts", &self.attempts)
@@ -257,6 +266,14 @@ pub struct NewQueuedJob {
     /// [`QueueState::Pending`] or [`QueueState::Suppressed`] — see
     /// [`QueueState::is_admissible`].
     pub state: QueueState,
+    /// Claim order **ahead of the id**: a lower value is claimed first, ties broken by arrival.
+    ///
+    /// Two values are named ([`NewQueuedJob::INTERACTIVE`], [`NewQueuedJob::BULK`]) and the
+    /// column is an integer rather than an enum so a later kind can slot between them without
+    /// a migration. What it buys is stated in decision 26's amendment: a sign-in code filed
+    /// after four thousand broadcast messages is delivered before them, instead of after the
+    /// ten minutes that make it useless.
+    pub priority: i32,
     /// Earliest run instant; `None` means "as soon as a worker picks it up".
     pub run_after: Option<DateTime<Utc>>,
     /// Idempotency key. Present ⇒ a second enqueue under the same key is a no-op rather than a
@@ -266,14 +283,33 @@ pub struct NewQueuedJob {
 }
 
 impl NewQueuedJob {
-    /// An item to run as soon as a worker gets to it.
+    /// Work somebody is waiting on right now — a sign-in code, an invitation. The default.
+    pub const INTERACTIVE: i32 = 0;
+
+    /// Work filed on somebody else's behalf: a broadcast that is one row per recipient and
+    /// whose latency nobody is watching. Never in front of [`NewQueuedJob::INTERACTIVE`].
+    pub const BULK: i32 = 100;
+
+    /// An item to run as soon as a worker gets to it, at interactive priority.
     pub fn pending(kind: JobKind, payload: serde_json::Value) -> Self {
-        Self { kind, payload, state: QueueState::Pending, run_after: None, dedupe_key: None }
+        Self {
+            kind,
+            payload,
+            state: QueueState::Pending,
+            priority: Self::INTERACTIVE,
+            run_after: None,
+            dedupe_key: None,
+        }
+    }
+
+    /// An item to run when nothing interactive is waiting ([`NewQueuedJob::BULK`]).
+    pub fn bulk(kind: JobKind, payload: serde_json::Value) -> Self {
+        Self { priority: Self::BULK, ..Self::pending(kind, payload) }
     }
 
     /// An item that is filed but must never be delivered (S-04.a, S-31).
     pub fn suppressed(kind: JobKind, payload: serde_json::Value) -> Self {
-        Self { kind, payload, state: QueueState::Suppressed, run_after: None, dedupe_key: None }
+        Self { state: QueueState::Suppressed, ..Self::pending(kind, payload) }
     }
 
     /// Sets the idempotency key.
@@ -287,6 +323,12 @@ impl NewQueuedJob {
         self.run_after = Some(at);
         self
     }
+
+    /// Sets the claim priority explicitly.
+    pub const fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
 }
 
 impl fmt::Debug for NewQueuedJob {
@@ -297,9 +339,53 @@ impl fmt::Debug for NewQueuedJob {
             .field("kind", &self.kind)
             .field("payload", &"<redacted>")
             .field("state", &self.state)
+            .field("priority", &self.priority)
             .field("run_after", &self.run_after)
             .field("dedupe_key", &self.dedupe_key)
             .finish()
+    }
+}
+
+/// How long a row that will never run again is kept, per terminal state.
+///
+/// Decision 26 promises the queue "does not become the next unbounded table", and the first
+/// implementation kept that promise for exactly one of the three states a row can settle in.
+/// The other two are the ones that matter most: a `suppressed` row is filed by an
+/// **unauthenticated** endpoint, one per policy-rejected sign-in attempt, and carries the
+/// attempted address in the clear — it has no reader at all once the request that filed it has
+/// returned (its whole purpose was to make that request cost the same as an accepted one,
+/// S-04.a/S-31) — and `dead` rows accumulate one per message that never arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueRetention {
+    /// Delete [`QueueState::Done`] rows last written before this instant.
+    pub done_before: DateTime<Utc>,
+    /// Delete [`QueueState::Suppressed`] rows last written before this instant. Short: nothing
+    /// reads them, and every one of them holds an address somebody typed at a login form.
+    pub suppressed_before: DateTime<Utc>,
+    /// Delete [`QueueState::Dead`] rows last written before this instant.
+    ///
+    /// Long, and never zero: a dead-lettered sign-in message is an account lockout with no
+    /// other visible cause, so it is the operator's record. Bounded all the same — a record
+    /// nobody can ever be rid of is a table that only grows.
+    pub dead_before: DateTime<Utc>,
+}
+
+/// What one retention pass deleted, per state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueuePurged {
+    /// Completed rows deleted.
+    pub done: u64,
+    /// Suppressed rows deleted.
+    pub suppressed: u64,
+    /// Dead letters deleted — the count an operator is warned about, because it is the only
+    /// deletion here that destroys a record somebody may still need.
+    pub dead: u64,
+}
+
+impl QueuePurged {
+    /// Rows deleted across every state.
+    pub const fn total(&self) -> u64 {
+        self.done + self.suppressed + self.dead
     }
 }
 
@@ -456,6 +542,7 @@ mod tests {
         let stored = QueuedJob {
             id: QueuedJobId::new(),
             kind: queued.kind,
+            priority: queued.priority,
             payload: queued.payload.clone(),
             state: QueueState::Pending,
             attempts: 0,
@@ -467,6 +554,28 @@ mod tests {
             updated_at: Utc::now(),
         };
         assert!(!format!("{stored:?}").contains("12345678"), "the stored row leaks the body");
+    }
+
+    #[test]
+    fn interactive_is_the_default_priority_and_bulk_never_precedes_it() {
+        // Decision 26's amendment: the whole point of the dimension is that a sign-in code
+        // filed *after* a broadcast is still claimed before it. That is only true while the
+        // default is the interactive value and bulk sorts behind it.
+        const { assert!(NewQueuedJob::INTERACTIVE < NewQueuedJob::BULK, "lower is claimed first") };
+        let payload = serde_json::json!({});
+        assert_eq!(NewQueuedJob::pending(MailJob::KIND, payload.clone()).priority, NewQueuedJob::INTERACTIVE);
+        assert_eq!(NewQueuedJob::suppressed(MailJob::KIND, payload.clone()).priority, NewQueuedJob::INTERACTIVE);
+        let bulk = NewQueuedJob::bulk(MailJob::KIND, payload.clone());
+        assert_eq!(bulk.priority, NewQueuedJob::BULK);
+        assert_eq!(bulk.state, QueueState::Pending, "bulk is still ordinary runnable work");
+        assert_eq!(NewQueuedJob::pending(MailJob::KIND, payload).with_priority(7).priority, 7);
+    }
+
+    #[test]
+    fn a_purge_reports_every_state_it_deleted() {
+        let purged = QueuePurged { done: 3, suppressed: 5, dead: 1 };
+        assert_eq!(purged.total(), 9);
+        assert_eq!(QueuePurged::default().total(), 0);
     }
 
     #[test]

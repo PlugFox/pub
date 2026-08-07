@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone as _, Utc};
-use pub_core::queue::{JobKind, NewQueuedJob, QueueOutcome, QueueState, QueuedJob, QueuedJobId};
+use pub_core::queue::{
+    JobKind, NewQueuedJob, QueueOutcome, QueuePurged, QueueRetention, QueueState, QueuedJob, QueuedJobId,
+};
 use pub_core::traits::JobQueueRepo;
 use pub_core::{Error, Result};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -29,7 +31,7 @@ use super::{db_err, parse_col, parse_ts, parse_ts_opt, q};
 const MAX_CLAIM_BATCH: u32 = 500;
 
 /// All queue columns, in [`QueueRow`] order.
-const COLS: &str = "id, kind, payload, state, attempts, run_after, locked_until, dedupe_key, last_error, \
+const COLS: &str = "id, kind, priority, payload, state, attempts, run_after, locked_until, dedupe_key, last_error, \
                     created_at, updated_at";
 
 /// SQLite-backed [`JobQueueRepo`].
@@ -49,6 +51,7 @@ impl SqliteJobQueueRepo {
 struct QueueRow {
     id: String,
     kind: String,
+    priority: i32,
     payload: String,
     state: String,
     attempts: i64,
@@ -67,6 +70,7 @@ impl TryFrom<QueueRow> for QueuedJob {
         Ok(QueuedJob {
             id: parse_col(&row.id)?,
             kind: parse_col::<JobKind>(&row.kind)?,
+            priority: row.priority,
             payload: serde_json::from_str(&row.payload)
                 .map_err(|err| Error::Database { message: format!("corrupt queue payload: {err}") })?,
             state: parse_col::<QueueState>(&row.state)?,
@@ -120,13 +124,14 @@ impl JobQueueRepo for SqliteJobQueueRepo {
         // already there — it may be running, or already done. The partial index's predicate is
         // repeated in the conflict target because that is how SQLite infers a partial index.
         let row: Option<QueueRow> = sqlx::query_as(q!(
-            "INSERT INTO job_queue (id, kind, payload, state, attempts, run_after, locked_until, dedupe_key, \
-             last_error, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, 0, ?, NULL, ?, NULL, ?, ?) \
+            "INSERT INTO job_queue (id, kind, priority, payload, state, attempts, run_after, locked_until, \
+             dedupe_key, last_error, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, NULL, ?, ?) \
              ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING {COLS}"
         ))
         .bind(QueuedJobId::new().to_string())
         .bind(new.kind.as_str())
+        .bind(new.priority)
         .bind(payload)
         .bind(new.state.as_str())
         .bind(super::ts(new.run_after.unwrap_or(now)))
@@ -163,7 +168,9 @@ impl JobQueueRepo for SqliteJobQueueRepo {
             QueryBuilder::new("UPDATE job_queue SET state = 'running', attempts = attempts + 1, locked_until = ");
         query.push_bind(super::ts(deadline(now, lease)));
         query.push(", updated_at = ").push_bind(super::ts(now));
-        // Oldest id first: the id is UUID v7, so this is arrival order without a sequence column.
+        // Priority first, then oldest id: the id is UUID v7, so the tie-break is arrival order
+        // without a sequence column, and the priority ahead of it is what keeps a sign-in code
+        // from being claimed behind a broadcast filed minutes earlier (decision 26 amendment).
         query.push(" WHERE id IN (SELECT id FROM job_queue WHERE state = 'pending' AND run_after <= ");
         query.push_bind(super::ts(now));
         query.push(" AND kind IN (");
@@ -171,13 +178,13 @@ impl JobQueueRepo for SqliteJobQueueRepo {
         for kind in kinds {
             separated.push_bind(kind.as_str());
         }
-        query.push(") ORDER BY id LIMIT ").push_bind(limit);
+        query.push(") ORDER BY priority, id LIMIT ").push_bind(limit);
         query.push(") RETURNING ").push(COLS);
 
         let rows: Vec<QueueRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
         let mut claimed: Vec<QueuedJob> = rows.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
-        // `RETURNING` makes no ordering promise; the caller was promised oldest first.
-        claimed.sort_by_key(|job| job.id);
+        // `RETURNING` makes no ordering promise; the caller was promised the claim order.
+        claimed.sort_by_key(|job| (job.priority, job.id));
         Ok(claimed)
     }
 
@@ -225,13 +232,27 @@ impl JobQueueRepo for SqliteJobQueueRepo {
         Ok(result.rows_affected())
     }
 
-    async fn purge(&self, before: DateTime<Utc>) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM job_queue WHERE state = 'done' AND updated_at < ?")
-            .bind(super::ts(before))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(result.rows_affected())
+    async fn purge(&self, retention: &QueueRetention) -> Result<QueuePurged> {
+        // One statement per state rather than one `OR`-ed DELETE, and the state as a **literal**
+        // rather than a bound parameter: each state has its own partial retention index, and
+        // SQLite can only use one when the statement's predicate visibly implies the index's.
+        // That matters here more than anywhere else in this file — a delete is a write, and an
+        // unindexed one holds the single write lock against every concurrent publish and
+        // sign-in for the length of its scan, on a table that only grows.
+        let mut purged = QueuePurged::default();
+        for (sql, before, counter) in [
+            ("DELETE FROM job_queue WHERE state = 'done' AND updated_at < ?", retention.done_before, &mut purged.done),
+            (
+                "DELETE FROM job_queue WHERE state = 'suppressed' AND updated_at < ?",
+                retention.suppressed_before,
+                &mut purged.suppressed,
+            ),
+            ("DELETE FROM job_queue WHERE state = 'dead' AND updated_at < ?", retention.dead_before, &mut purged.dead),
+        ] {
+            let result = sqlx::query(sql).bind(super::ts(before)).execute(&self.pool).await.map_err(db_err)?;
+            *counter = result.rows_affected();
+        }
+        Ok(purged)
     }
 
     async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>> {

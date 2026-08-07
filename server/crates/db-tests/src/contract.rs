@@ -11,13 +11,14 @@ use chrono::{DateTime, TimeZone as _, Utc};
 use pub_core::audit::{AuditActor, AuditFilter, AuditResult, NewAuditEvent};
 use pub_core::authorize::ActorContext;
 use pub_core::credential::CredentialType;
+use pub_core::event::EventId;
 use pub_core::notification::{NewNotification, NotificationCategory, NotificationPreference, NotificationPreferences};
 use pub_core::org::{NewInvitation, NewOrg, OrgProfile, UpstreamPolicy};
 use pub_core::package::{
     BaseScope, NewPackage, NewUpstreamVersion, NewVersion, PackageOptions, Publisher, Resolution, UpstreamSnapshot,
     Visibility,
 };
-use pub_core::queue::{JobKind, MailJob, NewQueuedJob, QueueOutcome, QueueState};
+use pub_core::queue::{JobKind, MailJob, NewQueuedJob, QueueOutcome, QueuePurged, QueueRetention, QueueState};
 use pub_core::search::{SearchDocument, SearchHit, SearchSort, SearchView, parse_query};
 use pub_core::session::{NewSession, SessionLimits};
 use pub_core::stats::{DownloadDelta, DownloadTotals};
@@ -2763,6 +2764,7 @@ pub async fn notifications(repos: &Repositories) {
                 NewNotification {
                     user_id: user,
                     category: NotificationCategory::Package,
+                    event_id: None,
                     event: "package.publish".to_owned(),
                     title: title.to_owned(),
                     org_id: Some(org.id),
@@ -2901,6 +2903,7 @@ pub async fn notifications(repos: &Repositories) {
     let batched = |user: UserId, title: &str| NewNotification {
         user_id: user,
         category: NotificationCategory::Org,
+        event_id: None,
         event: "org.membership".to_owned(),
         title: title.to_owned(),
         org_id: Some(org.id),
@@ -2954,6 +2957,67 @@ pub async fn notifications(repos: &Repositories) {
     assert!(repos.notifications.unread_counts(&[]).await.expect("empty").is_empty());
     let flood: Vec<UserId> = (0..=MAX_NOTIFICATION_BATCH).map(|_| alice.id).collect();
     assert_eq!(repos.notifications.unread_counts(&flood).await.expect_err("oversized").code(), "invalid_argument");
+
+    // Exactly-once fan-out (decision 26's amendment): `(user_id, event_id)` is unique, so a
+    // fan-out re-run after a crash — or any future path that re-emits one event — converges on
+    // the rows that are already there instead of filing everybody a second copy. Migration
+    // 0009's own header claimed "one row per (recipient, event)" and nothing enforced it. What
+    // the caller gets back is *what this call created*, which is what lets it announce only the
+    // rows it actually wrote.
+    let emission = EventId::generate();
+    let from_event =
+        |user: UserId, title: &str| NewNotification { event_id: Some(emission.clone()), ..batched(user, title) };
+    let before = repos.notifications.list(alice.id, false, None, 50).await.expect("feed").items.len();
+    let first_run = repos
+        .notifications
+        .create_many(&[from_event(alice.id, "one event"), from_event(bob.id, "one event")], t0() + hours(10))
+        .await
+        .expect("first fan-out");
+    assert_eq!(first_run.len(), 2, "both recipients are new");
+    let second_run = repos
+        .notifications
+        .create_many(&[from_event(alice.id, "one event"), from_event(bob.id, "one event")], t0() + hours(11))
+        .await
+        .expect("re-run fan-out");
+    assert!(second_run.is_empty(), "a re-run files nothing and reports nothing: {second_run:?}");
+    assert_eq!(
+        repos.notifications.list(alice.id, false, None, 50).await.expect("feed").items.len(),
+        before + 1,
+        "the two runs of one emission left exactly one row"
+    );
+    // A *different* emission is different work, and a row that names no emission never
+    // collides — otherwise one recipient could hold at most one notification.
+    let reemitted = repos
+        .notifications
+        .create_many(
+            &[NewNotification { event_id: Some(EventId::generate()), ..batched(alice.id, "second emission") }],
+            t0() + hours(12),
+        )
+        .await
+        .expect("second emission");
+    assert_eq!(reemitted.len(), 1, "a second emission is a second row");
+    let unkeyed = repos
+        .notifications
+        .create_many(&[batched(alice.id, "no event id"), batched(alice.id, "no event id either")], t0() + hours(13))
+        .await
+        .expect("unkeyed batch");
+    assert_eq!(unkeyed.len(), 2, "rows that name no emission must not collide with each other");
+    // A batch that repeats one recipient inside a single statement is the same conflict seen
+    // from the other side: the first wins, the second is skipped rather than erroring.
+    let repeated = EventId::generate();
+    let doubled = repos
+        .notifications
+        .create_many(
+            &[
+                NewNotification { event_id: Some(repeated.clone()), ..batched(bob.id, "once") },
+                NewNotification { event_id: Some(repeated), ..batched(bob.id, "twice") },
+            ],
+            t0() + hours(14),
+        )
+        .await
+        .expect("a batch that repeats a recipient");
+    assert_eq!(doubled.len(), 1, "one row per (recipient, event), even inside one statement");
+    assert_eq!(doubled[0].title, "once");
 }
 
 /// `JobQueueRepo`: the durable work queue behind asynchronous fan-out and outbound mail
@@ -2971,12 +3035,18 @@ pub async fn job_queue(repos: &Repositories) {
     repos.queue.ping().await.expect("ping");
     let lease = Duration::from_secs(60);
     let backoff = Duration::from_secs(30);
+    // One cutoff per terminal state (D43); `at` moves all three together for the walk below.
+    let retention_at = |instant: DateTime<Utc>| QueueRetention {
+        done_before: instant,
+        suppressed_before: instant,
+        dead_before: instant,
+    };
 
     // An empty queue answers every question without a special case.
     assert!(repos.queue.depth().await.expect("depth").is_empty());
     assert!(repos.queue.claim(&JobKind::ALL, 10, lease, t0()).await.expect("claim").is_empty());
     assert_eq!(repos.queue.reap_expired_leases(t0()).await.expect("reap"), 0);
-    assert_eq!(repos.queue.purge(t0()).await.expect("purge"), 0);
+    assert_eq!(repos.queue.purge(&retention_at(t0())).await.expect("purge"), QueuePurged::default());
     assert_eq!(repos.queue.get(QueuedJobId::new()).await.expect("get unknown"), None);
 
     // Enqueue: the stored row is the item plus the defaults the caller did not state.
@@ -2988,6 +3058,7 @@ pub async fn job_queue(repos: &Repositories) {
         .expect("a fresh item is stored");
     assert_eq!(mail.kind, JobKind::MailSend);
     assert_eq!(mail.state, QueueState::Pending);
+    assert_eq!(mail.priority, NewQueuedJob::INTERACTIVE, "the default is the priority a person waits at");
     assert_eq!(mail.attempts, 0);
     assert_eq!(mail.run_after, t0(), "no delay means runnable now");
     assert_eq!(mail.locked_until, None);
@@ -3129,22 +3200,81 @@ pub async fn job_queue(repos: &Repositories) {
     assert_eq!(done.last_error, None);
     assert_eq!(done.updated_at, t0() + days(2));
 
-    // Retention takes the done rows and nothing else.
+    // Retention: every terminal state has its own cutoff, and a state whose cutoff has not
+    // arrived is untouched by a pass that deletes another one (D43 — before this, `done` was
+    // the only state with a bound and the other two grew forever).
+    let at_the_bound = QueueRetention { done_before: t0() + days(2), suppressed_before: t0(), dead_before: t0() };
     assert_eq!(
-        repos.queue.purge(t0() + days(2)).await.expect("purge"),
-        0,
+        repos.queue.purge(&at_the_bound).await.expect("purge"),
+        QueuePurged::default(),
         "the bound is strict: a row written at it is not older than it"
     );
-    assert_eq!(repos.queue.purge(t0() + days(3)).await.expect("purge"), 1);
+    let done_only = QueueRetention { done_before: t0() + days(3), suppressed_before: t0(), dead_before: t0() };
+    assert_eq!(
+        repos.queue.purge(&done_only).await.expect("purge"),
+        QueuePurged { done: 1, suppressed: 0, dead: 0 },
+        "one state's cutoff is not another's"
+    );
     assert_eq!(repos.queue.get(queued.id).await.expect("get"), None);
-    assert_eq!(repos.queue.purge(t0() + days(365)).await.expect("purge"), 0, "only done rows are retention's to take");
     assert_eq!(repos.queue.get(dead.id).await.expect("get").expect("row").state, QueueState::Dead);
     assert_eq!(repos.queue.get(suppressed.id).await.expect("get").expect("row").state, QueueState::Suppressed);
 
-    // Depth is what the admin job table and the metrics gauge read.
+    // The suppressed row goes when *its* window closes: it is filed by an unauthenticated
+    // endpoint, one per policy-rejected sign-in attempt, and carries the attempted address in
+    // the clear with nothing left to read it (S-04.a/S-31).
+    let suppressed_only = QueueRetention { done_before: t0(), suppressed_before: t0() + days(3), dead_before: t0() };
     assert_eq!(
-        repos.queue.depth().await.expect("depth"),
-        vec![(JobKind::MailSend, QueueState::Dead, 1), (JobKind::MailSend, QueueState::Suppressed, 1)]
+        repos.queue.purge(&suppressed_only).await.expect("purge"),
+        QueuePurged { done: 0, suppressed: 1, dead: 0 }
+    );
+    assert_eq!(repos.queue.get(suppressed.id).await.expect("get"), None);
+    assert_eq!(
+        repos.queue.get(dead.id).await.expect("get").expect("row").state,
+        QueueState::Dead,
+        "the operator's record outlives both of them"
+    );
+
+    // And the dead letter goes last, at a window measured in weeks rather than hours.
+    assert_eq!(
+        repos.queue.purge(&retention_at(t0() + days(365))).await.expect("purge"),
+        QueuePurged { done: 0, suppressed: 0, dead: 1 }
+    );
+    assert_eq!(repos.queue.get(dead.id).await.expect("get"), None);
+
+    // Depth is what the admin job table and the metrics gauge read, and retention has just
+    // emptied every terminal state.
+    assert!(repos.queue.depth().await.expect("depth").is_empty());
+
+    // Priority is claimed ahead of arrival (decision 26's amendment). The bulk rows below are
+    // filed *first* and are still claimed last: this is the whole point — a CI pipeline
+    // publishing into a large org files thousands of broadcast messages, and the sign-in code
+    // requested a minute later must not wait behind them, because it expires in ten.
+    let fair = t0() + days(300);
+    let mut bulk = Vec::new();
+    for index in 0..3 {
+        let job = NewQueuedJob::bulk(MailJob::KIND, mail_payload(&format!("member{index}@corp.com")));
+        bulk.push(repos.queue.enqueue(&job, fair).await.expect("enqueue").expect("stored").id);
+    }
+    let interactive = repos
+        .queue
+        .enqueue(&NewQueuedJob::pending(MailJob::KIND, mail_payload("late@corp.com")), fair + minutes(1))
+        .await
+        .expect("enqueue")
+        .expect("stored");
+    assert_eq!(interactive.priority, NewQueuedJob::INTERACTIVE);
+    assert_eq!(repos.queue.get(bulk[0]).await.expect("get").expect("row").priority, NewQueuedJob::BULK);
+    let claimed = repos.queue.claim(&[JobKind::MailSend], 10, lease, fair + minutes(2)).await.expect("claim");
+    assert_eq!(
+        claimed.iter().map(|job| job.id).collect::<Vec<_>>(),
+        std::iter::once(interactive.id).chain(bulk.iter().copied()).collect::<Vec<_>>(),
+        "the newest interactive row precedes every older bulk row, and bulk stays in arrival order"
+    );
+    for job in &claimed {
+        repos.queue.complete(job.id, QueueOutcome::Done, backoff, fair + minutes(2)).await.expect("done");
+    }
+    assert_eq!(
+        repos.queue.purge(&retention_at(fair + days(2))).await.expect("purge"),
+        QueuePurged { done: 4, suppressed: 0, dead: 0 }
     );
 
     // Two drains racing over one backlog. On Postgres this is the `FOR UPDATE SKIP LOCKED`

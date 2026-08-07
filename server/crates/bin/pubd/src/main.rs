@@ -329,12 +329,6 @@ fn spawn_jobs(
     runtime: Arc<SettingsCache>,
 ) -> (Option<SchedulerHandle>, Arc<dyn JobTrigger>) {
     let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
-    let mut scheduler = Scheduler::new(Arc::clone(&lock));
-    // The same lock, so an operator's "run now" and a scheduled tick can never both hold one
-    // job's durable cursor.
-    let mut triggers = JobRegistry::new(lock);
-    let mut registered = Vec::new();
-
     // The work queue's drain (decision 26). Unconditional and first in the list: it carries the
     // sign-in mail, so there is no configuration under which this instance runs without it.
     // The mailer handed in is the *same* `Arc` the request path holds, so an administrator's
@@ -343,13 +337,27 @@ fn spawn_jobs(
     let queue_policy = QueuePolicy {
         interval: Duration::from_secs(queue_cfg.interval_secs),
         batch: queue_cfg.batch,
+        concurrency: queue_cfg.concurrency,
         lease: Duration::from_secs(queue_cfg.lease_secs),
         max_attempts: queue_cfg.max_attempts,
         backoff_base: Duration::from_secs(queue_cfg.backoff_base_secs),
         backoff_max: Duration::from_secs(queue_cfg.backoff_max_secs),
         retain_done: chrono::Duration::hours(queue_cfg.retain_done_hours),
+        retain_suppressed: chrono::Duration::hours(queue_cfg.retain_suppressed_hours),
+        retain_dead: chrono::Duration::days(queue_cfg.retain_dead_days),
         send_timeout: Duration::from_secs(queue_cfg.send_timeout_secs),
     };
+    // The lock TTL has to outlive the longest run it guards, and the drain's bound is derived
+    // from its lease (decision 26's amendment: it stops inside half of one). A TTL shorter than
+    // that would hand a second drain the lock while the first is still holding leases, which is
+    // exactly the double-send this wave is fixing — so an operator who raises `lease_secs` past
+    // the default TTL raises the TTL with it rather than silently breaking the invariant.
+    let mut scheduler =
+        Scheduler::new(Arc::clone(&lock)).with_lock_ttl(Scheduler::DEFAULT_LOCK_TTL.max(queue_policy.lease));
+    // The same lock, so an operator's "run now" and a scheduled tick can never both hold one
+    // job's durable cursor.
+    let mut triggers = JobRegistry::new(lock);
+    let mut registered = Vec::new();
     let center = build_notification_center(settings, repos.clone(), runtime);
     let queue_worker = Arc::new(
         pub_jobs::QueueWorker::new(repos.clone(), events, queue_policy)

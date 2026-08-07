@@ -13,6 +13,7 @@
 //! Time is always a parameter (`now: DateTime<Utc>`): repositories never read the clock, so
 //! expiry, throttling, and validity windows are deterministic under test.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +38,9 @@ use crate::package::{
     UpstreamCacheStats, UpstreamPackage, UpstreamSnapshot, UpstreamVersion, Version, Visibility,
 };
 use crate::page::Page;
-use crate::queue::{JobKind, NewQueuedJob, QueueOutcome, QueueState, QueuedJob, QueuedJobId};
+use crate::queue::{
+    JobKind, NewQueuedJob, QueueOutcome, QueuePurged, QueueRetention, QueueState, QueuedJob, QueuedJobId,
+};
 use crate::search::{InstanceCounters, SearchDocument, SearchFacets, SearchHit, SearchQuery, SearchView};
 use crate::semver::SemVer;
 use crate::session::{NewSession, Session, SessionLimits};
@@ -487,8 +490,13 @@ pub trait JobQueueRepo: Send + Sync {
     /// without mutating what is being checked.
     async fn get(&self, id: QueuedJobId) -> Result<Option<QueuedJob>>;
 
-    /// Leases up to `limit` runnable items of these `kinds`, oldest id first, marking each
-    /// `running` until `now + lease` and incrementing its attempt count.
+    /// Leases up to `limit` runnable items of these `kinds` — **lowest priority value first,
+    /// oldest id within a priority** — marking each `running` until `now + lease` and
+    /// incrementing its attempt count.
+    ///
+    /// The priority half of that order is what keeps a sign-in code from being claimed behind
+    /// a broadcast filed minutes earlier (decision 26's amendment); the id half is what makes
+    /// arrival order claim order inside one class of work.
     ///
     /// Runnable means `pending` **and** `run_after <= now`. Empty `kinds` or `limit == 0`
     /// returns an empty batch and performs no query. The returned rows carry their post-claim
@@ -515,12 +523,15 @@ pub trait JobQueueRepo: Send + Sync {
     /// reports how many. The attempt those items already spent is **not** given back.
     async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64>;
 
-    /// Deletes `done` items last written before `before`, and reports how many.
+    /// Deletes the rows of every terminal state that are older than that state's cutoff
+    /// ([`QueueRetention`]), and reports how many of each ([`QueuePurged`]).
     ///
-    /// Only `done`: `dead` rows are the operator's record of mail that never arrived, and a
-    /// queue table with no retention is how this becomes the next entry on the list of tables
-    /// that grow forever.
-    async fn purge(&self, before: DateTime<Utc>) -> Result<u64>;
+    /// Every state a row can settle in has a bound, because a queue with retention for one of
+    /// them still grows forever: `suppressed` rows are filed by an unauthenticated endpoint and
+    /// have no reader after that request, and `dead` rows are the operator's record — kept
+    /// long, deleted eventually, never silently (decision 26; the drain warns when it takes
+    /// one). `pending` and `running` rows are work, not history, and are never retention's.
+    async fn purge(&self, retention: &QueueRetention) -> Result<QueuePurged>;
 
     /// Per-`(kind, state)` item counts for `/metrics` and the admin job table, ordered by kind
     /// then state. Combinations with no rows are absent rather than reported as zero.
@@ -937,7 +948,8 @@ pub trait NotificationRepo: Send + Sync {
     /// Files one notification and returns the stored row.
     async fn create(&self, new: NewNotification, now: DateTime<Utc>) -> Result<Notification>;
 
-    /// Files a batch of notifications and returns the stored rows **in input order**.
+    /// Files a batch of notifications and returns **the rows this call created**, in input
+    /// order.
     ///
     /// The batch form exists because fan-out writes one row per recipient: an org event with
     /// two hundred members would otherwise be two hundred statements on one worker tick. Bounded
@@ -947,6 +959,12 @@ pub trait NotificationRepo: Send + Sync {
     /// Ids are minted in input order, which is what makes the returned order meaningful: a
     /// user's feed is ordered by notification id, so recipients handed over in audience order
     /// read their rows back in that order too.
+    ///
+    /// **An item whose `(user_id, event_id)` is already filed is skipped, not an error, and is
+    /// absent from the result** — that is the exactly-once guarantee decision 26's amendment
+    /// moved from a cross-table transaction to a uniqueness constraint. A re-run after a crash
+    /// therefore reports only what it actually added, which is what a caller publishing "you
+    /// have a new notification" hints off the result needs to know.
     async fn create_many(&self, new: &[NewNotification], now: DateTime<Utc>) -> Result<Vec<Notification>>;
 
     /// Unread counts for a batch of users, as `(user, count)` pairs in **unspecified** order.
@@ -1315,6 +1333,36 @@ impl JobTrigger for NoJobs {
     }
 }
 
+/// Proof of *which* acquisition of a lock a holder is talking about.
+///
+/// A lock with a TTL is a lock that can be lost while its holder still believes it has it: the
+/// TTL expires, somebody else acquires, and then the original holder finishes and releases —
+/// freeing a lock it no longer owns and letting a third worker in alongside the second. That is
+/// not hypothetical for the queue drain, whose overrun is exactly what decision 26's amendment
+/// bounds; the token is the other half of that fix. Opaque and unforgeable by construction: a
+/// fresh UUID per acquisition, compared by the implementation and by nobody else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LockToken(uuid::Uuid);
+
+impl LockToken {
+    /// Mints a token for one acquisition. Called by [`JobLock`] implementations only.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
+
+impl Default for LockToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for LockToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Leader-election lock guarding single-instance background jobs (PG advisory lock / Redis
 /// lock / trivial in-process lock for a single node).
 #[async_trait]
@@ -1322,10 +1370,15 @@ pub trait JobLock: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.
     async fn ping(&self) -> Result<()>;
 
-    /// Tries to acquire the named lock for at most `ttl`; returns `true` when this caller
-    /// now holds the lock. The TTL bounds how long a crashed holder can block others.
-    async fn try_acquire(&self, name: &str, ttl: Duration) -> Result<bool>;
+    /// Tries to acquire the named lock for at most `ttl`; `Some(token)` when this caller now
+    /// holds it, `None` when somebody else does. The TTL bounds how long a crashed holder can
+    /// block others.
+    async fn try_acquire(&self, name: &str, ttl: Duration) -> Result<Option<LockToken>>;
 
-    /// Releases the named lock. Releasing a lock that is not held is not an error.
-    async fn release(&self, name: &str) -> Result<()>;
+    /// Releases the named lock **only if `token` is still the acquisition that holds it**.
+    ///
+    /// A holder whose TTL expired while it was still working must therefore not be able to
+    /// free the lock the next holder took. Releasing a lock that is not held, or that is held
+    /// by a later acquisition, is a no-op rather than an error.
+    async fn release(&self, name: &str, token: LockToken) -> Result<()>;
 }

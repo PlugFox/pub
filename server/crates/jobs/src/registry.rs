@@ -146,6 +146,7 @@ impl JobRegistry {
                         "dead": report.dead,
                         "reaped": report.reaped,
                         "purged": report.purged,
+                        "purged_dead": report.purged_dead,
                         "dead_pending": report.dead_pending,
                     }))
                 }
@@ -190,11 +191,11 @@ impl JobTrigger for JobRegistry {
 
     async fn run_now(&self, name: &str, now: DateTime<Utc>) -> Result<serde_json::Value> {
         let runner = self.runners.get(name).cloned().ok_or_else(|| Error::NotFound { what: format!("job {name}") })?;
-        if !self.lock.try_acquire(name, MANUAL_LOCK_TTL).await? {
+        let Some(token) = self.lock.try_acquire(name, MANUAL_LOCK_TTL).await? else {
             return Err(Error::Conflict { message: format!("job {name} is already running on this cluster") });
-        }
+        };
         let outcome = runner(now).await;
-        if let Err(err) = self.lock.release(name).await {
+        if let Err(err) = self.lock.release(name, token).await {
             // A leaked lock expires on its own TTL; failing an otherwise successful run over
             // the release would be the worse answer.
             tracing::warn!(job = name, error = %err, "failed to release the job lock after a manual run");
@@ -224,11 +225,11 @@ mod tests {
         let mut registry = JobRegistry::new(Arc::clone(&lock));
         registry.runners.insert("probe".to_owned(), Arc::new(|_| async { Ok(serde_json::json!({})) }.boxed()));
 
-        assert!(lock.try_acquire("probe", Duration::from_secs(60)).await.unwrap());
+        let token = lock.try_acquire("probe", Duration::from_secs(60)).await.unwrap().expect("free");
         let err = registry.run_now("probe", Utc::now()).await.unwrap_err();
         assert_eq!(err.code(), "conflict");
 
-        lock.release("probe").await.unwrap();
+        lock.release("probe", token).await.unwrap();
         assert_eq!(registry.run_now("probe", Utc::now()).await.unwrap(), serde_json::json!({}));
     }
 
@@ -242,6 +243,6 @@ mod tests {
         );
         assert!(registry.run_now("flaky", Utc::now()).await.is_err());
         // A failed manual run must not wedge the scheduled one.
-        assert!(lock.try_acquire("flaky", Duration::from_secs(1)).await.unwrap());
+        assert!(lock.try_acquire("flaky", Duration::from_secs(1)).await.unwrap().is_some());
     }
 }

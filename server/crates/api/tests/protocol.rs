@@ -470,13 +470,18 @@ async fn finalize_keeps_the_staged_upload_across_a_publish_lock_conflict() {
     let finalize_url = app.proxied(upload.headers[header::LOCATION].to_str().unwrap());
 
     // Another publish of the same name is mid-flight: the per-name lock is held.
-    assert!(app.lock.try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(60)).await.unwrap());
+    let held = app
+        .lock
+        .try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the lock is free");
     let busy = app.pub_get(&finalize_url, Some(&acme.token)).await;
     assert_eq!(busy.status, StatusCode::BAD_REQUEST, "finalize stays inside 200-or-400: {:?}", busy.json);
     assert_eq!(busy.json["error"]["code"], "busy", "transient, distinct from the duplicate-version conflict");
 
     // Once the lock clears, the very same finalize URL succeeds — the staged upload survived.
-    app.lock.release("publish:pub:acme_core").await.unwrap();
+    app.lock.release("publish:pub:acme_core", held).await.unwrap();
     let done = app.pub_get(&finalize_url, Some(&acme.token)).await;
     assert_eq!(done.status, StatusCode::OK, "the lock conflict must not burn the session: {:?}", done.json);
 

@@ -324,11 +324,13 @@ impl RegistryService {
         // failure is transient and the API layer must be able to keep the staged upload
         // finalizable instead of burning it (a duplicate version, by contrast, is permanent).
         let lock_key = format!("publish:{}:{name}", request.format);
-        if !self.lock.try_acquire(&lock_key, self.policy.publish_lock_ttl).await? {
+        let Some(token) = self.lock.try_acquire(&lock_key, self.policy.publish_lock_ttl).await? else {
             return Err(Error::Busy { message: format!("another publish of {name} is already in progress") });
-        }
+        };
         let result = self.publish_locked(&request, prepared, now).await;
-        if let Err(err) = self.lock.release(&lock_key).await {
+        // With the token: a publish that outlived its TTL must not free the lock the publish
+        // that replaced it is holding.
+        if let Err(err) = self.lock.release(&lock_key, token).await {
             // A leaked lock expires on its own TTL; failing the publish over it would be worse.
             tracing::warn!(package = %name, version = %version, error = %err, "failed to release publish lock");
         }

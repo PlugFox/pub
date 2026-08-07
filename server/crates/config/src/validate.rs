@@ -290,21 +290,38 @@ impl Settings {
                 queue.backoff_max_secs, queue.backoff_base_secs
             )));
         }
+        if queue.concurrency == 0 {
+            // Zero deliveries in flight is a drain that claims a batch and sends none of it.
+            return Err(invalid("jobs.queue.concurrency must be greater than 0"));
+        }
         if queue.retain_done_hours <= 0 {
             return Err(invalid("jobs.queue.retain_done_hours must be greater than 0"));
+        }
+        if queue.retain_suppressed_hours <= 0 {
+            return Err(invalid("jobs.queue.retain_suppressed_hours must be greater than 0"));
+        }
+        if queue.retain_dead_days <= 0 {
+            // Zero would delete a dead letter on the tick after it was written, which is the
+            // one record an operator has that a message never arrived (decision 26).
+            return Err(invalid("jobs.queue.retain_dead_days must be greater than 0"));
         }
         if queue.send_timeout_secs == 0 {
             // Zero would mean every delivery times out before it starts — mail would retry
             // until the attempt budget ran out and then dead-letter, with SMTP never contacted.
             return Err(invalid("jobs.queue.send_timeout_secs must be greater than 0"));
         }
-        // The lease is what stops two workers from holding one item. A lease that expires while
-        // a tick is still running, or while one delivery is still on the wire, hands the item to
-        // the next claim and duplicates the message that is already being sent.
-        if queue.lease_secs <= queue.interval_secs || queue.lease_secs <= queue.send_timeout_secs {
+        // The lease is what stops two workers from holding one item, and the drain bounds
+        // itself at *half* a lease (decision 26's amendment) — so one delivery has to fit in
+        // that half, not merely in the whole. Below it a pass can never lease anything it has
+        // time to run, and the drain claims nothing at all: a queue that fills up while every
+        // signal says the job is ticking. The interval bound is the older half of the same
+        // rule: a lease that expires while the tick that took it is still running hands the
+        // item to the next claim and duplicates the message already on the wire.
+        if queue.lease_secs <= queue.interval_secs || queue.lease_secs < queue.send_timeout_secs.saturating_mul(2) {
             return Err(invalid(format!(
-                "jobs.queue.lease_secs = {} must exceed both jobs.queue.interval_secs = {} and \
-                 jobs.queue.send_timeout_secs = {}: a lease that expires mid-delivery is a duplicate message",
+                "jobs.queue.lease_secs = {} must exceed jobs.queue.interval_secs = {} and be at least twice \
+                 jobs.queue.send_timeout_secs = {}: the drain stops at half a lease, so a delivery that does not \
+                 fit in that half is work the drain can never claim",
                 queue.lease_secs, queue.interval_secs, queue.send_timeout_secs
             )));
         }
@@ -647,15 +664,37 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_that_does_not_fit_in_half_a_lease_is_refused() {
+        // The drain stops when it has spent half its lease (decision 26's amendment), and it
+        // stops by *not claiming* — so a send timeout longer than that half is a drain whose
+        // every pass is allowed zero items. The queue would fill up silently while the job
+        // ticked, which is precisely the class of failure this wave exists to remove.
+        let starved = QueueConfig { lease_secs: 40, send_timeout_secs: 30, ..QueueConfig::default() };
+        assert!(
+            with_queue(starved).validate().is_err(),
+            "a lease longer than one delivery but shorter than two is a drain that claims nothing"
+        );
+        let exact = QueueConfig { lease_secs: 60, send_timeout_secs: 30, ..QueueConfig::default() };
+        assert!(with_queue(exact).validate().is_ok(), "exactly twice is exactly one delivery per pass");
+    }
+
+    #[test]
     fn nonsensical_queue_settings_are_startup_errors() {
-        let cases: [(&str, QueueConfig); 6] = [
+        let cases: [(&str, QueueConfig); 9] = [
             // A drain that claims nothing is a queue that fills while the job ticks happily.
             ("batch", QueueConfig { batch: 0, ..QueueConfig::default() }),
             ("interval", QueueConfig { interval_secs: 0, ..QueueConfig::default() }),
             // Below one attempt every transient SMTP hiccup becomes a permanent dead letter.
             ("max_attempts", QueueConfig { max_attempts: 0, ..QueueConfig::default() }),
             ("backoff", QueueConfig { backoff_base_secs: 600, backoff_max_secs: 60, ..QueueConfig::default() }),
+            // Zero in flight is a drain that claims a batch and sends none of it.
+            ("concurrency", QueueConfig { concurrency: 0, ..QueueConfig::default() }),
             ("retention", QueueConfig { retain_done_hours: 0, ..QueueConfig::default() }),
+            // Every terminal state's window is bounded and none of them is zero: a suppressed
+            // row must not outlive its request forever, and a dead letter must not be deleted
+            // on the tick after it was written (D43).
+            ("suppressed retention", QueueConfig { retain_suppressed_hours: 0, ..QueueConfig::default() }),
+            ("dead retention", QueueConfig { retain_dead_days: 0, ..QueueConfig::default() }),
             // Zero would time out every delivery before it started: SMTP never contacted, every
             // message dead-lettered after burning its whole budget.
             ("send timeout", QueueConfig { send_timeout_secs: 0, ..QueueConfig::default() }),

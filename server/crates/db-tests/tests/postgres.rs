@@ -254,3 +254,38 @@ async fn job_queue_contract_s04_s31() {
     pub_db_tests::contract::job_queue(&db.repos()).await;
     db.cleanup().await;
 }
+
+/// The indexes the drain's per-tick statements need exist on this dialect too (SF2).
+///
+/// The SQLite leg asserts query plans; here the assertion is that the paired migration actually
+/// landed the same indexes, which is the failure mode a paired migration has: one dialect gets
+/// the fix and the other quietly does not. An `EXPLAIN` against an empty table would prove
+/// nothing — Postgres sequentially scans a table of eight rows whatever indexes exist.
+#[tokio::test]
+async fn the_drains_per_tick_indexes_exist() {
+    let Some(db) = TestDb::create("the_drains_per_tick_indexes_exist").await else { return };
+    let names: Vec<(String,)> = sqlx::query_as(
+        "SELECT indexname::text FROM pg_indexes WHERE tablename IN ('job_queue', 'notifications') ORDER BY indexname",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read pg_indexes");
+    let names: Vec<String> = names.into_iter().map(|row| row.0).collect();
+    for expected in [
+        "job_queue_claim_prio_idx",
+        "job_queue_retention_done_idx",
+        "job_queue_retention_suppressed_idx",
+        "job_queue_retention_dead_idx",
+        "job_queue_depth_idx",
+        "job_queue_lease_idx",
+        "job_queue_dedupe_idx",
+        "notifications_event_idx",
+    ] {
+        assert!(names.iter().any(|name| name == expected), "missing {expected}: {names:?}");
+    }
+    assert!(
+        !names.iter().any(|name| name == "job_queue_claim_idx"),
+        "the superseded claim index is still there, costing every enqueue a write for a plan nothing emits: {names:?}"
+    );
+    db.cleanup().await;
+}

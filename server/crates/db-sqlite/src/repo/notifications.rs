@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use pub_core::event::EventId;
 use pub_core::notification::{NewNotification, Notification, NotificationCategory, NotificationPreference};
 use pub_core::page::Page;
 use pub_core::traits::NotificationRepo;
@@ -125,13 +126,17 @@ impl NotificationRepo for SqliteNotificationRepo {
     async fn create(&self, new: NewNotification, now: DateTime<Utc>) -> Result<Notification> {
         let payload = serde_json::to_string(&new.payload)
             .map_err(|err| Error::Internal { message: format!("failed to encode notification payload: {err}") })?;
+        // No `ON CONFLICT` here, unlike the batched sibling: a single-row caller names one
+        // recipient deliberately, so a second row for the same emission is a caller error worth
+        // a `Conflict` rather than something to swallow.
         let row: NotificationRow = sqlx::query_as(q!(
-            "INSERT INTO notifications (id, user_id, category, event, title, org_id, payload, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLS}"
+            "INSERT INTO notifications (id, user_id, category, event_id, event, title, org_id, payload, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLS}"
         ))
         .bind(NotificationId::new().to_string())
         .bind(new.user_id.to_string())
         .bind(new.category.as_str())
+        .bind(new.event_id.as_ref().map(EventId::as_str))
         .bind(&new.event)
         .bind(&new.title)
         .bind(new.org_id.map(|org| org.to_string()))
@@ -166,19 +171,26 @@ impl NotificationRepo for SqliteNotificationRepo {
         let mut stored: HashMap<NotificationId, Notification> = HashMap::with_capacity(new.len());
         for chunk in (0..new.len()).collect::<Vec<_>>().chunks(MAX_INSERT_CHUNK) {
             let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT INTO notifications (id, user_id, category, event, title, org_id, payload, created_at) ",
+                "INSERT INTO notifications (id, user_id, category, event_id, event, title, org_id, payload, \
+                 created_at) ",
             );
             query.push_values(chunk.iter().copied(), |mut row, index| {
                 row.push_bind(ids[index].to_string())
                     .push_bind(new[index].user_id.to_string())
                     .push_bind(new[index].category.as_str())
+                    .push_bind(new[index].event_id.as_ref().map(EventId::as_str))
                     .push_bind(new[index].event.as_str())
                     .push_bind(new[index].title.as_str())
                     .push_bind(new[index].org_id.map(|org| org.to_string()))
                     .push_bind(payloads[index].as_str())
                     .push_bind(stamp.as_str());
             });
-            query.push(" RETURNING ").push(COLS);
+            // Exactly-once fan-out (decision 26's amendment): a re-run after a crash converges
+            // on the rows that are already there instead of filing everybody a second copy.
+            // The partial index's predicate is repeated in the conflict target because that is
+            // how SQLite infers a partial index.
+            query.push(" ON CONFLICT (user_id, event_id) WHERE event_id IS NOT NULL DO NOTHING RETURNING ");
+            query.push(COLS);
             let rows: Vec<NotificationRow> = query
                 .build_query_as()
                 .fetch_all(&mut *tx)
@@ -191,14 +203,10 @@ impl NotificationRepo for SqliteNotificationRepo {
         }
         tx.commit().await.map_err(db_err)?;
 
-        // `RETURNING` promises no order; the minted id sequence is the input order.
-        ids.into_iter()
-            .map(|id| {
-                stored.remove(&id).ok_or_else(|| Error::Database {
-                    message: format!("notification {id} is missing from its own insert"),
-                })
-            })
-            .collect()
+        // `RETURNING` promises no order; the minted id sequence is the input order. An id that
+        // is absent is a row this call did **not** file — the recipient already had one for
+        // this emission — and the contract is that those are simply not returned.
+        Ok(ids.into_iter().filter_map(|id| stored.remove(&id)).collect())
     }
 
     async fn list(

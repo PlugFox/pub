@@ -10,6 +10,12 @@
 //! items are filed, and only then does the worker complete this item and publish the
 //! `UserNotified` follow-ups — because the event contract promises a client acting on one finds
 //! the notification it names.
+//!
+//! Re-running this handler is safe by construction rather than by luck (decision 26's
+//! 2026-08-07 amendment): `notifications` is unique on `(user_id, event_id)` and every mail item
+//! carries a `mail:{event}:{recipient}` dedupe key, so a second run files no second row and
+//! sends no second message. That is what lets a partially failed fan-out ask to be run again
+//! instead of swallowing the recipients it could not queue.
 
 use std::sync::Arc;
 
@@ -59,16 +65,36 @@ impl JobHandler for FanoutHandler {
             Err(err) => return HandlerReport::retry(format!("fan-out failed: {err}")),
         };
 
+        let mut lost = 0u64;
         for mail in &delivery.mail {
-            // Deliberately not fatal, and deliberately not a retry of the whole item: the
-            // recipients' rows are already written, so re-running this item would file them a
-            // second time. Each mail item carries a `(event, recipient)` dedupe key, so the
-            // ones that *did* land are not duplicated either.
             if let Err(error) = self.queue.enqueue(mail, now).await {
+                // Counted, not just logged (decision 22's amendment makes observability of a
+                // swallowed enqueue contractual): the analogous failure at the bus boundary
+                // increments `notification_enqueue_failed_total`, and one recipient's mail
+                // going missing with no metric and no dead letter is the same invisible
+                // failure one layer down.
+                metrics::counter!("notification_mail_enqueue_failed_total", "event" => fanout.envelope.event.name())
+                    .increment(1);
                 tracing::error!(%error, event = fanout.envelope.event.name(), "queueing a notification email failed");
+                lost += 1;
             }
         }
 
-        HandlerReport { outcome: pub_core::queue::QueueOutcome::Done, followups: delivery.followups }
+        let outcome = if lost > 0 {
+            // Re-running the fan-out is now the *cheap* answer, which it was not when this
+            // handler was written: `(user_id, event_id)` is unique so the recipients' rows are
+            // filed once however many times this runs, and each mail item's
+            // `mail:{event}:{recipient}` key makes the enqueues that already landed no-ops. So
+            // the retry costs one audience resolution and recovers the messages that were lost,
+            // and a failure that outlives the attempt budget becomes a visible dead letter
+            // instead of a mailbox that stays empty.
+            pub_core::queue::QueueOutcome::Retry(format!("{lost} notification emails could not be queued"))
+        } else {
+            pub_core::queue::QueueOutcome::Done
+        };
+        // The follow-ups ride along whatever the outcome is: the recipients' rows *are* written,
+        // and this is the only run that will ever carry them — the retry's `create_many` finds
+        // them already there and reports nothing to announce.
+        HandlerReport { outcome, followups: delivery.followups }
     }
 }

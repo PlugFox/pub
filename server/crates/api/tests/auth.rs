@@ -615,9 +615,13 @@ async fn s04a_accepted_and_rejected_addresses_do_identical_work() {
 }
 
 /// **S-31.** A suppressed row is a dead end: the drain never claims it, so a blocked address
-/// cannot be talked into a redeemable code by anything the worker does later.
+/// cannot be talked into a redeemable code by anything the worker does later — and it does not
+/// live forever either (D43). This endpoint is unauthenticated and every row it files carries
+/// the address somebody typed at a login form, so "kept until the operator notices" is the
+/// wrong answer: nothing reads one after the request that filed it, and decision 26 promises
+/// the queue does not become the next unbounded table.
 #[tokio::test]
-async fn s31_a_blocked_address_row_is_never_claimed() {
+async fn s31_a_blocked_address_row_is_never_claimed_and_does_not_live_forever() {
     let app = TestApp::with_options(TestOptions {
         allowed_email_domains: vec!["corp.com".to_owned()],
         ..TestOptions::default()
@@ -629,13 +633,21 @@ async fn s31_a_blocked_address_row_is_never_claimed() {
     assert_eq!(report.claimed, 0, "a suppressed row must never be handed to a worker");
     assert!(app.mailer.sent().is_empty(), "and therefore must never produce a message");
 
-    // Days later, and after every retention tick in between, it is still exactly where it was.
-    app.advance(Duration::days(7));
-    app.drain_jobs().await;
+    // Inside its retention window it is still exactly where it was, and still unclaimable.
+    app.advance(Duration::minutes(30));
+    assert_eq!(app.drain_jobs().await.claimed, 0);
     assert_eq!(
         app.repos.queue.depth().await.expect("queue depth"),
         vec![(pub_core::queue::JobKind::MailSend, pub_core::queue::QueueState::Suppressed, 1)]
     );
+
+    // Past it, retention takes it: the only thing it ever had to do — make a rejected request
+    // cost what an accepted one costs — was done the moment the request returned.
+    app.advance(Duration::hours(2));
+    let report = app.drain_jobs().await;
+    assert_eq!(report.claimed, 0, "it is not claimed on the way out either");
+    assert_eq!(report.purged, 1);
+    assert!(app.repos.queue.depth().await.expect("queue depth").is_empty());
     assert!(app.mailer.sent().is_empty());
 }
 

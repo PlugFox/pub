@@ -961,6 +961,20 @@ integer · `PUB_JOBS__QUEUE__BATCH` · default: `50`
 
 Items leased per claim, and therefore the cost bound of one pass.
 
+An upper bound, not a target: a pass never leases more than the time left in the
+drain's own budget can actually run (`lease_secs / 2`, in rounds of `concurrency`
+deliveries of `send_timeout_secs`).
+
+### `jobs.queue.concurrency`
+
+integer · `PUB_JOBS__QUEUE__CONCURRENCY` · default: `4`
+
+Deliveries in flight at once inside one claimed batch.
+
+One at a time is what let a single slow recipient gate every message behind it,
+including the sign-in code. Bounded rather than unlimited because the other end is
+somebody's relay, and two hundred simultaneous connections is an outage you caused.
+
 ### `jobs.queue.lease_secs`
 
 integer · `PUB_JOBS__QUEUE__LEASE_SECS` · default: `120`
@@ -991,8 +1005,28 @@ Ceiling on the retry delay.
 
 integer · `PUB_JOBS__QUEUE__RETAIN_DONE_HOURS` · default: `24`
 
-Hours a completed item is kept before retention deletes it. Dead-lettered items are
-**never** purged — they are the operator's record of mail that never arrived.
+Hours a completed item is kept before retention deletes it.
+
+### `jobs.queue.retain_suppressed_hours`
+
+integer · `PUB_JOBS__QUEUE__RETAIN_SUPPRESSED_HOURS` · default: `1`
+
+Hours a suppressed item (S-04.a: one row per policy-rejected sign-in attempt, so both
+branches of the request cost the same) is kept.
+
+Short by default, and this is the security-relevant one: the rows are filed by an
+**unauthenticated** endpoint, each carries the attempted address in the clear, and
+nothing reads one after the request that filed it has returned.
+
+### `jobs.queue.retain_dead_days`
+
+integer · `PUB_JOBS__QUEUE__RETAIN_DEAD_DAYS` · default: `30`
+
+Days a dead-lettered item is kept for the operator before retention deletes it.
+
+Long, because a dead-lettered sign-in message is an account lockout with no other
+visible cause — but bounded, because decision 26 promises the queue does not become the
+next table that only grows. The drain logs a warning naming what it deleted.
 
 ### `jobs.queue.send_timeout_secs`
 

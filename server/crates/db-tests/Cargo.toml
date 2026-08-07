@@ -16,5 +16,6 @@ pub-config = { workspace = true }
 pub-db-postgres = { workspace = true }
 pub-db-sqlite = { workspace = true }
 # postgres: the env-gated contract run creates/drops throwaway databases on a live server.
-sqlx = { workspace = true, features = ["postgres"] }
+# sqlite: the query-plan assertions that keep the drain's per-tick statements off a full scan.
+sqlx = { workspace = true, features = ["postgres", "sqlite"] }
 tokio = { workspace = true }

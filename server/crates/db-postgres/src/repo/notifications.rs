@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use pub_core::event::EventId;
 use pub_core::notification::{NewNotification, Notification, NotificationCategory, NotificationPreference};
 use pub_core::page::Page;
 use pub_core::traits::NotificationRepo;
@@ -118,13 +119,17 @@ impl NotificationRepo for PgNotificationRepo {
     async fn create(&self, new: NewNotification, now: DateTime<Utc>) -> Result<Notification> {
         let payload = serde_json::to_string(&new.payload)
             .map_err(|err| Error::Internal { message: format!("failed to encode notification payload: {err}") })?;
+        // No `ON CONFLICT` here, unlike the batched sibling: a single-row caller names one
+        // recipient deliberately, so a second row for the same emission is a caller error worth
+        // a `Conflict` rather than something to swallow.
         let row: NotificationRow = sqlx::query_as(q!(
-            "INSERT INTO notifications (id, user_id, category, event, title, org_id, payload, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8) RETURNING {COLS}"
+            "INSERT INTO notifications (id, user_id, category, event_id, event, title, org_id, payload, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9) RETURNING {COLS}"
         ))
         .bind(*NotificationId::new().as_uuid())
         .bind(*new.user_id.as_uuid())
         .bind(new.category.as_str())
+        .bind(new.event_id.as_ref().map(EventId::as_str))
         .bind(&new.event)
         .bind(&new.title)
         .bind(new.org_id.map(|org| *org.as_uuid()))
@@ -149,6 +154,8 @@ impl NotificationRepo for PgNotificationRepo {
         let id_uuids: Vec<Uuid> = ids.iter().map(|id| *id.as_uuid()).collect();
         let users: Vec<Uuid> = new.iter().map(|item| *item.user_id.as_uuid()).collect();
         let categories: Vec<String> = new.iter().map(|item| item.category.as_str().to_owned()).collect();
+        let event_ids: Vec<Option<String>> =
+            new.iter().map(|item| item.event_id.as_ref().map(|id| id.as_str().to_owned())).collect();
         let events: Vec<String> = new.iter().map(|item| item.event.clone()).collect();
         let titles: Vec<String> = new.iter().map(|item| item.title.clone()).collect();
         let orgs: Vec<Option<Uuid>> = new.iter().map(|item| item.org_id.map(|org| *org.as_uuid())).collect();
@@ -161,17 +168,24 @@ impl NotificationRepo for PgNotificationRepo {
             .collect::<Result<_>>()?;
 
         // One statement over parallel arrays rather than a multi-row VALUES list: the bind
-        // count stays at eight regardless of the recipient count, so the batch size is bounded
+        // count stays at nine regardless of the recipient count, so the batch size is bounded
         // by policy (`MAX_RECIPIENT_BATCH`) and never by the protocol's parameter limit.
+        //
+        // `ON CONFLICT … DO NOTHING` is exactly-once fan-out (decision 26's amendment): a
+        // re-run after a crash converges on the rows that are already there instead of filing
+        // everybody a second copy. The index predicate is repeated in the conflict target
+        // because that is how a partial unique index is inferred.
         let rows: Vec<NotificationRow> = sqlx::query_as(q!(
-            "INSERT INTO notifications (id, user_id, category, event, title, org_id, payload, created_at) \
-             SELECT id, user_id, category, event, title, org_id, payload::jsonb, $8 \
-             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::uuid[], $7::text[]) \
-             AS batch (id, user_id, category, event, title, org_id, payload) RETURNING {COLS}"
+            "INSERT INTO notifications (id, user_id, category, event_id, event, title, org_id, payload, created_at) \
+             SELECT id, user_id, category, event_id, event, title, org_id, payload::jsonb, $9 \
+             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::text[], $7::uuid[], \
+             $8::text[]) AS batch (id, user_id, category, event_id, event, title, org_id, payload) \
+             ON CONFLICT (user_id, event_id) WHERE event_id IS NOT NULL DO NOTHING RETURNING {COLS}"
         ))
         .bind(&id_uuids)
         .bind(&users)
         .bind(&categories)
+        .bind(&event_ids)
         .bind(&events)
         .bind(&titles)
         .bind(&orgs)
@@ -187,13 +201,9 @@ impl NotificationRepo for PgNotificationRepo {
             let notification: Notification = row.try_into()?;
             stored.insert(notification.id, notification);
         }
-        ids.into_iter()
-            .map(|id| {
-                stored.remove(&id).ok_or_else(|| Error::Database {
-                    message: format!("notification {id} is missing from its own insert"),
-                })
-            })
-            .collect()
+        // An id that is absent is a row this call did **not** file — the recipient already had
+        // one for this emission — and the contract is that those are simply not returned.
+        Ok(ids.into_iter().filter_map(|id| stored.remove(&id)).collect())
     }
 
     async fn list(

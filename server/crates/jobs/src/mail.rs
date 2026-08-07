@@ -139,6 +139,7 @@ mod tests {
         QueuedJob {
             id: QueuedJobId::new(),
             kind: JobKind::MailSend,
+            priority: 0,
             payload: serde_json::to_value(mail).unwrap(),
             state: QueueState::Running,
             attempts: 1,

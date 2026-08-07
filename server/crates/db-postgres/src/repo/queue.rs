@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone as _, Utc};
-use pub_core::queue::{JobKind, NewQueuedJob, QueueOutcome, QueueState, QueuedJob, QueuedJobId};
+use pub_core::queue::{
+    JobKind, NewQueuedJob, QueueOutcome, QueuePurged, QueueRetention, QueueState, QueuedJob, QueuedJobId,
+};
 use pub_core::traits::JobQueueRepo;
 use pub_core::{Error, Result};
 use sqlx::PgPool;
@@ -31,8 +33,8 @@ use super::{db_err, parse_col, q};
 const MAX_CLAIM_BATCH: u32 = 500;
 
 /// All queue columns, in [`QueueRow`] order (`JSONB` reads back as text).
-const COLS: &str = "id, kind, payload::text AS payload, state, attempts, run_after, locked_until, dedupe_key, \
-                    last_error, created_at, updated_at";
+const COLS: &str = "id, kind, priority, payload::text AS payload, state, attempts, run_after, locked_until, \
+                    dedupe_key, last_error, created_at, updated_at";
 
 /// Postgres-backed [`JobQueueRepo`].
 #[derive(Debug, Clone)]
@@ -51,6 +53,7 @@ impl PgJobQueueRepo {
 struct QueueRow {
     id: Uuid,
     kind: String,
+    priority: i32,
     payload: String,
     state: String,
     attempts: i64,
@@ -69,6 +72,7 @@ impl TryFrom<QueueRow> for QueuedJob {
         Ok(QueuedJob {
             id: QueuedJobId::from_uuid(row.id),
             kind: parse_col::<JobKind>(&row.kind)?,
+            priority: row.priority,
             payload: serde_json::from_str(&row.payload)
                 .map_err(|err| Error::Database { message: format!("corrupt queue payload: {err}") })?,
             state: parse_col::<QueueState>(&row.state)?,
@@ -118,13 +122,14 @@ impl JobQueueRepo for PgJobQueueRepo {
         // already there — it may be running, or already done. The index predicate is repeated in
         // the conflict target because that is how a partial unique index is inferred.
         let row: Option<QueueRow> = sqlx::query_as(q!(
-            "INSERT INTO job_queue (id, kind, payload, state, attempts, run_after, locked_until, dedupe_key, \
-             last_error, created_at, updated_at) \
-             VALUES ($1, $2, $3::jsonb, $4, 0, $5, NULL, $6, NULL, $7, $7) \
+            "INSERT INTO job_queue (id, kind, priority, payload, state, attempts, run_after, locked_until, \
+             dedupe_key, last_error, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4::jsonb, $5, 0, $6, NULL, $7, NULL, $8, $8) \
              ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING RETURNING {COLS}"
         ))
         .bind(*QueuedJobId::new().as_uuid())
         .bind(new.kind.as_str())
+        .bind(new.priority)
         .bind(payload)
         .bind(new.state.as_str())
         .bind(new.run_after.unwrap_or(now))
@@ -156,12 +161,14 @@ impl JobQueueRepo for PgJobQueueRepo {
             return Ok(Vec::new());
         }
         let names: Vec<String> = kinds.iter().map(|kind| kind.as_str().to_owned()).collect();
-        // Oldest id first (UUID v7 = arrival order), and `SKIP LOCKED` so a concurrent drain
-        // takes the next batch instead of blocking on this one's rows.
+        // Priority first, then oldest id (UUID v7 = arrival order): the priority is what keeps
+        // a sign-in code from being claimed behind a broadcast filed minutes earlier
+        // (decision 26 amendment). `SKIP LOCKED` so a concurrent drain takes the next batch
+        // instead of blocking on this one's rows.
         let rows: Vec<QueueRow> = sqlx::query_as(q!(
             "UPDATE job_queue SET state = 'running', attempts = attempts + 1, locked_until = $1, updated_at = $2 \
              WHERE id IN (SELECT id FROM job_queue WHERE state = 'pending' AND run_after <= $2 AND kind = ANY($3) \
-             ORDER BY id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {COLS}"
+             ORDER BY priority, id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {COLS}"
         ))
         .bind(deadline(now, lease))
         .bind(now)
@@ -171,8 +178,8 @@ impl JobQueueRepo for PgJobQueueRepo {
         .await
         .map_err(db_err)?;
         let mut claimed: Vec<QueuedJob> = rows.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
-        // `RETURNING` makes no ordering promise; the caller was promised oldest first.
-        claimed.sort_by_key(|job| job.id);
+        // `RETURNING` makes no ordering promise; the caller was promised the claim order.
+        claimed.sort_by_key(|job| (job.priority, job.id));
         Ok(claimed)
     }
 
@@ -219,13 +226,26 @@ impl JobQueueRepo for PgJobQueueRepo {
         Ok(result.rows_affected())
     }
 
-    async fn purge(&self, before: DateTime<Utc>) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM job_queue WHERE state = 'done' AND updated_at < $1")
-            .bind(before)
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(result.rows_affected())
+    async fn purge(&self, retention: &QueueRetention) -> Result<QueuePurged> {
+        // One statement per state rather than one `OR`-ed DELETE, and the state as a **literal**
+        // rather than a bound parameter: each state has its own partial retention index, and the
+        // planner can only use one when the statement's predicate visibly implies the index's.
+        // The caller reports the dead-letter count separately, because that deletion is the one
+        // that destroys a record an operator may still need.
+        let mut purged = QueuePurged::default();
+        for (sql, before, counter) in [
+            ("DELETE FROM job_queue WHERE state = 'done' AND updated_at < $1", retention.done_before, &mut purged.done),
+            (
+                "DELETE FROM job_queue WHERE state = 'suppressed' AND updated_at < $1",
+                retention.suppressed_before,
+                &mut purged.suppressed,
+            ),
+            ("DELETE FROM job_queue WHERE state = 'dead' AND updated_at < $1", retention.dead_before, &mut purged.dead),
+        ] {
+            let result = sqlx::query(sql).bind(before).execute(&self.pool).await.map_err(db_err)?;
+            *counter = result.rows_affected();
+        }
+        Ok(purged)
     }
 
     async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>> {

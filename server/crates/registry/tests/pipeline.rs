@@ -420,7 +420,12 @@ async fn an_oversized_upload_is_rejected_before_any_storage_work() {
 async fn a_held_publish_lock_makes_a_concurrent_publish_conflict_not_race() {
     let h = Harness::new().await;
     // Simulate another instance mid-publish of the same name.
-    assert!(h.lock.try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(60)).await.expect("acquire"));
+    let held = h
+        .lock
+        .try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(60))
+        .await
+        .expect("acquire")
+        .expect("the lock is free");
 
     let err = h.service.publish(h.request(package("acme_core", "1.0.0", &[])), t0()).await.expect_err("locked");
     // `busy`, not `conflict`: the lock failure is transient, and it must stay structurally
@@ -430,10 +435,14 @@ async fn a_held_publish_lock_makes_a_concurrent_publish_conflict_not_race() {
     assert!(h.blob.keys().is_empty());
 
     // Once released, the same publish succeeds — and the lock is given back afterwards.
-    h.lock.release("publish:pub:acme_core").await.expect("release");
+    h.lock.release("publish:pub:acme_core", held).await.expect("release");
     h.service.publish(h.request(package("acme_core", "1.0.0", &[])), t0()).await.expect("publish after release");
     assert!(
-        h.lock.try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(1)).await.expect("acquire"),
+        h.lock
+            .try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(1))
+            .await
+            .expect("acquire")
+            .is_some(),
         "the service must release its lock"
     );
 }
