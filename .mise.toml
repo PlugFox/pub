@@ -1,0 +1,6 @@
+# Tool versions pinned for this repo (mise: https://mise.jdx.dev).
+# Rust is deliberately NOT managed here — rustup owns it (stable channel);
+# CI installs its own toolchains. Pin only what actually drifts between
+# machines and CI.
+[tools]
+bun = "1.3.14"

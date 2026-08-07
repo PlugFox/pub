@@ -16,6 +16,7 @@ Monorepo: Rust backend (`server/`), Bun/Astro/SolidJS frontend (`web/`), design 
 
 ## Commands
 
+- Canonical runner: `just` (see `justfile`) — `just server-check` · `just web-check` · `just check` · `just db-up [profile]` · `just audit` · `just secrets-scan`. Tool versions pinned in `.mise.toml` (Bun; Rust stays with rustup).
 - Server (from `server/`): `cargo fmt --check` · `cargo clippy --all-targets -- -D warnings` · `cargo test --workspace`
 - Web (from `web/`): `bun install` · `bun run check` · `bun run build` · `bun test`
 - Dev infra (optional — default dev loop needs NO containers: SQLite + fs blob + in-memory KV):

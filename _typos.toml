@@ -1,0 +1,32 @@
+# typos-cli configuration (https://github.com/crate-ci/typos).
+# The codebase deliberately uses some vocabulary the checker dislikes, and
+# tests carry random-looking fixtures (hashes, base32 seeds, unicode-ranges).
+
+[default]
+extend-ignore-re = [
+    # hashes, tokens, base64/base32 fixtures and other long opaque strings
+    "[A-Za-z0-9+/=_-]{24,}",
+    # CSS unicode-range values in fonts.css
+    "U\\+[0-9A-Fa-f?-]{2,}",
+    # prose plural of the SQL keyword and mixed-case "CHECKed" in dialect notes
+    "SELECTs",
+    "CHECKed",
+    # hyphenated "mis-sized" in QR docs
+    "mis-sized",
+    # RFC 4648 base32 test vector pair
+    "\\(\"fo\", \"MZXQ\"\\)",
+]
+
+[default.extend-words]
+# Deliberate, consistent vocabulary — not typos.
+unparseable = "unparseable"
+# DEFLATE/flate2 references in prose
+flate = "flate"
+# search-stemming test fixtures
+blok = "blok"
+# "look-alikes" in TOTP docs
+alikes = "alikes"
+# deliberate not-a-real-path test fixture in urls.test.ts
+lication = "lication"
+# near-collision OTP attempt-key fixture
+abd = "abd"
