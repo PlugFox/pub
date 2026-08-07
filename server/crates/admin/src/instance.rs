@@ -263,56 +263,32 @@ impl AdminService {
             return Err(Error::Invalid { message: "no settings sections were supplied".to_owned() });
         }
         let before = self.cache.current();
-        let mut written: Vec<&'static str> = Vec::new();
 
-        if let Some(registration) = &patch.registration {
-            let registration = normalize_registration(registration)?;
-            self.write(keys::REGISTRATION, &registration, now).await?;
-            written.push(keys::REGISTRATION);
-        }
+        // **Every section is validated before any section is written.** Six independent upserts
+        // with an early return between them meant a refused PATCH had already committed the
+        // sections ahead of the refusal, and the web form always submits all six: an SMTP typo
+        // silently dropped the `registry` anonymous-read flag the administrator had just ticked
+        // while the 400 named only SMTP. A 400 from here means nothing changed.
+        let registration = patch.registration.as_ref().map(normalize_registration).transpose()?;
         if let Some(limits) = &patch.rate_limits {
             validate_rate_limits(limits)?;
-            self.write(keys::RATE_LIMITS, limits, now).await?;
-            written.push(keys::RATE_LIMITS);
         }
-        if let Some(smtp) = &patch.smtp {
-            let sealed = self.seal_smtp_password(smtp, before.smtp.password_sealed.clone())?;
-            let section = SmtpSettings {
-                host: smtp.host.clone().map(|host| host.trim().to_owned()).filter(|host| !host.is_empty()),
-                port: smtp.port,
-                username: smtp.username.clone().filter(|user| !user.is_empty()),
-                from: smtp.from.clone(),
-                security: validate_security(&smtp.security)?,
-                password_sealed: sealed,
-            };
-            if section.port == 0 {
-                return Err(Error::Invalid { message: "smtp.port must be greater than 0".to_owned() });
+        let smtp = patch.smtp.as_ref().map(|smtp| self.validated_smtp(smtp, &before)).transpose()?;
+        if let Some(branding) = &patch.branding
+            && branding.name.trim().is_empty()
+        {
+            return Err(Error::Invalid { message: "branding.name must not be empty".to_owned() });
+        }
+
+        let mut written: Vec<&'static str> = Vec::new();
+        if let Err(error) = self.write_sections(&patch, registration, smtp, now, &mut written).await {
+            // Nothing here is a validation failure any more — this is the database itself. A
+            // section that did land is durable, so the cache must not keep serving the
+            // pre-PATCH document beside it (an S-24 divergence that outlives the request).
+            if let Err(error) = self.cache.reload(self.repos.settings.as_ref()).await {
+                tracing::error!(%error, "settings cache reload after a failed write failed");
             }
-            // The rest of the boot validator's SMTP rules, on the runtime plane. Both matter
-            // more here than at boot: a section the transport cannot be built from is not
-            // refused by the mailer, it is *ignored* — the previous transport keeps delivering
-            // and the surface reports settings that are not in force.
-            if section.host.is_some() && section.from.trim().is_empty() {
-                return Err(Error::Invalid { message: "smtp.from must be set when smtp.host is set".to_owned() });
-            }
-            validate_smtp_credentials(section.username.as_deref(), self.smtp_password_available(&section))?;
-            self.write(keys::SMTP, &section, now).await?;
-            written.push(keys::SMTP);
-        }
-        if let Some(branding) = &patch.branding {
-            if branding.name.trim().is_empty() {
-                return Err(Error::Invalid { message: "branding.name must not be empty".to_owned() });
-            }
-            self.write(keys::BRANDING, branding, now).await?;
-            written.push(keys::BRANDING);
-        }
-        if let Some(upstream) = &patch.upstream {
-            self.write(keys::UPSTREAM, upstream, now).await?;
-            written.push(keys::UPSTREAM);
-        }
-        if let Some(registry) = &patch.registry {
-            self.write(keys::REGISTRY, registry, now).await?;
-            written.push(keys::REGISTRY);
+            return Err(error);
         }
 
         // Reload from the durable rows rather than from the patch: whatever another instance
@@ -344,6 +320,83 @@ impl AdminService {
             .await;
 
         Ok(self.settings())
+    }
+
+    /// Validates one SMTP patch into the section that would be stored.
+    ///
+    /// Every rule the boot validator applies, plus one the boot plane does not need: the section
+    /// must be one the transport can actually be *built* from. That check matters more here than
+    /// at boot, because a stored section the mailer cannot build is not refused on the send path
+    /// — it is either unapplied (the previous transport keeps delivering to an endpoint this row
+    /// no longer names) or unusable (every message retries and then dead-letters). The write is
+    /// the last moment a human is attached to answer (decision 09 amendment).
+    fn validated_smtp(&self, patch: &SmtpPatch, before: &RuntimeSettings) -> Result<SmtpSettings> {
+        let section = SmtpSettings {
+            host: patch.host.clone().map(|host| host.trim().to_owned()).filter(|host| !host.is_empty()),
+            port: patch.port,
+            username: patch.username.clone().filter(|user| !user.is_empty()),
+            from: patch.from.clone(),
+            security: validate_security(&patch.security)?,
+            password_sealed: self.seal_smtp_password(patch, before.smtp.password_sealed.clone())?,
+        };
+        if section.port == 0 {
+            return Err(Error::Invalid { message: "smtp.port must be greater than 0".to_owned() });
+        }
+        if section.host.is_some() && section.from.trim().is_empty() {
+            return Err(Error::Invalid { message: "smtp.from must be set when smtp.host is set".to_owned() });
+        }
+        validate_smtp_credentials(section.username.as_deref(), self.smtp_password_available(&section))?;
+        if let Err(err) = pub_mail::validate_section(&section) {
+            // The mailer's text already names the offending field; the *code* becomes
+            // `invalid_argument` because this is a caller's bad input, not the process's own
+            // configuration — the API ladder maps the two to different statuses.
+            let message = match err {
+                Error::Config { message } => message,
+                other => other.to_string(),
+            };
+            return Err(Error::Invalid { message });
+        }
+        Ok(section)
+    }
+
+    /// Writes the validated sections, in a fixed order.
+    ///
+    /// Every value reaching this point has passed its validator, so the only failure left is the
+    /// database. `written` accumulates in place because the caller needs the list even when a
+    /// later write fails — that is what tells it the cache is now behind the durable rows.
+    async fn write_sections(
+        &self,
+        patch: &SettingsPatch,
+        registration: Option<RegistrationSettings>,
+        smtp: Option<SmtpSettings>,
+        now: DateTime<Utc>,
+        written: &mut Vec<&'static str>,
+    ) -> Result<()> {
+        if let Some(registration) = &registration {
+            self.write(keys::REGISTRATION, registration, now).await?;
+            written.push(keys::REGISTRATION);
+        }
+        if let Some(limits) = &patch.rate_limits {
+            self.write(keys::RATE_LIMITS, limits, now).await?;
+            written.push(keys::RATE_LIMITS);
+        }
+        if let Some(smtp) = &smtp {
+            self.write(keys::SMTP, smtp, now).await?;
+            written.push(keys::SMTP);
+        }
+        if let Some(branding) = &patch.branding {
+            self.write(keys::BRANDING, branding, now).await?;
+            written.push(keys::BRANDING);
+        }
+        if let Some(upstream) = &patch.upstream {
+            self.write(keys::UPSTREAM, upstream, now).await?;
+            written.push(keys::UPSTREAM);
+        }
+        if let Some(registry) = &patch.registry {
+            self.write(keys::REGISTRY, registry, now).await?;
+            written.push(keys::REGISTRY);
+        }
+        Ok(())
     }
 
     /// Seals a new SMTP password, or carries the stored one forward.
@@ -378,7 +431,8 @@ impl AdminService {
             return true;
         }
         let boot = &self.cache.defaults().smtp;
-        self.boot_smtp_password && section.same_endpoint(boot.host.as_deref(), boot.port, boot.username.as_deref())
+        self.boot_smtp_password
+            && section.same_endpoint(boot.host.as_deref(), boot.port, boot.username.as_deref(), &boot.security)
     }
 
     /// Sends a test message to the acting administrator's **own** verified address.
@@ -410,17 +464,27 @@ impl AdminService {
             current.branding.name
         );
 
-        let (delivered, error_code, detail) = match self.mailer.send(&to, &subject, &body).await {
-            Ok(()) if host.is_none() => (
-                true,
-                None,
-                Some(
-                    "no smtp host is configured — the message was written to the in-memory outbox and delivered nowhere"
-                        .to_owned(),
-                ),
-            ),
-            Ok(()) => (true, None, None),
+        // The verdict describes the transport that actually ran, which is not the same question
+        // as "did a mailer accept the message". A stored section the resolver could not build is
+        // either not in force — a memoized transport keeps delivering to an endpoint this row no
+        // longer names — or not usable at all, and answering `delivered: true` next to the host
+        // an administrator typed in is the one lie this action exists to prevent. No message is
+        // sent in that case: there is nothing to learn from it that the resolution has not said.
+        let (delivered, error_code, detail) = match self.mailer.resolution() {
             Err(err) => (false, Some(err.code()), Some(sanitize_detail(&err.to_string()))),
+            Ok(()) => match self.mailer.send(&to, &subject, &body).await {
+                Ok(()) if host.is_none() => (
+                    true,
+                    None,
+                    Some(
+                        "no smtp host is configured — the message was written to the in-memory outbox and delivered \
+                         nowhere"
+                            .to_owned(),
+                    ),
+                ),
+                Ok(()) => (true, None, None),
+                Err(err) => (false, Some(err.code()), Some(sanitize_detail(&err.to_string()))),
+            },
         };
         self.audit(
             actor,

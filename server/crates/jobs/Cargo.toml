@@ -44,3 +44,7 @@ pub-db-sqlite = { workspace = true }
 # The queue tests drive the real notification center over real rows: a double there would be
 # proving that the double behaves, not that a fan-out files anybody's notification.
 pub-events = { workspace = true }
+# The S-26.b regression builds its payload from the **production** renderer. Hand-written
+# subjects at every construction site are what made the original suite structurally blind to a
+# template that put the sign-in code in the unsealed subject column.
+pub-mail = { workspace = true }

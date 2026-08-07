@@ -14,6 +14,10 @@ chrono = { workspace = true }
 # drift apart.
 pub-auth = { workspace = true }
 pub-core = { workspace = true }
+# The settings write path validates an SMTP section by *building* it through the same call the
+# mailer uses, so the validator and the transport cannot drift (decision 09 amendment). No cycle:
+# pub-mail depends on pub-core alone, and pub-auth above already pulls it in transitively.
+pub-mail = { workspace = true }
 # Package moderation reuses the registry's own service methods, so a forced org archive
 # refreshes the search index exactly like a package-settings change does.
 pub-registry = { workspace = true }

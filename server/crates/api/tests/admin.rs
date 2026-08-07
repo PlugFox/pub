@@ -270,9 +270,22 @@ async fn s26_the_smtp_password_is_write_only() {
 
 /// Builds the SMTP patch body the D10 tests write.
 fn smtp_patch(host: &str, port: u16, from: &str, username: serde_json::Value, password: &str) -> serde_json::Value {
+    secured_smtp_patch(host, port, from, username, password, "tls")
+}
+
+/// The same body with an explicit transport security mode — which is part of the endpoint the
+/// boot credential belongs to (decision 09 amendment, S-26.a).
+fn secured_smtp_patch(
+    host: &str,
+    port: u16,
+    from: &str,
+    username: serde_json::Value,
+    password: &str,
+    security: &str,
+) -> serde_json::Value {
     serde_json::json!({ "smtp": {
         "host": host, "port": port, "username": username,
-        "from": from, "security": "tls", "password": password
+        "from": from, "security": security, "password": password
     }})
 }
 
@@ -352,12 +365,55 @@ async fn an_smtp_section_the_transport_could_not_be_built_from_is_refused_on_the
             }}),
         ),
         ("username with no password", smtp_patch("smtp.corp.com", 587, "Acme <noreply@corp.com>", "mailer".into(), "")),
+        // The one the wave shipped: non-empty, so the old validator took it, and unparsable as a
+        // mailbox, so `SmtpMailer::new` fails hours later on a path with no user attached. The
+        // write path now runs the transport build itself, which is the only check that cannot
+        // drift from what the mailer will actually do.
+        ("from that is not a mailbox", smtp_patch("smtp.corp.com", 587, "Acme Pub", null.clone(), "")),
     ] {
         let refused = app.patch("/api/v1/admin/settings", Some(&access), body).await;
         assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{label} was accepted: {:?}", refused.json);
     }
     // Nothing was stored, so the resolver still has nothing to apply.
     assert!(app.smtp_builds.built().is_empty());
+}
+
+/// A refused PATCH changes **nothing** — not even the sections validated before the failure.
+///
+/// The web form always submits all six sections, so an SMTP rule the administrator did not think
+/// they were touching used to silently drop the `registry` anonymous-read flag they had just
+/// ticked, while the 400 named only SMTP. `registry` was written last, so it was the first thing
+/// lost — a security flag dropped by an error message about mail.
+#[tokio::test]
+async fn a_refused_settings_patch_writes_none_of_its_sections() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+    let before = app.get("/api/v1/admin/settings", Some(&access)).await;
+    assert_eq!(before.json["data"]["registry"]["require_auth_for_read"], false);
+
+    let refused = app
+        .patch(
+            "/api/v1/admin/settings",
+            Some(&access),
+            serde_json::json!({
+                "registration": { "mode": "closed", "allowed_email_domains": [] },
+                "registry": { "require_auth_for_read": true },
+                // Refused: a login user the runtime plane has no password for.
+                "smtp": { "host": "smtp.corp.com", "port": 587, "username": "mailer",
+                          "from": "Acme <noreply@corp.com>", "security": "tls", "password": "" },
+            }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.json);
+
+    let after = app.get("/api/v1/admin/settings", Some(&access)).await;
+    assert_eq!(after.json["data"]["registry"]["require_auth_for_read"], false, "a security flag was dropped");
+    assert_eq!(after.json["data"]["registration"]["mode"], "open", "an earlier section was written anyway");
+    assert_eq!(after.json["data"]["version"], before.json["data"]["version"], "a refusal must not bump the version");
+    // The durable rows, not just this instance's cache: a peer polling the version would
+    // otherwise converge onto whatever landed.
+    let stored = app.repos.settings.get_all().await.expect("settings rows");
+    assert!(stored.is_empty(), "a refused patch wrote rows: {stored:?}");
 }
 
 /// **D10.** A peer instance picks the write up through the reconciliation poll — and rebuilds on
@@ -401,7 +457,7 @@ async fn d10_a_second_instance_picks_up_smtp_through_the_version_poll() {
 /// operator-credential escalation the write-only design does not otherwise cover, because that
 /// design is about *reading back*, not about *redirecting*.
 #[tokio::test]
-async fn s25_the_boot_password_is_only_used_for_the_boot_host() {
+async fn s26_a_the_boot_password_is_only_used_for_the_boot_endpoint() {
     let app = TestApp::with_options(TestOptions {
         smtp_host: Some("smtp.corp.com".to_owned()),
         smtp_port: 587,
@@ -411,6 +467,10 @@ async fn s25_the_boot_password_is_only_used_for_the_boot_host() {
     })
     .await;
     let access = admin_token(&app, "root@corp.com").await;
+    // Boot `[smtp]` defaults to starttls, and that is now part of the endpoint being matched.
+    let boot_patch = |username: serde_json::Value, password: &str| {
+        secured_smtp_patch("smtp.corp.com", 587, "Acme <noreply@corp.com>", username, password, "starttls")
+    };
     // Signing in already sent mail through the boot section.
     let built = app.smtp_builds.built();
     assert_eq!(built.len(), 1);
@@ -426,6 +486,30 @@ async fn s25_the_boot_password_is_only_used_for_the_boot_host() {
         )
         .await;
     assert_eq!(redirected.status, StatusCode::BAD_REQUEST, "{:?}", redirected.json);
+
+    // **The downgrade**, which the three-field gate accepted: same host, same port, same login
+    // user, `security` flipped to `none` and no password supplied. It used to store cleanly and
+    // put `AUTH PLAIN base64("\0mailer\0boot-secret-value")` on the wire in the clear on the very
+    // next send — which the administrator can trigger on demand with the test-mail button.
+    let downgraded = app
+        .patch(
+            "/api/v1/admin/settings",
+            Some(&access),
+            secured_smtp_patch("smtp.corp.com", 587, "Acme <noreply@corp.com>", "mailer".into(), "", "none"),
+        )
+        .await;
+    assert_eq!(downgraded.status, StatusCode::BAD_REQUEST, "the downgrade was accepted: {:?}", downgraded.json);
+    // An *upgrade* is a different endpoint too — "equal to boot" needs no ordering between modes.
+    let upgraded = app
+        .patch(
+            "/api/v1/admin/settings",
+            Some(&access),
+            smtp_patch("smtp.corp.com", 587, "Acme <noreply@corp.com>", "mailer".into(), ""),
+        )
+        .await;
+    assert_eq!(upgraded.status, StatusCode::BAD_REQUEST, "{:?}", upgraded.json);
+    send_one_message(&app, "dev@corp.com").await;
+    assert_eq!(app.smtp_builds.built().len(), 1, "no refused section may reach the transport");
 
     // Repointing it *without* a login user is a legitimate "send unauthenticated" — and the
     // transport that comes out carries no credential at all.
@@ -444,21 +528,89 @@ async fn s25_the_boot_password_is_only_used_for_the_boot_host() {
     assert_eq!(built[1].password, None, "the boot credential must never follow the host");
     assert!(!built[1].credentialed());
 
-    // Back on the boot endpoint, a cleared runtime password falls back to boot again — the
-    // symmetry decision 09 gives every other section, minus the redirection.
-    let home = app
+    // A plaintext transport with no login user is not a downgrade of anything: there is no
+    // credential to expose, so it is stored and built like any other section.
+    let plaintext = app
         .patch(
             "/api/v1/admin/settings",
             Some(&access),
-            smtp_patch("smtp.corp.com", 587, "Acme <noreply@corp.com>", "mailer".into(), ""),
+            secured_smtp_patch("smtp.corp.com", 25, "Acme <noreply@corp.com>", serde_json::Value::Null, "", "none"),
         )
         .await;
+    assert_eq!(plaintext.status, StatusCode::OK, "{:?}", plaintext.json);
+    send_one_message(&app, "dev@corp.com").await;
+    let built = app.smtp_builds.built();
+    assert_eq!(built.len(), 3);
+    assert_eq!(built[2].security, "none");
+    assert_eq!(built[2].password, None, "an unencrypted transport never carries the operator's credential");
+
+    // Back on the boot endpoint — same host, port, user *and* security — a cleared runtime
+    // password falls back to boot again: the symmetry decision 09 gives every other section,
+    // minus the redirection.
+    let home = app.patch("/api/v1/admin/settings", Some(&access), boot_patch("mailer".into(), "")).await;
     assert_eq!(home.status, StatusCode::OK, "{:?}", home.json);
     assert_eq!(home.json["data"]["smtp"]["password_set"], false, "nothing is stored; the fallback is boot config");
     send_one_message(&app, "dev@corp.com").await;
     let built = app.smtp_builds.built();
-    assert_eq!(built.len(), 3);
-    assert_eq!(built[2].password.as_deref(), Some("boot-secret-value"));
+    assert_eq!(built.len(), 4);
+    assert_eq!(built[3].password.as_deref(), Some("boot-secret-value"));
+}
+
+/// **D10.** A stored section the resolver cannot build is an error on the send path — never a
+/// silent hand-off to the in-memory sink, and never a green test-mail report.
+///
+/// Before this fix the sink stood in whenever a build failed with nothing memoized, which is
+/// *every* send after a restart: every sign-in code went into an in-process `Vec`, the queue
+/// marked each row `done`, `dead_pending` stayed 0, and the test-mail action answered
+/// `delivered: true` for a host it never contacted. An instance nobody could sign in to where
+/// every observable signal said mail works (decision 09 amendment).
+#[tokio::test]
+async fn d10_a_section_the_resolver_cannot_build_fails_the_send_instead_of_discarding_it() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+
+    // The KEK-rotation / ephemeral-development-KEK case: a sealed password this process cannot
+    // open. It is the one unbuildable section the write validator cannot catch — the row was
+    // valid when it was written — which is exactly why the send path must not treat it as "no
+    // SMTP configured" and quietly accept the message.
+    // Composed rather than pasted: a base64 literal in a `password_sealed` field is what the
+    // repository's own secret scanner exists to shout about, and it cannot tell this apart.
+    let unopenable = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not sealed under this kek");
+    let section = serde_json::json!({
+        "host": "smtp.corp.com", "port": 587, "username": "mailer",
+        "from": "Acme <noreply@corp.com>", "security": "starttls",
+        "password_sealed": unopenable
+    });
+    app.repos
+        .settings
+        .upsert(pub_core::settings::keys::SMTP, &section, app.now())
+        .await
+        .expect("store the unopenable section");
+    app.runtime.reload(app.repos.settings.as_ref()).await.expect("reload");
+
+    // The test-mail action answers for the transport that ran, not for the row it read.
+    let report = app.post_empty("/api/v1/admin/settings/smtp/test", Some(&access)).await;
+    assert_eq!(report.status, StatusCode::OK, "a wrong SMTP config is not a 5xx: {:?}", report.json);
+    assert_eq!(report.json["data"]["delivered"], false, "a host it never contacted was reported as delivered");
+    assert_eq!(report.json["data"]["host"], "smtp.corp.com");
+    assert!(
+        report.json["data"]["detail"].as_str().is_some_and(|detail| !detail.is_empty()),
+        "the operator needs the reason: {:?}",
+        report.json["data"]["detail"]
+    );
+    assert!(app.smtp_builds.built().is_empty(), "no transport could be built at all");
+    let audited = app.audit_event("admin.smtp.test").await.expect("the failure is audited");
+    assert_eq!(audited.result, AuditResult::Failure);
+
+    // …and a queued sign-in code is retried — and eventually dead-lettered — rather than marked
+    // delivered. `retried` is what makes it visible on the admin job surface.
+    let sent_before = app.mailer.sent().len();
+    let requested = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": "dev@corp.com" })).await;
+    assert_eq!(requested.status, StatusCode::OK, "{:?}", requested.json);
+    let drain = app.drain_jobs().await;
+    assert_eq!(drain.delivered, 0, "an undeliverable message must never be reported delivered");
+    assert_eq!(drain.retried, 1, "the row stays in the queue where an operator can see it");
+    assert_eq!(app.mailer.sent().len(), sent_before, "a configured host must never fall back to the outbox");
 }
 
 /// **S-26.** The stored password is unsealed into the transport and nowhere else.

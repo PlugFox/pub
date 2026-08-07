@@ -455,6 +455,7 @@ impl TestApp {
                 host: settings.smtp.host.clone(),
                 port: settings.smtp.port,
                 username: settings.smtp.username.clone(),
+                security: settings.smtp.security.as_str().to_owned(),
                 password: settings.smtp.password.as_ref().map(|secret| secret.expose().to_owned()),
             },
             Arc::clone(&mailer) as Arc<dyn Mailer>,

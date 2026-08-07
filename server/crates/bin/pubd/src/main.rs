@@ -610,6 +610,7 @@ fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>, kek: Vec<u8>) 
         host: settings.smtp.host.clone(),
         port: settings.smtp.port,
         username: settings.smtp.username.clone(),
+        security: settings.smtp.security.as_str().to_owned(),
         password: settings.smtp.password.as_ref().map(|secret| secret.expose().to_owned()),
     };
     let mailer = Arc::new(RuntimeMailer::new(
@@ -623,8 +624,14 @@ fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>, kek: Vec<u8>) 
     // Resolve once here so a section the transport cannot be built from is reported at startup
     // rather than on somebody's first sign-in. A failure is deliberately **not** fatal: the
     // effective section is runtime data now, and one bad admin edit must not stop every instance
-    // in the cluster from booting.
-    let _warmed = mailer.resolve();
+    // in the cluster from booting. It is loud, though — the error names the offending field, and
+    // every message queued until it is corrected retries and then dead-letters (decision 09).
+    if let Err(error) = mailer.resolve() {
+        tracing::error!(
+            %error,
+            "the effective smtp section cannot be applied — outbound mail will retry and dead-letter until it is corrected"
+        );
+    }
     let resolved = mailer.describe();
     tracing::info!(
         host = ?resolved.host,

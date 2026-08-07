@@ -1218,6 +1218,21 @@ pub trait Mailer: Send + Sync {
         let _ = html;
         self.send(to, subject, text).await
     }
+
+    /// Whether the transport that would run right now is the one the settings document names.
+    ///
+    /// The diagnostic seam behind `POST /api/v1/admin/settings/smtp/test`. A mailer that
+    /// resolves its transport from runtime settings keeps the *previous* transport when a
+    /// rebuild fails (decision 09), which means a successful `send` proves only that *some*
+    /// endpoint accepted the message — not the one the stored section describes. An action whose
+    /// entire purpose is diagnosing SMTP has to be able to tell those apart, or it answers
+    /// `delivered: true` for a host it never contacted in exactly the case it exists for.
+    ///
+    /// Defaulted to `Ok(())`: a transport with nothing to resolve — the SMTP transport itself,
+    /// the in-memory outbox, every test double — is always the one in force.
+    fn resolution(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The full set of repository handles, as one cloneable bundle.

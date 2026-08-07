@@ -190,20 +190,28 @@ pub struct SmtpSettings {
 
 impl SmtpSettings {
     /// Whether this section points at exactly the endpoint described by `host`/`port`/
-    /// `username` — the host comparison is ASCII-case-insensitive because DNS is.
+    /// `username`/`security` — the host comparison is ASCII-case-insensitive because DNS is.
     ///
     /// This is the gate on the boot `[smtp]` password (decision 09 amendment, S-26.a). The boot
     /// credential is the *default* of the runtime one, but a default that followed the section
     /// wherever an administrator repointed it would hand the operator's SMTP password to a
     /// server of the administrator's choosing. One rule, two compositions: the mailer pairs it
     /// with the password itself, the admin surface pairs it with the password's mere presence.
-    pub fn same_endpoint(&self, host: Option<&str>, port: u16, username: Option<&str>) -> bool {
+    ///
+    /// **Transport security is part of the endpoint.** Comparing only host, port and username
+    /// left an instance administrator who never held the credential a one-field escalation:
+    /// flip `security` to `none`, leave the other three alone, and the next send puts
+    /// `AUTH PLAIN` with the operator's password on the wire in the clear for anyone with a
+    /// network position. A downgrade is as effective a redirection as a new hostname, so the
+    /// match is on all four fields — including an *upgrade*, because "equal to boot" is the only
+    /// comparison that needs no ordering between modes to be safe.
+    pub fn same_endpoint(&self, host: Option<&str>, port: u16, username: Option<&str>, security: &str) -> bool {
         let same_host = match (self.host.as_deref(), host) {
             (Some(mine), Some(theirs)) => mine.eq_ignore_ascii_case(theirs),
             (None, None) => true,
             _ => false,
         };
-        same_host && self.port == port && self.username.as_deref() == username
+        same_host && self.port == port && self.username.as_deref() == username && self.security == security
     }
 }
 
@@ -484,16 +492,18 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_smtp_credential_only_matches_its_own_endpoint() {
+    fn s26_a_the_boot_smtp_credential_only_matches_its_own_endpoint() {
         // S-26.a: repointing the host must not carry the operator's boot password along.
         let boot = SmtpSettings {
             host: Some("smtp.corp.com".to_owned()),
             port: 587,
             username: Some("mailer".to_owned()),
+            security: "tls".to_owned(),
             ..SmtpSettings::default()
         };
-        let same =
-            |section: &SmtpSettings| section.same_endpoint(boot.host.as_deref(), boot.port, boot.username.as_deref());
+        let same = |section: &SmtpSettings| {
+            section.same_endpoint(boot.host.as_deref(), boot.port, boot.username.as_deref(), &boot.security)
+        };
         assert!(same(&boot));
         // DNS is case-insensitive, so a case variant is the same server.
         assert!(same(&SmtpSettings { host: Some("SMTP.Corp.COM".to_owned()), ..boot.clone() }));
@@ -501,8 +511,13 @@ mod tests {
         assert!(!same(&SmtpSettings { port: 2525, ..boot.clone() }));
         assert!(!same(&SmtpSettings { username: Some("someone-else".to_owned()), ..boot.clone() }));
         assert!(!same(&SmtpSettings { host: None, ..boot.clone() }));
+        // The security flip: same host, same port, same login user — and the operator's
+        // credential would have gone out in `AUTH PLAIN` over an unencrypted connection. A
+        // downgrade is a redirection, so it fails the match exactly like a new hostname does.
+        assert!(!same(&SmtpSettings { security: "none".to_owned(), ..boot.clone() }));
+        assert!(!same(&SmtpSettings { security: "starttls".to_owned(), ..boot.clone() }));
         // Both unset is still "the same endpoint" — an instance with no SMTP at all.
-        assert!(SmtpSettings::default().same_endpoint(None, 0, None));
+        assert!(SmtpSettings::default().same_endpoint(None, 0, None, ""));
     }
 
     #[test]

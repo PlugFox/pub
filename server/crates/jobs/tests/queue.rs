@@ -36,6 +36,9 @@ use pub_jobs::{FanoutHandler, MailHandler, QueuePolicy, QueueWorker};
 
 const KEK: [u8; 32] = [11u8; 32];
 
+/// The sign-in code the S-26.b regression looks for, in the row and in the delivered message.
+const CODE: &str = "12345678";
+
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap()
 }
@@ -571,16 +574,25 @@ async fn d12_retention_purges_done_rows_and_keeps_the_operators_record() {
 async fn s26_b_a_queued_sign_in_body_is_unreadable_in_the_table_and_delivered_in_the_clear() {
     // The row a database dump, a replica or a backup would contain must not hold a redeemable
     // code; the worker is the only thing that ever sees the plaintext.
+    //
+    // The payload is built from the **production renderer**, not from a hand-written literal.
+    // Every one of the suite's seven `MailJob` construction sites used to hard-code a benign
+    // subject, so the assertion below passed while production shipped `"{code} is your sign-in
+    // code"` — the code in the clear in the one column that is deliberately not sealed. A test
+    // that constructs its own subject cannot see a leak in the template that makes them.
     let harness = Harness::new(MailMode::Deliver).await;
-    let sealed = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        pub_auth::secretbox::seal(&KEK, &pub_auth::random::OsRandom, b"Your code is 12345678").unwrap(),
-    );
+    let rendered = pub_mail::render_otp_email(CODE, Some("203.0.113.7"), 10).expect("render the sign-in email");
+    let seal = |plaintext: &str| {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            pub_auth::secretbox::seal(&KEK, &pub_auth::random::OsRandom, plaintext.as_bytes()).unwrap(),
+        )
+    };
     let payload = serde_json::to_value(MailJob {
         to: "alice@corp.com".to_owned(),
-        subject: "Your sign-in code".to_owned(),
-        text: sealed,
-        html: None,
+        subject: rendered.subject.clone(),
+        text: seal(&rendered.text),
+        html: Some(seal(&rendered.html)),
         sealed: true,
     })
     .unwrap();
@@ -594,13 +606,14 @@ async fn s26_b_a_queued_sign_in_body_is_unreadable_in_the_table_and_delivered_in
         .id;
 
     let stored = harness.row(id).await;
-    assert!(!stored.payload.to_string().contains("12345678"), "the stored row must not hold the code");
+    assert!(!stored.payload.to_string().contains(CODE), "the stored row must not hold the code: {}", stored.payload);
     assert!(stored.payload["to"].as_str() == Some("alice@corp.com"), "the recipient stays identifiable");
+    assert!(!stored.payload["subject"].as_str().expect("subject").is_empty(), "a dead letter stays identifiable");
     // Nor may a log line: the row's own `Debug` redacts the payload (S-25.a).
-    assert!(!format!("{stored:?}").contains("12345678"));
+    assert!(!format!("{stored:?}").contains(CODE));
 
     harness.worker(QueuePolicy::default()).run_once(t0()).await.expect("drain");
-    assert_eq!(harness.mailer.sent()[0].2, "Your code is 12345678", "the delivered message is the plaintext");
+    assert!(harness.mailer.sent()[0].2.contains(CODE), "the delivered message is the plaintext");
 }
 
 #[tokio::test]
