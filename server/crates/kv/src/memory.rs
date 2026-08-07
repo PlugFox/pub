@@ -22,6 +22,11 @@ impl moka::Expiry<String, Entry> for PerEntryTtl {
         Some(value.1)
     }
 
+    /// This covers [`Kv::incr`] too, which supplies its TTL on *every* increment, so a counter
+    /// under sustained traffic never reaches its expiry. A rate-limit window therefore cannot be
+    /// expressed by the TTL and lives in the key instead (S-24.d); `RedisKv`'s unconditional
+    /// `PEXPIRE` behaves identically, and `incr_rearms_the_ttl_on_every_increment` asserts it
+    /// here rather than leaving it an implementation accident.
     fn expire_after_update(
         &self,
         _key: &String,
@@ -121,6 +126,9 @@ mod tests {
 
     const SHORT: Duration = Duration::from_millis(80);
     const LONG: Duration = Duration::from_secs(60);
+    /// TTL for the sliding-expiry test: wide enough that scheduling jitter on a loaded runner
+    /// cannot be mistaken for an expiry.
+    const SLIDING: Duration = Duration::from_millis(500);
 
     #[tokio::test]
     async fn get_returns_what_was_set() {
@@ -178,6 +186,22 @@ mod tests {
         let mut seen: Vec<u64> = tasks.join_all().await;
         seen.sort_unstable();
         assert_eq!(seen, (1..=64).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn incr_rearms_the_ttl_on_every_increment() {
+        // The rate limiter is built on knowing this (S-24.d): a counter that keeps being hit
+        // never expires, so a fixed window can never be carried by the TTL — it lives in the
+        // key. If this ever becomes "arm on create only", that design must be revisited.
+        let kv = MemoryKv::new();
+        let step = SLIDING / 4;
+        let mut counts = vec![kv.incr("hot", SLIDING).await.unwrap()];
+        for _ in 0..5 {
+            tokio::time::sleep(step).await;
+            counts.push(kv.incr("hot", SLIDING).await.unwrap());
+        }
+        // The six increments span 5 × 125 ms — past the 500 ms TTL each one supplied.
+        assert_eq!(counts, vec![1, 2, 3, 4, 5, 6], "every increment must slide the expiry forward");
     }
 
     #[tokio::test]

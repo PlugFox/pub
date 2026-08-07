@@ -408,23 +408,28 @@ async fn s24_email_bucket_is_case_folded() {
 
 /// `Retry-After` must be the real remainder of the fixed window, not a constant: a client that
 /// obeys it retries exactly when the budget is back.
+///
+/// Windows are aligned and tumbling (S-24.d), so the deadline is the next hour boundary — not an
+/// hour from the caller's first request. The clock is pushed off the boundary first, because the
+/// harness starts on one and the two readings would otherwise be identical.
 #[tokio::test]
 async fn s24_retry_after_matches_the_real_window_remainder() {
     let app = TestApp::new().await;
-    // Five requests, 61 s apart: the hourly window is anchored at the first one.
-    let mut elapsed = 0;
+    app.advance(Duration::seconds(1000));
+    let mut into_window = 1000;
+    // Five requests, 61 s apart — spaced past the resend throttle so the hourly cap is what trips.
     for _ in 0..5 {
         assert_eq!(
             app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": EMAIL })).await.status,
             StatusCode::OK
         );
         app.advance(Duration::seconds(61));
-        elapsed += 61;
+        into_window += 61;
     }
     let limited = app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": EMAIL })).await;
     assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
     let retry_after: i64 = limited.headers[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
-    assert_eq!(retry_after, 3600 - elapsed, "Retry-After must be the window remainder");
+    assert_eq!(retry_after, 3600 - into_window, "Retry-After must be the seconds left in the aligned window");
 
     // Obeying it works: one second earlier is still limited, exactly then is allowed.
     app.advance(Duration::seconds(retry_after - 1));
@@ -437,6 +442,32 @@ async fn s24_retry_after_matches_the_real_window_remainder() {
         app.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": EMAIL })).await.status,
         StatusCode::OK
     );
+}
+
+/// Parallel credential redemptions must each spend a unit of the login bucket (S-24.d). Under a
+/// `get` → decide → `set` counter the whole burst reads the same count and costs one unit, so
+/// "10/min/IP" stops bounding anything the moment an attacker stops waiting for the replies —
+/// and the per-code ≤5 budget it backstops goes with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s24_parallel_credential_redemptions_cannot_exceed_the_login_bucket() {
+    let app = TestApp::with_options(TestOptions { login_per_ip_minute: 5, ..TestOptions::default() }).await;
+    let burst: Vec<Request<Body>> = (0..30)
+        .map(|_| {
+            let body = serde_json::json!({ "pending_id": "00".repeat(16), "email": EMAIL, "code": "12345678" });
+            app.request(Method::POST, "/api/v1/auth/otp/verify", None, Some(body), DEFAULT_IP)
+        })
+        .collect();
+    let responses = app.send_concurrent(burst).await;
+
+    let admitted: Vec<&ApiResponse> =
+        responses.iter().filter(|response| response.status != StatusCode::TOO_MANY_REQUESTS).collect();
+    assert_eq!(admitted.len(), 5, "exactly the per-minute budget may reach the handler");
+    for response in admitted {
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "an admitted redemption still fails on the bogus code");
+    }
+    for response in responses.iter().filter(|response| response.status == StatusCode::TOO_MANY_REQUESTS) {
+        assert!(response.headers.contains_key(header::RETRY_AFTER), "every 429 must say when to come back (S-24)");
+    }
 }
 
 /// Credential redemption is throttled per IP (S-24 "login 10/min/IP"). Without it the ≤5

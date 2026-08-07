@@ -270,6 +270,29 @@ async fn s24_repeated_token_auth_failures_are_throttled_not_answered_forever() {
     assert_eq!(app.pub_get(&path, Some(&acme.token)).await.status, StatusCode::OK);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s24_parallel_token_auth_failures_each_spend_the_budget() {
+    // S-24.d: the budget is spent with an atomic increment, so firing the failures in parallel
+    // buys nothing. A `get` → decide → `set` counter lets a whole burst share one unit, which
+    // hands an attacker unlimited 401s — and every one of those costs a co-located client its
+    // stored credential (S-14.a).
+    let app = TestApp::with_options(TestOptions { token_auth_fail_per_ip_minute: 5, ..TestOptions::default() }).await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    publish_ok(&app, &acme, "acme_core", "1.0.0").await;
+    let path = format!("{}/api/packages/acme_core", acme.base());
+
+    let burst = (0..30).map(|_| app.pub_request(Method::GET, &path, Some("pub_bogus"), Some(PUB_ACCEPT))).collect();
+    let responses = app.send_concurrent(burst).await;
+
+    let unauthorized = responses.iter().filter(|r| r.status == StatusCode::UNAUTHORIZED).count();
+    let throttled = responses.iter().filter(|r| r.status == StatusCode::TOO_MANY_REQUESTS).count();
+    assert_eq!(unauthorized, 5, "only the budget's worth of failures may be answered with a 401");
+    assert_eq!(throttled, 25, "every failure past the budget must be a 429");
+    for response in responses.iter().filter(|r| r.status == StatusCode::TOO_MANY_REQUESTS) {
+        assert!(response.headers.contains_key(header::RETRY_AFTER));
+    }
+}
+
 // --------------------------------------------------- sharp edges 3, 7, 10: the listing shape
 
 #[tokio::test]

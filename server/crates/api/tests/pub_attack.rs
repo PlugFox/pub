@@ -12,6 +12,7 @@
 //! | S-20 hostile archives are permanent 4xx | [`hostile_archives_are_refused_with_a_permanent_4xx`] |
 //! | S-20 nothing hides behind the tar stream | [`a_smuggled_second_gzip_member_never_reaches_the_blob_store`] |
 //! | S-24 publish budget per org | [`s24_publish_uploads_are_capped_per_org`] |
+//! | S-24.d the budget is not bypassable in parallel | [`s24_parallel_uploads_cannot_exceed_the_org_publish_budget`] |
 //! | S-04 private names are not enumerable | [`private_and_unknown_names_answer_identical_bytes`] |
 //! | S-18 blob keys are content-addressed only | [`blob_keys_cannot_be_steered_by_names_or_versions`] |
 //! | S-21 provenance cannot be borrowed | [`an_upload_cannot_be_finalized_from_another_org`] |
@@ -19,6 +20,7 @@
 mod common;
 
 use std::io::Write as _;
+use std::sync::Arc;
 
 use axum::http::{StatusCode, header};
 use common::{TestApp, TestOptions, package_archive};
@@ -313,6 +315,36 @@ async fn s24_publish_uploads_are_capped_per_org() {
         events.items.iter().any(|event| event.action == "package.publish.throttled"),
         "a throttle trip must be visible to an operator"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s24_parallel_uploads_cannot_exceed_the_org_publish_budget() {
+    // S-24.d: the budget is spent with an atomic increment before a single byte is stored. Under
+    // a `get` → decide → `set` counter a parallel burst reads one count, so the hourly budget
+    // bounds one *burst* rather than one upload — and staged blobs are the thing it exists to
+    // bound, since nothing sweeps abandoned ones yet.
+    //
+    // A wire-level guard, not the race proof: the token and org lookups ahead of the budget hit
+    // the single-connection `:memory:` pool, which staggers the burst enough that the old
+    // read-modify-write also passed this. `ratelimit::hit_is_atomic_under_concurrency` is where
+    // the defect is actually caught.
+    let app = Arc::new(TestApp::with_options(TestOptions { publish_per_hour_org: 2, ..TestOptions::default() }).await);
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let upload_url = format!("{}/api/packages/versions/newUpload", acme.base());
+    let archive = Arc::new(package_archive("acme_core", "1.0.0"));
+
+    let mut burst = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (app, url, token, archive) =
+            (Arc::clone(&app), upload_url.clone(), acme.token.clone(), Arc::clone(&archive));
+        burst.spawn(async move { app.pub_upload(&url, Some(&token), &archive).await.status });
+    }
+    let statuses = burst.join_all().await;
+
+    let accepted = statuses.iter().filter(|status| **status == StatusCode::NO_CONTENT).count();
+    assert_eq!(accepted, 2, "exactly the hourly budget may store bytes, however parallel the burst");
+    let throttled = statuses.iter().filter(|status| **status == StatusCode::TOO_MANY_REQUESTS).count();
+    assert_eq!(throttled, 6, "{statuses:?}");
 }
 
 // -------------------------------------------------------------------------- enumeration
