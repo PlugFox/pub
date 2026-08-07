@@ -7,17 +7,17 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership};
+use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, UpstreamPolicy};
 use pub_core::traits::OrgRepo;
 use pub_core::{Error, InvitationId, OrgId, Result, RoleLevel, UserId};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
-use super::{db_err, q, write_err};
+use super::{db_err, parse_col, q, write_err};
 
 /// All org columns, in [`OrgRow`] order.
-const ORG_COLS: &str = "id, name, slug, created_at, updated_at";
+const ORG_COLS: &str = "id, name, slug, upstream_policy, created_at, updated_at";
 /// All membership columns, in [`MemberRow`] order.
 const MEMBER_COLS: &str = "org_id, user_id, role_level, created_at, updated_at";
 /// All invitation columns, in [`InvitationRow`] order.
@@ -42,19 +42,23 @@ struct OrgRow {
     id: Uuid,
     name: String,
     slug: String,
+    upstream_policy: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
-impl From<OrgRow> for Org {
-    fn from(row: OrgRow) -> Self {
-        Org {
+impl TryFrom<OrgRow> for Org {
+    type Error = Error;
+
+    fn try_from(row: OrgRow) -> Result<Self> {
+        Ok(Org {
             id: OrgId::from_uuid(row.id),
             name: row.name,
             slug: row.slug,
+            upstream_policy: parse_col::<UpstreamPolicy>(&row.upstream_policy)?,
             created_at: row.created_at,
             updated_at: row.updated_at,
-        }
+        })
     }
 }
 
@@ -161,6 +165,8 @@ impl OrgRepo for PgOrgRepo {
 
     async fn create(&self, new: NewOrg, creator: UserId, now: DateTime<Utc>) -> Result<Org> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // `upstream_policy` is left to its column default (`allow`, decision 01): a new org
+        // inherits the instance's proxy posture rather than carrying an opinion from creation.
         let row: OrgRow = sqlx::query_as(q!(
             "INSERT INTO orgs (id, name, slug, created_at, updated_at) VALUES ($1, $2, $3, $4, $5) \
              RETURNING {ORG_COLS}"
@@ -188,7 +194,7 @@ impl OrgRepo for PgOrgRepo {
         .map_err(|err| write_err(err, "creator is already a member", "user"))?;
 
         tx.commit().await.map_err(db_err)?;
-        Ok(row.into())
+        row.try_into()
     }
 
     async fn get(&self, id: OrgId) -> Result<Option<Org>> {
@@ -197,7 +203,7 @@ impl OrgRepo for PgOrgRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?;
-        Ok(row.map(Into::into))
+        row.map(TryInto::try_into).transpose()
     }
 
     async fn get_by_slug(&self, slug: &str) -> Result<Option<Org>> {
@@ -207,7 +213,20 @@ impl OrgRepo for PgOrgRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?;
-        Ok(row.map(Into::into))
+        row.map(TryInto::try_into).transpose()
+    }
+
+    async fn set_upstream_policy(&self, id: OrgId, policy: UpstreamPolicy, now: DateTime<Utc>) -> Result<Org> {
+        let row: Option<OrgRow> = sqlx::query_as(q!(
+            "UPDATE orgs SET upstream_policy = $1, updated_at = $2 WHERE id = $3 RETURNING {ORG_COLS}"
+        ))
+        .bind(policy.as_str())
+        .bind(now)
+        .bind(*id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?.try_into()
     }
 
     async fn list_for_user(&self, user: UserId) -> Result<Vec<OrgMembership>> {
@@ -229,7 +248,7 @@ impl OrgRepo for PgOrgRepo {
         .map_err(db_err)?;
 
         rows.into_iter()
-            .map(|row| Ok(OrgMembership { org: row.org.into(), role: role_from_i16(row.role_level)? }))
+            .map(|row| Ok(OrgMembership { org: row.org.try_into()?, role: role_from_i16(row.role_level)? }))
             .collect()
     }
 

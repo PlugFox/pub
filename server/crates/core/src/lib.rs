@@ -13,6 +13,7 @@ pub mod error;
 pub mod event;
 pub mod format;
 pub mod id;
+pub mod jobs;
 pub mod org;
 pub mod package;
 pub mod page;

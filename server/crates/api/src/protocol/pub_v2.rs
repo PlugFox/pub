@@ -13,6 +13,12 @@
 //! 3. **All publish validation happens at finalize** (sharp edge 5). Step 1 has no package
 //!    name to check, step 2 is a byte sink; step 3 answers `200 {"success":…}` or
 //!    `400 {"error":…}` and nothing in between.
+//!
+//! Proxied packages (decision 07) go out through the *same* shapes: a listing fetched from
+//! upstream is re-emitted with upstream's flags, hashes, and pubspecs verbatim and with
+//! `archive_url` rewritten under this request's base, and its archive is served from our own
+//! blob store. A client cannot tell a proxied package from a local one, which is the point —
+//! `PUB_HOSTED_URL` replaces pub.dev rather than sitting beside it (sharp edge 12).
 
 use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
@@ -240,15 +246,26 @@ pub async fn version_listing(
     params: PathParams,
 ) -> Result<PubJson<PackageListing>, ProtocolError> {
     let name = params.require("name")?;
-    let package = resolve_package(&state, &base, &principal, name).await?;
-    let versions = load_versions(&state, package.id).await?;
-    if versions.is_empty() {
-        // A claim or package row with nothing published (or everything hard-deleted) is not
-        // resolvable; a listing with an empty `versions` array would make the client fail
-        // with a confusing "no versions available" instead of "no such package".
-        return Err(ProtocolError::not_found(format!("package {name}")));
+    match resolve_target(&state, &base, &principal, name).await? {
+        Target::Local(package) => {
+            let versions = load_versions(&state, package.id).await?;
+            if versions.is_empty() {
+                // A claim or package row with nothing published (or everything hard-deleted)
+                // is not resolvable; a listing with an empty `versions` array would make the
+                // client fail with a confusing "no versions available" instead of "no such
+                // package".
+                return Err(ProtocolError::not_found(format!("package {name}")));
+            }
+            Ok(PubJson(build_listing(&base, &package, &versions)))
+        }
+        Target::Upstream(upstream) => {
+            let listing = upstream
+                .listing(FORMAT, name, (state.clock)())
+                .await?
+                .ok_or_else(|| ProtocolError::not_found(format!("package {}", clip(name))))?;
+            Ok(PubJson(build_proxied_listing(&base, &listing)))
+        }
     }
-    Ok(PubJson(build_listing(&base, &package, &versions)))
 }
 
 /// Publish step 1 — authorize "may publish *something*", hand back the upload URL.
@@ -479,9 +496,24 @@ pub async fn legacy_version(
     let name = params.require("name")?.to_owned();
     let requested = SemVer::parse(params.require("version")?)
         .map_err(|_| ProtocolError::not_found(format!("version of package {}", clip(&name))))?;
-    let package = resolve_package(&state, &base, &principal, &name).await?;
-    let version = live_version(&state, package.id, &requested).await?;
-    Ok(PubJson(build_version(&base, &package.name, &version)))
+    match resolve_target(&state, &base, &principal, &name).await? {
+        Target::Local(package) => {
+            let version = live_version(&state, package.id, &requested).await?;
+            Ok(PubJson(build_version(&base, &package.name, &version)))
+        }
+        Target::Upstream(upstream) => {
+            let listing = upstream
+                .listing(FORMAT, &name, (state.clock)())
+                .await?
+                .ok_or_else(|| ProtocolError::not_found(format!("package {}", clip(&name))))?;
+            let found = listing
+                .versions
+                .iter()
+                .find(|candidate| candidate.version == requested)
+                .ok_or_else(|| ProtocolError::not_found(format!("version {requested}")))?;
+            Ok(PubJson(build_proxied_version(&base, &listing.name, found)))
+        }
+    }
 }
 
 /// Legacy archive download (docs/protocol.md endpoint 7). Same bytes as [`archive`].
@@ -517,19 +549,38 @@ pub async fn legacy_archive(
 
 // ----------------------------------------------------------------------------------- helpers
 
+/// What a package name resolves to inside this base.
+enum Target<'a> {
+    /// A locally claimed package this principal may read (decision 01 steps 1 and 2).
+    Local(Package),
+    /// The name is claimed nowhere on this instance and this base may consult the proxy
+    /// (decision 01 step 3). Carries the service so the caller cannot reach it any other way.
+    Upstream(&'a pub_registry::UpstreamService),
+}
+
 /// Resolves a package name **through the base's resolution order** and nothing else.
 ///
 /// Handlers never touch `get_by_name` directly: decision 01's ordering (org-owned →
 /// instance-public → upstream-iff-unclaimed) lives in
 /// [`pub_core::traits::PackageRepo::resolve_in_base`], so "local always wins" cannot be
-/// bypassed by a handler that forgets a step. Everything unreadable — restricted, unclaimed,
-/// or syntactically impossible — collapses into the same 404 (S-04).
-async fn resolve_package(
-    state: &AppState,
+/// bypassed by a handler that forgets a step. Everything unreadable — restricted, unclaimed
+/// with no usable proxy, or syntactically impossible — collapses into the same 404 (S-04).
+///
+/// This is also the **only** place the proxy can be entered (S-16). Two facts make that
+/// structural rather than conventional:
+///
+/// - [`Resolution::Unclaimed`] is produced on exactly one path inside `resolve_in_base` —
+///   after `lookup_claim` came back empty — so a locally claimed name can never reach here as
+///   a proxy candidate, whatever a caller does with the result.
+/// - The [`Target::Upstream`] arm *carries* the service. A handler that wanted to proxy a
+///   local name would have to obtain an `UpstreamService` reference some other way, and there
+///   is no other way inside this module.
+async fn resolve_target<'a>(
+    state: &'a AppState,
     base: &Base,
     principal: &Principal,
     name: &str,
-) -> Result<Package, ProtocolError> {
+) -> Result<Target<'a>, ProtocolError> {
     let unknown = || ProtocolError::not_found(format!("package {}", clip(name)));
     // A name that could never be claimed cannot exist. Answering 400 would also make the
     // endpoint a name-syntax oracle with a different status than a real miss.
@@ -538,14 +589,29 @@ async fn resolve_package(
     }
     let resolution = state.repos.packages.resolve_in_base(FORMAT, name, base.scope(), principal.actor()).await?;
     match principal.narrow(resolution) {
-        Resolution::Readable(package) => Ok(package),
+        Resolution::Readable(package) => Ok(Target::Local(package)),
         // Claimed here but not readable from this base — never a proxy candidate (S-16).
         Resolution::Restricted { .. } => Err(unknown()),
-        // TODO(decision 07, proxy slice): an unclaimed name is exactly where the upstream
-        // read-through fetch hooks in. Until it lands, unclaimed reads as unknown.
-        Resolution::Unclaimed => Err(unknown()),
+        Resolution::Unclaimed => upstream_for(state, base).map(Target::Upstream).ok_or_else(unknown),
         _ => Err(unknown()),
     }
+}
+
+/// The proxy service, if this base may use it (decision 01 per-org policy, S-16).
+///
+/// Two gates, and they are different things: `[upstream].enabled` is the instance operator's
+/// switch (absent service = no proxying anywhere), while `orgs.upstream_policy` is the org's
+/// own. A blocked org's registry serves exactly its own and the instance's public packages,
+/// and an unclaimed name there answers the same 404 an unknown one does — a distinguishable
+/// "blocked" status would tell a caller that the name exists upstream (S-04).
+///
+/// The public root has no org and therefore no org policy; it follows the instance switch.
+fn upstream_for<'a>(state: &'a AppState, base: &Base) -> Option<&'a pub_registry::UpstreamService> {
+    let allowed = match &base.org {
+        Some(org) => org.upstream_policy.allows_upstream(),
+        None => true,
+    };
+    if allowed { state.upstream.as_deref() } else { None }
 }
 
 /// Reads every live version of a package, ascending by semver precedence.
@@ -580,6 +646,11 @@ async fn live_version(state: &AppState, package: PackageId, version: &SemVer) ->
 
 /// Resolve → look up → plan the download. Shared by the current and legacy archive routes so
 /// the two can never diverge on visibility or on which bytes they serve.
+///
+/// Proxied archives take the same last step as local ones: the blob key is derived from the
+/// content hash, so "serve the bytes for this sha256" is the *only* thing this function can
+/// express. That is what makes S-19's serve-time re-verification structural — a wrong archive
+/// would have to be stored under a key that is not its own hash.
 async fn serve_archive(
     state: &AppState,
     base: &Base,
@@ -587,12 +658,26 @@ async fn serve_archive(
     name: &str,
     version: &SemVer,
 ) -> Result<Response, ProtocolError> {
-    let package = resolve_package(state, base, principal, name).await?;
-    let found = live_version(state, package.id, version).await?;
-    let key = RegistryService::blob_key(FORMAT, &found.archive_sha256);
+    let (sha256, size) = match resolve_target(state, base, principal, name).await? {
+        Target::Local(package) => {
+            let found = live_version(state, package.id, version).await?;
+            (found.archive_sha256, Some(found.archive_size))
+        }
+        Target::Upstream(upstream) => {
+            // Cache miss, integrity failure, oversized archive, upstream down: every one of
+            // them is a 404 here, never a 5xx the client would hammer (sharp edge 2).
+            let proxied = upstream
+                .archive(FORMAT, name, version, (state.clock)())
+                .await?
+                .ok_or_else(|| ProtocolError::not_found(format!("archive of {} {version}", clip(name))))?;
+            (proxied.archive_sha256, proxied.archive_size)
+        }
+    };
+
+    let key = RegistryService::blob_key(FORMAT, &sha256);
     match state.blob.download(&key).await {
         Ok(DownloadPlan::Redirect(url)) => redirect_to(&url),
-        Ok(DownloadPlan::Stream(stream)) => Ok(stream_archive(name, version, found.archive_size, stream)),
+        Ok(DownloadPlan::Stream(stream)) => Ok(stream_archive(name, version, size, stream)),
         // Metadata without bytes is a broken store, not a missing package — but answering
         // anything but 404 here would leak that the version exists while the bytes do not.
         Err(pub_core::Error::NotFound { .. }) => {
@@ -614,11 +699,15 @@ fn redirect_to(url: &url::Url) -> Result<Response, ProtocolError> {
 }
 
 /// Streams the stored bytes verbatim.
-fn stream_archive(name: &str, version: &SemVer, size: i64, stream: ByteStream) -> Response {
+///
+/// `size` is optional because it is metadata, not the payload: a proxied row whose size we
+/// never measured would otherwise advertise `Content-Length: 0` for a body that is not empty,
+/// which is worse than advertising nothing at all.
+fn stream_archive(name: &str, version: &SemVer, size: Option<i64>, stream: ByteStream) -> Response {
     let mut response = Response::new(Body::from_stream(stream));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-    if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
+    if let Some(value) = size.filter(|size| *size > 0).and_then(|size| HeaderValue::from_str(&size.to_string()).ok()) {
         headers.insert(header::CONTENT_LENGTH, value);
     }
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{name}-{version}.tar.gz\"")) {
@@ -744,10 +833,11 @@ fn upload_error(status: StatusCode, detail: &str) -> ProtocolError {
     ProtocolError::invalid(format!("the upload could not be read as multipart/form-data: {detail}"))
 }
 
-/// Builds the listing body.
+/// Builds the listing body for a local package.
 fn build_listing(base: &Base, package: &Package, versions: &[Version]) -> PackageListing {
     let infos: Vec<VersionInfo> = versions.iter().map(|v| build_version(base, &package.name, v)).collect();
-    let latest = infos[latest_index(versions)].clone();
+    let ladder: Vec<(bool, bool)> = versions.iter().map(|v| (v.is_retracted(), v.version.is_pre_release())).collect();
+    let latest = infos[latest_index(&ladder)].clone();
     PackageListing {
         name: package.name.clone(),
         latest,
@@ -759,7 +849,7 @@ fn build_listing(base: &Base, package: &Package, versions: &[Version]) -> Packag
     }
 }
 
-/// Builds one version entry.
+/// Builds one version entry for a local package.
 fn build_version(base: &Base, name: &str, version: &Version) -> VersionInfo {
     VersionInfo {
         version: version.version.to_string(),
@@ -770,17 +860,61 @@ fn build_version(base: &Base, name: &str, version: &Version) -> VersionInfo {
     }
 }
 
-/// Index of the version a fresh `pub add` should pick, in an ascending-ordered slice.
+/// Builds the listing body for a proxied package (decision 07).
+///
+/// Everything except `archive_url` is upstream's, verbatim: flags, hashes, and the pubspec
+/// documents. `archive_url` is rewritten under *this request's* base (sharp edge 3) — serving
+/// upstream's CDN URL would send the client past the cache, past the per-org policy, and past
+/// stale-serving, and would break the credential prefix rule for a private instance (sharp
+/// edge 4).
+///
+/// `replacedBy` is **not** filtered by `isDiscontinued` here, unlike the local path: upstream's
+/// listing is upstream's truth and re-deriving parts of it is how a proxy starts disagreeing
+/// with the registry it proxies.
+///
+/// [`pub_registry::ProxiedListing::stale`] is deliberately *not* consulted: the staleness
+/// marker is tracing and metrics only (decision 07), and the service emits it once where the
+/// staleness is decided. Re-emitting it here would double every counter, and putting it on the
+/// wire would be a protocol change no client asked for.
+fn build_proxied_listing(base: &Base, listing: &pub_registry::ProxiedListing) -> PackageListing {
+    let infos: Vec<VersionInfo> =
+        listing.versions.iter().map(|version| build_proxied_version(base, &listing.name, version)).collect();
+    let ladder: Vec<(bool, bool)> =
+        listing.versions.iter().map(|v| (v.retracted, v.version.is_pre_release())).collect();
+    let latest = infos[latest_index(&ladder)].clone();
+    PackageListing {
+        name: listing.name.clone(),
+        latest,
+        versions: infos,
+        is_discontinued: listing.discontinued,
+        replaced_by: listing.replaced_by.clone(),
+    }
+}
+
+/// Builds one version entry for a proxied package.
+fn build_proxied_version(base: &Base, name: &str, version: &pub_registry::ProxiedVersion) -> VersionInfo {
+    VersionInfo {
+        version: version.version.to_string(),
+        retracted: version.retracted,
+        archive_url: base.absolute(&format!("/api/archives/{name}-{}.tar.gz", version.version)),
+        archive_sha256: version.archive_sha256.clone(),
+        pubspec: version.pubspec.clone(),
+    }
+}
+
+/// Index of the version a fresh `pub add` should pick, given `(retracted, pre_release)` flags
+/// in ascending precedence order.
 ///
 /// Highest live stable, else highest live pre-release, else the highest version there is —
 /// a package whose every version is retracted still has to report *something*, and reporting
-/// the newest keeps `latest` consistent with the array's tail.
-fn latest_index(versions: &[Version]) -> usize {
+/// the newest keeps `latest` consistent with the array's tail. One rule for local and proxied
+/// listings alike: a client must not be able to tell them apart by how `latest` is chosen.
+fn latest_index(versions: &[(bool, bool)]) -> usize {
     debug_assert!(!versions.is_empty(), "callers must reject empty listings first");
     versions
         .iter()
-        .rposition(|v| !v.is_retracted() && !v.version.is_pre_release())
-        .or_else(|| versions.iter().rposition(|v| !v.is_retracted()))
+        .rposition(|(retracted, pre_release)| !retracted && !pre_release)
+        .or_else(|| versions.iter().rposition(|(retracted, _)| !retracted))
         .unwrap_or(versions.len() - 1)
 }
 
@@ -866,6 +1000,11 @@ mod tests {
 
     use super::*;
 
+    /// Projects versions onto the `(retracted, pre_release)` pairs `latest_index` reads.
+    fn ladder(versions: &[Version]) -> Vec<(bool, bool)> {
+        versions.iter().map(|v| (v.is_retracted(), v.version.is_pre_release())).collect()
+    }
+
     fn version(raw: &str, retracted: bool) -> Version {
         Version {
             id: VersionId::new(),
@@ -885,22 +1024,22 @@ mod tests {
 
     #[test]
     fn latest_prefers_the_newest_live_stable() {
-        let versions = [version("1.0.0", false), version("1.1.0", false), version("2.0.0-beta.1", false)];
+        let versions = ladder(&[version("1.0.0", false), version("1.1.0", false), version("2.0.0-beta.1", false)]);
         assert_eq!(latest_index(&versions), 1);
     }
 
     #[test]
     fn latest_skips_retracted_versions() {
-        let versions = [version("1.0.0", false), version("1.1.0", true)];
+        let versions = ladder(&[version("1.0.0", false), version("1.1.0", true)]);
         assert_eq!(latest_index(&versions), 0);
     }
 
     #[test]
     fn latest_falls_back_to_a_prerelease_then_to_anything() {
-        let only_pre = [version("1.0.0-alpha", false), version("1.0.0-beta", false)];
+        let only_pre = ladder(&[version("1.0.0-alpha", false), version("1.0.0-beta", false)]);
         assert_eq!(latest_index(&only_pre), 1);
         // Every version retracted: still has to name one, and the newest is the least wrong.
-        let all_retracted = [version("1.0.0", true), version("1.1.0", true)];
+        let all_retracted = ladder(&[version("1.0.0", true), version("1.1.0", true)]);
         assert_eq!(latest_index(&all_retracted), 1);
     }
 

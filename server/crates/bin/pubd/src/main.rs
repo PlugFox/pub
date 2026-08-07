@@ -16,17 +16,24 @@ use pub_auth::jwt::Keyring;
 use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::{OsRandom, RandomSource as _};
 use pub_blob::ObjectStoreBlob;
-use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, Settings, SmtpSecurityMode};
+use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, MirrorModeConfig, Settings, SmtpSecurityMode};
+use pub_core::Format;
 use pub_core::event::{EventSink, NoopEventSink};
 use pub_core::session::SessionLimits;
 use pub_core::traits::JobLock;
 use pub_core::traits::{BlobStore, Kv, Mailer, Repositories};
 use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
-use pub_jobs::InMemoryJobLock;
+use pub_jobs::{
+    BLOB_GC_JOB, BlobGc, GcPolicy, InMemoryJobLock, MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorWorker, Scheduler,
+    SchedulerHandle,
+};
 use pub_kv::{MemoryKv, RedisKv};
 use pub_mail::{InMemoryMailer, SmtpMailer, SmtpSecurity, SmtpSettings};
-use pub_registry::{ArchiveLimits, RegistryPolicy, RegistryService};
+use pub_registry::upstream::http::{HttpUpstream, HttpUpstreamConfig};
+use pub_registry::{
+    ArchiveLimits, RegistryPolicy, RegistryService, UpstreamClient, UpstreamService, UpstreamServicePolicy,
+};
 use pub_telemetry::LogFormat;
 
 /// Version string surfaced by `pubd --version`: crate version + git hash + build date.
@@ -51,9 +58,15 @@ async fn main() -> anyhow::Result<()> {
     let mailer = build_mailer(&settings)?;
     let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer))?;
     let registry = build_registry(&settings, repos.clone(), Arc::clone(&blob));
+    let upstream = build_upstream(&settings, repos.clone(), Arc::clone(&blob))?;
+
+    // The scheduler owns its tasks and aborts them when the handle drops, so it must outlive
+    // `serve` — a mirror sweep that stops the moment the binding is dropped would be a very
+    // confusing bug.
+    let _jobs = spawn_jobs(&settings, repos.clone(), Arc::clone(&blob), upstream.clone());
 
     let listen = settings.server.listen.clone();
-    let state = AppState::new(settings, repos, blob, kv, auth, registry);
+    let state = AppState::new(settings, repos, blob, kv, auth, registry).with_upstream(upstream);
     let app = pub_api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("failed to bind {listen}"))?;
@@ -124,6 +137,132 @@ fn build_registry(settings: &Settings, repos: Repositories, blob: Arc<dyn BlobSt
     let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
     let events: Arc<dyn EventSink> = Arc::new(NoopEventSink);
     Arc::new(RegistryService::new(repos, blob, lock, events, policy))
+}
+
+/// Builds the upstream read-through proxy from the `[upstream]` config section (decision 07).
+///
+/// Returns `None` when the proxy is disabled, and that `None` is load-bearing: with no service
+/// in `AppState` there is no upstream branch in the resolution path at all, which is exactly
+/// what an air-gapped deployment is buying (as opposed to a proxy that is configured but keeps
+/// answering nothing).
+fn build_upstream(
+    settings: &Settings,
+    repos: Repositories,
+    blob: Arc<dyn BlobStore>,
+) -> anyhow::Result<Option<Arc<UpstreamService>>> {
+    let cfg = &settings.upstream;
+    if !cfg.enabled {
+        tracing::info!("upstream proxy disabled — unclaimed package names resolve to 404");
+        return Ok(None);
+    }
+
+    let client: Arc<dyn UpstreamClient> = Arc::new(
+        HttpUpstream::new(HttpUpstreamConfig {
+            base_url: cfg.base_url.clone(),
+            user_agent: cfg.user_agent.clone(),
+            auth_token: cfg.auth_token.as_ref().map(|token| token.expose().to_owned()),
+            connect_timeout: Duration::from_secs(cfg.connect_timeout_secs),
+            listing_timeout: Duration::from_secs(cfg.listing_timeout_secs),
+            archive_timeout: Duration::from_secs(cfg.archive_timeout_secs),
+            max_retries: cfg.max_retries,
+            retry_backoff: Duration::from_millis(cfg.retry_backoff_ms),
+            retry_max_backoff: Duration::from_millis(cfg.retry_max_backoff_ms),
+            max_listing_bytes: cfg.max_listing_bytes,
+            // The config validator already refuses a plaintext upstream in production mode;
+            // this flag is what lets a dev instance point at a mock on localhost.
+            allow_plaintext: settings.server.mode != pub_config::RunMode::Production,
+        })
+        .map_err(|err| anyhow::anyhow!("{err}"))?,
+    );
+
+    // The event sink is a no-op until the domain event bus lands (decision 22); the S-19
+    // alarms it will carry are audit-logged unconditionally in the meantime.
+    let events: Arc<dyn EventSink> = Arc::new(NoopEventSink);
+    let policy = UpstreamServicePolicy {
+        listing_ttl: chrono::Duration::seconds(cfg.listing_ttl_secs as i64),
+        max_archive_bytes: cfg.max_archive_bytes,
+        circuit_failure_threshold: cfg.circuit_failure_threshold,
+        circuit_open: chrono::Duration::seconds(cfg.circuit_open_secs as i64),
+        max_concurrent_fetches: cfg.max_concurrent_fetches as usize,
+    };
+    tracing::info!(upstream = %cfg.base_url, ttl_secs = cfg.listing_ttl_secs, "upstream read-through proxy enabled");
+    Ok(Some(Arc::new(UpstreamService::new(repos, blob, client, events, policy))))
+}
+
+/// Registers the enabled background jobs and spawns the leader-locked scheduler
+/// (decision 03; docs/architecture.md "Background jobs").
+///
+/// Both jobs are **off by default** and each is skipped entirely when it is: a job that is not
+/// registered cannot tick, which is a stronger guarantee than a job whose body returns early —
+/// and for the GC, which deletes bytes, that difference is the point.
+///
+/// The lock is the in-process one for now (single instance); the Redis-backed implementation
+/// arrives with the multi-instance tier, and it is a one-line change here because the scheduler
+/// only ever sees `Arc<dyn JobLock>`.
+fn spawn_jobs(
+    settings: &Settings,
+    repos: Repositories,
+    blob: Arc<dyn BlobStore>,
+    upstream: Option<Arc<pub_registry::UpstreamService>>,
+) -> Option<SchedulerHandle> {
+    let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
+    let mut scheduler = Scheduler::new(lock);
+    let mut registered = Vec::new();
+
+    let mirror_cfg = settings.upstream.mirror;
+    if let Some(upstream) = upstream.filter(|_| mirror_cfg.mode.is_enabled()) {
+        let policy = MirrorPolicy {
+            mode: match mirror_cfg.mode {
+                MirrorModeConfig::Off => MirrorMode::Off,
+                MirrorModeConfig::Recent => MirrorMode::Recent,
+                MirrorModeConfig::Full => MirrorMode::Full,
+            },
+            interval: Duration::from_secs(mirror_cfg.interval_secs),
+            chunk: mirror_cfg.chunk as usize,
+            concurrency: mirror_cfg.concurrency as usize,
+            refresh_after: chrono::Duration::seconds(mirror_cfg.refresh_after_secs as i64),
+            archives: mirror_cfg.archives,
+            archive_versions: mirror_cfg.archive_versions as usize,
+            resweep_after: chrono::Duration::seconds(mirror_cfg.resweep_after_secs as i64),
+        };
+        let interval = policy.interval;
+        let worker = Arc::new(MirrorWorker::new(repos.clone(), upstream, Format::Pub, policy));
+        scheduler.add(MIRROR_JOB, interval, move || {
+            let worker = Arc::clone(&worker);
+            async move {
+                worker.run_once(chrono::Utc::now()).await?;
+                Ok(())
+            }
+        });
+        registered.push(MIRROR_JOB);
+    }
+
+    let gc_cfg = settings.jobs.blob_gc;
+    if gc_cfg.enabled {
+        let policy = GcPolicy {
+            enabled: true,
+            interval: Duration::from_secs(gc_cfg.interval_secs),
+            dry_run: gc_cfg.dry_run,
+            min_age: chrono::Duration::seconds(gc_cfg.min_age_secs as i64),
+        };
+        let interval = policy.interval;
+        let gc = Arc::new(BlobGc::new(repos, blob, vec![Format::Pub], policy));
+        scheduler.add(BLOB_GC_JOB, interval, move || {
+            let gc = Arc::clone(&gc);
+            async move {
+                gc.run_once(chrono::Utc::now()).await?;
+                Ok(())
+            }
+        });
+        registered.push(BLOB_GC_JOB);
+    }
+
+    if registered.is_empty() {
+        tracing::info!("no background jobs enabled");
+        return None;
+    }
+    tracing::info!(jobs = ?registered, "background jobs scheduled");
+    Some(scheduler.spawn())
 }
 
 /// Selects the KV backend by config kind (decision 09; redis is mandatory for replicas > 1).

@@ -36,6 +36,8 @@ base64 = { workspace = true }
 # The conformance suite publishes real `.tar.gz` packages through the HTTP surface — a
 # hand-rolled fixture would not exercise the ingest path the CLI actually drives.
 flate2 = { workspace = true }
+# The scripted upstream in the proxy suite hands back a streamed archive body.
+futures = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 # The adversarial suite forges tokens the way an attacker would: raw Ed25519 key material

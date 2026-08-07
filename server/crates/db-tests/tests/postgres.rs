@@ -163,3 +163,31 @@ async fn resolve_in_base_scope_contract_decision01() {
     pub_db_tests::contract::resolve_in_base_scope(&db.repos()).await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn upstream_repo_contract_s19() {
+    let Some(db) = TestDb::create("upstream_repo_contract_s19").await else { return };
+    pub_db_tests::contract::upstream_repo(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn upstream_mirror_reads_contract() {
+    let Some(db) = TestDb::create("upstream_mirror_reads_contract").await else { return };
+    pub_db_tests::contract::upstream_mirror_reads(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn supply_chain_registers_contract_s17_s19() {
+    let Some(db) = TestDb::create("supply_chain_registers_contract_s17_s19").await else { return };
+    pub_db_tests::contract::supply_chain_registers(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn job_repo_contract() {
+    let Some(db) = TestDb::create("job_repo_contract").await else { return };
+    pub_db_tests::contract::job_repo(&db.repos()).await;
+    db.cleanup().await;
+}

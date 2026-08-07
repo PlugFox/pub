@@ -26,10 +26,12 @@ use url::Url;
 use crate::audit::{AuditEvent, AuditFilter, NewAuditEvent};
 use crate::authorize::{Action, ActorContext, Resource, authorize};
 use crate::credential::Credential;
-use crate::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership};
+use crate::jobs::{JobOutcome, JobProgress, JobState};
+use crate::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, UpstreamPolicy};
 use crate::package::{
-    BaseScope, NameClaim, NewPackage, NewVersion, Package, PackageOptions, PublishedVersion, Resolution, Version,
-    Visibility,
+    BaseScope, NameClaim, NewPackage, NewQuarantineEntry, NewShadowingAlarm, NewVersion, Package, PackageOptions,
+    PublishedVersion, QuarantineEntry, Resolution, ShadowingAlarm, UpstreamCacheEntry, UpstreamPackage,
+    UpstreamSnapshot, UpstreamVersion, Version, Visibility,
 };
 use crate::page::Page;
 use crate::semver::SemVer;
@@ -258,6 +260,135 @@ pub trait PackageRepo: Send + Sync {
     }
 }
 
+/// Proxy-cache persistence: upstream listing snapshots and the per-version rows behind them
+/// (decision 07, S-19).
+///
+/// This repository is deliberately **not** part of [`PackageRepo`]: an upstream row is not a
+/// package we own. It has no org, no claim, no publisher, and no lifecycle of its own — it is
+/// a cached copy of somebody else's truth, and keeping it in a separate trait is what stops a
+/// resolution path from confusing the two (S-16 "local always wins" is only meaningful while
+/// the two sets are distinguishable).
+///
+/// Two contracts are load-bearing and are asserted by the shared contract suite against every
+/// backend:
+///
+/// 1. **A snapshot never deletes.** [`UpstreamRepo::save_snapshot`] upserts; versions missing
+///    from the new listing keep their rows, because we may already hold their bytes and a
+///    hash in somebody's `pubspec.lock` has to keep resolving.
+/// 2. **A cached version's hash and size are immutable** (S-19 byte-drift). Once
+///    [`UpstreamVersion::cached`] is set, `save_snapshot` keeps the recorded
+///    `archive_sha256` even when upstream now advertises a different one — and the
+///    `archive_size` measured while caching, since a later claim must not make the served
+///    `Content-Length` disagree with the bytes. The service layer detects and alarms on the
+///    drift; this rule makes overwriting impossible even if it did not.
+#[async_trait]
+pub trait UpstreamRepo: Send + Sync {
+    /// Cheap connectivity probe used by `/healthz`.
+    async fn ping(&self) -> Result<()>;
+
+    /// The cached snapshot row for `(format, name)`; `None` when the name was never fetched.
+    async fn get_package(&self, format: Format, name: &str) -> Result<Option<UpstreamPackage>>;
+
+    /// Every cached version of an upstream package, ascending by semver precedence.
+    async fn list_versions(&self, package: PackageId) -> Result<Vec<UpstreamVersion>>;
+
+    /// One cached upstream version by exact number; `None` when unknown.
+    async fn get_version(&self, package: PackageId, version: &SemVer) -> Result<Option<UpstreamVersion>>;
+
+    /// Writes a listing snapshot (upsert, per contract 1 and 2 above) and returns the stored
+    /// package row.
+    async fn save_snapshot(&self, snapshot: UpstreamSnapshot, now: DateTime<Utc>) -> Result<UpstreamPackage>;
+
+    /// Records that the archive bytes for this version are now in our blob store, under the
+    /// content-addressed key derived from `sha256`, and how many bytes they are.
+    ///
+    /// The hash is passed and matched rather than trusted from the row: the caller verified it
+    /// against the bytes it just stored (S-19), and a row whose hash moved underneath a
+    /// concurrent snapshot must not be marked cached for the wrong content. Returns whether a
+    /// row was updated. Unknown id → `false`, never an error: the cache is best-effort.
+    ///
+    /// `size` is recorded because upstream listings do not carry one and the served response
+    /// needs a `Content-Length`; a later snapshot must not erase it (see
+    /// [`UpstreamRepo::save_snapshot`]).
+    async fn mark_cached(&self, id: VersionId, sha256: &str, size: i64, now: DateTime<Utc>) -> Result<bool>;
+
+    /// Snapshots older than `before`, **oldest first**, capped at `limit` — the mirror
+    /// worker's steady-state work queue (decision 07 mirror mode).
+    ///
+    /// No cursor: refreshing a snapshot updates its `fetched_at`, which moves it to the back of
+    /// this ordering, so repeated calls walk the whole cache without one. That is also what
+    /// makes the job idempotent — an interrupted pass simply re-reads the packages it had not
+    /// reached yet.
+    async fn list_stale(&self, format: Format, before: DateTime<Utc>, limit: u32) -> Result<Vec<UpstreamPackage>>;
+
+    /// The admin-facing cache inventory: one aggregated row per cached upstream package,
+    /// keyset-paginated over the name.
+    async fn list_cached(&self, format: Format, cursor: Option<&str>, limit: u32) -> Result<Page<UpstreamCacheEntry>>;
+
+    /// How many **cached** upstream versions reference this content hash.
+    ///
+    /// The proxy stores its archives under the same content-addressed keys a local publish
+    /// uses, so unreferenced-blob GC has to ask both this and
+    /// [`PackageRepo::count_versions_with_sha256`] before it deletes anything. Missing this
+    /// half would delete bytes a `pubspec.lock` pins through the proxy (S-18).
+    async fn count_cached_with_sha256(&self, sha256: &str) -> Result<u64>;
+
+    /// Records a refused archive (S-19 hash mismatch). Repeated observations of one
+    /// `(format, name, version)` collapse onto one row: `occurrences` increments and
+    /// `last_seen_at` advances.
+    async fn record_quarantine(&self, entry: NewQuarantineEntry, now: DateTime<Utc>) -> Result<QuarantineEntry>;
+
+    /// Quarantined items, most recently observed first.
+    async fn list_quarantine(&self, limit: u32) -> Result<Vec<QuarantineEntry>>;
+
+    /// Records that a locally claimed name was observed upstream (S-17).
+    ///
+    /// Returns the row and whether this call **raised** the alarm — either the first-ever
+    /// observation, or the first one after an admin acknowledged it. Only a raise is worth an
+    /// audit event, a notification, and a page; every subsequent sighting is a counter, or the
+    /// mirror worker would re-alert on every sweep for as long as the condition holds.
+    async fn record_shadowing(&self, alarm: NewShadowingAlarm, now: DateTime<Utc>) -> Result<(ShadowingAlarm, bool)>;
+
+    /// Shadowing alarms, newest observation first. `active_only` hides acknowledged ones.
+    async fn list_shadowing(&self, active_only: bool, limit: u32) -> Result<Vec<ShadowingAlarm>>;
+
+    /// Acknowledges a shadowing alarm; returns whether an active alarm was acknowledged.
+    ///
+    /// Acknowledging is bookkeeping, never policy: the local package wins before and after,
+    /// because the alternative would make an admin click a button to keep their own package.
+    async fn acknowledge_shadowing(&self, format: Format, name: &str, now: DateTime<Utc>) -> Result<bool>;
+}
+
+/// Durable background-job state (decision 03 leader-locked scheduler; see [`crate::jobs`]).
+///
+/// Separate from [`JobLock`] on purpose: the lock answers "may I run right now" and lives
+/// wherever leader election does (KV, PG advisory locks), while this answers "where did I get
+/// to" and has to be durable across every restart and every leader change. One instance
+/// acquiring the lock must resume the cursor the *previous* leader wrote.
+#[async_trait]
+pub trait JobRepo: Send + Sync {
+    /// Cheap connectivity probe used by `/healthz`.
+    async fn ping(&self) -> Result<()>;
+
+    /// The job's state; `None` when it has never run.
+    async fn get(&self, name: &str) -> Result<Option<JobState>>;
+
+    /// Every job's state, ordered by name — the admin surface's job table.
+    async fn list(&self) -> Result<Vec<JobState>>;
+
+    /// Stamps the start of a run (creating the row on first use) and returns the state to
+    /// **resume from**, cursor included. Increments `runs`.
+    async fn begin_run(&self, name: &str, now: DateTime<Utc>) -> Result<JobState>;
+
+    /// Records mid-run progress: sets `cursor`/`phase` and *adds* the reported counters
+    /// ([`JobProgress`]). Safe to call as often as the job checkpoints.
+    async fn checkpoint(&self, name: &str, progress: &JobProgress, now: DateTime<Utc>) -> Result<JobState>;
+
+    /// Records how the run ended (see [`JobOutcome`]). A failure keeps the cursor, so the next
+    /// run continues rather than starting over.
+    async fn finish_run(&self, name: &str, outcome: JobOutcome, now: DateTime<Utc>) -> Result<JobState>;
+}
+
 /// User account persistence.
 #[async_trait]
 pub trait UserRepo: Send + Sync {
@@ -372,6 +503,14 @@ pub trait OrgRepo: Send + Sync {
 
     /// The org with this slug (case-insensitive); `None` when unknown.
     async fn get_by_slug(&self, slug: &str) -> Result<Option<Org>>;
+
+    /// Sets the org's upstream-proxy policy (decision 01, S-16) and bumps `updated_at`.
+    /// Unknown id → `NotFound`.
+    ///
+    /// A dedicated setter rather than a general "update org" patch: this field is a
+    /// *resolution* policy — flipping it changes which packages an entire team can install —
+    /// so it gets its own audited call site instead of riding along with a rename.
+    async fn set_upstream_policy(&self, id: OrgId, policy: UpstreamPolicy, now: DateTime<Utc>) -> Result<Org>;
 
     /// Every org the user is a member of, with the user's role, oldest org first.
     async fn list_for_user(&self, user: UserId) -> Result<Vec<OrgMembership>>;
@@ -608,6 +747,34 @@ pub trait BlobStore: Send + Sync {
     /// content-addressed, so identical uploads share one object (docs/protocol.md sharp
     /// edge 3 — served bytes are stable forever).
     async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Every object under `prefix`, with its size and last-modified time.
+    ///
+    /// Exists for one caller — the unreferenced-blob GC job — and the last-modified time is
+    /// what makes that job safe: the publish pipeline writes bytes *before* the version row
+    /// (an interrupted publish must leave garbage, never a row pointing at nothing), so a
+    /// freshly written blob is legitimately unreferenced for the width of one transaction.
+    /// GC therefore refuses to touch anything younger than its grace period, and a backend
+    /// that cannot report an age cannot be swept.
+    ///
+    /// The default is [`crate::Error::Unimplemented`]: a store that cannot enumerate is not a
+    /// broken store, it just cannot be garbage-collected, and the job reports that as a job
+    /// failure rather than silently deleting on incomplete information.
+    async fn list(&self, prefix: &str) -> Result<Vec<BlobObject>> {
+        let _ = prefix;
+        Err(crate::Error::Unimplemented { what: "this blob backend cannot enumerate objects".to_owned() })
+    }
+}
+
+/// One stored object, as [`BlobStore::list`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobObject {
+    /// Storage key.
+    pub key: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Last modification time, when the backend reports one.
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 /// Key-value store **and** pub/sub broker (decision 03) — one seam for revocation fast paths,
@@ -682,6 +849,8 @@ pub trait Mailer: Send + Sync {
 pub struct Repositories {
     /// Packages, versions, and name claims.
     pub packages: Arc<dyn PackageRepo>,
+    /// Upstream proxy cache (decision 07).
+    pub upstream: Arc<dyn UpstreamRepo>,
     /// User accounts.
     pub users: Arc<dyn UserRepo>,
     /// Identity credentials.
@@ -696,6 +865,8 @@ pub struct Repositories {
     pub audit: Arc<dyn AuditRepo>,
     /// Runtime settings.
     pub settings: Arc<dyn SettingsRepo>,
+    /// Durable background-job state (decision 03, decision 07 mirror).
+    pub jobs: Arc<dyn JobRepo>,
 }
 
 /// Leader-election lock guarding single-instance background jobs (PG advisory lock / Redis

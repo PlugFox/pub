@@ -124,6 +124,11 @@ pub struct Settings {
     pub smtp: SmtpConfig,
     /// Registry ingest limits and version-lifecycle policy.
     pub registry: RegistryConfig,
+    /// Upstream proxy (decision 07): where unclaimed names are fetched from, and under what
+    /// timeouts, retries, and failure budget.
+    pub upstream: UpstreamConfig,
+    /// Background jobs (decision 03 leader-locked scheduler).
+    pub jobs: JobsConfig,
 }
 
 /// Deployment mode: gates the dev-only secret fallbacks (S-25).
@@ -582,6 +587,228 @@ impl Default for RegistryConfig {
     }
 }
 
+/// Upstream proxy settings (decision 07, S-16/S-19).
+///
+/// The section describes **one** upstream per instance, because decision 07's read-through
+/// cache resolves a name against exactly one source of truth; per-format upstreams
+/// (registry.npmjs.org, crates.io — decision 21) become sibling sections when their protocol
+/// modules land, not a list here, since each speaks a different wire format.
+///
+/// [`Debug`] is hand-written: [`UpstreamConfig::auth_token`] is a bearer credential for
+/// authenticated upstreams and must never reach a log line (S-25.a).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamConfig {
+    /// Whether unclaimed names may be proxied at all. Off flips every upstream lookup into
+    /// the same 404 an unknown name gets — the switch an air-gapped instance turns.
+    pub enabled: bool,
+    /// Upstream base URL, without a trailing slash (`https://pub.dev`). HTTPS is required in
+    /// production mode: the listing carries the `archive_sha256` we verify against, so a
+    /// plaintext listing hands an on-path attacker the integrity check as well as the bytes.
+    pub base_url: String,
+    /// `User-Agent` sent upstream. Operators of public mirrors ask for a contactable one.
+    pub user_agent: String,
+    /// Bearer token for upstreams that require authentication (a private mirror, a paid
+    /// registry). Unset for pub.dev. Secret — S-25.
+    pub auth_token: Option<Secret>,
+    /// TCP+TLS connect timeout in seconds.
+    pub connect_timeout_secs: u64,
+    /// Whole-request timeout for a listing fetch in seconds.
+    pub listing_timeout_secs: u64,
+    /// Whole-request timeout for an archive download in seconds — larger, because it moves
+    /// megabytes over a link we do not control.
+    pub archive_timeout_secs: u64,
+    /// Retries **after** the first attempt for a transient upstream failure.
+    pub max_retries: u32,
+    /// First retry backoff in milliseconds; doubles per attempt up to
+    /// [`UpstreamConfig::retry_max_backoff_ms`].
+    pub retry_backoff_ms: u64,
+    /// Ceiling for the exponential retry backoff in milliseconds.
+    pub retry_max_backoff_ms: u64,
+    /// Largest upstream archive accepted, in bytes. Enforced against the advertised
+    /// `Content-Length` *and* while streaming, since the header is upstream's claim.
+    pub max_archive_bytes: u64,
+    /// Largest upstream listing document accepted, in bytes. A listing is parsed into memory
+    /// and carries a whole pubspec per version, so it needs its own bound.
+    pub max_listing_bytes: u64,
+    /// How long a cached listing is served without re-asking upstream, in seconds. This is
+    /// the knob that decides how quickly an upstream retraction becomes visible here, and how
+    /// much traffic the hot path (re-fetched by the client before every resolve) sends out.
+    pub listing_ttl_secs: u64,
+    /// Maximum simultaneous in-flight upstream requests from this instance. Independent of
+    /// the single-flight guard, which collapses duplicate work for *one* package.
+    pub max_concurrent_fetches: u32,
+    /// Consecutive failures that trip the circuit breaker open.
+    pub circuit_failure_threshold: u32,
+    /// How long the breaker stays open before it lets one probe through, in seconds.
+    pub circuit_open_secs: u64,
+    /// Mirror-mode sync worker (decision 07's second half); off by default.
+    pub mirror: MirrorConfig,
+}
+
+/// How much of upstream the mirror worker keeps warm (`[upstream.mirror] mode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MirrorModeConfig {
+    /// No worker: the cache is filled by traffic alone (pure read-through). The default,
+    /// because mirroring is a deliberate decision about egress and storage.
+    #[default]
+    Off,
+    /// Keep the packages this instance already caches fresh, oldest snapshot first.
+    Recent,
+    /// One initial sweep over upstream's whole package-name list, then `recent` forever after.
+    Full,
+}
+
+impl MirrorModeConfig {
+    /// Canonical lowercase name as used in config files.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Recent => "recent",
+            Self::Full => "full",
+        }
+    }
+
+    /// Whether a worker should be scheduled at all.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// Mirror sync worker settings (decision 07).
+///
+/// Mirror mode is read-through *warmed by a job*: every knob here is about **when** the shared
+/// ingest pipeline runs, never about what it stores. The integrity rules (S-19), the pubspec
+/// validator (S-20), and the per-org policy are the same ones a cache miss goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MirrorConfig {
+    /// `off` (default) | `recent` | `full`.
+    pub mode: MirrorModeConfig,
+    /// Seconds between ticks.
+    pub interval_secs: u64,
+    /// Packages processed per tick — the bound on how long one tick holds the leader lock.
+    pub chunk: u32,
+    /// Packages refreshed simultaneously. Excess refreshes queue on the upstream semaphore
+    /// (`max_concurrent_fetches`), so this bounds *our* concurrency and that one still bounds
+    /// upstream's.
+    pub concurrency: u32,
+    /// A snapshot younger than this is left alone: the mirror's freshness target and its
+    /// throttle in one number.
+    pub refresh_after_secs: u64,
+    /// Whether to pull archive **bytes** as well as metadata. Off by default: metadata
+    /// mirroring keeps resolution fast and leaves bytes to the read-through path, while an
+    /// air-gapped instance needs the bytes and pays for them.
+    pub archives: bool,
+    /// With `archives` on, how many of a package's newest live versions to warm per pass.
+    pub archive_versions: u32,
+    /// In `full` mode, seconds after a completed enumeration before the next one starts.
+    ///
+    /// Enumeration is also drift repair (decision 07) and the only channel through which a
+    /// *newly appearing* upstream namesake of a locally claimed package can be noticed (S-17) —
+    /// the read path never asks upstream about a claimed name. A mirror that swept once would
+    /// go permanently blind to it.
+    pub resweep_after_secs: u64,
+}
+
+impl Default for MirrorConfig {
+    fn default() -> Self {
+        Self {
+            mode: MirrorModeConfig::Off,
+            interval_secs: 300,
+            chunk: 200,
+            concurrency: 4,
+            refresh_after_secs: 3600,
+            archives: false,
+            archive_versions: 1,
+            resweep_after_secs: 24 * 3600,
+        }
+    }
+}
+
+/// Background-job settings (decision 03: leader-locked interval scheduler).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobsConfig {
+    /// Unreferenced-blob garbage collection.
+    pub blob_gc: BlobGcConfig,
+}
+
+/// Unreferenced-blob GC settings.
+///
+/// Off and dry-run by default in both cases for the same reason: the job deletes bytes
+/// permanently, and byte stability is the one property this system cannot repair after the
+/// fact (S-18). An operator turns it on, reads a dry-run pass, then clears `dry_run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlobGcConfig {
+    /// Whether the job is scheduled at all.
+    pub enabled: bool,
+    /// Seconds between passes.
+    pub interval_secs: u64,
+    /// Report what would be deleted and delete nothing.
+    pub dry_run: bool,
+    /// Grace period: objects younger than this are never collected. Must exceed the staged
+    /// upload TTL (1 hour) — a staged upload is finalizable, and therefore live, that whole
+    /// time without any database row referencing it.
+    pub min_age_secs: u64,
+}
+
+impl Default for BlobGcConfig {
+    fn default() -> Self {
+        Self { enabled: false, interval_secs: 6 * 3600, dry_run: true, min_age_secs: 24 * 3600 }
+    }
+}
+
+impl std::fmt::Debug for UpstreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamConfig")
+            .field("enabled", &self.enabled)
+            .field("base_url", &self.base_url)
+            .field("user_agent", &self.user_agent)
+            .field("auth_token", &self.auth_token)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("listing_timeout_secs", &self.listing_timeout_secs)
+            .field("archive_timeout_secs", &self.archive_timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .field("retry_backoff_ms", &self.retry_backoff_ms)
+            .field("retry_max_backoff_ms", &self.retry_max_backoff_ms)
+            .field("max_archive_bytes", &self.max_archive_bytes)
+            .field("max_listing_bytes", &self.max_listing_bytes)
+            .field("listing_ttl_secs", &self.listing_ttl_secs)
+            .field("max_concurrent_fetches", &self.max_concurrent_fetches)
+            .field("circuit_failure_threshold", &self.circuit_failure_threshold)
+            .field("circuit_open_secs", &self.circuit_open_secs)
+            .field("mirror", &self.mirror)
+            .finish()
+    }
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: "https://pub.dev".to_owned(),
+            user_agent: concat!("pub/", env!("CARGO_PKG_VERSION"), " (self-hosted registry)").to_owned(),
+            auth_token: None,
+            connect_timeout_secs: 10,
+            listing_timeout_secs: 30,
+            archive_timeout_secs: 300,
+            max_retries: 2,
+            retry_backoff_ms: 250,
+            retry_max_backoff_ms: 5_000,
+            max_archive_bytes: 100 * 1024 * 1024,
+            max_listing_bytes: 8 * 1024 * 1024,
+            listing_ttl_secs: 300,
+            max_concurrent_fetches: 8,
+            circuit_failure_threshold: 5,
+            circuit_open_secs: 30,
+            mirror: MirrorConfig::default(),
+        }
+    }
+}
+
 /// Multi-instance topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -731,6 +958,68 @@ impl Settings {
         let _ = writeln!(out, "  registry.auth_read   = {}", self.registry.require_auth_for_read);
         let _ =
             writeln!(out, "  registry.rate_limit  = publish {}/h/org", self.registry.rate_limit.publish_per_hour_org);
+
+        if self.upstream.enabled {
+            let _ = writeln!(out, "  upstream.base_url    = {}", self.upstream.base_url);
+            let _ = writeln!(out, "  upstream.auth_token  = {}", mask_opt(&self.upstream.auth_token));
+            let _ = writeln!(
+                out,
+                "  upstream.timeouts    = connect {}s, listing {}s, archive {}s",
+                self.upstream.connect_timeout_secs,
+                self.upstream.listing_timeout_secs,
+                self.upstream.archive_timeout_secs
+            );
+            let _ = writeln!(
+                out,
+                "  upstream.retry       = {} retries, backoff {}..{} ms",
+                self.upstream.max_retries, self.upstream.retry_backoff_ms, self.upstream.retry_max_backoff_ms
+            );
+            let _ = writeln!(
+                out,
+                "  upstream.limits      = archive {} MB, listing {} MB, ttl {}s, {} concurrent",
+                self.upstream.max_archive_bytes / (1024 * 1024),
+                self.upstream.max_listing_bytes / (1024 * 1024),
+                self.upstream.listing_ttl_secs,
+                self.upstream.max_concurrent_fetches
+            );
+            let _ = writeln!(
+                out,
+                "  upstream.breaker     = {} failures, open {}s",
+                self.upstream.circuit_failure_threshold, self.upstream.circuit_open_secs
+            );
+            let mirror = &self.upstream.mirror;
+            if mirror.mode.is_enabled() {
+                let _ = writeln!(
+                    out,
+                    "  upstream.mirror      = {} every {}s, {} per tick, {} concurrent, refresh after {}s, \
+                     resweep after {}s, archives {}",
+                    mirror.mode.as_str(),
+                    mirror.interval_secs,
+                    mirror.chunk,
+                    mirror.concurrency,
+                    mirror.refresh_after_secs,
+                    mirror.resweep_after_secs,
+                    if mirror.archives { format!("{} newest", mirror.archive_versions) } else { "off".to_owned() }
+                );
+            } else {
+                let _ = writeln!(out, "  upstream.mirror      = <off — cache filled by traffic only>");
+            }
+        } else {
+            let _ = writeln!(out, "  upstream             = <disabled — unclaimed names are 404>");
+        }
+
+        let gc = &self.jobs.blob_gc;
+        if gc.enabled {
+            let _ = writeln!(
+                out,
+                "  jobs.blob_gc         = every {}s, grace {}s{}",
+                gc.interval_secs,
+                gc.min_age_secs,
+                if gc.dry_run { " (DRY RUN — nothing is deleted)" } else { "" }
+            );
+        } else {
+            let _ = writeln!(out, "  jobs.blob_gc         = <disabled>");
+        }
 
         // Auth: secrets masked (S-25); kids are public metadata and are listed for rotation
         // sanity checks.

@@ -393,12 +393,52 @@ impl RegistryService {
             })
             .await;
 
+        // S-17: the name became locally claimed just now. If we already proxy a package under
+        // it, the shadowing condition exists from this moment — and the publish path is the
+        // only place that arrival order can be seen, because the read path never asks upstream
+        // about a claimed name (S-16). One indexed read on a first publish; nothing at all on
+        // every subsequent version.
+        if published.package_created {
+            self.observe_shadowing(request.format, name, now).await;
+        }
+
         Ok(PublishOutcome {
             package: published.package,
             version: published.version,
             package_created: published.package_created,
             blob_key,
         })
+    }
+
+    /// Raises an S-17 alarm when the freshly claimed name is one the proxy already caches.
+    ///
+    /// Best-effort by construction: the publish has already committed, the local package
+    /// already wins, and failing a successful publish because an alarm could not be filed
+    /// would be the wrong trade. Failures are loud in the log instead.
+    async fn observe_shadowing(&self, format: Format, name: &str, now: DateTime<Utc>) {
+        let snapshot = match self.repos.upstream.get_package(format, name).await {
+            Ok(Some(snapshot)) => snapshot,
+            // No upstream snapshot: nothing has been observed upstream under this name, so
+            // there is nothing to alarm about yet. The mirror worker covers the other order.
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(package = name, error = %err, "shadowing check could not read the upstream cache");
+                return;
+            }
+        };
+        let upstream_version = match self.repos.upstream.list_versions(snapshot.id).await {
+            // `list_versions` is ascending by semver precedence, so the tail is the highest.
+            Ok(versions) => versions.last().map(|version| version.version.to_string()),
+            Err(err) => {
+                tracing::warn!(package = name, error = %err, "shadowing check could not read upstream versions");
+                None
+            }
+        };
+        let observation =
+            crate::shadow::ShadowObservation { format, name, upstream: &snapshot.upstream, upstream_version };
+        if let Err(err) = crate::shadow::observe(&self.repos, self.events.as_ref(), observation, now).await {
+            tracing::error!(package = name, error = %err, "failed to record a shadowing alarm");
+        }
     }
 
     /// Hash + validate + parse + render, on a blocking worker.

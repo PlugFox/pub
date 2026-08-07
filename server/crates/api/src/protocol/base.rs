@@ -161,6 +161,7 @@ mod tests {
             id: OrgId::new(),
             name: slug.to_owned(),
             slug: slug.to_owned(),
+            upstream_policy: pub_core::org::UpstreamPolicy::Allow,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });

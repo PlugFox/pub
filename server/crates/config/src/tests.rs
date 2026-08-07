@@ -640,3 +640,195 @@ fn nonsensical_registry_limits_are_startup_errors() {
         assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
     }
 }
+
+// --- upstream proxy (decision 07) ---
+
+#[test]
+fn upstream_defaults_point_at_pub_dev_and_are_summarized() {
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert!(settings.upstream.enabled, "decision 07 ships the read-through proxy on by default");
+    assert_eq!(settings.upstream.base_url, "https://pub.dev");
+    assert_eq!(settings.upstream.max_archive_bytes, 100 * 1024 * 1024);
+    assert_eq!(settings.upstream.listing_ttl_secs, 300);
+    assert_eq!(settings.upstream.circuit_failure_threshold, 5);
+    assert!(settings.upstream.auth_token.is_none());
+    let summary = settings.summary();
+    assert!(summary.contains("upstream.base_url    = https://pub.dev"), "{summary}");
+    assert!(summary.contains("upstream.breaker     = 5 failures, open 30s"), "{summary}");
+}
+
+#[test]
+fn a_disabled_upstream_says_so_in_the_summary() {
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_UPSTREAM__ENABLED", "false")])).unwrap();
+    assert!(!settings.upstream.enabled);
+    let summary = settings.summary();
+    assert!(summary.contains("upstream             = <disabled"), "{summary}");
+}
+
+#[test]
+fn upstream_settings_are_configurable_from_the_environment() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_UPSTREAM__BASE_URL", "https://mirror.corp.test"),
+            ("PUB_UPSTREAM__LISTING_TTL_SECS", "60"),
+            ("PUB_UPSTREAM__MAX_ARCHIVE_BYTES", "1048576"),
+            ("PUB_UPSTREAM__AUTH_TOKEN", "s3cret-mirror-token"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(settings.upstream.base_url, "https://mirror.corp.test");
+    assert_eq!(settings.upstream.listing_ttl_secs, 60);
+    assert_eq!(settings.upstream.max_archive_bytes, 1024 * 1024);
+    assert_eq!(settings.upstream.auth_token.as_ref().map(Secret::expose), Some("s3cret-mirror-token"));
+}
+
+#[test]
+fn s25_the_upstream_auth_token_is_never_printed() {
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_UPSTREAM__AUTH_TOKEN", "s3cret-mirror-token")])).unwrap();
+    let summary = settings.summary();
+    assert!(!summary.contains("s3cret-mirror-token"), "upstream token leaked:\n{summary}");
+    assert!(summary.contains("upstream.auth_token  = ***"), "{summary}");
+    // A derived Debug reachable from Settings is the other way a secret reaches a log line.
+    assert!(!format!("{:?}", settings.upstream).contains("s3cret-mirror-token"));
+}
+
+#[test]
+fn s19_a_plaintext_upstream_is_refused_in_production() {
+    // The listing carries the sha256 we verify archives against, so an http upstream hands an
+    // on-path attacker the integrity check itself.
+    let production = env(&[
+        ("PUB_SERVER__MODE", "production"),
+        ("PUB_AUTH__OTP_PEPPER", "pepper"),
+        ("PUB_AUTH__KEK", &seed_b64()),
+        ("PUB_AUTH__JWT__KID", "k1"),
+        ("PUB_AUTH__JWT__SIGNING_KEY", &seed_b64()),
+        ("PUB_UPSTREAM__BASE_URL", "http://pub.dev"),
+    ]);
+    assert!(load_from(&CliArgs::default(), production).is_err(), "http upstream accepted in production");
+    // Dev mode allows it — a mock upstream on localhost is how the proxy is tested.
+    let dev = load_from(&CliArgs::default(), env(&[("PUB_UPSTREAM__BASE_URL", "http://127.0.0.1:9999")])).unwrap();
+    assert_eq!(dev.upstream.base_url, "http://127.0.0.1:9999");
+}
+
+#[test]
+fn nonsensical_upstream_settings_are_startup_errors() {
+    let cases: &[(&str, &str)] = &[
+        ("PUB_UPSTREAM__BASE_URL", "not a url"),
+        ("PUB_UPSTREAM__BASE_URL", "ftp://pub.dev"),
+        // Credentials belong in auth_token, where they are a masked Secret (S-25.a).
+        ("PUB_UPSTREAM__BASE_URL", "https://user:pass@pub.dev"),
+        ("PUB_UPSTREAM__BASE_URL", "https://pub.dev/?x=1"),
+        ("PUB_UPSTREAM__USER_AGENT", "   "),
+        ("PUB_UPSTREAM__CONNECT_TIMEOUT_SECS", "0"),
+        ("PUB_UPSTREAM__ARCHIVE_TIMEOUT_SECS", "0"),
+        ("PUB_UPSTREAM__RETRY_BACKOFF_MS", "0"),
+        ("PUB_UPSTREAM__RETRY_MAX_BACKOFF_MS", "10"),
+        ("PUB_UPSTREAM__MAX_ARCHIVE_BYTES", "0"),
+        ("PUB_UPSTREAM__MAX_LISTING_BYTES", "0"),
+        ("PUB_UPSTREAM__MAX_CONCURRENT_FETCHES", "0"),
+        ("PUB_UPSTREAM__CIRCUIT_FAILURE_THRESHOLD", "0"),
+        ("PUB_UPSTREAM__CIRCUIT_OPEN_SECS", "0"),
+    ];
+    for (key, value) in cases {
+        assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
+    }
+}
+
+#[test]
+fn a_disabled_upstream_is_still_validated() {
+    // A typo in a section nobody reads today becomes a startup failure the day somebody flips
+    // `enabled` — which is the worst possible moment for it.
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_UPSTREAM__ENABLED", "false"), ("PUB_UPSTREAM__BASE_URL", "not a url")]),
+    );
+    assert!(settings.is_err(), "a disabled upstream must still be checked");
+}
+
+// --- mirror mode and background jobs (decision 07 second half, decision 03) ---
+
+#[test]
+fn the_mirror_and_the_gc_are_both_off_by_default() {
+    // A mirror is a deliberate decision about egress and storage, and the GC deletes bytes
+    // permanently — neither is something a default should start doing on somebody's behalf.
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.upstream.mirror.mode, MirrorModeConfig::Off);
+    assert!(!settings.upstream.mirror.mode.is_enabled());
+    assert!(!settings.jobs.blob_gc.enabled);
+    assert!(settings.jobs.blob_gc.dry_run, "the first real pass should be a report, not a deletion");
+    assert_eq!(settings.jobs.blob_gc.min_age_secs, 24 * 3600);
+
+    let summary = settings.summary();
+    assert!(summary.contains("upstream.mirror      = <off"), "{summary}");
+    assert!(summary.contains("jobs.blob_gc         = <disabled>"), "{summary}");
+}
+
+#[test]
+fn mirror_and_gc_settings_come_from_the_environment_and_are_summarized() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_UPSTREAM__MIRROR__MODE", "full"),
+            ("PUB_UPSTREAM__MIRROR__INTERVAL_SECS", "60"),
+            ("PUB_UPSTREAM__MIRROR__CHUNK", "50"),
+            ("PUB_UPSTREAM__MIRROR__CONCURRENCY", "8"),
+            ("PUB_UPSTREAM__MIRROR__ARCHIVES", "true"),
+            ("PUB_UPSTREAM__MIRROR__ARCHIVE_VERSIONS", "3"),
+            ("PUB_JOBS__BLOB_GC__ENABLED", "true"),
+            ("PUB_JOBS__BLOB_GC__DRY_RUN", "false"),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(settings.upstream.mirror.mode, MirrorModeConfig::Full);
+    assert_eq!(settings.upstream.mirror.chunk, 50);
+    assert!(settings.upstream.mirror.archives);
+    assert_eq!(settings.upstream.mirror.archive_versions, 3);
+    assert!(settings.jobs.blob_gc.enabled);
+    assert!(!settings.jobs.blob_gc.dry_run);
+
+    let summary = settings.summary();
+    assert!(summary.contains("upstream.mirror      = full every 60s, 50 per tick"), "{summary}");
+    assert!(summary.contains("archives 3 newest"), "{summary}");
+    assert!(summary.contains("jobs.blob_gc         = every 21600s"), "{summary}");
+    assert!(!summary.contains("DRY RUN"), "{summary}");
+}
+
+#[test]
+fn a_mirror_without_a_proxy_is_a_startup_error() {
+    // A worker with the proxy switched off would fetch and store packages resolution can never
+    // serve: an expensive way to do nothing that looks like a working mirror from outside.
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_UPSTREAM__ENABLED", "false"), ("PUB_UPSTREAM__MIRROR__MODE", "recent")]),
+    );
+    assert!(settings.is_err());
+}
+
+#[test]
+fn nonsensical_job_settings_are_startup_errors() {
+    let cases = [
+        // Zero would be a scheduled job that can never do work — an outage dressed as config.
+        ("PUB_UPSTREAM__MIRROR__CHUNK", "0"),
+        ("PUB_UPSTREAM__MIRROR__CONCURRENCY", "0"),
+        ("PUB_UPSTREAM__MIRROR__INTERVAL_SECS", "0"),
+        ("PUB_UPSTREAM__MIRROR__REFRESH_AFTER_SECS", "0"),
+        ("PUB_UPSTREAM__MIRROR__RESWEEP_AFTER_SECS", "0"),
+        ("PUB_JOBS__BLOB_GC__INTERVAL_SECS", "0"),
+        // A grace period below the staged-upload TTL would let the collector delete a publish
+        // out from under a client that is still retrying its finalize.
+        ("PUB_JOBS__BLOB_GC__MIN_AGE_SECS", "60"),
+    ];
+    for (key, value) in cases {
+        assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
+    }
+    // `archive_versions = 0` only matters when archives are actually mirrored.
+    assert!(
+        load_from(
+            &CliArgs::default(),
+            env(&[("PUB_UPSTREAM__MIRROR__ARCHIVES", "true"), ("PUB_UPSTREAM__MIRROR__ARCHIVE_VERSIONS", "0")])
+        )
+        .is_err()
+    );
+    assert!(load_from(&CliArgs::default(), env(&[("PUB_UPSTREAM__MIRROR__ARCHIVE_VERSIONS", "0")])).is_ok());
+}

@@ -1,6 +1,6 @@
 [package]
 name = "pub-jobs"
-description = "Interval scheduler with JobLock leader election for background jobs."
+description = "Interval scheduler with JobLock leader election: mirror sync, blob GC."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,27 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
+# The `metrics` facade is always compiled; whether anything records is decision 23's
+# config-gated exporter. Mirror lag and GC volume are the two numbers an operator watches
+# without reading logs.
+metrics = { workspace = true }
 pub-core = { workspace = true }
+# The mirror worker warms the *same* ingest pipeline the read-through path uses (decision 07):
+# it drives `UpstreamService`, it does not reimplement it.
+pub-registry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 # test-util enables tokio::time::pause/advance for deterministic scheduler tests.
 tokio = { workspace = true, features = ["test-util"] }
+# The job tests run against a real migrated database and a real blob store: job state that
+# survives a restart is the whole point, and a repository double cannot prove it.
+pub-blob = { workspace = true }
+pub-config = { workspace = true }
+pub-db-sqlite = { workspace = true }

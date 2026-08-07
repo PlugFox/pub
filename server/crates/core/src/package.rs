@@ -309,6 +309,175 @@ pub struct UpstreamPackage {
     pub fetched_at: DateTime<Utc>,
 }
 
+/// A whole upstream listing as one write: the package row plus every version it advertised
+/// (decision 07 ingest, shared by the read-through path and the mirror worker).
+///
+/// It is a *snapshot*, not a diff: the repository upserts the package row and each version
+/// row, and **never deletes** versions that are missing from it. Upstream removing a version
+/// from a listing must not remove ours — we may already hold the bytes, and a hash somebody
+/// pinned in `pubspec.lock` has to keep resolving (docs/protocol.md sharp edge 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamSnapshot {
+    /// Artifact format.
+    pub format: Format,
+    /// Package name upstream.
+    pub name: String,
+    /// Upstream base URL the snapshot came from.
+    pub upstream: String,
+    /// Upstream `isDiscontinued`, verbatim.
+    pub discontinued: bool,
+    /// Upstream `replacedBy`, verbatim.
+    pub replaced_by: Option<String>,
+    /// Upstream `advisoriesUpdated`, verbatim (never regenerated — the client compares it
+    /// against its own cache, docs/protocol.md sharp edge 11).
+    pub advisories_updated: Option<String>,
+    /// The raw listing document as fetched, kept for re-emission and for the archive URLs.
+    pub listing: Option<serde_json::Value>,
+    /// Every version the listing advertised.
+    pub versions: Vec<NewUpstreamVersion>,
+}
+
+/// One version inside an [`UpstreamSnapshot`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewUpstreamVersion {
+    /// The upstream version.
+    pub version: SemVer,
+    /// Upstream metadata document as JSON, preserved verbatim.
+    pub pubspec: serde_json::Value,
+    /// Upstream-advertised `archive_sha256` (64 lowercase hex).
+    pub archive_sha256: String,
+    /// Archive size in bytes, when upstream reports it.
+    pub archive_size: Option<i64>,
+    /// Upstream `retracted` flag, verbatim.
+    pub retracted: bool,
+    /// Upstream publication time, when reported.
+    pub published_at: Option<DateTime<Utc>>,
+}
+
+/// One row of the admin-facing cache inventory: what an upstream package costs us.
+///
+/// Deliberately an aggregate rather than the raw rows: the question the admin UI asks is "what
+/// is in the mirror and how big is it", and answering it by listing every version of every
+/// cached package would be tens of thousands of rows for one screen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamCacheEntry {
+    /// Artifact format.
+    pub format: Format,
+    /// Package name upstream.
+    pub name: String,
+    /// Upstream base URL the snapshot came from.
+    pub upstream: String,
+    /// How many versions the snapshot knows about.
+    pub versions: i64,
+    /// How many of them we hold bytes for.
+    pub cached_versions: i64,
+    /// Total size of the bytes we hold, in bytes. Only cached versions have a measured size.
+    pub cached_bytes: i64,
+    /// Whether upstream marks the package discontinued.
+    pub discontinued: bool,
+    /// When the snapshot was last refreshed (UTC) — the per-package sync lag.
+    pub fetched_at: DateTime<Utc>,
+}
+
+/// A refused upstream archive, kept so the admin UI can list what the proxy is rejecting
+/// (S-19: hash mismatch ⇒ never stored, never served).
+///
+/// The record is *not* the enforcement — the bytes were already refused when it is written —
+/// it is the evidence. Repeated occurrences of one `(name, version)` collapse onto one row
+/// with a counter, because a package under active tampering is fetched by every developer on
+/// the team and a row per attempt would bury the signal it is meant to raise.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineEntry {
+    /// Artifact format.
+    pub format: Format,
+    /// Package name upstream.
+    pub name: String,
+    /// The refused version, canonical string form.
+    pub version: String,
+    /// Upstream base URL the bytes came from.
+    pub upstream: String,
+    /// The sha256 upstream advertised in its listing.
+    pub expected_sha256: String,
+    /// The sha256 of the bytes it actually served.
+    pub actual_sha256: String,
+    /// How many times this mismatch has been observed.
+    pub occurrences: i64,
+    /// First observation (UTC).
+    pub first_seen_at: DateTime<Utc>,
+    /// Most recent observation (UTC).
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// Payload for recording a quarantine (see [`QuarantineEntry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewQuarantineEntry {
+    /// Artifact format.
+    pub format: Format,
+    /// Package name upstream.
+    pub name: String,
+    /// The refused version, canonical string form.
+    pub version: String,
+    /// Upstream base URL.
+    pub upstream: String,
+    /// Advertised sha256.
+    pub expected_sha256: String,
+    /// Actual sha256 of the served bytes.
+    pub actual_sha256: String,
+}
+
+/// An active shadowing alarm: a name claimed **here** was observed upstream (S-17).
+///
+/// The registry keeps serving the local package — that is decision 01's "local always wins",
+/// and it is not negotiable — so this row is a *notification*, not a policy switch. It exists
+/// because the condition is the dependency-confusion precondition: from this moment on, a
+/// developer whose `PUB_HOSTED_URL` points somewhere else resolves a different package under
+/// the same name, and the org's admins are the only people who can decide whether that is a
+/// squat, a coincidence, or their own open-source release.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowingAlarm {
+    /// Artifact format.
+    pub format: Format,
+    /// The shadowed name.
+    pub name: String,
+    /// Org holding the local claim — the audience for the alarm.
+    pub org_id: OrgId,
+    /// Upstream base URL where the name was observed.
+    pub upstream: String,
+    /// The highest version upstream advertises, when the observation carried one.
+    pub upstream_version: Option<String>,
+    /// How many times the name has been observed upstream.
+    pub observations: i64,
+    /// First observation (UTC).
+    pub first_seen_at: DateTime<Utc>,
+    /// Most recent observation (UTC).
+    pub last_seen_at: DateTime<Utc>,
+    /// When an admin acknowledged the alarm; `None` = active. Acknowledging never changes
+    /// resolution — the local package won before the alarm and keeps winning after it.
+    pub acknowledged_at: Option<DateTime<Utc>>,
+}
+
+impl ShadowingAlarm {
+    /// Whether the alarm still wants an admin's attention.
+    pub fn is_active(&self) -> bool {
+        self.acknowledged_at.is_none()
+    }
+}
+
+/// Payload for recording a shadowing observation (see [`ShadowingAlarm`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewShadowingAlarm {
+    /// Artifact format.
+    pub format: Format,
+    /// The shadowed name.
+    pub name: String,
+    /// Org holding the local claim.
+    pub org_id: OrgId,
+    /// Upstream base URL where the name was observed.
+    pub upstream: String,
+    /// Highest upstream version observed, when known.
+    pub upstream_version: Option<String>,
+}
+
 /// Cached upstream version metadata (decision 07).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamVersion {

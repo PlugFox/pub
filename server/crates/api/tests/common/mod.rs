@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod oidc;
+pub mod upstream;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -31,8 +32,10 @@ use pub_db_sqlite::SqliteDb;
 use pub_jobs::InMemoryJobLock;
 use pub_kv::MemoryKv;
 use pub_mail::InMemoryMailer;
-use pub_registry::{RegistryPolicy, RegistryService};
+use pub_registry::{RegistryPolicy, RegistryService, UpstreamClient, UpstreamService, UpstreamServicePolicy};
 use tower::ServiceExt as _;
+
+use upstream::MockUpstream;
 
 /// Deterministic base instant shared by every scenario.
 pub fn t0() -> DateTime<Utc> {
@@ -81,6 +84,17 @@ pub struct TestOptions {
     pub token_auth_fail_per_ip_minute: u32,
     /// S-24 publish-upload budget per org per hour.
     pub publish_per_hour_org: u32,
+    /// Decision 07: attach the read-through proxy over a scripted upstream. `false` leaves
+    /// `AppState::upstream` empty, which is what `[upstream].enabled = false` produces.
+    pub upstream: bool,
+    /// How long a proxied listing stays fresh before upstream is re-asked.
+    pub upstream_listing_ttl_secs: i64,
+    /// Largest archive accepted from upstream.
+    pub upstream_max_archive_bytes: u64,
+    /// Consecutive upstream failures that trip the circuit breaker.
+    pub upstream_circuit_failure_threshold: u32,
+    /// How long the breaker stays open before letting a probe through.
+    pub upstream_circuit_open_secs: i64,
 }
 
 impl Default for TestOptions {
@@ -98,6 +112,11 @@ impl Default for TestOptions {
             blob: None,
             token_auth_fail_per_ip_minute: 30,
             publish_per_hour_org: 30,
+            upstream: false,
+            upstream_listing_ttl_secs: 300,
+            upstream_max_archive_bytes: 100 * 1024 * 1024,
+            upstream_circuit_failure_threshold: 5,
+            upstream_circuit_open_secs: 30,
         }
     }
 }
@@ -155,6 +174,8 @@ pub struct TestApp {
     pub mailer: Arc<InMemoryMailer>,
     /// The assembled state, so a scenario can rebuild the app over the same backends.
     pub state: AppState,
+    /// The scripted upstream, when the scenario enabled the proxy.
+    pub upstream: Option<Arc<MockUpstream>>,
     clock: Arc<Mutex<DateTime<Utc>>>,
 }
 
@@ -222,9 +243,32 @@ impl TestApp {
             Arc::new(NoopEventSink) as Arc<dyn EventSink>,
             RegistryPolicy::default(),
         ));
+        let mock_upstream = options.upstream.then(|| Arc::new(MockUpstream::default()));
+        let proxy = mock_upstream.as_ref().map(|mock| {
+            Arc::new(UpstreamService::new(
+                repos.clone(),
+                Arc::clone(&blob),
+                Arc::clone(mock) as Arc<dyn UpstreamClient>,
+                Arc::new(NoopEventSink) as Arc<dyn EventSink>,
+                UpstreamServicePolicy {
+                    listing_ttl: Duration::seconds(options.upstream_listing_ttl_secs),
+                    max_archive_bytes: options.upstream_max_archive_bytes,
+                    circuit_failure_threshold: options.upstream_circuit_failure_threshold,
+                    circuit_open: Duration::seconds(options.upstream_circuit_open_secs),
+                    max_concurrent_fetches: 8,
+                },
+            ))
+        });
+
         let state = AppState::new(settings, repos.clone(), blob, kv_handle, auth, registry)
+            .with_upstream(proxy)
             .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
-        Self { router: pub_api::router(state.clone()), repos, kv, mailer, state, clock }
+        Self { router: pub_api::router(state.clone()), repos, kv, mailer, state, upstream: mock_upstream, clock }
+    }
+
+    /// The scripted upstream; panics when the scenario did not enable the proxy.
+    pub fn mock_upstream(&self) -> &MockUpstream {
+        self.upstream.as_deref().expect("this scenario did not enable the upstream proxy")
     }
 
     /// Rebuilds the whole application over the **same** backends, as a process restart would.
@@ -250,6 +294,7 @@ impl TestApp {
             Arc::clone(&self.state.auth),
             registry,
         )
+        .with_upstream(self.state.upstream.clone())
         .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
         Self {
             router: pub_api::router(state.clone()),
@@ -257,6 +302,7 @@ impl TestApp {
             kv: Arc::clone(&self.kv),
             mailer: Arc::clone(&self.mailer),
             state,
+            upstream: self.upstream.clone(),
             clock: Arc::clone(&self.clock),
         }
     }

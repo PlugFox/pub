@@ -34,20 +34,24 @@ use sqlx::PgPool;
 
 mod audit;
 mod credentials;
+mod jobs;
 mod orgs;
 mod packages;
 mod sessions;
 mod settings;
 mod tokens;
+mod upstream;
 mod users;
 
 pub use audit::PgAuditRepo;
 pub use credentials::PgCredentialRepo;
+pub use jobs::PgJobRepo;
 pub use orgs::PgOrgRepo;
 pub use packages::PgPackageRepo;
 pub use sessions::PgSessionRepo;
 pub use settings::PgSettingsRepo;
 pub use tokens::PgTokenRepo;
+pub use upstream::PgUpstreamRepo;
 pub use users::PgUserRepo;
 
 /// Builds a query string from **const fragments only** (column lists, table names) and marks
@@ -64,13 +68,15 @@ pub(crate) use q;
 pub fn repositories(pool: PgPool) -> Repositories {
     Repositories {
         packages: Arc::new(PgPackageRepo::new(pool.clone())),
+        upstream: Arc::new(PgUpstreamRepo::new(pool.clone())),
         users: Arc::new(PgUserRepo::new(pool.clone())),
         credentials: Arc::new(PgCredentialRepo::new(pool.clone())),
         orgs: Arc::new(PgOrgRepo::new(pool.clone())),
         sessions: Arc::new(PgSessionRepo::new(pool.clone())),
         tokens: Arc::new(PgTokenRepo::new(pool.clone())),
         audit: Arc::new(PgAuditRepo::new(pool.clone())),
-        settings: Arc::new(PgSettingsRepo::new(pool)),
+        settings: Arc::new(PgSettingsRepo::new(pool.clone())),
+        jobs: Arc::new(PgJobRepo::new(pool)),
     }
 }
 

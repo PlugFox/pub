@@ -9,8 +9,11 @@ use chrono::{DateTime, TimeZone as _, Utc};
 use pub_core::audit::{AuditActor, AuditFilter, AuditResult, NewAuditEvent};
 use pub_core::authorize::ActorContext;
 use pub_core::credential::CredentialType;
-use pub_core::org::{NewInvitation, NewOrg};
-use pub_core::package::{BaseScope, NewPackage, NewVersion, PackageOptions, Publisher, Resolution, Visibility};
+use pub_core::org::{NewInvitation, NewOrg, UpstreamPolicy};
+use pub_core::package::{
+    BaseScope, NewPackage, NewUpstreamVersion, NewVersion, PackageOptions, Publisher, Resolution, UpstreamSnapshot,
+    Visibility,
+};
 use pub_core::session::{NewSession, SessionLimits};
 use pub_core::token::{NewToken, TokenScope};
 use pub_core::traits::Repositories;
@@ -272,6 +275,24 @@ pub async fn org_repo(repos: &Repositories) {
         .expect_err("duplicate slug");
     assert_eq!(err.code(), "conflict");
 
+    // Decision 01: a fresh org inherits the instance's proxy posture, and the policy is a
+    // durable, separately-settable field — flipping it changes what an entire team resolves.
+    assert_eq!(org.upstream_policy, UpstreamPolicy::Allow);
+    let blocked =
+        repos.orgs.set_upstream_policy(org.id, UpstreamPolicy::Block, t0() + hours(6)).await.expect("block upstream");
+    assert_eq!(blocked.upstream_policy, UpstreamPolicy::Block);
+    assert_eq!(blocked.updated_at, t0() + hours(6));
+    assert_eq!(blocked.created_at, t0(), "a policy change is not a re-creation");
+    // Every read path carries it, not just the one that wrote it.
+    assert_eq!(repos.orgs.get(org.id).await.expect("get").expect("org").upstream_policy, UpstreamPolicy::Block);
+    assert_eq!(
+        repos.orgs.get_by_slug("acme").await.expect("slug").expect("org").upstream_policy,
+        UpstreamPolicy::Block
+    );
+    repos.orgs.set_upstream_policy(org.id, UpstreamPolicy::Allow, t0() + hours(7)).await.expect("restore");
+    let err = repos.orgs.set_upstream_policy(OrgId::new(), UpstreamPolicy::Block, t0()).await.expect_err("unknown org");
+    assert_eq!(err.code(), "not_found");
+
     // add_member: happy path, duplicates, invalid role, unknown user.
     let member = repos.orgs.add_member(org.id, bob.id, RoleLevel::READ, t0() + hours(1)).await.expect("add member");
     assert_eq!(member.role, RoleLevel::READ);
@@ -286,6 +307,7 @@ pub async fn org_repo(repos: &Repositories) {
     let bob_orgs = repos.orgs.list_for_user(bob.id).await.expect("list orgs");
     assert_eq!(bob_orgs.len(), 1);
     assert_eq!(bob_orgs[0].org.id, org.id);
+    assert_eq!(bob_orgs[0].org.upstream_policy, UpstreamPolicy::Allow, "the joined listing carries the policy too");
     assert_eq!(bob_orgs[0].role, RoleLevel::READ);
 
     // update_member_role: happy path and NotFound.
@@ -1473,4 +1495,354 @@ pub async fn resolve_in_base_scope(repos: &Repositories) {
         repos.packages.resolve_in_base(Format::Pub, "http", BaseScope::Org(acme.id), &both).await.expect("r"),
         Resolution::Unclaimed
     );
+}
+
+/// Builds one upstream version payload with deterministic content.
+fn upstream_version(version: &str, sha256: &str, retracted: bool) -> NewUpstreamVersion {
+    NewUpstreamVersion {
+        version: SemVer::parse(version).expect("semver"),
+        pubspec: serde_json::json!({ "name": "http", "version": version, "description": "upstream fixture" }),
+        archive_sha256: sha256.to_owned(),
+        archive_size: Some(1024),
+        retracted,
+        published_at: Some(t0()),
+    }
+}
+
+/// Builds an upstream listing snapshot for `http`.
+fn upstream_snapshot(versions: Vec<NewUpstreamVersion>, discontinued: bool) -> UpstreamSnapshot {
+    UpstreamSnapshot {
+        format: Format::Pub,
+        name: "http".to_owned(),
+        upstream: "https://pub.dev".to_owned(),
+        discontinued,
+        replaced_by: discontinued.then(|| "http2".to_owned()),
+        advisories_updated: Some("2026-08-01T00:00:00Z".to_owned()),
+        listing: Some(serde_json::json!({ "name": "http", "versions": [] })),
+        versions,
+    }
+}
+
+/// `UpstreamRepo` (decision 07, S-19): snapshot upsert semantics, precedence ordering, the
+/// cached-hash freeze that makes byte-drift detectable, and `mark_cached`'s hash predicate.
+pub async fn upstream_repo(repos: &Repositories) {
+    repos.upstream.ping().await.expect("ping");
+    assert!(repos.upstream.get_package(Format::Pub, "http").await.expect("miss").is_none());
+
+    // A first snapshot creates the package row and every version, flags verbatim.
+    let sha_a = "a".repeat(64);
+    let sha_b = "b".repeat(64);
+    let sha_c = "c".repeat(64);
+    let stored = repos
+        .upstream
+        .save_snapshot(
+            upstream_snapshot(
+                vec![
+                    upstream_version("1.0.0", &sha_a, false),
+                    upstream_version("1.0.0-beta.11", &sha_b, true),
+                    upstream_version("1.0.0-beta.2", &sha_c, false),
+                ],
+                false,
+            ),
+            t0(),
+        )
+        .await
+        .expect("first snapshot");
+    assert_eq!(stored.name, "http");
+    assert_eq!(stored.upstream, "https://pub.dev");
+    assert!(!stored.discontinued);
+    assert_eq!(stored.advisories_updated.as_deref(), Some("2026-08-01T00:00:00Z"));
+    assert_eq!(stored.fetched_at, t0());
+    assert!(stored.listing.is_some(), "the raw document is what archive urls are re-derived from");
+
+    // Ordering is semver precedence, not text: `1.0.0-beta.2` before `1.0.0-beta.11`.
+    let versions = repos.upstream.list_versions(stored.id).await.expect("list");
+    let order: Vec<String> = versions.iter().map(|v| v.version.to_string()).collect();
+    assert_eq!(order, ["1.0.0-beta.2", "1.0.0-beta.11", "1.0.0"]);
+    let beta11 = versions.iter().find(|v| v.version.to_string() == "1.0.0-beta.11").expect("beta.11");
+    assert!(beta11.retracted, "upstream's retraction flag is preserved verbatim");
+    assert!(!beta11.cached, "a snapshot records metadata, never bytes");
+    assert_eq!(beta11.archive_size, Some(1024));
+    assert_eq!(beta11.pubspec["description"], "upstream fixture");
+    assert_eq!(beta11.published_at, Some(t0()));
+
+    // get_version: hit and miss.
+    let one = SemVer::parse("1.0.0").unwrap();
+    let cached_row = repos.upstream.get_version(stored.id, &one).await.expect("get").expect("1.0.0");
+    assert_eq!(cached_row.archive_sha256, sha_a);
+    assert!(repos.upstream.get_version(stored.id, &SemVer::parse("9.9.9").unwrap()).await.expect("get").is_none());
+
+    // mark_cached is guarded by the hash: a row whose hash moved must not be marked cached for
+    // content it no longer advertises.
+    assert!(
+        !repos.upstream.mark_cached(cached_row.id, &sha_b, 4096, t0()).await.expect("wrong hash"),
+        "hash must match"
+    );
+    assert!(repos.upstream.mark_cached(cached_row.id, &sha_a, 4096, t0() + hours(1)).await.expect("mark"));
+    assert!(!repos.upstream.mark_cached(pub_core::VersionId::new(), &sha_a, 4096, t0()).await.expect("unknown id"));
+
+    // A second snapshot upserts: package flags change, new versions appear, **missing ones
+    // survive** (we may already hold their bytes), and a cached version's hash is frozen —
+    // which is what makes S-19 byte-drift detectable instead of silently applied.
+    let drifted = "d".repeat(64);
+    let refreshed = repos
+        .upstream
+        .save_snapshot(
+            upstream_snapshot(
+                vec![
+                    // 1.0.0 is cached; upstream now claims different bytes for it.
+                    upstream_version("1.0.0", &drifted, true),
+                    // 1.0.0-beta.2 is not cached; its hash is upstream's to correct.
+                    upstream_version("1.0.0-beta.2", &drifted, false),
+                    upstream_version("2.0.0", &drifted, false),
+                ],
+                true,
+            ),
+            t0() + hours(2),
+        )
+        .await
+        .expect("second snapshot");
+    assert!(refreshed.discontinued, "package-level flags follow upstream");
+    assert_eq!(refreshed.replaced_by.as_deref(), Some("http2"));
+    assert_eq!(refreshed.id, stored.id, "the snapshot upserts rather than creating a second row");
+    assert_eq!(refreshed.fetched_at, t0() + hours(2));
+
+    let versions = repos.upstream.list_versions(stored.id).await.expect("list again");
+    let order: Vec<String> = versions.iter().map(|v| v.version.to_string()).collect();
+    assert_eq!(order, ["1.0.0-beta.2", "1.0.0-beta.11", "1.0.0", "2.0.0"], "a dropped version keeps its row");
+
+    let one_row = repos.upstream.get_version(stored.id, &one).await.expect("get").expect("1.0.0");
+    assert_eq!(one_row.archive_sha256, sha_a, "S-19: a cached version's hash never moves");
+    assert!(one_row.cached, "and it stays cached");
+    assert_eq!(one_row.archive_size, Some(4096), "nor does the size we measured while caching");
+    assert!(one_row.retracted, "everything else about it does follow upstream");
+
+    let beta2 = versions.iter().find(|v| v.version.to_string() == "1.0.0-beta.2").expect("beta.2");
+    assert_eq!(beta2.archive_sha256, drifted, "an uncached version's hash is upstream's to correct");
+
+    // Formats do not collide: the same name under another format is a different row.
+    assert!(repos.upstream.get_package(Format::Pub, "other_pkg").await.expect("miss").is_none());
+}
+
+/// `UpstreamRepo` mirror-facing reads (decision 07 second half): the oldest-snapshot queue the
+/// mirror worker walks, the admin cache inventory with its sizes, and the second half of the
+/// GC reference check.
+pub async fn upstream_mirror_reads(repos: &Repositories) {
+    let sha_a = "a".repeat(64);
+    let sha_b = "b".repeat(64);
+
+    // Two packages fetched at different times.
+    let http = repos
+        .upstream
+        .save_snapshot(
+            upstream_snapshot(
+                vec![upstream_version("1.0.0", &sha_a, false), upstream_version("2.0.0", &sha_b, false)],
+                false,
+            ),
+            t0(),
+        )
+        .await
+        .expect("http snapshot");
+    let mut other = upstream_snapshot(vec![upstream_version("1.0.0", &sha_a, false)], false);
+    other.name = "path".to_owned();
+    other.versions[0].pubspec = serde_json::json!({ "name": "path", "version": "1.0.0" });
+    repos.upstream.save_snapshot(other, t0() + hours(2)).await.expect("path snapshot");
+
+    // The mirror's steady-state queue is oldest-snapshot-first and bounded by the cutoff.
+    let stale = repos.upstream.list_stale(Format::Pub, t0() + hours(1), 10).await.expect("stale");
+    assert_eq!(
+        stale.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        ["http"],
+        "only snapshots older than the cutoff"
+    );
+    let all = repos.upstream.list_stale(Format::Pub, t0() + hours(3), 10).await.expect("stale");
+    assert_eq!(all.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["http", "path"], "oldest first");
+    assert_eq!(
+        repos.upstream.list_stale(Format::Pub, t0() + hours(3), 1).await.expect("stale").len(),
+        1,
+        "limit holds"
+    );
+    assert!(repos.upstream.list_stale(Format::Pub, t0(), 10).await.expect("stale").is_empty());
+
+    // GC's second register: only *cached* versions count as blob references.
+    assert_eq!(repos.upstream.count_cached_with_sha256(&sha_a).await.expect("count"), 0, "a snapshot holds no bytes");
+    let cached_row =
+        repos.upstream.get_version(http.id, &SemVer::parse("1.0.0").unwrap()).await.expect("get").expect("row");
+    assert!(repos.upstream.mark_cached(cached_row.id, &sha_a, 2048, t0() + hours(3)).await.expect("mark"));
+    assert_eq!(repos.upstream.count_cached_with_sha256(&sha_a).await.expect("count"), 1);
+    assert_eq!(repos.upstream.count_cached_with_sha256(&sha_b).await.expect("count"), 0);
+
+    // The admin inventory aggregates per package: version counts and the bytes we actually hold.
+    let page = repos.upstream.list_cached(Format::Pub, None, 50).await.expect("inventory");
+    assert!(!page.has_more);
+    let names: Vec<&str> = page.items.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["http", "path"], "ordered by name");
+    let http_entry = &page.items[0];
+    assert_eq!(http_entry.versions, 2);
+    assert_eq!(http_entry.cached_versions, 1, "only one version has bytes");
+    assert_eq!(http_entry.cached_bytes, 2048, "and only measured sizes are summed");
+    assert_eq!(page.items[1].cached_bytes, 0);
+    assert_eq!(http_entry.upstream, "https://pub.dev");
+
+    // Keyset pagination over the name.
+    let first = repos.upstream.list_cached(Format::Pub, None, 1).await.expect("page 1");
+    assert!(first.has_more);
+    let second = repos.upstream.list_cached(Format::Pub, first.cursor.as_deref(), 1).await.expect("page 2");
+    assert_eq!(second.items[0].name, "path");
+    assert!(!second.has_more);
+    assert_eq!(
+        repos.upstream.list_cached(Format::Pub, Some("not-a-cursor"), 10).await.unwrap_err().code(),
+        "invalid_argument"
+    );
+}
+
+/// The two supply-chain registers (S-17 shadowing, S-19 quarantine): one row per incident,
+/// counters instead of duplicates, and "raised" reported exactly once per incident.
+pub async fn supply_chain_registers(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    repos.packages.claim_name(Format::Pub, "acme_core", org.id, t0()).await.expect("claim");
+
+    // --- S-19 quarantine: repeated refusals of one version collapse onto one row ---
+    let entry = |actual: &str| pub_core::package::NewQuarantineEntry {
+        format: Format::Pub,
+        name: "http".to_owned(),
+        version: "1.0.0".to_owned(),
+        upstream: "https://pub.dev".to_owned(),
+        expected_sha256: "a".repeat(64),
+        actual_sha256: actual.to_owned(),
+    };
+    let first = repos.upstream.record_quarantine(entry(&"b".repeat(64)), t0()).await.expect("quarantine");
+    assert_eq!(first.occurrences, 1);
+    assert_eq!(first.first_seen_at, t0());
+    let again = repos.upstream.record_quarantine(entry(&"c".repeat(64)), t0() + hours(1)).await.expect("again");
+    assert_eq!(again.occurrences, 2, "a package under active tampering is fetched by the whole team");
+    assert_eq!(again.first_seen_at, t0(), "the first sighting is the incident's start");
+    assert_eq!(again.last_seen_at, t0() + hours(1));
+    assert_eq!(again.actual_sha256, "c".repeat(64), "the newest evidence wins");
+
+    let listed = repos.upstream.list_quarantine(10).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "http");
+    assert_eq!(listed[0].expected_sha256, "a".repeat(64));
+
+    // --- S-17 shadowing: raised once per incident, counted thereafter ---
+    let alarm = |version: Option<&str>| pub_core::package::NewShadowingAlarm {
+        format: Format::Pub,
+        name: "acme_core".to_owned(),
+        org_id: org.id,
+        upstream: "https://pub.dev".to_owned(),
+        upstream_version: version.map(ToOwned::to_owned),
+    };
+    let (raised, is_new) = repos.upstream.record_shadowing(alarm(Some("9.9.9")), t0()).await.expect("raise");
+    assert!(is_new, "the first sighting raises the alarm");
+    assert_eq!(raised.org_id, org.id, "the claim holder is the audience");
+    assert_eq!(raised.upstream_version.as_deref(), Some("9.9.9"));
+    assert_eq!(raised.observations, 1);
+    assert!(raised.is_active());
+
+    let (again, is_new) = repos.upstream.record_shadowing(alarm(Some("9.9.10")), t0() + hours(1)).await.expect("again");
+    assert!(!is_new, "a sweep re-observing an ongoing condition must not re-page anybody");
+    assert_eq!(again.observations, 2);
+    assert_eq!(again.first_seen_at, t0(), "the incident keeps its start");
+    assert_eq!(again.last_seen_at, t0() + hours(1));
+    assert_eq!(again.upstream_version.as_deref(), Some("9.9.10"), "the newest sighting wins");
+
+    assert_eq!(repos.upstream.list_shadowing(true, 10).await.expect("active").len(), 1);
+
+    // Acknowledging is bookkeeping — and idempotent.
+    assert!(repos.upstream.acknowledge_shadowing(Format::Pub, "acme_core", t0() + hours(2)).await.expect("ack"));
+    assert!(!repos.upstream.acknowledge_shadowing(Format::Pub, "acme_core", t0() + hours(3)).await.expect("ack again"));
+    assert!(!repos.upstream.acknowledge_shadowing(Format::Pub, "nope_pkg", t0()).await.expect("unknown"));
+    assert!(repos.upstream.list_shadowing(true, 10).await.expect("active").is_empty());
+    let all = repos.upstream.list_shadowing(false, 10).await.expect("all");
+    assert_eq!(all.len(), 1);
+    assert!(!all[0].is_active());
+
+    // A sighting after an acknowledgement is a *new* incident: it raises again and restarts the
+    // clock, so an admin who cleared the alarm hears about it coming back.
+    let (reraised, is_new) = repos.upstream.record_shadowing(alarm(None), t0() + days(1)).await.expect("re-raise");
+    assert!(is_new);
+    assert!(reraised.is_active());
+    assert_eq!(reraised.observations, 1);
+    assert_eq!(reraised.first_seen_at, t0() + days(1));
+}
+
+/// `JobRepo` (decision 03): resume-across-restart semantics, additive counters, and the
+/// success/failure bracket the admin surface reads.
+pub async fn job_repo(repos: &Repositories) {
+    use pub_core::jobs::{JobOutcome, JobProgress};
+
+    repos.jobs.ping().await.expect("ping");
+    assert!(repos.jobs.get("mirror-sync").await.expect("unknown job").is_none());
+    assert!(repos.jobs.list().await.expect("list").is_empty());
+
+    // First run creates the row; there is nothing to resume from yet.
+    let started = repos.jobs.begin_run("mirror-sync", t0()).await.expect("begin");
+    assert_eq!(started.runs, 1);
+    assert_eq!(started.cursor, None);
+    assert_eq!(started.last_run_at, Some(t0()));
+    assert_eq!(started.last_success_at, None);
+
+    // Checkpoints set the cursor absolutely and *add* their counters, so two checkpoints in one
+    // run cannot lose each other's work.
+    let progress = JobProgress {
+        cursor: Some("{\"page\":null,\"offset\":200}".to_owned()),
+        phase: "sweep".to_owned(),
+        processed: 200,
+        failed: 3,
+    };
+    let mid = repos.jobs.checkpoint("mirror-sync", &progress, t0() + hours(1)).await.expect("checkpoint");
+    assert_eq!(mid.processed, 200);
+    assert_eq!(mid.failures, 3);
+    assert_eq!(mid.phase, "sweep");
+    let progress =
+        JobProgress { cursor: Some("{\"page\":null,\"offset\":400}".to_owned()), processed: 200, ..progress };
+    let mid = repos.jobs.checkpoint("mirror-sync", &progress, t0() + hours(2)).await.expect("checkpoint");
+    assert_eq!(mid.processed, 400, "counters accumulate");
+    assert_eq!(mid.failures, 6);
+    assert_eq!(mid.cursor.as_deref(), Some("{\"page\":null,\"offset\":400}"));
+
+    // A failure keeps the cursor: the next run continues instead of starting over.
+    let failed = repos
+        .jobs
+        .finish_run("mirror-sync", JobOutcome::Failure("upstream down".to_owned()), t0() + hours(3))
+        .await
+        .expect("finish");
+    assert_eq!(failed.last_error.as_deref(), Some("upstream down"));
+    assert_eq!(failed.last_success_at, None);
+    assert_eq!(failed.cursor.as_deref(), Some("{\"page\":null,\"offset\":400}"));
+    assert_eq!(failed.lag_seconds(t0() + hours(3)), None, "a job that never succeeded has no lag, it has an alarm");
+
+    // The next run — the restart case — resumes from exactly that cursor.
+    let resumed = repos.jobs.begin_run("mirror-sync", t0() + hours(4)).await.expect("resume");
+    assert_eq!(resumed.runs, 2);
+    assert_eq!(resumed.cursor.as_deref(), Some("{\"page\":null,\"offset\":400}"));
+    assert_eq!(resumed.processed, 400, "counters survive the run boundary");
+    assert_eq!(resumed.last_error.as_deref(), Some("upstream down"), "still the last known outcome");
+
+    // A success clears the error and stamps the freshness the admin surface reads.
+    let done = repos.jobs.finish_run("mirror-sync", JobOutcome::Success, t0() + hours(5)).await.expect("finish");
+    assert_eq!(done.last_error, None);
+    assert_eq!(done.last_success_at, Some(t0() + hours(5)));
+    assert_eq!(done.lag_seconds(t0() + hours(6)), Some(3600));
+
+    // Clearing the cursor is how a completed sweep hands over to the steady-state phase.
+    let cleared = repos
+        .jobs
+        .checkpoint(
+            "mirror-sync",
+            &JobProgress { cursor: None, phase: "recent".to_owned(), ..JobProgress::default() },
+            t0() + hours(6),
+        )
+        .await
+        .expect("clear");
+    assert_eq!(cleared.cursor, None);
+    assert_eq!(cleared.phase, "recent");
+
+    // Jobs are independent, listed by name, and finishing an unknown one is NotFound.
+    repos.jobs.begin_run("blob-gc", t0() + hours(7)).await.expect("second job");
+    let listed: Vec<String> = repos.jobs.list().await.expect("list").into_iter().map(|job| job.name).collect();
+    assert_eq!(listed, ["blob-gc", "mirror-sync"]);
+    assert_eq!(repos.jobs.finish_run("never-ran", JobOutcome::Success, t0()).await.unwrap_err().code(), "not_found");
 }

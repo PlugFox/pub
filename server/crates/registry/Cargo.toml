@@ -8,25 +8,36 @@ publish.workspace = true
 
 [dependencies]
 ammonia = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 comrak = { workspace = true }
 flate2 = { workspace = true }
+futures = { workspace = true }
+# The `metrics` facade is always compiled; whether anything records is decision 23's
+# config-gated exporter. Upstream health (stale serves, quarantines, drift) is the one part of
+# the registry an operator has to watch without reading logs.
+metrics = { workspace = true }
 pub-core = { workspace = true }
+# "stream": the upstream archive body is consumed as a stream so the size cap is enforced
+# while bytes arrive rather than after they have all been buffered.
+reqwest = { workspace = true, features = ["stream"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 yaml-rust2 = { workspace = true }
 
 [dev-dependencies]
 # The publish pipeline is transactional by contract; its tests run against a real migrated
 # SQLite database rather than a hand-written repository double.
-async-trait = { workspace = true }
 flate2 = { workspace = true }
-futures = { workspace = true }
+# The upstream status-mapping tests build responses from bare `http::Response` values.
+http = { workspace = true }
 pub-config = { workspace = true }
 pub-db-sqlite = { workspace = true }
 pub-jobs = { workspace = true }

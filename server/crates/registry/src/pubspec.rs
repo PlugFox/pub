@@ -108,9 +108,29 @@ pub struct Pubspec {
 impl Pubspec {
     /// Parses and validates `pubspec.yaml` text.
     pub fn parse(raw: &str) -> Result<Self, PubspecError> {
-        let json = parse_yaml_document(raw)?;
+        Self::from_json(parse_yaml_document(raw)?)
+    }
+
+    /// Validates an already-decoded metadata document.
+    ///
+    /// The rules half of [`Pubspec::parse`], reachable without going through YAML — which is
+    /// what the upstream proxy needs: a pub.dev version listing embeds each version's pubspec
+    /// as **JSON**, and an ingested document has to clear exactly the same bar as a locally
+    /// published one (S-20). Splitting the two is what keeps "same validation" a fact rather
+    /// than a claim: there is one implementation of the name and version rules, and the depth
+    /// cap applies to a document that arrived as JSON just as it does to one that arrived as
+    /// YAML.
+    ///
+    /// The YAML-specific defence (rejecting `*alias` at the event level, so a billion-laughs
+    /// bomb is never expanded) has no JSON counterpart — JSON has no aliases. Its residue
+    /// does: the *expanded* form of such a bomb is a huge, deeply nested document, and that is
+    /// what [`MAX_DEPTH`] and the caller's byte cap on the listing stop here.
+    pub fn from_json(json: serde_json::Value) -> Result<Self, PubspecError> {
         if !json.is_object() {
             return Err(PubspecError::NotAMapping);
+        }
+        if exceeds_depth(&json, MAX_DEPTH) {
+            return Err(PubspecError::TooDeep);
         }
 
         let name = json.get("name").and_then(serde_json::Value::as_str).ok_or(PubspecError::MissingName)?.to_owned();
@@ -304,6 +324,31 @@ fn json_string(text: String) -> serde_json::Value {
     serde_json::Value::String(text)
 }
 
+/// Whether a decoded document nests more than `max` containers deep.
+///
+/// Depth counts *containers*, exactly as the YAML builder's stack does, so a document
+/// accepted through one path is accepted through the other.
+///
+/// Iterative on purpose. The YAML path enforces the cap while *building*, so nothing deeper
+/// than [`MAX_DEPTH`] is ever constructed there; a JSON document handed to
+/// [`Pubspec::from_json`] arrives already built, and walking an attacker-shaped tree
+/// recursively is how a depth check becomes the stack overflow it was meant to prevent.
+fn exceeds_depth(root: &serde_json::Value, max: usize) -> bool {
+    let mut stack = vec![(root, 1usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > max {
+            return true;
+        }
+        let children: Box<dyn Iterator<Item = &serde_json::Value>> = match value {
+            serde_json::Value::Object(map) => Box::new(map.values()),
+            serde_json::Value::Array(items) => Box::new(items.iter()),
+            _ => continue,
+        };
+        stack.extend(children.filter(|child| child.is_object() || child.is_array()).map(|child| (child, depth + 1)));
+    }
+    false
+}
+
 /// Truncates attacker-controlled text before it reaches an error message.
 fn clip(text: &str) -> String {
     if text.chars().count() <= MAX_NAME_LEN {
@@ -474,5 +519,60 @@ publish_to: none
     fn errors_map_to_permanent_4xx_domain_errors() {
         let err: Error = PubspecError::MissingName.into();
         assert_eq!(err.code(), "invalid_argument");
+    }
+
+    #[test]
+    fn from_json_applies_the_same_rules_as_the_yaml_path() {
+        // The proxy ingests pubspecs that arrived as JSON inside an upstream listing; they
+        // must clear the same bar as a locally published one (S-20).
+        let good = Pubspec::from_json(serde_json::json!({ "name": "acme_core", "version": "1.0.0" })).unwrap();
+        assert_eq!(good.name, "acme_core");
+        assert_eq!(good.version.to_string(), "1.0.0");
+
+        assert_eq!(Pubspec::from_json(serde_json::json!(["not", "a", "map"])).unwrap_err(), PubspecError::NotAMapping);
+        assert_eq!(
+            Pubspec::from_json(serde_json::json!({ "version": "1.0.0" })).unwrap_err(),
+            PubspecError::MissingName
+        );
+        assert_eq!(
+            Pubspec::from_json(serde_json::json!({ "name": "acme_core" })).unwrap_err(),
+            PubspecError::MissingVersion
+        );
+        assert!(matches!(
+            Pubspec::from_json(serde_json::json!({ "name": "Acme_Core", "version": "1.0.0" })).unwrap_err(),
+            PubspecError::InvalidName { .. }
+        ));
+        assert!(matches!(
+            Pubspec::from_json(serde_json::json!({ "name": "acme_core", "version": "nope" })).unwrap_err(),
+            PubspecError::InvalidVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn from_json_rejects_the_expanded_form_of_an_alias_bomb() {
+        // JSON has no aliases, so the YAML event-level defence has nothing to bite on here.
+        // What crosses the wire instead is the *expansion*: a deeply nested document. Build
+        // it bottom-up so the fixture itself never recurses.
+        let mut deep = serde_json::json!("leaf");
+        for _ in 0..MAX_DEPTH + 5 {
+            deep = serde_json::json!({ "nest": deep });
+        }
+        let doc = serde_json::json!({ "name": "acme_core", "version": "1.0.0", "deep": deep });
+        assert_eq!(Pubspec::from_json(doc).unwrap_err(), PubspecError::TooDeep);
+    }
+
+    #[test]
+    fn depth_check_walks_arrays_and_objects_without_recursing() {
+        // Three containers: the root map, the array, the inner map. Scalars are not a level.
+        assert!(!exceeds_depth(&serde_json::json!({ "a": [1, 2, { "b": "c" }] }), 3));
+        assert!(exceeds_depth(&serde_json::json!({ "a": [1, 2, { "b": "c" }] }), 2));
+        // A pathological tree must be answered, not overflowed. (The fixture stays at 2 000
+        // levels because `serde_json::Value`'s own `Drop` is recursive — the check under test
+        // is the one that must not be.)
+        let mut deep = serde_json::json!(0);
+        for _ in 0..2_000 {
+            deep = serde_json::Value::Array(vec![deep]);
+        }
+        assert!(exceeds_depth(&deep, MAX_DEPTH));
     }
 }

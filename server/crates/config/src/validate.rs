@@ -46,6 +46,111 @@ impl Settings {
         self.validate_auth()?;
         self.validate_smtp()?;
         self.validate_registry()?;
+        self.validate_upstream()?;
+        self.validate_jobs()?;
+        Ok(())
+    }
+
+    /// Background-job invariants (decision 03 scheduler, decision 07 mirror).
+    fn validate_jobs(&self) -> Result<(), ConfigError> {
+        let mirror = &self.upstream.mirror;
+        if mirror.mode.is_enabled() && !self.upstream.enabled {
+            // A mirror worker with the proxy switched off would fetch and store packages that
+            // resolution can never serve — an expensive way to do nothing, and one that looks
+            // like a working mirror from the outside.
+            return Err(invalid(format!(
+                "upstream.mirror.mode = '{}' requires upstream.enabled = true",
+                mirror.mode.as_str()
+            )));
+        }
+        if mirror.interval_secs == 0 || mirror.refresh_after_secs == 0 || mirror.resweep_after_secs == 0 {
+            return Err(invalid(
+                "upstream.mirror interval_secs, refresh_after_secs, and resweep_after_secs must be greater than 0",
+            ));
+        }
+        if mirror.chunk == 0 || mirror.concurrency == 0 {
+            // Zero would be a scheduled job that can never do work: an outage that looks like
+            // a configured mirror. Turning the worker off is `mode = "off"`.
+            return Err(invalid("upstream.mirror.chunk and upstream.mirror.concurrency must be greater than 0"));
+        }
+        if mirror.archives && mirror.archive_versions == 0 {
+            return Err(invalid("upstream.mirror.archive_versions must be greater than 0 when archives are mirrored"));
+        }
+
+        let gc = &self.jobs.blob_gc;
+        if gc.interval_secs == 0 {
+            return Err(invalid("jobs.blob_gc.interval_secs must be greater than 0"));
+        }
+        // A staged upload is finalizable — and therefore live — for an hour after its bytes are
+        // written, with no database row referencing it. A shorter grace period would let the
+        // collector delete a publish out from under the client that is retrying its finalize.
+        if gc.min_age_secs < 3600 {
+            return Err(invalid(format!(
+                "jobs.blob_gc.min_age_secs = {} must be at least 3600: a staged upload stays finalizable \
+                 for an hour with nothing referencing it",
+                gc.min_age_secs
+            )));
+        }
+        Ok(())
+    }
+
+    /// Upstream proxy invariants (decision 07, S-19).
+    fn validate_upstream(&self) -> Result<(), ConfigError> {
+        let upstream = &self.upstream;
+        // A disabled proxy still gets validated: a typo in a section nobody reads today is a
+        // startup failure the day somebody flips `enabled`, which is the worst time for it.
+        let base = url::Url::parse(&upstream.base_url)
+            .map_err(|err| invalid(format!("upstream.base_url is not a valid URL: {err}")))?;
+        match base.scheme() {
+            "https" => {}
+            // Plain http is a dev/test convenience (a mock upstream on localhost). In
+            // production the listing carries the `archive_sha256` we verify bytes against, so
+            // a plaintext listing would hand an on-path attacker the integrity check itself
+            // (S-19) — the same reasoning as the OIDC issuer rule.
+            "http" if self.server.mode == RunMode::Dev => {}
+            other => {
+                return Err(invalid(format!(
+                    "upstream.base_url scheme '{other}' is not allowed (https required in production)"
+                )));
+            }
+        }
+        if base.cannot_be_a_base() || base.host_str().is_none() {
+            return Err(invalid("upstream.base_url must have a host"));
+        }
+        if !base.username().is_empty() || base.password().is_some() {
+            // Credentials belong in `upstream.auth_token`, where they are a `Secret` and stay
+            // out of every log line that ever prints the base URL (S-25.a).
+            return Err(invalid("upstream.base_url must not carry user-info; use upstream.auth_token"));
+        }
+        if base.query().is_some() || base.fragment().is_some() {
+            return Err(invalid("upstream.base_url must not carry a query or fragment"));
+        }
+        if upstream.user_agent.trim().is_empty() {
+            return Err(invalid("upstream.user_agent must not be empty"));
+        }
+        if upstream.connect_timeout_secs == 0
+            || upstream.listing_timeout_secs == 0
+            || upstream.archive_timeout_secs == 0
+        {
+            return Err(invalid("upstream timeouts must be greater than 0"));
+        }
+        if upstream.retry_backoff_ms == 0 || upstream.retry_max_backoff_ms < upstream.retry_backoff_ms {
+            return Err(invalid(format!(
+                "upstream.retry_max_backoff_ms ({}) must be at least upstream.retry_backoff_ms ({}), which must be > 0",
+                upstream.retry_max_backoff_ms, upstream.retry_backoff_ms
+            )));
+        }
+        if upstream.max_archive_bytes == 0 || upstream.max_listing_bytes == 0 {
+            return Err(invalid("upstream.max_archive_bytes and upstream.max_listing_bytes must be greater than 0"));
+        }
+        if upstream.max_concurrent_fetches == 0 {
+            // Zero would be "the proxy is on but may never fetch" — an outage that looks like
+            // a missing package. Turning the proxy off is `enabled = false`.
+            return Err(invalid("upstream.max_concurrent_fetches must be greater than 0"));
+        }
+        if upstream.circuit_failure_threshold == 0 || upstream.circuit_open_secs == 0 {
+            return Err(invalid("upstream circuit-breaker thresholds must be greater than 0"));
+        }
         Ok(())
     }
 

@@ -28,8 +28,8 @@ server/
 ├── Cargo.toml                  # workspace; [workspace.dependencies] pins everything
 ├── crates/
 │   ├── core/                   # domain types, error enums (decision 16), trait definitions:
-│   │                           #   PackageRepo UserRepo OrgRepo TokenRepo SessionRepo
-│   │                           #   AuditRepo SettingsRepo ClaimRepo UpstreamRepo
+│   │                           #   PackageRepo UpstreamRepo UserRepo OrgRepo TokenRepo
+│   │                           #   SessionRepo AuditRepo SettingsRepo JobRepo
 │   │                           #   BlobStore Kv (store+broker) PackageSearch Mailer JobLock
 │   │                           # zero infrastructure dependencies
 │   ├── config/                 # layered load: defaults → TOML → env → CLI; validation;
@@ -44,11 +44,14 @@ server/
 │   ├── auth/                   # OIDC (openidconnect), email OTP, TOTP (totp-rs),
 │   │                           #   JWT Ed25519 keyring (kid rotation), token hashing
 │   ├── registry/               # domain services: publish pipeline, resolution policy,
-│   │                           #   proxy ingest, retraction, claims, readme rendering
+│   │                           #   proxy ingest (upstream.rs + upstream/http.rs: the
+│   │                           #   UpstreamClient seam over reqwest+rustls), retraction,
+│   │                           #   claims, readme rendering
 │   ├── mail/                   # lettre + askama templates (text+HTML multipart)
 │   ├── jobs/                   # interval scheduler + JobLock leader election;
-│   │                           #   mirror sync, blob GC, session/OTP purge, reindex,
-│   │                           #   webhook delivery (retries, dead-letter)
+│   │                           #   mirror.rs (decision 07 sync worker driving
+│   │                           #   UpstreamService), gc.rs (unreferenced-blob GC);
+│   │                           #   later: session/OTP purge, reindex, webhook delivery
 │   ├── api/                    # axum routers (utoipa OpenApiRouter), extractors, DTOs;
 │   │                           #   one protocol module per format (pub now; npm/cargo
 │   │                           #   later — decision 21) + app REST + SSE;
@@ -64,10 +67,12 @@ Wiring is plain runtime polymorphism: `AppState` holds `Arc<dyn PackageRepo>`, `
 ## Data model (core entities)
 
 - `users` — profile, status; `credentials` polymorphic over type (`oidc_google` keyed by `(iss,sub)`, `email_otp`, `totp` seed encrypted with env KEK, `recovery_code`, future `webauthn`).
-- `orgs`, `org_members (org_id, user_id, role_level)` — cumulative role levels **Read(50) / Write(100) / Admin(200) / Owner(250)** with gaps for future roles, mirrored into JWT claims, all checks through one `authorize()` chokepoint ([decision 19](decisions.md#19--rbac-cumulative-role-levels-with-a-single-authorize-chokepoint)); ≥1 Owner invariant; `invitations` (hashed single-use token, 7-day expiry, bound to email, default role Read).
+- `orgs (…, upstream_policy)` — per-org proxy policy `allow` (default) | `block` ([decision 01](decisions.md#01--per-org-virtual-registry-urls)); `org_members (org_id, user_id, role_level)` — cumulative role levels **Read(50) / Write(100) / Admin(200) / Owner(250)** with gaps for future roles, mirrored into JWT claims, all checks through one `authorize()` chokepoint ([decision 19](decisions.md#19--rbac-cumulative-role-levels-with-a-single-authorize-chokepoint)); ≥1 Owner invariant; `invitations` (hashed single-use token, 7-day expiry, bound to email, default role Read).
 - `packages (format, name, org_id, visibility, discontinued, replaced_by, unlisted)` — unique per `(format, name)` per instance ([decision 21](decisions.md#21--multi-format-artifact-space-pub-first-npm-cargo--later): pub in v1, npm/cargo later share these entities); `name_claims` — `(format, name)` → org, written at first publish, consulted by resolution and shadowing alerts.
 - `versions (package_id, semver columns, pubspec JSONB/TEXT, archive_sha256, readme_html, changelog_html, retracted_at, tombstone)` — immutable; archive bytes content-addressed in blob store by sha256.
-- `upstream_packages / upstream_versions` — proxy cache metadata (listing snapshots, sha256, fetched_at, upstream flags verbatim).
+- `upstream_packages / upstream_versions` — proxy cache metadata (listing snapshots incl. the raw document, sha256, size, `cached`, `fetched_at`, upstream flags verbatim) behind `UpstreamRepo`. Deliberately **not** part of `PackageRepo`: an upstream row has no org, no claim, no publisher, and no lifecycle of its own, and "local always wins" (S-16) is only meaningful while the two sets stay distinguishable. Snapshots upsert and never delete; a `cached` version's hash and size are frozen (S-19 byte-drift). `fetched_at` is also the mirror worker's work queue (oldest snapshot first).
+- `upstream_quarantine (format, name, version, both hashes, occurrences, first/last_seen_at)` and `shadowing_alarms (format, name, org_id, upstream, upstream_version, observations, first/last_seen_at, acknowledged_at)` — the two supply-chain registers behind `UpstreamRepo` ([S-19](security.md#4-supply-chain--registry-integrity), [S-17.a](security.md#4-supply-chain--registry-integrity)). One row per incident with a counter, never one per sighting: both feed an admin surface, and an alarm channel that repeats stops being read. Neither is enforcement — the refusal and the resolution order already happened.
+- `jobs (name, cursor, phase, last_run_at, last_success_at, last_error, runs, processed, failures)` — durable background-job state behind `JobRepo`, keyed by the same name the `JobLock` uses. The cursor is opaque to the repository (interpreting it would put job logic in the schema) and counters are added to rather than written, so a run that dies between checkpoints leaves its partial progress recorded. This is what makes a full mirror sweep resume across restarts and leader changes.
 - `sessions` (refresh-token hash, device metadata, revoked_at) and `tokens` (SHA-256 hash, display hint, scopes, org binding, package patterns, expiry, last_used throttled).
 - `audit_log` — append-only (INSERT-only DB role), ULID ids, dot-namespaced actions, actor/IP/UA/org/target/metadata.
 - `notifications (user_id, category, payload, read_at)` — the notification center's persisted feed (unread counts, per-category preferences); fed by the same domain events as the SSE stream, email for high-importance categories.
@@ -96,7 +101,9 @@ Resolution order inside `B/o/{org}`: org-owned → instance-public → upstream 
 
 **Publish pipeline**: step 1 (`versions/new`) verifies only that the token has `publish` scope — the request carries no package name; org binding, token package patterns, and name-claim checks are enforced at finalize (pub.dev does the same). Finalize: per-name lock (`JobLock`) → tar.gz safety validation (size cap, path traversal, symlink escapes) → pubspec parse + name/version/claim/quota checks → sha256 → content-addressed blob write → README/CHANGELOG render (comrak + ammonia + syntect) → DB row + audit event → search index update. Uploaded bytes are stored verbatim and served forever (lockfile hashes depend on it).
 
-**Proxy ingest** (shared by read-through and mirror worker): fetch upstream listing → verify/record `archive_sha256` → store bytes content-addressed → snapshot metadata → serve stale on upstream outage (circuit breaker). Proxied listings are **re-emitted with `archive_url` rewritten under the requesting virtual base `B`** — never upstream's CDN URL, otherwise clients download straight from pub.dev and caching, per-org policy, and stale-serving are silently bypassed. Flags (`retracted`, `isDiscontinued`, `replacedBy`, `advisoriesUpdated`), pubspec JSON, and `archive_sha256` are preserved verbatim. Mirror mode = jobs-crate worker warming the same pipeline: initial sweep + drift repair via `/api/package-names`, fast path via recent-changes polling.
+**Proxy ingest** (`registry/src/upstream.rs`, shared by read-through and the future mirror worker): fetch upstream listing → validate every version's pubspec with the *publish* validator (S-20) → snapshot metadata, preserving flags verbatim → on an archive miss, fetch, **verify `archive_sha256` before storing** (S-19), store byte-identical and content-addressed. Proxied listings are **re-emitted with `archive_url` rewritten under the requesting virtual base `B`** — never upstream's CDN URL, otherwise clients download straight from pub.dev and caching, per-org policy, and stale-serving are silently bypassed. Flags (`retracted`, `isDiscontinued`, `replacedBy`), pubspec JSON, and `archive_sha256` are preserved verbatim; `advisoriesUpdated` is stored but not advertised until the advisories endpoint exists ([protocol.md sharp edge 11](protocol.md#sharp-edges-violate--break-clients)).
+
+A cached listing is served without asking upstream for `upstream.listing_ttl_secs` (default 300); archives are immutable and cached forever. Degradation is uniform and never 5xx: an unreachable upstream or an open circuit serves the cached snapshot with a staleness marker in tracing/metrics, and anything never cached is a 404. Guards: a per-instance in-process circuit breaker (half-open admits one probe), a per-upstream concurrency semaphore, and a single-flight lock so N simultaneous misses of one package cause one upstream fetch. The breaker counts **reachability** failures only — timeouts, connection errors, the transient status family — on the listing *and* archive paths; a 404, a listing the ingest validator refuses, and one past the size cap are facts about a single package and must not degrade the instance ([S-19.a](security.md#4-supply-chain--registry-integrity)). The network itself sits behind the `UpstreamClient` trait (`upstream/http.rs`: reqwest + rustls, retries with exponential backoff on transient failures only, SSRF-guarded destinations, plus the `/api/package-names` enumeration the mirror sweeps), so the whole pipeline is testable without a socket. Mirror mode is the jobs-crate worker warming this same pipeline through `UpstreamService::refresh` — see "Background jobs" below.
 
 ## Realtime events (SSE)
 
@@ -105,6 +112,13 @@ Resolution order inside `B/o/{org}`: org-owned → instance-public → upstream 
 ## Background jobs
 
 Interval scheduler in `jobs/` guarded by `JobLock` leader election (PG advisory lock / Redis lock / trivial single-node): mirror sync, unreferenced-blob GC, expired session/OTP/invitation purge, audit retention, search reindex, token-expiry notification emails. Job state (last-run, cursors) in DB; every job idempotent and safe to rerun.
+
+Two jobs exist today, both **off by default** and each skipped entirely when disabled — a job that is not registered cannot tick, which is a stronger guarantee than one whose body returns early:
+
+- **Mirror sync** (`mirror.rs`, decision 07 second half). `off` | `recent` | `full`. `recent` re-polls the packages this instance already caches, oldest snapshot first; `full` first enumerates upstream's `/api/package-names`, chunked and resumable from a durable cursor, then behaves like `recent` until `resweep_after` starts the next enumeration. Both drive `UpstreamService::refresh` — the read-through pipeline with the read TTL replaced by a caller-supplied freshness floor — so there is no second ingest path. A name claimed locally is observed as an [S-17](security.md#4-supply-chain--registry-integrity) alarm and never mirrored; an open circuit skips the whole tick rather than spending the half-open probe on the first name of a chunk.
+- **Unreferenced-blob GC** (`gc.rs`). Collects content-addressed archives no live version and no cached upstream version references, plus staged uploads past the grace period. Dry-run by default; `min_age` (≥ the 1-hour staged-upload TTL) protects the window in which a blob is legitimately unreferenced, since publish writes bytes before the version row.
+
+Domain counters both jobs feed (decision 23, exporter off by default): `upstream_fetch_total{kind,outcome}`, `cache_hit_ratio`, `upstream_sync_lag_seconds`, `quarantine_total`, `shadowing_alarms_total`, `blob_gc_{scanned,deleted,bytes}_total`.
 
 ## Frontend workspace
 
@@ -129,7 +143,7 @@ Service worker policy: precache app shell + hashed assets; SWR for metadata/sear
 
 ## Configuration & secrets
 
-Boot-time only (env/CLI/mounted files, never DB): DB URL, blob credentials, Redis URL, JWT signing keys, OTP/HMAC pepper, KEK, OIDC client secret, public base URL, instance role flags. Runtime-changeable via admin UI (DB `settings` + KV invalidation): SMTP (password encrypted with KEK), rate-limit numbers, proxy/org policies, registration mode, banners. Rotation: Ed25519 keyring with `kid` overlap; envelope encryption (KEK wraps DEKs) for TOTP seeds/SMTP.
+Boot-time only (env/CLI/mounted files, never DB): DB URL, blob credentials, Redis URL, JWT signing keys, OTP/HMAC pepper, KEK, OIDC client secret, upstream auth token, public base URL, instance role flags. Runtime-changeable via admin UI (DB `settings` + KV invalidation): SMTP (password encrypted with KEK), rate-limit numbers, proxy/org policies, registration mode, banners. Rotation: Ed25519 keyring with `kid` overlap; envelope encryption (KEK wraps DEKs) for TOTP seeds/SMTP.
 
 ## Observability
 
@@ -138,7 +152,8 @@ Boot-time only (env/CLI/mounted files, never DB): DB URL, blob credentials, Redi
 ## Testing strategy
 
 - **Unit**: domain logic, token/JWT/OTP corner cases (expiry grace, malformed input, replay), cursor pagination, resolution policy table-tests.
-- **Integration**: full axum stack over SQLite `:memory:` + InMemory blob + memory KV — protocol conformance suite (every spec status code and header, incl. 401-vs-403-vs-404 ladder), RBAC matrix (role × action × visibility), publish pipeline (dup version, oversized, path-traversal tar, retract/unretract), proxy behavior (shadowing, stale-serve, sha256 mismatch quarantine).
+- **Integration**: full axum stack over SQLite `:memory:` + InMemory blob + memory KV — protocol conformance suite (every spec status code and header, incl. 401-vs-403-vs-404 ladder), RBAC matrix (role × action × visibility), publish pipeline (dup version, oversized, path-traversal tar, retract/unretract), proxy behavior against a scripted upstream (cold miss, cache hit, sha256-mismatch quarantine, byte-drift, stale-serve, circuit breaker, single-flight, per-org policy, shadowing).
+- **Jobs** (`crates/jobs/tests/`): the real worker over a real migrated database and blob store, with only the network scripted — two replicas under one leader lock never running a tick concurrently, `recent` picking up a new upstream version and skipping fresh snapshots, a chunked `full` sweep resuming across a simulated restart and re-enumerating after its window, an S-17 alarm raised once and never mirrored, and a GC that keeps bytes a live version or a cached upstream version still shares.
 - **Backend matrix in CI**: same integration suite against Postgres (+ MinIO, Redis) via services/testcontainers; SQLite path runs on every PR, full matrix on merge + nightly.
 - **E2E**: a CI job running the real `dart pub` client (Dart docker image) against a live server: token add, get, publish, retraction visibility, proxy fetch.
 - **Frontend**: bun test for pure logic (i18n, interceptors, stores); vitest browser mode for ui-kit components; Playwright smoke for auth + publish-token flows; Lighthouse/bundle budgets per roadmap step 8.

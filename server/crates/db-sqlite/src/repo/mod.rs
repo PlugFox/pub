@@ -24,20 +24,24 @@ use sqlx::SqlitePool;
 
 mod audit;
 mod credentials;
+mod jobs;
 mod orgs;
 mod packages;
 mod sessions;
 mod settings;
 mod tokens;
+mod upstream;
 mod users;
 
 pub use audit::SqliteAuditRepo;
 pub use credentials::SqliteCredentialRepo;
+pub use jobs::SqliteJobRepo;
 pub use orgs::SqliteOrgRepo;
 pub use packages::SqlitePackageRepo;
 pub use sessions::SqliteSessionRepo;
 pub use settings::SqliteSettingsRepo;
 pub use tokens::SqliteTokenRepo;
+pub use upstream::SqliteUpstreamRepo;
 pub use users::SqliteUserRepo;
 
 /// Builds a query string from **const fragments only** (column lists, table names) and marks
@@ -54,13 +58,15 @@ pub(crate) use q;
 pub fn repositories(pool: SqlitePool) -> Repositories {
     Repositories {
         packages: Arc::new(SqlitePackageRepo::new(pool.clone())),
+        upstream: Arc::new(SqliteUpstreamRepo::new(pool.clone())),
         users: Arc::new(SqliteUserRepo::new(pool.clone())),
         credentials: Arc::new(SqliteCredentialRepo::new(pool.clone())),
         orgs: Arc::new(SqliteOrgRepo::new(pool.clone())),
         sessions: Arc::new(SqliteSessionRepo::new(pool.clone())),
         tokens: Arc::new(SqliteTokenRepo::new(pool.clone())),
         audit: Arc::new(SqliteAuditRepo::new(pool.clone())),
-        settings: Arc::new(SqliteSettingsRepo::new(pool)),
+        settings: Arc::new(SqliteSettingsRepo::new(pool.clone())),
+        jobs: Arc::new(SqliteJobRepo::new(pool)),
     }
 }
 

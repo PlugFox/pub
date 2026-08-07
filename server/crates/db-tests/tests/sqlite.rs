@@ -82,3 +82,23 @@ async fn resolve_visibility_contract_s04() {
 async fn resolve_in_base_scope_contract_decision01() {
     pub_db_tests::contract::resolve_in_base_scope(&fresh_repos().await).await;
 }
+
+#[tokio::test]
+async fn upstream_repo_contract_s19() {
+    pub_db_tests::contract::upstream_repo(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn upstream_mirror_reads_contract() {
+    pub_db_tests::contract::upstream_mirror_reads(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn supply_chain_registers_contract_s17_s19() {
+    pub_db_tests::contract::supply_chain_registers(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn job_repo_contract() {
+    pub_db_tests::contract::job_repo(&fresh_repos().await).await;
+}

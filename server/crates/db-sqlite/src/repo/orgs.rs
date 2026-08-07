@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership};
+use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, UpstreamPolicy};
 use pub_core::traits::OrgRepo;
 use pub_core::{Error, InvitationId, OrgId, Result, RoleLevel, UserId};
 use sqlx::sqlite::SqliteRow;
@@ -11,7 +11,7 @@ use sqlx::{Row as _, SqlitePool};
 use super::{db_err, parse_col, parse_ts, parse_ts_opt, q, write_err};
 
 /// All org columns, in [`OrgRow`] order.
-const ORG_COLS: &str = "id, name, slug, created_at, updated_at";
+const ORG_COLS: &str = "id, name, slug, upstream_policy, created_at, updated_at";
 /// All membership columns, in [`MemberRow`] order.
 const MEMBER_COLS: &str = "org_id, user_id, role_level, created_at, updated_at";
 /// All invitation columns, in [`InvitationRow`] order.
@@ -36,6 +36,7 @@ struct OrgRow {
     id: String,
     name: String,
     slug: String,
+    upstream_policy: String,
     created_at: String,
     updated_at: String,
 }
@@ -48,6 +49,7 @@ impl TryFrom<OrgRow> for Org {
             id: parse_col(&row.id)?,
             name: row.name,
             slug: row.slug,
+            upstream_policy: parse_col::<UpstreamPolicy>(&row.upstream_policy)?,
             created_at: parse_ts(&row.created_at)?,
             updated_at: parse_ts(&row.updated_at)?,
         })
@@ -145,6 +147,8 @@ impl OrgRepo for SqliteOrgRepo {
     async fn create(&self, new: NewOrg, creator: UserId, now: DateTime<Utc>) -> Result<Org> {
         let stamp = super::ts(now);
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // `upstream_policy` is left to its column default (`allow`, decision 01): a new org
+        // inherits the instance's proxy posture rather than carrying an opinion from creation.
         let row: OrgRow = sqlx::query_as(q!(
             "INSERT INTO orgs (id, name, slug, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING {ORG_COLS}"
         ))
@@ -191,6 +195,18 @@ impl OrgRepo for SqliteOrgRepo {
             .await
             .map_err(db_err)?;
         row.map(TryInto::try_into).transpose()
+    }
+
+    async fn set_upstream_policy(&self, id: OrgId, policy: UpstreamPolicy, now: DateTime<Utc>) -> Result<Org> {
+        let row: Option<OrgRow> =
+            sqlx::query_as(q!("UPDATE orgs SET upstream_policy = ?, updated_at = ? WHERE id = ? RETURNING {ORG_COLS}"))
+                .bind(policy.as_str())
+                .bind(super::ts(now))
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?.try_into()
     }
 
     async fn list_for_user(&self, user: UserId) -> Result<Vec<OrgMembership>> {

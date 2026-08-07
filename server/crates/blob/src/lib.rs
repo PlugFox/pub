@@ -16,7 +16,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use pub_config::{BlobConfig, BlobKind};
-use pub_core::traits::{BlobStore, DownloadPlan};
+use pub_core::traits::{BlobObject, BlobStore, DownloadPlan};
 use pub_core::{Error, Result};
 
 /// [`BlobStore`] backed by any `object_store` implementation.
@@ -112,6 +112,26 @@ impl BlobStore for ObjectStoreBlob {
             Err(err) => Err(blob_err(err)),
         }
     }
+
+    /// Recursive listing under `prefix` (the unreferenced-blob GC job's only enumeration path).
+    ///
+    /// `object_store`'s `list` already walks every level below the prefix, which is what this
+    /// caller needs: archive keys are sharded (`pub/ab/<sha>.tar.gz`), so a delimiter-based
+    /// listing would return 256 directories and no objects.
+    async fn list(&self, prefix: &str) -> Result<Vec<BlobObject>> {
+        let path = ObjectPath::from(prefix);
+        let mut stream = self.store.list(Some(&path));
+        let mut objects = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(blob_err)?;
+            objects.push(BlobObject {
+                key: meta.location.as_ref().to_owned(),
+                size: meta.size,
+                last_modified: Some(meta.last_modified),
+            });
+        }
+        Ok(objects)
+    }
 }
 
 fn blob_err(err: object_store::Error) -> Error {
@@ -181,6 +201,37 @@ mod tests {
         blob.delete("pub/cd/cdef.tar.gz").await.unwrap();
         assert_eq!(blob.download("pub/cd/cdef.tar.gz").await.unwrap_err().code(), "not_found");
         blob.delete("pub/cd/cdef.tar.gz").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_walks_shards_and_reports_sizes() {
+        // GC enumerates content-addressed keys, which are sharded two levels deep — a
+        // delimiter-based listing would hand back directories and no objects.
+        let blob = ObjectStoreBlob::memory();
+        blob.put("pub/ab/abcd.tar.gz", Bytes::from_static(b"12345")).await.unwrap();
+        blob.put("pub/cd/cdef.tar.gz", Bytes::from_static(b"123")).await.unwrap();
+        blob.put("uploads/pub/session.tar.gz", Bytes::from_static(b"staged")).await.unwrap();
+
+        let mut listed = blob.list("pub/").await.unwrap();
+        listed.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(listed.len(), 2, "the staging namespace is outside the prefix: {listed:?}");
+        assert_eq!(listed[0].key, "pub/ab/abcd.tar.gz");
+        assert_eq!(listed[0].size, 5);
+        assert!(listed[0].last_modified.is_some(), "GC needs an age to respect its grace period");
+        assert_eq!(listed[1].size, 3);
+        assert!(blob.list("nothing/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fs_list_walks_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BlobConfig { path: dir.path().join("blobs").to_string_lossy().into_owned(), ..BlobConfig::default() };
+        let blob = ObjectStoreBlob::fs(&cfg).unwrap();
+        blob.put("pub/ab/abcd.tar.gz", Bytes::from_static(b"12345")).await.unwrap();
+        let listed = blob.list("pub/").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "pub/ab/abcd.tar.gz");
+        assert_eq!(listed[0].size, 5);
     }
 
     #[tokio::test]
