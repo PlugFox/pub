@@ -14,9 +14,19 @@
     "./sessions": "./src/sessions.ts",
     "./tokens": "./src/tokens.ts",
     "./orgs": "./src/orgs.ts",
-    "./pub-api": "./src/pub-api.ts"
+    "./pub-api": "./src/pub-api.ts",
+    "./home": "./src/home.ts",
+    "./packages": "./src/packages.ts",
+    "./notifications": "./src/notifications.ts",
+    "./admin": "./src/admin.ts",
+    "./events": "./src/events.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "gen:api": "bun scripts/gen-api.ts"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.13.0",
+    "typescript": "5.9.3"
   }
 }

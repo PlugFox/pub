@@ -19,6 +19,7 @@
     "./table": "./src/table.tsx",
     "./tabs": "./src/tabs.tsx",
     "./menu": "./src/menu.tsx",
+    "./popover": "./src/popover.tsx",
     "./alert": "./src/alert.tsx",
     "./spinner": "./src/spinner.tsx",
     "./empty-state": "./src/empty-state.tsx",

@@ -1,6 +1,8 @@
+import { type AdminApi, createAdminApi } from "./admin";
 import { type AuthApi, createAuthApi } from "./auth";
 import { type ApiClient, createClient, type FetchLike } from "./client";
 import { ApiError } from "./errors";
+import { createHomeApi, type HomeApi } from "./home";
 import {
   type AuthLostReason,
   createAuthInterceptor,
@@ -9,7 +11,9 @@ import {
   mutationHeadersInterceptor,
   type StepUpSignal,
 } from "./interceptors";
+import { createNotificationsApi, type NotificationsApi } from "./notifications";
 import { createOrgsApi, type OrgsApi } from "./orgs";
+import { createPackagesApi, type PackagesApi } from "./packages";
 import { createSessionsApi, type SessionsApi } from "./sessions";
 import { createTokenStorage, type TokenPair, type TokenStorage } from "./storage";
 import { createTokensApi, type TokensApi } from "./tokens";
@@ -50,10 +54,26 @@ export type PubApi = {
   readonly sessions: SessionsApi;
   readonly tokens: TokensApi;
   readonly orgs: OrgsApi;
+  readonly home: HomeApi;
+  readonly packages: PackagesApi;
+  readonly notifications: NotificationsApi;
+  readonly admin: AdminApi;
   /** Clears the refresh denial latch after a fresh sign-in. */
   resetAuth(): void;
   /** Whether the latch is closed (a refresh has been refused). */
   isAuthDenied(): boolean;
+  /**
+   * Rotates the token pair immediately and reports whether a new one landed.
+   *
+   * The access token carries the caller's org role levels (decision 03), and a
+   * membership **grant** deliberately does not revoke sessions
+   * ([S-09.a](../../../docs/security.md)) — nothing stale can spend authority
+   * that did not exist yet, so the token simply keeps its old, narrower claim
+   * until it is next rotated. Call this after an action that grants the caller
+   * a membership; otherwise the new org's private packages, member list, and
+   * event-stream audience stay invisible for up to one access TTL.
+   */
+  renewAuth(): Promise<boolean>;
 };
 
 /**
@@ -61,12 +81,15 @@ export type PubApi = {
  *
  * `null` for the `mfa_required` shape and for any response missing a half —
  * a half-stored pair is worse than none (the interceptor would refresh with
- * `undefined` on the very first call).
+ * `undefined` on the very first call). Both absent and explicitly-`null` count
+ * as missing: the generated types allow either, and a stored `"null"` string
+ * would be a credential-shaped value that never authenticates.
  */
 export function loginTokenPair(login: LoginDto): TokenPair | null {
-  if (login.mfa_required) return null;
   const { access_token: accessToken, refresh_token: refreshToken } = login;
-  if (accessToken === undefined || refreshToken === undefined) return null;
+  if (login.mfa_required) return null;
+  if (accessToken === undefined || accessToken === null) return null;
+  if (refreshToken === undefined || refreshToken === null) return null;
   return { accessToken, refreshToken };
 }
 
@@ -119,7 +142,12 @@ export function createPubApi(options: PubApiOptions = {}): PubApi {
     sessions: createSessionsApi(client),
     tokens: createTokensApi(client),
     orgs: createOrgsApi(client),
+    home: createHomeApi(client),
+    packages: createPackagesApi(client),
+    notifications: createNotificationsApi(client),
+    admin: createAdminApi(client),
     resetAuth: authInterceptor.reset,
     isAuthDenied: authInterceptor.isDenied,
+    renewAuth: authInterceptor.renew,
   };
 }

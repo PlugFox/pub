@@ -6,8 +6,6 @@ export const app = {
   skipToContent: { id: "app.skipToContent", en: "Skip to content" },
   /** Sidebar link to the app's start page (/app). */
   navOverview: { id: "app.navOverview", en: "Overview" },
-  /** Sidebar link to the package list. */
-  navPackages: { id: "app.navPackages", en: "Packages" },
   /** Sidebar link to the package search screen. */
   navSearch: { id: "app.navSearch", en: "Search" },
   /** Sidebar link to the list of organizations the user belongs to. */
@@ -288,26 +286,648 @@ export const app = {
   orgsSlugRequired: { id: "app.orgsSlugRequired", en: "Enter a slug of lowercase letters, digits, and hyphens." },
   /** Toast confirming that an organization was created. */
   orgsCreated: { id: "app.orgsCreated", en: "Organization created." },
-  /** Heading of the single-organization screen. */
-  orgDetailTitle: { id: "app.orgDetailTitle", en: "Organization" },
-  /** Placeholder text on the organization detail screen while the management endpoints are being built. */
-  orgDetailTodo: { id: "app.orgDetailTodo", en: "Members, invitations, packages, settings, and the audit log for this organization arrive with the management API." },
-  /** Badge marking a screen whose backend endpoints do not exist yet. */
-  comingSoon: { id: "app.comingSoon", en: "Coming soon" },
-  /** Body of the placeholder card on the packages screen. */
-  placeholderPackages: { id: "app.placeholderPackages", en: "The package index, version history, and README rendering land with the registry read API." },
-  /** Body of the placeholder card on the search screen. */
-  placeholderSearch: { id: "app.placeholderSearch", en: "Full-text search with filter tags lands with the search API." },
-  /** Shown on the search placeholder when the user actually typed a query; `{query}` is their input. */
-  placeholderSearchQuery: { id: "app.placeholderSearchQuery", en: "You searched for “{query}”. Nothing is wired up yet — this screen is a placeholder." },
-  /** Body of the placeholder card on the notifications screen. */
-  placeholderNotifications: { id: "app.placeholderNotifications", en: "The notification center lands with the event stream." },
-  /** Body of the placeholder card on the admin screen. */
-  placeholderAdmin: { id: "app.placeholderAdmin", en: "Instance settings, user and organization management, moderation, and the audit viewer land with the admin API." },
+  /** Button that opens the dialog for redeeming an organization invitation code, and its submit button. */
+  orgsAcceptInvite: { id: "app.orgsAcceptInvite", en: "Accept invitation" },
+  /** Title of the dialog for redeeming an organization invitation code. */
+  orgsAcceptInviteTitle: { id: "app.orgsAcceptInviteTitle", en: "Join an organization" },
+  /** Description of the invitation dialog, explaining where the code comes from. */
+  orgsAcceptInviteBody: { id: "app.orgsAcceptInviteBody", en: "Paste the invitation code from the email an administrator sent you." },
+  /** Label of the invitation-code field. */
+  orgsInviteCodeField: { id: "app.orgsInviteCodeField", en: "Invitation code" },
+  /** Validation message when the invitation dialog is submitted with an empty code. */
+  orgsInviteCodeRequired: { id: "app.orgsInviteCodeRequired", en: "Enter the invitation code." },
+  /** Uniform failure for a rejected invitation code; the reasons are deliberately not distinguished. */
+  orgsInviteCodeInvalid: { id: "app.orgsInviteCodeInvalid", en: "That invitation code is not valid. It may have expired or already been used." },
+  /** Toast confirming a redeemed invitation; `{org}` is the organization's display name. */
+  orgsInviteAccepted: { id: "app.orgsInviteAccepted", en: "You joined {org}." },
   /** Heading of the app's start screen. */
   overviewTitle: { id: "app.overviewTitle", en: "Overview" },
-  /** Line on the overview screen naming the current user; `{name}` is their display name. */
-  overviewSignedInAs: { id: "app.overviewSignedInAs", en: "Signed in as {name}" },
-  /** Body of the placeholder card on the overview screen. */
-  overviewTodo: { id: "app.overviewTodo", en: "Instance statistics, top packages, and recent activity land with the read API." },
+  /** Submit button that persists an edited form (package options, org profile, admin settings). */
+  save: { id: "app.save", en: "Save" },
+  /** Button that removes a member from an organization. */
+  remove: { id: "app.remove", en: "Remove" },
+  /** Subline under the instance name on the landing screen when the administrator set no tagline. */
+  homeTaglineFallback: { id: "app.homeTaglineFallback", en: "A self-hosted package registry for Dart and Flutter." },
+  /** Primary call-to-action on the landing screen; opens the search screen. */
+  homeBrowse: { id: "app.homeBrowse", en: "Browse packages" },
+  /** Small heading above the three landing counters. */
+  homeCountersTitle: { id: "app.homeCountersTitle", en: "This instance" },
+  /** Label of the landing counter showing how many packages the reader can see. */
+  homeCounterPackages: { id: "app.homeCounterPackages", en: "Packages" },
+  /** Label of the landing counter showing how many live versions the reader can see. */
+  homeCounterVersions: { id: "app.homeCounterVersions", en: "Versions" },
+  /** Label of the landing counter showing how many organizations exist. */
+  homeCounterOrgs: { id: "app.homeCounterOrgs", en: "Organizations" },
+  /** Footnote under the landing counters explaining that they are scoped to the caller's visibility. */
+  homeCountersScoped: { id: "app.homeCountersScoped", en: "Counters cover what you can see — signing in to more organizations shows more." },
+  /** Heading of the landing rail listing the most recently updated packages. */
+  homeRecentTitle: { id: "app.homeRecentTitle", en: "Recently updated" },
+  /** Heading of the landing rail listing packages by all-time download count. */
+  homePopularTitle: { id: "app.homePopularTitle", en: "Most downloaded" },
+  /** Empty state inside a landing rail when the instance has no visible packages. */
+  homeRailEmpty: { id: "app.homeRailEmpty", en: "Nothing published yet" },
+  /** Label of the owning-organization field on a package card and on the package page. */
+  pkgOrg: { id: "app.pkgOrg", en: "Organization" },
+  /** Label of the all-time download counter on a package card and on the package page. */
+  pkgDownloads: { id: "app.pkgDownloads", en: "Downloads" },
+  /** Label of the last-update timestamp on a package card. */
+  pkgUpdated: { id: "app.pkgUpdated", en: "Updated" },
+  /** Badge on a package that is visible only inside its owning organization. */
+  pkgFlagPrivate: { id: "app.pkgFlagPrivate", en: "Private" },
+  /** Badge on a package hidden from search and listings but still resolvable by name. */
+  pkgFlagUnlisted: { id: "app.pkgFlagUnlisted", en: "Unlisted" },
+  /** Badge on a package its maintainers marked as no longer maintained. */
+  pkgFlagDiscontinued: { id: "app.pkgFlagDiscontinued", en: "Discontinued" },
+  /** Badge shown when the newest published version of a package is retracted. */
+  pkgFlagLatestRetracted: { id: "app.pkgFlagLatestRetracted", en: "Latest retracted" },
+  /** Heading of the package search screen. */
+  searchTitle: { id: "app.searchTitle", en: "Search" },
+  /** Subtitle under the search screen heading. */
+  searchSubtitle: { id: "app.searchSubtitle", en: "Full-text search over package names, descriptions, and readmes, with filter tags." },
+  /** Label of the search input on the search screen. */
+  searchFieldLabel: { id: "app.searchFieldLabel", en: "Query" },
+  /** Submit button of the search form. */
+  searchSubmit: { id: "app.searchSubmit", en: "Search" },
+  /** Label of the ordering select on the search screen. */
+  searchSortLabel: { id: "app.searchSortLabel", en: "Sort by" },
+  /** Search ordering option — best text match first. */
+  searchSortRelevance: { id: "app.searchSortRelevance", en: "Relevance" },
+  /** Search ordering option — most recently updated first. */
+  searchSortUpdated: { id: "app.searchSortUpdated", en: "Recently updated" },
+  /** Search ordering option — alphabetical by package name. */
+  searchSortName: { id: "app.searchSortName", en: "Name" },
+  /** Search ordering option — most downloaded first. */
+  searchSortDownloads: { id: "app.searchSortDownloads", en: "Downloads" },
+  /** Badge shown when the server applied a different ordering than requested; {sort} is the ordering name. */
+  searchSortApplied: { id: "app.searchSortApplied", en: "Sorted by {sort}" },
+  /** Result count above the search results; {count} is the already formatted total across all pages. */
+  searchTotal: { id: "app.searchTotal", en: {"one":"{count} package","other":"{count} packages"} },
+  /** Warning listing query tokens the server's parser could not interpret; {filters} is a comma-separated list. */
+  searchIgnoredFilters: { id: "app.searchIgnoredFilters", en: "These filters were not understood and were ignored: {filters}" },
+  /** Heading above the organization facet chips on the search screen. */
+  searchFacetOrgs: { id: "app.searchFacetOrgs", en: "Organizations" },
+  /** Empty state title when a search returns no results. */
+  searchEmptyTitle: { id: "app.searchEmptyTitle", en: "No packages found" },
+  /** Empty state body when a search with query text returns no results. */
+  searchEmptyBody: { id: "app.searchEmptyBody", en: "Try fewer filters, or check the search syntax help." },
+  /** Empty state body when browsing without a query returns no results. */
+  searchEmptyBrowse: { id: "app.searchEmptyBrowse", en: "This instance has no packages you can see yet." },
+  /** Error message shown when the search request fails. */
+  searchFailed: { id: "app.searchFailed", en: "The search could not be completed." },
+  /** Accessible name of the pagination controls under a cursor-paginated list. */
+  searchPagination: { id: "app.searchPagination", en: "Result pages" },
+  /** Button that loads the next page of a cursor-paginated list. */
+  searchNextPage: { id: "app.searchNextPage", en: "Next page" },
+  /** Button that drops the page cursor and returns to the first page of a list. */
+  searchFirstPage: { id: "app.searchFirstPage", en: "Back to first page" },
+  /** Button next to the search field that opens the query-syntax help popover. */
+  searchSyntaxTrigger: { id: "app.searchSyntaxTrigger", en: "Syntax" },
+  /** Title of the query-syntax help popover. */
+  searchSyntaxTitle: { id: "app.searchSyntaxTitle", en: "Search syntax" },
+  /** Introductory line of the search-syntax help popover. */
+  searchSyntaxIntro: { id: "app.searchSyntaxIntro", en: "Combine free text with filter tags. Unknown tags are ignored and listed above the results." },
+  /** Help text for the org: search filter tag. */
+  searchSyntaxOrg: { id: "app.searchSyntaxOrg", en: "Only packages owned by that organization." },
+  /** Help text for the topic: search filter tag. */
+  searchSyntaxTopic: { id: "app.searchSyntaxTopic", en: "Only packages declaring that topic in their pubspec." },
+  /** Help text for the dependency: search filter tag. */
+  searchSyntaxDependency: { id: "app.searchSyntaxDependency", en: "Only packages that depend on that package." },
+  /** Help text for the is: search filter tag, listing the accepted flag values. */
+  searchSyntaxIs: { id: "app.searchSyntaxIs", en: "Flags: public, private, discontinued, unlisted." },
+  /** Help text for the format: search filter tag. */
+  searchSyntaxFormat: { id: "app.searchSyntaxFormat", en: "Artifact format; only pub exists today." },
+  /** Help text for the sort: search filter tag. */
+  searchSyntaxSort: { id: "app.searchSyntaxSort", en: "Ordering inside the query; overrides the control." },
+  /** Help text for negating a search filter tag with a leading minus sign. */
+  searchSyntaxNegate: { id: "app.searchSyntaxNegate", en: "A leading minus excludes matches of that filter." },
+  /** Help text for quoting an exact phrase in a search query. */
+  searchSyntaxPhrase: { id: "app.searchSyntaxPhrase", en: "Quotes match the words next to each other." },
+  /** Accessible name of the package page's tab list. */
+  pkgTabs: { id: "app.pkgTabs", en: "Package sections" },
+  /** Package page tab showing the rendered README of the latest version. */
+  pkgTabReadme: { id: "app.pkgTabReadme", en: "Readme" },
+  /** Package page tab showing the rendered CHANGELOG of the latest version. */
+  pkgTabChangelog: { id: "app.pkgTabChangelog", en: "Changelog" },
+  /** Package page tab listing every published version. */
+  pkgTabVersions: { id: "app.pkgTabVersions", en: "Versions" },
+  /** Package page tab listing packages that depend on this one. */
+  pkgTabDependents: { id: "app.pkgTabDependents", en: "Dependents" },
+  /** Package page tab with the pubspec snippet and the hosted registry URL. */
+  pkgTabInstalling: { id: "app.pkgTabInstalling", en: "Installing" },
+  /** Package page tab with the management controls, shown only to organization members. */
+  pkgTabManage: { id: "app.pkgTabManage", en: "Manage" },
+  /** Column header and label for a package version number. */
+  pkgVersion: { id: "app.pkgVersion", en: "Version" },
+  /** Live version count in the package page header; {count} is the already formatted number. */
+  pkgVersionCount: { id: "app.pkgVersionCount", en: {"one":"{count} version","other":"{count} versions"} },
+  /** Column header for a version's publication date. */
+  pkgPublished: { id: "app.pkgPublished", en: "Published" },
+  /** Column header for the account that published a version; only visible inside the owning organization. */
+  pkgPublisher: { id: "app.pkgPublisher", en: "Published by" },
+  /** Column header for the archive size of a version. */
+  pkgArchiveSize: { id: "app.pkgArchiveSize", en: "Size" },
+  /** Badge on a version that has been retracted. */
+  pkgRetracted: { id: "app.pkgRetracted", en: "Retracted" },
+  /** Accessible name of the version table on the package page. */
+  pkgVersionsTable: { id: "app.pkgVersionsTable", en: "Versions of this package" },
+  /** Empty state on the versions tab when a package has no live versions. */
+  pkgVersionsEmpty: { id: "app.pkgVersionsEmpty", en: "No versions" },
+  /** Footnote under a truncated version list on the package page. */
+  pkgVersionsTruncated: { id: "app.pkgVersionsTruncated", en: "Only the most recent versions are listed; the pub client sees all of them." },
+  /** Empty state on the dependents tab. */
+  pkgDependentsEmpty: { id: "app.pkgDependentsEmpty", en: "Nothing depends on this package" },
+  /** Empty state body on the dependents tab. */
+  pkgDependentsEmptyBody: { id: "app.pkgDependentsEmptyBody", en: "Dependents appear once another package on this instance declares it in its pubspec." },
+  /** Empty state on the readme tab when the version has no rendered README. */
+  pkgNoReadme: { id: "app.pkgNoReadme", en: "This version shipped without a README" },
+  /** Empty state on the changelog tab when the version has no rendered CHANGELOG. */
+  pkgNoChangelog: { id: "app.pkgNoChangelog", en: "This version shipped without a CHANGELOG" },
+  /** Alert on the package page explaining the discontinued flag. */
+  pkgDiscontinuedBody: { id: "app.pkgDiscontinuedBody", en: "The maintainers marked this package as no longer maintained." },
+  /** Link inside the discontinued alert pointing at the suggested replacement; {name} is a package name. */
+  pkgReplacedBy: { id: "app.pkgReplacedBy", en: "Use {name} instead." },
+  /** Alert on the package page explaining what a retracted newest version means for the shown latest version. */
+  pkgLatestRetractedBody: { id: "app.pkgLatestRetractedBody", en: "The newest published version is retracted, so the version above is an older one that resolution still picks." },
+  /** Alert on the package page explaining the unlisted flag. */
+  pkgUnlistedBody: { id: "app.pkgUnlistedBody", en: "This package is hidden from search and listings. It still resolves by name." },
+  /** Alert on a version page explaining what retraction means. */
+  pkgVersionRetractedBody: { id: "app.pkgVersionRetractedBody", en: "This version is excluded from new resolutions. Existing lockfiles keep working." },
+  /** Button at the bottom of a version page returning to the package's version list. */
+  pkgBackToVersions: { id: "app.pkgBackToVersions", en: "Back to all versions" },
+  /** Heading of the installing tab section carrying the dependency snippet. */
+  pkgInstallPubspecTitle: { id: "app.pkgInstallPubspecTitle", en: "Add to pubspec.yaml" },
+  /** Explanation under the pubspec snippet on the installing tab. */
+  pkgInstallPubspecBody: { id: "app.pkgInstallPubspecBody", en: "The hosted URL is part of the snippet on purpose — without it the dependency resolves against pub.dev on any machine that has no PUB_HOSTED_URL set." },
+  /** Heading of the installing tab section carrying the organization's virtual registry base. */
+  pkgInstallHostedTitle: { id: "app.pkgInstallHostedTitle", en: "Registry URL" },
+  /** Explanation under the registry URL on the installing tab. */
+  pkgInstallHostedBody: { id: "app.pkgInstallHostedBody", en: "This is the PUB_HOSTED_URL for the owning organization." },
+  /** Heading of the installing tab section shown for private packages, carrying the token command. */
+  pkgInstallTokenTitle: { id: "app.pkgInstallTokenTitle", en: "Authenticate first" },
+  /** Explanation above the dart pub token add command on the installing tab. */
+  pkgInstallTokenBody: { id: "app.pkgInstallTokenBody", en: "This package is private, so the pub client needs a token for this registry base." },
+  /** Introductory alert at the top of the package management tab. */
+  manageIntro: { id: "app.manageIntro", en: "These controls change what the registry serves. Retraction and deletion are audited." },
+  /** Heading of the package options card on the management tab. */
+  manageOptionsTitle: { id: "app.manageOptionsTitle", en: "Options" },
+  /** Subtitle of the package options card. */
+  manageOptionsBody: { id: "app.manageOptionsBody", en: "Visibility and discovery flags. All of them are reversible." },
+  /** Toast confirming that package options were updated. */
+  manageOptionsSaved: { id: "app.manageOptionsSaved", en: "Options saved." },
+  /** Label of the package visibility select on the management tab. */
+  manageVisibility: { id: "app.manageVisibility", en: "Visibility" },
+  /** Option of the package visibility select. */
+  manageVisibilityPublic: { id: "app.manageVisibilityPublic", en: "Public — anyone may read it" },
+  /** Option of the package visibility select. */
+  manageVisibilityPrivate: { id: "app.manageVisibilityPrivate", en: "Private — only the organization" },
+  /** Checkbox label for hiding a package from search and listings. */
+  manageUnlisted: { id: "app.manageUnlisted", en: "Unlisted" },
+  /** Hint under the unlisted checkbox on the package management tab. */
+  manageUnlistedHint: { id: "app.manageUnlistedHint", en: "Hidden from search, facets, counters, and organization listings — still resolvable by name." },
+  /** Checkbox label for marking a package as no longer maintained. */
+  manageDiscontinued: { id: "app.manageDiscontinued", en: "Discontinued" },
+  /** Hint under the discontinued checkbox on the package management tab. */
+  manageDiscontinuedHint: { id: "app.manageDiscontinuedHint", en: "The pub client warns about it; existing versions stay downloadable." },
+  /** Label of the replacement-package field, only meaningful while the package is discontinued. */
+  manageReplacedBy: { id: "app.manageReplacedBy", en: "Replaced by" },
+  /** Hint under the replaced-by field on the package management tab. */
+  manageReplacedByHint: { id: "app.manageReplacedByHint", en: "Only meaningful while discontinued. Leave empty to clear it." },
+  /** Heading of the retraction card on the package management tab. */
+  manageRetractTitle: { id: "app.manageRetractTitle", en: "Retraction" },
+  /** Subtitle of the retraction card. */
+  manageRetractBody: { id: "app.manageRetractBody", en: "A retracted version stays downloadable but is excluded from new resolutions." },
+  /** Alert on the retraction card explaining the restore window. */
+  manageRetractWindow: { id: "app.manageRetractWindow", en: "Retraction can be undone only for a limited window after it happens; afterwards the only way forward is publishing a new version." },
+  /** Accessible name of the retraction table on the package management tab. */
+  manageRetractTable: { id: "app.manageRetractTable", en: "Versions and their retraction state" },
+  /** Column header for the timestamp at which a version was retracted. */
+  manageRetractedAt: { id: "app.manageRetractedAt", en: "Retracted at" },
+  /** Screen-reader-only header of the action column in the retraction table. */
+  manageRetractAction: { id: "app.manageRetractAction", en: "Retraction action" },
+  /** Button that retracts one version. */
+  manageRetract: { id: "app.manageRetract", en: "Retract" },
+  /** Button that undoes the retraction of one version. */
+  manageUnretract: { id: "app.manageUnretract", en: "Restore" },
+  /** Toast confirming a retraction; {version} is the version number. */
+  manageRetracted: { id: "app.manageRetracted", en: "Version {version} retracted." },
+  /** Toast confirming that a retraction was undone; {version} is the version number. */
+  manageUnretracted: { id: "app.manageUnretracted", en: "Version {version} restored." },
+  /** Heading of the hard-delete card and title of its confirmation dialog. */
+  manageDeleteTitle: { id: "app.manageDeleteTitle", en: "Delete a version permanently" },
+  /** Subtitle of the hard-delete card on the package management tab. */
+  manageDeleteBody: { id: "app.manageDeleteBody", en: "Removes the archive bytes. The version number stays burned forever and can never be republished." },
+  /** Description inside the hard-delete confirmation dialog. */
+  manageDeleteWarning: { id: "app.manageDeleteWarning", en: "This cannot be undone. Prefer retraction unless the bytes themselves must go." },
+  /** Button that opens and confirms the hard-delete dialog. */
+  manageDeleteAction: { id: "app.manageDeleteAction", en: "Delete version" },
+  /** Label of the typed-confirmation field in the hard-delete dialog. */
+  manageDeleteConfirmLabel: { id: "app.manageDeleteConfirmLabel", en: "Type the package and version to confirm" },
+  /** Hint showing the exact confirmation string; {expected} is "name@version". */
+  manageDeleteConfirmHint: { id: "app.manageDeleteConfirmHint", en: "Exactly {expected}" },
+  /** Label of the mandatory reason field in the hard-delete dialog. */
+  manageDeleteReason: { id: "app.manageDeleteReason", en: "Reason" },
+  /** Hint under the reason field in the hard-delete dialog. */
+  manageDeleteReasonHint: { id: "app.manageDeleteReasonHint", en: "Recorded in the audit log." },
+  /** Toast confirming a hard delete; {version} is the version number. */
+  manageDeleted: { id: "app.manageDeleted", en: "Version {version} deleted." },
+  /** Heading of the transfer card and title of its confirmation dialog. */
+  manageTransferTitle: { id: "app.manageTransferTitle", en: "Transfer ownership" },
+  /** Subtitle of the transfer card on the package management tab. */
+  manageTransferBody: { id: "app.manageTransferBody", en: "Moves the package to another organization you own. Its registry base changes with it." },
+  /** Description inside the transfer confirmation dialog. */
+  manageTransferWarning: { id: "app.manageTransferWarning", en: "Existing dependencies keep resolving, but the hosted URL your team pastes changes." },
+  /** Button that opens and confirms the transfer dialog. */
+  manageTransferAction: { id: "app.manageTransferAction", en: "Transfer" },
+  /** Label of the target organization select in the transfer dialog. */
+  manageTransferTarget: { id: "app.manageTransferTarget", en: "Receiving organization" },
+  /** Label of the typed-confirmation field in the transfer dialog. */
+  manageTransferConfirmLabel: { id: "app.manageTransferConfirmLabel", en: "Type the package name to confirm" },
+  /** Message replacing the transfer button when the caller owns no eligible target organization. */
+  manageTransferNoTargets: { id: "app.manageTransferNoTargets", en: "You own no other organization that could receive this package." },
+  /** Toast confirming a transfer; {org} is the receiving organization slug. */
+  manageTransferred: { id: "app.manageTransferred", en: "Transferred to {org}." },
+  /** Badge on an organization that was archived by a forced deletion. */
+  orgArchived: { id: "app.orgArchived", en: "Archived" },
+  /** Explanation above the organization's virtual registry base. */
+  orgRegistryHint: { id: "app.orgRegistryHint", en: "Point the pub client at this base to publish and consume this organization's packages." },
+  /** Footnote on the organization page; {policy} is allow or block. */
+  orgUpstreamPolicy: { id: "app.orgUpstreamPolicy", en: "Upstream proxy policy: {policy}" },
+  /** Heading of the package list on the organization page. */
+  orgPackagesTitle: { id: "app.orgPackagesTitle", en: "Packages" },
+  /** Empty state of the organization's package list. */
+  orgPackagesEmpty: { id: "app.orgPackagesEmpty", en: "No packages you can see" },
+  /** Empty state body of the organization's package list. */
+  orgPackagesEmptyBody: { id: "app.orgPackagesEmptyBody", en: "Private packages appear here once you are a member of this organization." },
+  /** Footnote under a truncated organization package list. */
+  orgPackagesTruncated: { id: "app.orgPackagesTruncated", en: "Only the newest packages are listed. Use search to see the rest." },
+  /** Heading of the organization member list. */
+  orgMembersTitle: { id: "app.orgMembersTitle", en: "Members" },
+  /** Empty state of the organization member list. */
+  orgMembersEmpty: { id: "app.orgMembersEmpty", en: "No members" },
+  /** Column header for a member's display name. */
+  orgMemberName: { id: "app.orgMemberName", en: "Member" },
+  /** Column header for the date a membership was created. */
+  orgMemberSince: { id: "app.orgMemberSince", en: "Member since" },
+  /** Link on the organization page to its management screen; visible to Admins and Owners. */
+  orgManageLink: { id: "app.orgManageLink", en: "Manage organization" },
+  /** Link on the organization page to the token screen; visible to Admins and Owners. */
+  orgTokensLink: { id: "app.orgTokensLink", en: "CLI tokens" },
+  /** Heading of the organization management screen. */
+  orgManageTitle: { id: "app.orgManageTitle", en: "Organization settings" },
+  /** Message shown when a member below Admin opens the organization management screen. */
+  orgManageForbidden: { id: "app.orgManageForbidden", en: "Managing this organization needs the Admin role." },
+  /** Heading of the profile card on the organization management screen. */
+  orgManageProfileTitle: { id: "app.orgManageProfileTitle", en: "Profile" },
+  /** Label of the organization description field. */
+  orgManageDescription: { id: "app.orgManageDescription", en: "Description" },
+  /** Hint under the read-only slug field on the organization management screen. */
+  orgManageSlugLocked: { id: "app.orgManageSlugLocked", en: "The slug is the registry base and cannot change — renaming it would break every configured PUB_HOSTED_URL." },
+  /** Label of the organization's upstream policy select. */
+  orgManageUpstream: { id: "app.orgManageUpstream", en: "Upstream proxy" },
+  /** Hint under the upstream policy select. */
+  orgManageUpstreamHint: { id: "app.orgManageUpstreamHint", en: "Blocking stops this organization's registry base from falling through to the upstream registry." },
+  /** Option of the organization upstream policy select. */
+  orgUpstreamAllow: { id: "app.orgUpstreamAllow", en: "Allow — fall through to the upstream registry" },
+  /** Option of the organization upstream policy select. */
+  orgUpstreamBlock: { id: "app.orgUpstreamBlock", en: "Block — serve local packages only" },
+  /** Toast confirming that the organization profile was saved. */
+  orgManageSaved: { id: "app.orgManageSaved", en: "Organization updated." },
+  /** Alert above the member table explaining the step-up gate and session revocation. */
+  orgMemberStepUpNotice: { id: "app.orgMemberStepUpNotice", en: "Granting Write or above asks for your second factor again, and a demotion signs the member out everywhere." },
+  /** Toast confirming a member's role change. */
+  orgMemberRoleChanged: { id: "app.orgMemberRoleChanged", en: "Role updated." },
+  /** Toast after a demotion that revoked sessions; {count} is how many sessions ended. */
+  orgMemberRoleChangedRevoked: { id: "app.orgMemberRoleChangedRevoked", en: {"one":"Role updated; {count} session was ended.","other":"Role updated; {count} sessions were ended."} },
+  /** Title of the member removal confirmation dialog. */
+  orgMemberRemoveTitle: { id: "app.orgMemberRemoveTitle", en: "Remove member" },
+  /** Body of the member removal dialog; {name} is the member's display name. */
+  orgMemberRemoveBody: { id: "app.orgMemberRemoveBody", en: "{name} loses access to this organization's packages and is signed out of it." },
+  /** Toast confirming that a member was removed. */
+  orgMemberRemoved: { id: "app.orgMemberRemoved", en: "Member removed." },
+  /** Heading of the invitation section on the organization management screen. */
+  orgInvitationsTitle: { id: "app.orgInvitationsTitle", en: "Invitations" },
+  /** Empty state of the invitation list. */
+  orgInvitationsEmpty: { id: "app.orgInvitationsEmpty", en: "No invitations" },
+  /** Submit button of the invitation form. */
+  orgInviteAction: { id: "app.orgInviteAction", en: "Invite" },
+  /** Column header for an invitation's status. */
+  orgInviteStatus: { id: "app.orgInviteStatus", en: "Status" },
+  /** Column header for an invitation's expiry date. */
+  orgInviteExpires: { id: "app.orgInviteExpires", en: "Expires" },
+  /** Toast confirming that an invitation was created. */
+  orgInviteSent: { id: "app.orgInviteSent", en: "Invitation created." },
+  /** Toast confirming that an invitation was revoked. */
+  orgInviteRevoked: { id: "app.orgInviteRevoked", en: "Invitation revoked." },
+  /** Heading of the show-once panel carrying a fresh invitation token. */
+  orgInviteTokenTitle: { id: "app.orgInviteTokenTitle", en: "Invitation link token" },
+  /** Body of the show-once invitation token panel. */
+  orgInviteTokenBody: { id: "app.orgInviteTokenBody", en: "Shown once. It is also emailed — copy it if this instance has no SMTP configured." },
+  /** Subtitle of the notification center screen. */
+  notifSubtitle: { id: "app.notifSubtitle", en: "Publishes, membership changes, and security alarms from your organizations." },
+  /** Unread total above the feed and the accessible name of the header badge; {count} is the number. */
+  notifUnreadCount: { id: "app.notifUnreadCount", en: {"zero":"No unread notifications","one":"{count} unread notification","other":"{count} unread notifications"} },
+  /** Badge marking a single unread notification in the feed. */
+  notifUnread: { id: "app.notifUnread", en: "Unread" },
+  /** Button that marks one notification read. */
+  notifMarkRead: { id: "app.notifMarkRead", en: "Mark read" },
+  /** Button that marks every unread notification read. */
+  notifMarkAllRead: { id: "app.notifMarkAllRead", en: "Mark all read" },
+  /** Link on a notification that opens the package or organization it refers to. */
+  notifOpen: { id: "app.notifOpen", en: "Open" },
+  /** Filter button showing every notification. */
+  notifFilterAll: { id: "app.notifFilterAll", en: "All" },
+  /** Filter button narrowing the feed to unread notifications. */
+  notifFilterUnread: { id: "app.notifFilterUnread", en: "Unread only" },
+  /** Empty state of the full notification feed. */
+  notifEmpty: { id: "app.notifEmpty", en: "No notifications yet" },
+  /** Empty state of the feed filtered to unread notifications. */
+  notifEmptyUnread: { id: "app.notifEmptyUnread", en: "Nothing unread" },
+  /** Empty state body of the notification feed. */
+  notifEmptyBody: { id: "app.notifEmptyBody", en: "Activity in your organizations shows up here." },
+  /** Footnote under a truncated notification feed. */
+  notifTruncated: { id: "app.notifTruncated", en: "Older notifications are not shown." },
+  /** Alert shown while the event stream is reconnecting. */
+  notifStreamReconnecting: { id: "app.notifStreamReconnecting", en: "Live updates are reconnecting. The list below is still correct; it just will not update on its own right now." },
+  /** Notification category covering publishes, retractions, and option changes. */
+  notifCategoryPackage: { id: "app.notifCategoryPackage", en: "Packages" },
+  /** Notification category covering membership and invitation events. */
+  notifCategoryOrg: { id: "app.notifCategoryOrg", en: "Organizations" },
+  /** Notification category covering shadowing alarms and upstream integrity events. */
+  notifCategorySecurity: { id: "app.notifCategorySecurity", en: "Security" },
+  /** Link and heading for the notification preferences screen. */
+  notifPreferences: { id: "app.notifPreferences", en: "Preferences" },
+  /** Subtitle of the notification preferences screen. */
+  notifPrefsSubtitle: { id: "app.notifPrefsSubtitle", en: "Choose where each category is delivered. Three categories, not one switch per event type." },
+  /** Heading of the preference list card. */
+  notifPrefsCategories: { id: "app.notifPrefsCategories", en: "Categories" },
+  /** Checkbox label for in-app delivery of a notification category. */
+  notifPrefsInApp: { id: "app.notifPrefsInApp", en: "In the notification center" },
+  /** Checkbox label for email delivery of a notification category. */
+  notifPrefsEmail: { id: "app.notifPrefsEmail", en: "By email" },
+  /** Hint under the package notification category. */
+  notifPrefsPackageHint: { id: "app.notifPrefsPackageHint", en: "Publishes and retractions in your organizations. Not emailed by default — a publish firehose in an inbox gets the sender filtered." },
+  /** Hint under the organization notification category. */
+  notifPrefsOrgHint: { id: "app.notifPrefsOrgHint", en: "Membership and invitation changes. High importance, emailed by default." },
+  /** Hint under the security notification category. */
+  notifPrefsSecurityHint: { id: "app.notifPrefsSecurityHint", en: "Shadowing alarms and upstream integrity events. Only organization Admins and Owners receive them." },
+  /** Toast confirming that notification preferences were saved. */
+  notifPrefsSaved: { id: "app.notifPrefsSaved", en: "Preferences saved." },
+  /** Toast for a shadowing alarm arriving over the event stream; {name} is the package name. */
+  eventShadowing: { id: "app.eventShadowing", en: "Upstream now publishes a package with a name claimed here: {name}" },
+  /** Toast for a quarantined upstream archive arriving over the event stream; {name} is the package name. */
+  eventQuarantine: { id: "app.eventQuarantine", en: "An upstream archive failed its checksum and was refused: {name}" },
+  /** Toast for a membership event arriving over the event stream. */
+  eventOrgMembership: { id: "app.eventOrgMembership", en: "Your organization membership changed." },
+  /** Toast shown when the server refuses the event stream because of the per-user connection cap. */
+  eventStreamCapped: { id: "app.eventStreamCapped", en: "Too many live connections for this account — live updates are off in this tab." },
+  /** Subtitle of the instance administration screen. */
+  adminSubtitle: { id: "app.adminSubtitle", en: "Runtime settings, accounts, organizations, the audit log, and background jobs." },
+  /** Admin panel tab showing instance statistics. */
+  adminTabStats: { id: "app.adminTabStats", en: "Overview" },
+  /** Admin panel tab with the runtime settings form. */
+  adminTabSettings: { id: "app.adminTabSettings", en: "Settings" },
+  /** Admin panel tab with the user table. */
+  adminTabUsers: { id: "app.adminTabUsers", en: "Accounts" },
+  /** Admin panel tab with the organization table. */
+  adminTabOrgs: { id: "app.adminTabOrgs", en: "Organizations" },
+  /** Admin panel tab with the audit log viewer. */
+  adminTabAudit: { id: "app.adminTabAudit", en: "Audit log" },
+  /** Admin panel tab with background job state and manual triggers. */
+  adminTabJobs: { id: "app.adminTabJobs", en: "Jobs" },
+  /** Toast confirming a settings write; {version} is the new settings version number. */
+  adminSettingsSaved: { id: "app.adminSettingsSaved", en: "Settings saved (version {version})." },
+  /** Footnote next to the settings save button; {version} is the stored settings version. */
+  adminSettingsVersion: { id: "app.adminSettingsVersion", en: "Current settings version — {version}" },
+  /** Alert at the top of the settings form when client-side validation failed. */
+  adminSettingsInvalid: { id: "app.adminSettingsInvalid", en: "Some fields need fixing before this can be saved." },
+  /** Inline validation message for an empty required settings field. */
+  adminFieldRequired: { id: "app.adminFieldRequired", en: "This field cannot be empty." },
+  /** Inline validation message for a settings field that must be a positive integer. */
+  adminFieldPositive: { id: "app.adminFieldPositive", en: "Enter a whole number of at least 1." },
+  /** Inline validation message for a malformed entry in the email domain allowlist. */
+  adminFieldDomain: { id: "app.adminFieldDomain", en: "Each line must be a domain, without an @ and with at least one dot." },
+  /** Heading of the branding section of the settings form. */
+  adminBrandingTitle: { id: "app.adminBrandingTitle", en: "Branding" },
+  /** Subtitle of the branding settings section. */
+  adminBrandingBody: { id: "app.adminBrandingBody", en: "How this instance names itself. Changes take effect on the next request, not the next restart." },
+  /** Label of the instance name field. */
+  adminBrandingName: { id: "app.adminBrandingName", en: "Instance name" },
+  /** Label of the one-line instance description field. */
+  adminBrandingTagline: { id: "app.adminBrandingTagline", en: "Tagline" },
+  /** Label of the absolute logo URL field. */
+  adminBrandingLogo: { id: "app.adminBrandingLogo", en: "Logo URL" },
+  /** Label of the accent colour field. */
+  adminBrandingColor: { id: "app.adminBrandingColor", en: "Accent colour" },
+  /** Hint under the accent colour field explaining why the value is not applied to the UI. */
+  adminBrandingColorHint: { id: "app.adminBrandingColorHint", en: "Stored and reported, but not applied to the interface — the theme's colour pairs are contrast-checked at build time and a custom value would bypass that gate." },
+  /** Heading of the registration policy section of the settings form. */
+  adminRegistrationTitle: { id: "app.adminRegistrationTitle", en: "Registration" },
+  /** Subtitle of the registration settings section. */
+  adminRegistrationBody: { id: "app.adminRegistrationBody", en: "Who may create an account on this instance." },
+  /** Label of the registration mode select. */
+  adminRegistrationMode: { id: "app.adminRegistrationMode", en: "Mode" },
+  /** Label of the sign-in email domain allowlist textarea. */
+  adminAllowedDomains: { id: "app.adminAllowedDomains", en: "Allowed email domains" },
+  /** Hint under the email domain allowlist. */
+  adminAllowedDomainsHint: { id: "app.adminAllowedDomainsHint", en: "One per line. Empty allows every domain — a typo here is a lockout, not a filter." },
+  /** Heading of the rate limit section of the settings form. */
+  adminLimitsTitle: { id: "app.adminLimitsTitle", en: "Rate limits" },
+  /** Subtitle of the rate limit settings section. */
+  adminLimitsBody: { id: "app.adminLimitsBody", en: "Every value must be at least 1 — a zero would lock this instance out of its own sign-in." },
+  /** Label of the per-email OTP request limit. */
+  adminLimitOtpEmail: { id: "app.adminLimitOtpEmail", en: "Sign-in codes per email, per hour" },
+  /** Label of the per-IP OTP request limit. */
+  adminLimitOtpIp: { id: "app.adminLimitOtpIp", en: "Sign-in codes per IP, per hour" },
+  /** Label of the per-IP credential redemption limit. */
+  adminLimitLoginIp: { id: "app.adminLimitLoginIp", en: "Credential attempts per IP, per minute" },
+  /** Label of the per-IP failed CLI token authentication limit. */
+  adminLimitTokenFail: { id: "app.adminLimitTokenFail", en: "Failed token authentications per IP, per minute" },
+  /** Label of the per-organization publish limit. */
+  adminLimitPublish: { id: "app.adminLimitPublish", en: "Publishes per organization, per hour" },
+  /** Heading of the SMTP section of the settings form. */
+  adminSmtpTitle: { id: "app.adminSmtpTitle", en: "Outgoing mail" },
+  /** Subtitle of the SMTP settings section. */
+  adminSmtpBody: { id: "app.adminSmtpBody", en: "Used for sign-in codes, invitations, and high-importance notifications." },
+  /** Label of the SMTP hostname field. */
+  adminSmtpHost: { id: "app.adminSmtpHost", en: "Host" },
+  /** Hint under the SMTP hostname field. */
+  adminSmtpHostHint: { id: "app.adminSmtpHostHint", en: "Empty disables runtime SMTP; the instance then falls back to its boot configuration." },
+  /** Label of the SMTP port field. */
+  adminSmtpPort: { id: "app.adminSmtpPort", en: "Port" },
+  /** Label of the SMTP login field. */
+  adminSmtpUsername: { id: "app.adminSmtpUsername", en: "Username" },
+  /** Label of the SMTP From mailbox field. */
+  adminSmtpFrom: { id: "app.adminSmtpFrom", en: "From address" },
+  /** Label of the SMTP transport security select. */
+  adminSmtpSecurity: { id: "app.adminSmtpSecurity", en: "Transport security" },
+  /** Badge shown when a SMTP password is stored on the server. */
+  adminSmtpPasswordSet: { id: "app.adminSmtpPasswordSet", en: "Password stored" },
+  /** Badge shown when no SMTP password is stored on the server. */
+  adminSmtpPasswordUnset: { id: "app.adminSmtpPasswordUnset", en: "No password stored" },
+  /** Checkbox that opts the SMTP password field into the settings patch; unchecked keeps the stored secret. */
+  adminSmtpSetPassword: { id: "app.adminSmtpSetPassword", en: "Set a new password" },
+  /** Label of the write-only SMTP password field. */
+  adminSmtpPassword: { id: "app.adminSmtpPassword", en: "New password" },
+  /** Hint under the SMTP password field explaining the write-only contract. */
+  adminSmtpPasswordHint: { id: "app.adminSmtpPasswordHint", en: "Never returned by the API. Leave the field empty to clear the stored password instead of replacing it." },
+  /** Heading of the upstream section of the settings form. */
+  adminUpstreamTitle: { id: "app.adminUpstreamTitle", en: "Upstream proxy" },
+  /** Subtitle of the upstream settings section. */
+  adminUpstreamBody: { id: "app.adminUpstreamBody", en: "Whether unclaimed names may resolve through the upstream registry, and what new organizations start with." },
+  /** Checkbox toggling the instance-wide upstream proxy. */
+  adminUpstreamEnabled: { id: "app.adminUpstreamEnabled", en: "Proxy enabled instance-wide" },
+  /** Label of the default upstream policy select. */
+  adminUpstreamDefault: { id: "app.adminUpstreamDefault", en: "Default policy for new organizations" },
+  /** Accessible name of the admin user table. */
+  adminUsersTitle: { id: "app.adminUsersTitle", en: "Accounts" },
+  /** Empty state of the admin user table. */
+  adminUsersEmpty: { id: "app.adminUsersEmpty", en: "No accounts match" },
+  /** Label of the admin user search field. */
+  adminUserSearch: { id: "app.adminUserSearch", en: "Email or name" },
+  /** Label and column header for an account's lifecycle status. */
+  adminUserStatus: { id: "app.adminUserStatus", en: "Status" },
+  /** Option of the account status filter that applies no narrowing. */
+  adminAnyStatus: { id: "app.adminAnyStatus", en: "Any status" },
+  /** Submit button of a table filter form. */
+  adminApplyFilters: { id: "app.adminApplyFilters", en: "Apply" },
+  /** Column header for an account's creation date. */
+  adminUserCreated: { id: "app.adminUserCreated", en: "Created" },
+  /** Badge marking an account that administers the instance. */
+  adminUserAdmin: { id: "app.adminUserAdmin", en: "Instance admin" },
+  /** Button that suspends an account and revokes its sessions. */
+  adminUserSuspend: { id: "app.adminUserSuspend", en: "Suspend" },
+  /** Button that lifts a suspension. */
+  adminUserUnsuspend: { id: "app.adminUserUnsuspend", en: "Unsuspend" },
+  /** Toast confirming a suspension. */
+  adminUserSuspended: { id: "app.adminUserSuspended", en: "Account suspended; its sessions were revoked." },
+  /** Toast confirming that a suspension was lifted. */
+  adminUserUnsuspended: { id: "app.adminUserUnsuspended", en: "Account unsuspended." },
+  /** Accessible name of the admin organization table. */
+  adminOrgsTitle: { id: "app.adminOrgsTitle", en: "Organizations" },
+  /** Empty state of the admin organization table. */
+  adminOrgsEmpty: { id: "app.adminOrgsEmpty", en: "No organizations" },
+  /** Column header for an organization's member count. */
+  adminOrgMembers: { id: "app.adminOrgMembers", en: "Members" },
+  /** Column header for an organization's package count. */
+  adminOrgPackages: { id: "app.adminOrgPackages", en: "Packages" },
+  /** Column header for an organization's creation date. */
+  adminOrgCreated: { id: "app.adminOrgCreated", en: "Created" },
+  /** Accessible name of the audit log table. */
+  adminAuditTitle: { id: "app.adminAuditTitle", en: "Audit log" },
+  /** Empty state of the audit log viewer. */
+  adminAuditEmpty: { id: "app.adminAuditEmpty", en: "No audit events match" },
+  /** Column header for an audit event's timestamp. */
+  adminAuditWhen: { id: "app.adminAuditWhen", en: "When" },
+  /** Label and column header for an audit event's dot-namespaced action. */
+  adminAuditAction: { id: "app.adminAuditAction", en: "Action" },
+  /** Hint under the audit action filter explaining prefix matching. */
+  adminAuditActionHint: { id: "app.adminAuditActionHint", en: "Matched as a prefix, so org.member. covers every membership action." },
+  /** Label of the audit filter narrowing to one organization. */
+  adminAuditOrg: { id: "app.adminAuditOrg", en: "Organization id" },
+  /** Label and column header for the account or token behind an audit event. */
+  adminAuditActor: { id: "app.adminAuditActor", en: "Actor id" },
+  /** Column header for what an audit event acted on. */
+  adminAuditTarget: { id: "app.adminAuditTarget", en: "Target" },
+  /** Column header for whether an audited action succeeded. */
+  adminAuditResult: { id: "app.adminAuditResult", en: "Result" },
+  /** Label of the audit filter's inclusive start timestamp. */
+  adminAuditFrom: { id: "app.adminAuditFrom", en: "From" },
+  /** Label of the audit filter's exclusive end timestamp. */
+  adminAuditUntil: { id: "app.adminAuditUntil", en: "Until" },
+  /** Button that removes every audit log filter. */
+  adminAuditClear: { id: "app.adminAuditClear", en: "Clear filters" },
+  /** Column header for an audit event's structured metadata. */
+  adminAuditContext: { id: "app.adminAuditContext", en: "Context" },
+  /** Disclosure that reveals an audit event's metadata document. */
+  adminAuditShowContext: { id: "app.adminAuditShowContext", en: "Show context" },
+  /** Heading of the registry totals on the admin dashboard. */
+  adminStatsRegistry: { id: "app.adminStatsRegistry", en: "Registry" },
+  /** Heading of the account counts on the admin dashboard. */
+  adminStatsAccounts: { id: "app.adminStatsAccounts", en: "Accounts" },
+  /** Heading of the proxy cache figures on the admin dashboard. */
+  adminStatsUpstream: { id: "app.adminStatsUpstream", en: "Upstream cache" },
+  /** Admin statistic — total package rows. */
+  adminStatPackages: { id: "app.adminStatPackages", en: "Packages" },
+  /** Admin statistic — how many packages are public. */
+  adminStatPublic: { id: "app.adminStatPublic", en: "Public" },
+  /** Admin statistic — total live version rows. */
+  adminStatVersions: { id: "app.adminStatVersions", en: "Live versions" },
+  /** Admin statistic — how many versions are currently retracted. */
+  adminStatRetracted: { id: "app.adminStatRetracted", en: "Retracted" },
+  /** Admin statistic — hard-deleted versions kept as tombstones so the number cannot be reused. */
+  adminStatTombstoned: { id: "app.adminStatTombstoned", en: "Burned numbers" },
+  /** Admin statistic — summed archive size of the live versions. */
+  adminStatStorage: { id: "app.adminStatStorage", en: "Archive storage" },
+  /** Admin statistic — every account row. */
+  adminStatUsers: { id: "app.adminStatUsers", en: "Accounts" },
+  /** Admin statistic — accounts that can sign in. */
+  adminStatActive: { id: "app.adminStatActive", en: "Active" },
+  /** Admin statistic — suspended accounts. */
+  adminStatSuspended: { id: "app.adminStatSuspended", en: "Suspended" },
+  /** Admin statistic — instance administrators. */
+  adminStatAdmins: { id: "app.adminStatAdmins", en: "Administrators" },
+  /** Admin statistic — anonymized account deletion tombstones. */
+  adminStatDeleted: { id: "app.adminStatDeleted", en: "Deletion tombstones" },
+  /** Admin statistic — organizations on the instance. */
+  adminStatOrgs: { id: "app.adminStatOrgs", en: "Organizations" },
+  /** Admin statistic — upstream packages we hold a snapshot for. */
+  adminStatCachedPackages: { id: "app.adminStatCachedPackages", en: "Cached packages" },
+  /** Admin statistic — upstream versions whose bytes are held. */
+  adminStatCachedVersions: { id: "app.adminStatCachedVersions", en: "Cached versions" },
+  /** Admin statistic — size of the cached upstream archives. */
+  adminStatCachedBytes: { id: "app.adminStatCachedBytes", en: "Cached bytes" },
+  /** Admin statistic — unacknowledged shadowing alarms. */
+  adminStatShadowingActive: { id: "app.adminStatShadowingActive", en: "Open shadowing alarms" },
+  /** Heading of the shadowing alarm table on the admin dashboard. */
+  adminShadowingTitle: { id: "app.adminShadowingTitle", en: "Shadowing alarms" },
+  /** Alert above the shadowing alarm table explaining what the alarm means. */
+  adminShadowingBody: { id: "app.adminShadowingBody", en: "An upstream registry publishes these names too. Local packages always win resolution, so nothing broke — but somebody may be squatting a name your organization uses." },
+  /** Column header for the shadowed package name. */
+  adminShadowingName: { id: "app.adminShadowingName", en: "Name" },
+  /** Column header for the upstream base URL where a shadowing was observed. */
+  adminShadowingUpstream: { id: "app.adminShadowingUpstream", en: "Upstream" },
+  /** Column header for the most recent observation of an alarm. */
+  adminShadowingSeen: { id: "app.adminShadowingSeen", en: "Last seen" },
+  /** Column header for how many times a shadowing was observed. */
+  adminShadowingActive: { id: "app.adminShadowingActive", en: "Sightings" },
+  /** Heading of the quarantine table on the admin dashboard. */
+  adminQuarantineTitle: { id: "app.adminQuarantineTitle", en: "Quarantined upstream archives" },
+  /** Alert above the quarantine table explaining the refusal. */
+  adminQuarantineBody: { id: "app.adminQuarantineBody", en: "The bytes upstream served did not match the checksum it advertised, so they were refused rather than cached." },
+  /** Column header for the checksum upstream advertised. */
+  adminQuarantineExpected: { id: "app.adminQuarantineExpected", en: "Advertised" },
+  /** Column header for the checksum of the bytes upstream actually served. */
+  adminQuarantineActual: { id: "app.adminQuarantineActual", en: "Received" },
+  /** Introductory alert on the admin jobs tab. */
+  adminJobsIntro: { id: "app.adminJobsIntro", en: "Jobs run on a schedule behind a cluster-wide lock. Triggering one here runs it now, on this instance, under the same lock." },
+  /** Empty state when the instance reports no runnable jobs. */
+  adminJobsNone: { id: "app.adminJobsNone", en: "This instance runs no jobs on demand" },
+  /** Button that triggers a background job; {job} is the job name. */
+  adminJobRun: { id: "app.adminJobRun", en: "Run {job}" },
+  /** Label of a job trigger button while its run is in flight; {job} is the job name. */
+  adminJobRunning: { id: "app.adminJobRunning", en: "Running {job}…" },
+  /** Toast confirming a manual job run; {job} is the job name. */
+  adminJobRan: { id: "app.adminJobRan", en: "Job {job} finished." },
+  /** Heading of the panel showing a finished job's own summary document; {job} is the job name. */
+  adminJobSummary: { id: "app.adminJobSummary", en: "Summary of {job}" },
+  /** Column header for a background job's name. */
+  adminJobName: { id: "app.adminJobName", en: "Job" },
+  /** Column header for when a job last completed successfully. */
+  adminJobLastSuccess: { id: "app.adminJobLastSuccess", en: "Last success" },
+  /** Cell value for a job that has never succeeded. */
+  adminJobNever: { id: "app.adminJobNever", en: "Never" },
+  /** Column header for how many times a job has started. */
+  adminJobRuns: { id: "app.adminJobRuns", en: "Runs" },
+  /** Column header for how many work items a job has processed in total. */
+  adminJobProcessed: { id: "app.adminJobProcessed", en: "Processed" },
+  /** Column header for how many job runs failed. */
+  adminJobFailures: { id: "app.adminJobFailures", en: "Failures" },
+  /** Title of the 404 state a screen shows when the API answers 404 for the thing it was loading (an unknown name, or one the caller may not read). */
+  resourceNotFoundTitle: { id: "app.resourceNotFoundTitle", en: "Not found" },
+  /** Body of the 404 state a screen shows when the API answers 404 for the thing it was loading. */
+  resourceNotFoundBody: { id: "app.resourceNotFoundBody", en: "This name does not exist here, or it is not visible to you. Signing in to the owning organization may show it." },
+  /** Title of the 403 state a screen shows when the API refuses because the caller's role is too low. */
+  resourceForbiddenTitle: { id: "app.resourceForbiddenTitle", en: "You do not have access" },
+  /** Body of the 403 state a screen shows when the caller's role is too low; deliberately offers no retry. */
+  resourceForbiddenBody: { id: "app.resourceForbiddenBody", en: "This screen needs a higher role than you have here. Ask an administrator of this organization or instance if you need it." },
 } as const;

@@ -103,7 +103,9 @@ export function loginReducer(state: LoginState, event: LoginEvent): LoginState {
 
     case "loginResolved": {
       if (state.step === "done") return state;
-      const mfaToken = event.login.mfa_token;
+      // The generated type allows both `undefined` and `null` for an absent
+      // handle; neither is redeemable, so both fall through to "done".
+      const mfaToken = event.login.mfa_token ?? undefined;
       if (event.login.mfa_required && mfaToken !== undefined) {
         // Keep the mode across an MFA→MFA resolution (a recovery-code retry).
         return {

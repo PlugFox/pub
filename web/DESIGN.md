@@ -236,6 +236,15 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   sanctioned root margin** in the kit, because a separator's whole job is the
   gap around it and `MenuContent` cannot use `gap-*` without also spacing the
   items it deliberately packs. Content is actions — never a form.
+- **Popover** (Kobalte) — transient surface: `w-80 max-w-sm rounded-lg border
+  bg-surface p-4 shadow-md`, arrow, a `text-sm font-semibold` title row and a
+  built-in close button (i18n `common.close`). The line against Tooltip is
+  behavioural, not visual, and it decides which one a screen may use: a
+  Tooltip opens on hover, is never focusable, and holds a short hint; a
+  Popover opens on **click**, takes focus, closes on Escape, and may hold
+  headings, links, code, and copyable text. Reference documentation (the
+  search-syntax help) is a Popover; an icon's one-line explanation is a
+  Tooltip.
 - **Toast** — transient message, `rounded-lg border p-4 shadow-md`, same four
   intents as Alert, with a close button. `ToastRegion` is the fixed
   bottom-right stack: `aria-live="polite"`, `pointer-events-none` on the
@@ -255,6 +264,25 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   callers place it in a `bg-qr-surface text-qr-ink` well. `fallback` renders
   when the payload exceeds capacity — 2FA enrollment degrades to manual secret
   entry rather than to a blank box.
+
+### App-owned surfaces (not in the kit)
+
+One visual surface deliberately lives in `apps/site` rather than in
+`packages/ui`, and it is documented here because it is still a design
+decision:
+
+- **Prose** (`apps/site/src/app/prose.tsx`, styled by
+  [`styles/prose.css`](apps/site/src/styles/prose.css)) — the container for
+  README/CHANGELOG HTML the **server** rendered and sanitized (S-11). It is the
+  only place in the product that assigns `innerHTML`, and it accepts nothing
+  but those two fields. Two consequences shape it: the incoming markup carries
+  no classes, so the styling is descendant selectors rather than a class
+  string — written with `@apply` of semantic utilities so no token leaks and
+  no `[` appears in a class attribute (§7); and because a package cannot
+  import the app's Tailwind entry, the stylesheet belongs to the app, which is
+  what keeps it out of the kit. Type scale, radii, and colours are the same
+  tokens as everywhere else; long tables and code blocks scroll inside their
+  own box (§8) rather than widening the page.
 
 **Kobalte state variants.** Primitives report state through data attributes;
 `theme.css` names them so component class strings stay free of arbitrary-value

@@ -14,6 +14,7 @@ import { EmptyState } from "@pub/ui/empty-state";
 import { Input } from "@pub/ui/input";
 import { Label } from "@pub/ui/label";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "@pub/ui/menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@pub/ui/popover";
 import { QrCode } from "@pub/ui/qr-code";
 import { Separator } from "@pub/ui/separator";
 import { Skeleton } from "@pub/ui/skeleton";
@@ -315,6 +316,37 @@ const registry: readonly ShowcaseEntry[] = [
           <MenuItem>Sign out</MenuItem>
         </MenuContent>
       </Menu>
+    ),
+  },
+  {
+    name: "Popover",
+    note: "Click-opened panel that MAY hold headings, links, and copyable text — unlike Tooltip, which is a hover hint and holds none. Used for the search-syntax reference.",
+    render: () => (
+      <Popover>
+        <PopoverTrigger class={buttonVariants({ intent: "outline", size: "md" })}>
+          Search syntax
+        </PopoverTrigger>
+        <PopoverContent title="Search syntax">
+          <dl class="flex flex-col gap-2">
+            <div class="flex flex-col gap-0.5">
+              <dt>
+                <code class="rounded-sm bg-accent-soft px-1.5 py-0.5 font-mono text-xs text-accent">
+                  org:acme
+                </code>
+              </dt>
+              <dd class="text-xs text-ink-muted">Only packages owned by that organization.</dd>
+            </div>
+            <div class="flex flex-col gap-0.5">
+              <dt>
+                <code class="rounded-sm bg-accent-soft px-1.5 py-0.5 font-mono text-xs text-accent">
+                  -is:discontinued
+                </code>
+              </dt>
+              <dd class="text-xs text-ink-muted">A leading minus excludes matches.</dd>
+            </div>
+          </dl>
+        </PopoverContent>
+      </Popover>
     ),
   },
   {

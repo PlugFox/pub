@@ -10,6 +10,29 @@
  */
 
 /**
+ * The router's base (decision 14: the island owns everything under `/app`).
+ *
+ * Kept next to the path helpers because it is the one value that has to agree
+ * between the `<Router base>` and every place that converts a BROWSER path
+ * into a ROUTER path.
+ */
+export const APP_BASE = "/app";
+
+/**
+ * Strips the router base off a browser pathname.
+ *
+ * `useLocation().pathname` reports the address-bar path, base included
+ * (`/app/tokens`), while `navigate()` and `<A href>` take router-relative
+ * paths (`/tokens`) and re-add the base themselves. Round-tripping one through
+ * the other — which is exactly what a `return_to` does — therefore has to drop
+ * the base once, or the redirect after sign-in lands on `/app/app/tokens`.
+ */
+export function toRouterPath(pathname: string, base: string = APP_BASE): string {
+  if (pathname === base) return "/";
+  return pathname.startsWith(`${base}/`) ? pathname.slice(base.length) : pathname;
+}
+
+/**
  * Narrows a `return_to` value to a same-origin absolute path.
  *
  * Anything that could leave the origin collapses to "/": a scheme
@@ -35,4 +58,42 @@ export function safeReturnTo(raw: string | null | undefined): string {
  */
 export function registryBase(slug: string, origin: string): string {
   return `${origin}/o/${slug}/pub`;
+}
+
+/**
+ * The `pubspec.yaml` block that installs a package from this instance.
+ *
+ * `hosted:` with an explicit `url:` is not optional here and not a nicety: a
+ * bare `hosted: ^1.0.0` resolves against `PUB_HOSTED_URL`, so a snippet
+ * without the URL works on the author's machine (where the env var is set) and
+ * silently reaches for pub.dev on a teammate's. Two spaces of indentation and
+ * the caret constraint match what `dart pub add` writes, so the snippet can be
+ * pasted next to lines the tool produced without reformatting the file.
+ *
+ * The version is rendered as a caret range because that is what `pub add`
+ * picks; a pinned version is the exception a user types themselves.
+ */
+export function pubspecSnippet(name: string, version: string, hostedUrl: string): string {
+  return [
+    "dependencies:",
+    `  ${name}:`,
+    `    hosted: ${hostedUrl}`,
+    `    version: ^${version}`,
+  ].join("\n");
+}
+
+/** In-app path of a package page; `tab` deep-links one of its tabs. */
+export function packagePath(name: string, tab?: string): string {
+  const base = `/packages/${encodeURIComponent(name)}`;
+  return tab === undefined || tab === "readme" ? base : `${base}/${tab}`;
+}
+
+/** In-app path of one version's page. */
+export function packageVersionPath(name: string, version: string): string {
+  return `/packages/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`;
+}
+
+/** In-app path of an organization page. */
+export function orgPath(slug: string): string {
+  return `/orgs/${encodeURIComponent(slug)}`;
 }

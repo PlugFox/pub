@@ -23,11 +23,6 @@ navOverview:
   ru: Обзор
   desc: Sidebar link to the app's start page (/app).
 
-navPackages:
-  en: Packages
-  ru: Пакеты
-  desc: Sidebar link to the package list.
-
 navSearch:
   en: Search
   ru: Поиск
@@ -750,59 +745,1661 @@ orgsCreated:
   ru: Организация создана.
   desc: Toast confirming that an organization was created.
 
-orgDetailTitle:
-  en: Organization
-  ru: Организация
-  desc: Heading of the single-organization screen.
+orgsAcceptInvite:
+  en: Accept invitation
+  ru: Принять приглашение
+  desc: Button that opens the dialog for redeeming an organization invitation code, and its submit button.
 
-orgDetailTodo:
-  en: Members, invitations, packages, settings, and the audit log for this organization arrive with the management API.
-  ru: Участники, приглашения, пакеты, настройки и журнал аудита появятся вместе с API управления.
-  desc: Placeholder text on the organization detail screen while the management endpoints are being built.
+orgsAcceptInviteTitle:
+  en: Join an organization
+  ru: Присоединиться к организации
+  desc: Title of the dialog for redeeming an organization invitation code.
+
+orgsAcceptInviteBody:
+  en: Paste the invitation code from the email an administrator sent you.
+  ru: Вставьте код приглашения из письма, которое отправил администратор.
+  desc: Description of the invitation dialog, explaining where the code comes from.
+
+orgsInviteCodeField:
+  en: Invitation code
+  ru: Код приглашения
+  desc: Label of the invitation-code field.
+
+orgsInviteCodeRequired:
+  en: Enter the invitation code.
+  ru: Введите код приглашения.
+  desc: Validation message when the invitation dialog is submitted with an empty code.
+
+orgsInviteCodeInvalid:
+  en: That invitation code is not valid. It may have expired or already been used.
+  ru: Этот код приглашения недействителен. Возможно, он истёк или уже использован.
+  desc: Uniform failure for a rejected invitation code; the reasons are deliberately not distinguished.
+
+orgsInviteAccepted:
+  en: You joined {org}.
+  ru: Вы присоединились к {org}.
+  desc: Toast confirming a redeemed invitation; `{org}` is the organization's display name.
 
 # --- placeholders for areas the API has not shipped ---
-
-comingSoon:
-  en: Coming soon
-  ru: Скоро
-  desc: Badge marking a screen whose backend endpoints do not exist yet.
-
-placeholderPackages:
-  en: The package index, version history, and README rendering land with the registry read API.
-  ru: Каталог пакетов, история версий и отображение README появятся вместе с API чтения реестра.
-  desc: Body of the placeholder card on the packages screen.
-
-placeholderSearch:
-  en: Full-text search with filter tags lands with the search API.
-  ru: Полнотекстовый поиск с фильтрами появится вместе с API поиска.
-  desc: Body of the placeholder card on the search screen.
-
-placeholderSearchQuery:
-  en: You searched for “{query}”. Nothing is wired up yet — this screen is a placeholder.
-  ru: Вы искали «{query}». Пока ничего не подключено — это заглушка.
-  desc: Shown on the search placeholder when the user actually typed a query; `{query}` is their input.
-
-placeholderNotifications:
-  en: The notification center lands with the event stream.
-  ru: Центр уведомлений появится вместе с потоком событий.
-  desc: Body of the placeholder card on the notifications screen.
-
-placeholderAdmin:
-  en: Instance settings, user and organization management, moderation, and the audit viewer land with the admin API.
-  ru: Настройки инстанса, управление пользователями и организациями, модерация и просмотр аудита появятся вместе с API администрирования.
-  desc: Body of the placeholder card on the admin screen.
 
 overviewTitle:
   en: Overview
   ru: Обзор
   desc: Heading of the app's start screen.
 
-overviewSignedInAs:
-  en: Signed in as {name}
-  ru: Вы вошли как {name}
-  desc: Line on the overview screen naming the current user; `{name}` is their display name.
 
-overviewTodo:
-  en: Instance statistics, top packages, and recent activity land with the read API.
-  ru: Статистика инстанса, популярные пакеты и последние события появятся вместе с API чтения.
-  desc: Body of the placeholder card on the overview screen.
+# --- shared verbs ---
+
+save:
+  en: Save
+  ru: Сохранить
+  desc: Submit button that persists an edited form (package options, org profile, admin settings).
+
+remove:
+  en: Remove
+  ru: Удалить
+  desc: Button that removes a member from an organization.
+
+# --- home / landing dashboard ---
+
+homeTaglineFallback:
+  en: A self-hosted package registry for Dart and Flutter.
+  ru: Локальный реестр пакетов для Dart и Flutter.
+  desc: Subline under the instance name on the landing screen when the administrator set no tagline.
+
+homeBrowse:
+  en: Browse packages
+  ru: Смотреть пакеты
+  desc: Primary call-to-action on the landing screen; opens the search screen.
+
+homeCountersTitle:
+  en: This instance
+  ru: Этот сервер
+  desc: Small heading above the three landing counters.
+
+homeCounterPackages:
+  en: Packages
+  ru: Пакеты
+  desc: Label of the landing counter showing how many packages the reader can see.
+
+homeCounterVersions:
+  en: Versions
+  ru: Версии
+  desc: Label of the landing counter showing how many live versions the reader can see.
+
+homeCounterOrgs:
+  en: Organizations
+  ru: Организации
+  desc: Label of the landing counter showing how many organizations exist.
+
+homeCountersScoped:
+  en: Counters cover what you can see — signing in to more organizations shows more.
+  ru: "Счётчики показывают только доступное вам: чем больше организаций, тем больше цифры."
+  desc: Footnote under the landing counters explaining that they are scoped to the caller's visibility.
+
+homeRecentTitle:
+  en: Recently updated
+  ru: Недавно обновлённые
+  desc: Heading of the landing rail listing the most recently updated packages.
+
+homePopularTitle:
+  en: Most downloaded
+  ru: Самые скачиваемые
+  desc: Heading of the landing rail listing packages by all-time download count.
+
+homeRailEmpty:
+  en: Nothing published yet
+  ru: Пока ничего не опубликовано
+  desc: Empty state inside a landing rail when the instance has no visible packages.
+
+# --- package card & flags ---
+
+pkgOrg:
+  en: Organization
+  ru: Организация
+  desc: Label of the owning-organization field on a package card and on the package page.
+
+pkgDownloads:
+  en: Downloads
+  ru: Скачивания
+  desc: Label of the all-time download counter on a package card and on the package page.
+
+pkgUpdated:
+  en: Updated
+  ru: Обновлён
+  desc: Label of the last-update timestamp on a package card.
+
+pkgFlagPrivate:
+  en: Private
+  ru: Приватный
+  desc: Badge on a package that is visible only inside its owning organization.
+
+pkgFlagUnlisted:
+  en: Unlisted
+  ru: Скрытый
+  desc: Badge on a package hidden from search and listings but still resolvable by name.
+
+pkgFlagDiscontinued:
+  en: Discontinued
+  ru: Не поддерживается
+  desc: Badge on a package its maintainers marked as no longer maintained.
+
+pkgFlagLatestRetracted:
+  en: Latest retracted
+  ru: Последняя версия отозвана
+  desc: Badge shown when the newest published version of a package is retracted.
+
+# --- search ---
+
+searchTitle:
+  en: Search
+  ru: Поиск
+  desc: Heading of the package search screen.
+
+searchSubtitle:
+  en: Full-text search over package names, descriptions, and readmes, with filter tags.
+  ru: Полнотекстовый поиск по названиям, описаниям и readme пакетов с фильтрами-тегами.
+  desc: Subtitle under the search screen heading.
+
+searchFieldLabel:
+  en: Query
+  ru: Запрос
+  desc: Label of the search input on the search screen.
+
+searchSubmit:
+  en: Search
+  ru: Найти
+  desc: Submit button of the search form.
+
+searchSortLabel:
+  en: Sort by
+  ru: Сортировка
+  desc: Label of the ordering select on the search screen.
+
+searchSortRelevance:
+  en: Relevance
+  ru: Релевантность
+  desc: Search ordering option — best text match first.
+
+searchSortUpdated:
+  en: Recently updated
+  ru: По обновлению
+  desc: Search ordering option — most recently updated first.
+
+searchSortName:
+  en: Name
+  ru: По названию
+  desc: Search ordering option — alphabetical by package name.
+
+searchSortDownloads:
+  en: Downloads
+  ru: По скачиваниям
+  desc: Search ordering option — most downloaded first.
+
+searchSortApplied:
+  en: Sorted by {sort}
+  ru: "Отсортировано: {sort}"
+  desc: Badge shown when the server applied a different ordering than requested; {sort} is the ordering name.
+
+searchTotal:
+  en:
+    one: "{count} package"
+    other: "{count} packages"
+  ru:
+    one: "{count} пакет"
+    few: "{count} пакета"
+    many: "{count} пакетов"
+    other: "{count} пакета"
+  desc: Result count above the search results; {count} is the already formatted total across all pages.
+
+searchIgnoredFilters:
+  en: "These filters were not understood and were ignored: {filters}"
+  ru: "Эти фильтры не распознаны и пропущены: {filters}"
+  desc: Warning listing query tokens the server's parser could not interpret; {filters} is a comma-separated list.
+
+searchFacetOrgs:
+  en: Organizations
+  ru: Организации
+  desc: Heading above the organization facet chips on the search screen.
+
+searchEmptyTitle:
+  en: No packages found
+  ru: Пакеты не найдены
+  desc: Empty state title when a search returns no results.
+
+searchEmptyBody:
+  en: Try fewer filters, or check the search syntax help.
+  ru: Уберите часть фильтров или загляните в справку по синтаксису.
+  desc: Empty state body when a search with query text returns no results.
+
+searchEmptyBrowse:
+  en: This instance has no packages you can see yet.
+  ru: На этом сервере пока нет доступных вам пакетов.
+  desc: Empty state body when browsing without a query returns no results.
+
+searchFailed:
+  en: The search could not be completed.
+  ru: Не удалось выполнить поиск.
+  desc: Error message shown when the search request fails.
+
+searchPagination:
+  en: Result pages
+  ru: Страницы результатов
+  desc: Accessible name of the pagination controls under a cursor-paginated list.
+
+searchNextPage:
+  en: Next page
+  ru: Следующая страница
+  desc: Button that loads the next page of a cursor-paginated list.
+
+searchFirstPage:
+  en: Back to first page
+  ru: К первой странице
+  desc: Button that drops the page cursor and returns to the first page of a list.
+
+searchSyntaxTrigger:
+  en: Syntax
+  ru: Синтаксис
+  desc: Button next to the search field that opens the query-syntax help popover.
+
+searchSyntaxTitle:
+  en: Search syntax
+  ru: Синтаксис поиска
+  desc: Title of the query-syntax help popover.
+
+searchSyntaxIntro:
+  en: Combine free text with filter tags. Unknown tags are ignored and listed above the results.
+  ru: Свободный текст можно сочетать с фильтрами. Нераспознанные теги игнорируются и перечисляются над результатами.
+  desc: Introductory line of the search-syntax help popover.
+
+searchSyntaxOrg:
+  en: Only packages owned by that organization.
+  ru: Только пакеты этой организации.
+  desc: "Help text for the org: search filter tag."
+
+searchSyntaxTopic:
+  en: Only packages declaring that topic in their pubspec.
+  ru: Только пакеты с этой темой в pubspec.
+  desc: "Help text for the topic: search filter tag."
+
+searchSyntaxDependency:
+  en: Only packages that depend on that package.
+  ru: Только пакеты, зависящие от указанного.
+  desc: "Help text for the dependency: search filter tag."
+
+searchSyntaxIs:
+  en: "Flags: public, private, discontinued, unlisted."
+  ru: "Признаки: public, private, discontinued, unlisted."
+  desc: "Help text for the is: search filter tag, listing the accepted flag values."
+
+searchSyntaxFormat:
+  en: Artifact format; only pub exists today.
+  ru: Формат артефакта; пока существует только pub.
+  desc: "Help text for the format: search filter tag."
+
+searchSyntaxSort:
+  en: Ordering inside the query; overrides the control.
+  ru: Сортировка прямо в запросе; имеет приоритет над списком.
+  desc: "Help text for the sort: search filter tag."
+
+searchSyntaxNegate:
+  en: A leading minus excludes matches of that filter.
+  ru: Минус перед фильтром исключает совпадения.
+  desc: Help text for negating a search filter tag with a leading minus sign.
+
+searchSyntaxPhrase:
+  en: Quotes match the words next to each other.
+  ru: Кавычки ищут слова подряд.
+  desc: Help text for quoting an exact phrase in a search query.
+
+# --- package page ---
+
+pkgTabs:
+  en: Package sections
+  ru: Разделы пакета
+  desc: Accessible name of the package page's tab list.
+
+pkgTabReadme:
+  en: Readme
+  ru: Readme
+  desc: Package page tab showing the rendered README of the latest version.
+
+pkgTabChangelog:
+  en: Changelog
+  ru: Изменения
+  desc: Package page tab showing the rendered CHANGELOG of the latest version.
+
+pkgTabVersions:
+  en: Versions
+  ru: Версии
+  desc: Package page tab listing every published version.
+
+pkgTabDependents:
+  en: Dependents
+  ru: Зависимые
+  desc: Package page tab listing packages that depend on this one.
+
+pkgTabInstalling:
+  en: Installing
+  ru: Установка
+  desc: Package page tab with the pubspec snippet and the hosted registry URL.
+
+pkgTabManage:
+  en: Manage
+  ru: Управление
+  desc: Package page tab with the management controls, shown only to organization members.
+
+pkgVersion:
+  en: Version
+  ru: Версия
+  desc: Column header and label for a package version number.
+
+pkgVersionCount:
+  en:
+    one: "{count} version"
+    other: "{count} versions"
+  ru:
+    one: "{count} версия"
+    few: "{count} версии"
+    many: "{count} версий"
+    other: "{count} версии"
+  desc: Live version count in the package page header; {count} is the already formatted number.
+
+pkgPublished:
+  en: Published
+  ru: Опубликована
+  desc: Column header for a version's publication date.
+
+pkgPublisher:
+  en: Published by
+  ru: Опубликовал
+  desc: Column header for the account that published a version; only visible inside the owning organization.
+
+pkgArchiveSize:
+  en: Size
+  ru: Размер
+  desc: Column header for the archive size of a version.
+
+pkgRetracted:
+  en: Retracted
+  ru: Отозвана
+  desc: Badge on a version that has been retracted.
+
+pkgVersionsTable:
+  en: Versions of this package
+  ru: Версии пакета
+  desc: Accessible name of the version table on the package page.
+
+pkgVersionsEmpty:
+  en: No versions
+  ru: Нет версий
+  desc: Empty state on the versions tab when a package has no live versions.
+
+pkgVersionsTruncated:
+  en: Only the most recent versions are listed; the pub client sees all of them.
+  ru: Показаны только последние версии; клиент pub видит все.
+  desc: Footnote under a truncated version list on the package page.
+
+pkgDependentsEmpty:
+  en: Nothing depends on this package
+  ru: Никто не зависит от этого пакета
+  desc: Empty state on the dependents tab.
+
+pkgDependentsEmptyBody:
+  en: Dependents appear once another package on this instance declares it in its pubspec.
+  ru: Зависимые появятся, когда другой пакет этого сервера укажет его в своём pubspec.
+  desc: Empty state body on the dependents tab.
+
+pkgNoReadme:
+  en: This version shipped without a README
+  ru: В этой версии нет README
+  desc: Empty state on the readme tab when the version has no rendered README.
+
+pkgNoChangelog:
+  en: This version shipped without a CHANGELOG
+  ru: В этой версии нет CHANGELOG
+  desc: Empty state on the changelog tab when the version has no rendered CHANGELOG.
+
+pkgDiscontinuedBody:
+  en: The maintainers marked this package as no longer maintained.
+  ru: Сопровождающие отметили пакет как более не поддерживаемый.
+  desc: Alert on the package page explaining the discontinued flag.
+
+pkgReplacedBy:
+  en: Use {name} instead.
+  ru: Используйте {name}.
+  desc: Link inside the discontinued alert pointing at the suggested replacement; {name} is a package name.
+
+pkgLatestRetractedBody:
+  en: The newest published version is retracted, so the version above is an older one that resolution still picks.
+  ru: Самая новая версия отозвана, поэтому выше показана более старая — именно её выберет разрешение зависимостей.
+  desc: Alert on the package page explaining what a retracted newest version means for the shown latest version.
+
+pkgUnlistedBody:
+  en: This package is hidden from search and listings. It still resolves by name.
+  ru: Пакет скрыт из поиска и списков, но по-прежнему доступен по имени.
+  desc: Alert on the package page explaining the unlisted flag.
+
+pkgVersionRetractedBody:
+  en: This version is excluded from new resolutions. Existing lockfiles keep working.
+  ru: Эта версия исключена из новых разрешений зависимостей. Существующие lock-файлы продолжают работать.
+  desc: Alert on a version page explaining what retraction means.
+
+pkgBackToVersions:
+  en: Back to all versions
+  ru: Ко всем версиям
+  desc: Button at the bottom of a version page returning to the package's version list.
+
+pkgInstallPubspecTitle:
+  en: Add to pubspec.yaml
+  ru: Добавить в pubspec.yaml
+  desc: Heading of the installing tab section carrying the dependency snippet.
+
+pkgInstallPubspecBody:
+  en: The hosted URL is part of the snippet on purpose — without it the dependency resolves against pub.dev on any machine that has no PUB_HOSTED_URL set.
+  ru: "URL реестра указан в сниппете намеренно: без него зависимость на машине без PUB_HOSTED_URL будет искаться на pub.dev."
+  desc: Explanation under the pubspec snippet on the installing tab.
+
+pkgInstallHostedTitle:
+  en: Registry URL
+  ru: Адрес реестра
+  desc: Heading of the installing tab section carrying the organization's virtual registry base.
+
+pkgInstallHostedBody:
+  en: This is the PUB_HOSTED_URL for the owning organization.
+  ru: Это PUB_HOSTED_URL организации-владельца.
+  desc: Explanation under the registry URL on the installing tab.
+
+pkgInstallTokenTitle:
+  en: Authenticate first
+  ru: Сначала авторизуйтесь
+  desc: Heading of the installing tab section shown for private packages, carrying the token command.
+
+pkgInstallTokenBody:
+  en: This package is private, so the pub client needs a token for this registry base.
+  ru: Пакет приватный, поэтому клиенту pub нужен токен для этого адреса реестра.
+  desc: Explanation above the dart pub token add command on the installing tab.
+
+# --- package management ---
+
+manageIntro:
+  en: These controls change what the registry serves. Retraction and deletion are audited.
+  ru: Эти действия меняют то, что отдаёт реестр. Отзыв и удаление попадают в журнал аудита.
+  desc: Introductory alert at the top of the package management tab.
+
+manageOptionsTitle:
+  en: Options
+  ru: Параметры
+  desc: Heading of the package options card on the management tab.
+
+manageOptionsBody:
+  en: Visibility and discovery flags. All of them are reversible.
+  ru: Видимость и признаки обнаружения. Все изменения обратимы.
+  desc: Subtitle of the package options card.
+
+manageOptionsSaved:
+  en: Options saved.
+  ru: Параметры сохранены.
+  desc: Toast confirming that package options were updated.
+
+manageVisibility:
+  en: Visibility
+  ru: Видимость
+  desc: Label of the package visibility select on the management tab.
+
+manageVisibilityPublic:
+  en: Public — anyone may read it
+  ru: Публичный — доступен всем
+  desc: Option of the package visibility select.
+
+manageVisibilityPrivate:
+  en: Private — only the organization
+  ru: Приватный — только организация
+  desc: Option of the package visibility select.
+
+manageUnlisted:
+  en: Unlisted
+  ru: Скрыть из списков
+  desc: Checkbox label for hiding a package from search and listings.
+
+manageUnlistedHint:
+  en: Hidden from search, facets, counters, and organization listings — still resolvable by name.
+  ru: Скрыт из поиска, фасетов, счётчиков и списков организации, но остаётся доступным по имени.
+  desc: Hint under the unlisted checkbox on the package management tab.
+
+manageDiscontinued:
+  en: Discontinued
+  ru: Не поддерживается
+  desc: Checkbox label for marking a package as no longer maintained.
+
+manageDiscontinuedHint:
+  en: The pub client warns about it; existing versions stay downloadable.
+  ru: Клиент pub предупредит об этом; опубликованные версии остаются доступными.
+  desc: Hint under the discontinued checkbox on the package management tab.
+
+manageReplacedBy:
+  en: Replaced by
+  ru: Заменён пакетом
+  desc: Label of the replacement-package field, only meaningful while the package is discontinued.
+
+manageReplacedByHint:
+  en: Only meaningful while discontinued. Leave empty to clear it.
+  ru: Учитывается только для неподдерживаемых пакетов. Пустое поле очищает значение.
+  desc: Hint under the replaced-by field on the package management tab.
+
+manageRetractTitle:
+  en: Retraction
+  ru: Отзыв версий
+  desc: Heading of the retraction card on the package management tab.
+
+manageRetractBody:
+  en: A retracted version stays downloadable but is excluded from new resolutions.
+  ru: Отозванная версия остаётся доступной для скачивания, но исключается из новых разрешений зависимостей.
+  desc: Subtitle of the retraction card.
+
+manageRetractWindow:
+  en: Retraction can be undone only for a limited window after it happens; afterwards the only way forward is publishing a new version.
+  ru: Отзыв можно отменить лишь в течение ограниченного времени; позже остаётся только опубликовать новую версию.
+  desc: Alert on the retraction card explaining the restore window.
+
+manageRetractTable:
+  en: Versions and their retraction state
+  ru: Версии и их состояние отзыва
+  desc: Accessible name of the retraction table on the package management tab.
+
+manageRetractedAt:
+  en: Retracted at
+  ru: Отозвана
+  desc: Column header for the timestamp at which a version was retracted.
+
+manageRetractAction:
+  en: Retraction action
+  ru: Действие отзыва
+  desc: Screen-reader-only header of the action column in the retraction table.
+
+manageRetract:
+  en: Retract
+  ru: Отозвать
+  desc: Button that retracts one version.
+
+manageUnretract:
+  en: Restore
+  ru: Восстановить
+  desc: Button that undoes the retraction of one version.
+
+manageRetracted:
+  en: Version {version} retracted.
+  ru: Версия {version} отозвана.
+  desc: Toast confirming a retraction; {version} is the version number.
+
+manageUnretracted:
+  en: Version {version} restored.
+  ru: Версия {version} восстановлена.
+  desc: Toast confirming that a retraction was undone; {version} is the version number.
+
+manageDeleteTitle:
+  en: Delete a version permanently
+  ru: Безвозвратное удаление версии
+  desc: Heading of the hard-delete card and title of its confirmation dialog.
+
+manageDeleteBody:
+  en: Removes the archive bytes. The version number stays burned forever and can never be republished.
+  ru: Удаляет содержимое архива. Номер версии остаётся занятым навсегда и не может быть переиспользован.
+  desc: Subtitle of the hard-delete card on the package management tab.
+
+manageDeleteWarning:
+  en: This cannot be undone. Prefer retraction unless the bytes themselves must go.
+  ru: Отменить это невозможно. Если дело не в самих байтах, используйте отзыв версии.
+  desc: Description inside the hard-delete confirmation dialog.
+
+manageDeleteAction:
+  en: Delete version
+  ru: Удалить версию
+  desc: Button that opens and confirms the hard-delete dialog.
+
+manageDeleteConfirmLabel:
+  en: Type the package and version to confirm
+  ru: "Подтвердите: введите пакет и версию"
+  desc: Label of the typed-confirmation field in the hard-delete dialog.
+
+manageDeleteConfirmHint:
+  en: Exactly {expected}
+  ru: Ровно {expected}
+  desc: Hint showing the exact confirmation string; {expected} is "name@version".
+
+manageDeleteReason:
+  en: Reason
+  ru: Причина
+  desc: Label of the mandatory reason field in the hard-delete dialog.
+
+manageDeleteReasonHint:
+  en: Recorded in the audit log.
+  ru: Записывается в журнал аудита.
+  desc: Hint under the reason field in the hard-delete dialog.
+
+manageDeleted:
+  en: Version {version} deleted.
+  ru: Версия {version} удалена.
+  desc: Toast confirming a hard delete; {version} is the version number.
+
+manageTransferTitle:
+  en: Transfer ownership
+  ru: Передача пакета
+  desc: Heading of the transfer card and title of its confirmation dialog.
+
+manageTransferBody:
+  en: Moves the package to another organization you own. Its registry base changes with it.
+  ru: Переносит пакет в другую вашу организацию. Вместе с ним меняется и адрес реестра.
+  desc: Subtitle of the transfer card on the package management tab.
+
+manageTransferWarning:
+  en: Existing dependencies keep resolving, but the hosted URL your team pastes changes.
+  ru: Существующие зависимости продолжат разрешаться, но адрес реестра для новых установок изменится.
+  desc: Description inside the transfer confirmation dialog.
+
+manageTransferAction:
+  en: Transfer
+  ru: Передать
+  desc: Button that opens and confirms the transfer dialog.
+
+manageTransferTarget:
+  en: Receiving organization
+  ru: Организация-получатель
+  desc: Label of the target organization select in the transfer dialog.
+
+manageTransferConfirmLabel:
+  en: Type the package name to confirm
+  ru: "Подтвердите: введите имя пакета"
+  desc: Label of the typed-confirmation field in the transfer dialog.
+
+manageTransferNoTargets:
+  en: You own no other organization that could receive this package.
+  ru: У вас нет другой организации-владельца, которая могла бы принять пакет.
+  desc: Message replacing the transfer button when the caller owns no eligible target organization.
+
+manageTransferred:
+  en: Transferred to {org}.
+  ru: Передан организации {org}.
+  desc: Toast confirming a transfer; {org} is the receiving organization slug.
+
+# --- organization pages ---
+
+orgArchived:
+  en: Archived
+  ru: Архивная
+  desc: Badge on an organization that was archived by a forced deletion.
+
+orgRegistryHint:
+  en: Point the pub client at this base to publish and consume this organization's packages.
+  ru: Укажите этот адрес клиенту pub, чтобы публиковать и получать пакеты организации.
+  desc: Explanation above the organization's virtual registry base.
+
+orgUpstreamPolicy:
+  en: "Upstream proxy policy: {policy}"
+  ru: "Политика прокси к upstream: {policy}"
+  desc: Footnote on the organization page; {policy} is allow or block.
+
+orgPackagesTitle:
+  en: Packages
+  ru: Пакеты
+  desc: Heading of the package list on the organization page.
+
+orgPackagesEmpty:
+  en: No packages you can see
+  ru: Нет доступных вам пакетов
+  desc: Empty state of the organization's package list.
+
+orgPackagesEmptyBody:
+  en: Private packages appear here once you are a member of this organization.
+  ru: Приватные пакеты появятся здесь, когда вы станете участником организации.
+  desc: Empty state body of the organization's package list.
+
+orgPackagesTruncated:
+  en: Only the newest packages are listed. Use search to see the rest.
+  ru: Показаны только самые новые пакеты. Остальные — через поиск.
+  desc: Footnote under a truncated organization package list.
+
+orgMembersTitle:
+  en: Members
+  ru: Участники
+  desc: Heading of the organization member list.
+
+orgMembersEmpty:
+  en: No members
+  ru: Нет участников
+  desc: Empty state of the organization member list.
+
+orgMemberName:
+  en: Member
+  ru: Участник
+  desc: Column header for a member's display name.
+
+orgMemberSince:
+  en: Member since
+  ru: В организации с
+  desc: Column header for the date a membership was created.
+
+orgManageLink:
+  en: Manage organization
+  ru: Управление организацией
+  desc: Link on the organization page to its management screen; visible to Admins and Owners.
+
+orgTokensLink:
+  en: CLI tokens
+  ru: Токены CLI
+  desc: Link on the organization page to the token screen; visible to Admins and Owners.
+
+orgManageTitle:
+  en: Organization settings
+  ru: Настройки организации
+  desc: Heading of the organization management screen.
+
+orgManageForbidden:
+  en: Managing this organization needs the Admin role.
+  ru: Для управления организацией нужна роль Admin.
+  desc: Message shown when a member below Admin opens the organization management screen.
+
+orgManageProfileTitle:
+  en: Profile
+  ru: Профиль
+  desc: Heading of the profile card on the organization management screen.
+
+orgManageDescription:
+  en: Description
+  ru: Описание
+  desc: Label of the organization description field.
+
+orgManageSlugLocked:
+  en: The slug is the registry base and cannot change — renaming it would break every configured PUB_HOSTED_URL.
+  ru: "Идентификатор — это адрес реестра, его нельзя менять: иначе сломаются все настроенные PUB_HOSTED_URL."
+  desc: Hint under the read-only slug field on the organization management screen.
+
+orgManageUpstream:
+  en: Upstream proxy
+  ru: Прокси к upstream
+  desc: Label of the organization's upstream policy select.
+
+orgManageUpstreamHint:
+  en: Blocking stops this organization's registry base from falling through to the upstream registry.
+  ru: Блокировка запрещает адресу реестра организации обращаться к внешнему реестру.
+  desc: Hint under the upstream policy select.
+
+orgUpstreamAllow:
+  en: Allow — fall through to the upstream registry
+  ru: Разрешить — обращаться к внешнему реестру
+  desc: Option of the organization upstream policy select.
+
+orgUpstreamBlock:
+  en: Block — serve local packages only
+  ru: Блокировать — только локальные пакеты
+  desc: Option of the organization upstream policy select.
+
+orgManageSaved:
+  en: Organization updated.
+  ru: Организация обновлена.
+  desc: Toast confirming that the organization profile was saved.
+
+orgMemberStepUpNotice:
+  en: Granting Write or above asks for your second factor again, and a demotion signs the member out everywhere.
+  ru: Выдача роли Write и выше потребует второй фактор, а понижение завершит все сеансы участника.
+  desc: Alert above the member table explaining the step-up gate and session revocation.
+
+orgMemberRoleChanged:
+  en: Role updated.
+  ru: Роль обновлена.
+  desc: Toast confirming a member's role change.
+
+orgMemberRoleChangedRevoked:
+  en:
+    one: Role updated; {count} session was ended.
+    other: Role updated; {count} sessions were ended.
+  ru:
+    one: Роль обновлена, завершён {count} сеанс.
+    few: Роль обновлена, завершено {count} сеанса.
+    many: Роль обновлена, завершено {count} сеансов.
+    other: Роль обновлена, завершено {count} сеанса.
+  desc: Toast after a demotion that revoked sessions; {count} is how many sessions ended.
+
+orgMemberRemoveTitle:
+  en: Remove member
+  ru: Удалить участника
+  desc: Title of the member removal confirmation dialog.
+
+orgMemberRemoveBody:
+  en: "{name} loses access to this organization's packages and is signed out of it."
+  ru: "{name} потеряет доступ к пакетам организации, и её сеансы будут завершены."
+  desc: Body of the member removal dialog; {name} is the member's display name.
+
+orgMemberRemoved:
+  en: Member removed.
+  ru: Участник удалён.
+  desc: Toast confirming that a member was removed.
+
+orgInvitationsTitle:
+  en: Invitations
+  ru: Приглашения
+  desc: Heading of the invitation section on the organization management screen.
+
+orgInvitationsEmpty:
+  en: No invitations
+  ru: Приглашений нет
+  desc: Empty state of the invitation list.
+
+orgInviteAction:
+  en: Invite
+  ru: Пригласить
+  desc: Submit button of the invitation form.
+
+orgInviteStatus:
+  en: Status
+  ru: Статус
+  desc: Column header for an invitation's status.
+
+orgInviteExpires:
+  en: Expires
+  ru: Истекает
+  desc: Column header for an invitation's expiry date.
+
+orgInviteSent:
+  en: Invitation created.
+  ru: Приглашение создано.
+  desc: Toast confirming that an invitation was created.
+
+orgInviteRevoked:
+  en: Invitation revoked.
+  ru: Приглашение отозвано.
+  desc: Toast confirming that an invitation was revoked.
+
+orgInviteTokenTitle:
+  en: Invitation link token
+  ru: Токен приглашения
+  desc: Heading of the show-once panel carrying a fresh invitation token.
+
+orgInviteTokenBody:
+  en: Shown once. It is also emailed — copy it if this instance has no SMTP configured.
+  ru: Показывается один раз. Он также отправлен по почте — скопируйте, если SMTP не настроен.
+  desc: Body of the show-once invitation token panel.
+
+# --- notifications ---
+
+notifSubtitle:
+  en: Publishes, membership changes, and security alarms from your organizations.
+  ru: Публикации, изменения участников и оповещения безопасности из ваших организаций.
+  desc: Subtitle of the notification center screen.
+
+notifUnreadCount:
+  en:
+    zero: No unread notifications
+    one: "{count} unread notification"
+    other: "{count} unread notifications"
+  ru:
+    zero: Нет непрочитанных уведомлений
+    one: "{count} непрочитанное уведомление"
+    few: "{count} непрочитанных уведомления"
+    many: "{count} непрочитанных уведомлений"
+    other: "{count} непрочитанных уведомления"
+  desc: Unread total above the feed and the accessible name of the header badge; {count} is the number.
+
+notifUnread:
+  en: Unread
+  ru: Новое
+  desc: Badge marking a single unread notification in the feed.
+
+notifMarkRead:
+  en: Mark read
+  ru: Прочитано
+  desc: Button that marks one notification read.
+
+notifMarkAllRead:
+  en: Mark all read
+  ru: Прочитать все
+  desc: Button that marks every unread notification read.
+
+notifOpen:
+  en: Open
+  ru: Открыть
+  desc: Link on a notification that opens the package or organization it refers to.
+
+notifFilterAll:
+  en: All
+  ru: Все
+  desc: Filter button showing every notification.
+
+notifFilterUnread:
+  en: Unread only
+  ru: Только непрочитанные
+  desc: Filter button narrowing the feed to unread notifications.
+
+notifEmpty:
+  en: No notifications yet
+  ru: Уведомлений пока нет
+  desc: Empty state of the full notification feed.
+
+notifEmptyUnread:
+  en: Nothing unread
+  ru: Непрочитанных нет
+  desc: Empty state of the feed filtered to unread notifications.
+
+notifEmptyBody:
+  en: Activity in your organizations shows up here.
+  ru: Здесь появится активность из ваших организаций.
+  desc: Empty state body of the notification feed.
+
+notifTruncated:
+  en: Older notifications are not shown.
+  ru: Более старые уведомления не показаны.
+  desc: Footnote under a truncated notification feed.
+
+notifStreamReconnecting:
+  en: Live updates are reconnecting. The list below is still correct; it just will not update on its own right now.
+  ru: Идёт переподключение к потоку событий. Список ниже корректен, но пока не обновляется сам.
+  desc: Alert shown while the event stream is reconnecting.
+
+notifCategoryPackage:
+  en: Packages
+  ru: Пакеты
+  desc: Notification category covering publishes, retractions, and option changes.
+
+notifCategoryOrg:
+  en: Organizations
+  ru: Организации
+  desc: Notification category covering membership and invitation events.
+
+notifCategorySecurity:
+  en: Security
+  ru: Безопасность
+  desc: Notification category covering shadowing alarms and upstream integrity events.
+
+notifPreferences:
+  en: Preferences
+  ru: Настройки
+  desc: Link and heading for the notification preferences screen.
+
+notifPrefsSubtitle:
+  en: Choose where each category is delivered. Three categories, not one switch per event type.
+  ru: Выберите, куда доставлять каждую категорию. Категорий три — переключателя на каждый тип события нет.
+  desc: Subtitle of the notification preferences screen.
+
+notifPrefsCategories:
+  en: Categories
+  ru: Категории
+  desc: Heading of the preference list card.
+
+notifPrefsInApp:
+  en: In the notification center
+  ru: В центре уведомлений
+  desc: Checkbox label for in-app delivery of a notification category.
+
+notifPrefsEmail:
+  en: By email
+  ru: По электронной почте
+  desc: Checkbox label for email delivery of a notification category.
+
+notifPrefsPackageHint:
+  en: Publishes and retractions in your organizations. Not emailed by default — a publish firehose in an inbox gets the sender filtered.
+  ru: "Публикации и отзывы в ваших организациях. По умолчанию без почты: поток публикаций в ящике быстро уходит в спам."
+  desc: Hint under the package notification category.
+
+notifPrefsOrgHint:
+  en: Membership and invitation changes. High importance, emailed by default.
+  ru: Изменения участников и приглашений. Важная категория, по умолчанию с почтой.
+  desc: Hint under the organization notification category.
+
+notifPrefsSecurityHint:
+  en: Shadowing alarms and upstream integrity events. Only organization Admins and Owners receive them.
+  ru: Оповещения о затенении имён и о целостности upstream. Их получают только Admin и Owner организации.
+  desc: Hint under the security notification category.
+
+notifPrefsSaved:
+  en: Preferences saved.
+  ru: Настройки сохранены.
+  desc: Toast confirming that notification preferences were saved.
+
+# --- live event stream ---
+
+eventShadowing:
+  en: "Upstream now publishes a package with a name claimed here: {name}"
+  ru: "Во внешнем реестре появился пакет с занятым здесь именем: {name}"
+  desc: Toast for a shadowing alarm arriving over the event stream; {name} is the package name.
+
+eventQuarantine:
+  en: "An upstream archive failed its checksum and was refused: {name}"
+  ru: "Архив из внешнего реестра не прошёл проверку контрольной суммы и отклонён: {name}"
+  desc: Toast for a quarantined upstream archive arriving over the event stream; {name} is the package name.
+
+eventOrgMembership:
+  en: Your organization membership changed.
+  ru: Ваше участие в организации изменилось.
+  desc: Toast for a membership event arriving over the event stream.
+
+eventStreamCapped:
+  en: Too many live connections for this account — live updates are off in this tab.
+  ru: Слишком много активных подключений для этого аккаунта — живые обновления в этой вкладке отключены.
+  desc: Toast shown when the server refuses the event stream because of the per-user connection cap.
+
+# --- instance administration ---
+
+adminSubtitle:
+  en: Runtime settings, accounts, organizations, the audit log, and background jobs.
+  ru: Настройки времени выполнения, аккаунты, организации, журнал аудита и фоновые задачи.
+  desc: Subtitle of the instance administration screen.
+
+adminTabStats:
+  en: Overview
+  ru: Обзор
+  desc: Admin panel tab showing instance statistics.
+
+adminTabSettings:
+  en: Settings
+  ru: Настройки
+  desc: Admin panel tab with the runtime settings form.
+
+adminTabUsers:
+  en: Accounts
+  ru: Аккаунты
+  desc: Admin panel tab with the user table.
+
+adminTabOrgs:
+  en: Organizations
+  ru: Организации
+  desc: Admin panel tab with the organization table.
+
+adminTabAudit:
+  en: Audit log
+  ru: Журнал аудита
+  desc: Admin panel tab with the audit log viewer.
+
+adminTabJobs:
+  en: Jobs
+  ru: Задачи
+  desc: Admin panel tab with background job state and manual triggers.
+
+adminSettingsSaved:
+  en: Settings saved (version {version}).
+  ru: Настройки сохранены (версия {version}).
+  desc: Toast confirming a settings write; {version} is the new settings version number.
+
+adminSettingsVersion:
+  en: Current settings version — {version}
+  ru: Текущая версия настроек — {version}
+  desc: Footnote next to the settings save button; {version} is the stored settings version.
+
+adminSettingsInvalid:
+  en: Some fields need fixing before this can be saved.
+  ru: Некоторые поля нужно исправить перед сохранением.
+  desc: Alert at the top of the settings form when client-side validation failed.
+
+adminFieldRequired:
+  en: This field cannot be empty.
+  ru: Поле не может быть пустым.
+  desc: Inline validation message for an empty required settings field.
+
+adminFieldPositive:
+  en: Enter a whole number of at least 1.
+  ru: Введите целое число не меньше 1.
+  desc: Inline validation message for a settings field that must be a positive integer.
+
+adminFieldDomain:
+  en: Each line must be a domain, without an @ and with at least one dot.
+  ru: В каждой строке должен быть домен — без @ и хотя бы с одной точкой.
+  desc: Inline validation message for a malformed entry in the email domain allowlist.
+
+adminBrandingTitle:
+  en: Branding
+  ru: Оформление
+  desc: Heading of the branding section of the settings form.
+
+adminBrandingBody:
+  en: How this instance names itself. Changes take effect on the next request, not the next restart.
+  ru: Как этот сервер себя называет. Изменения действуют со следующего запроса, а не с перезапуска.
+  desc: Subtitle of the branding settings section.
+
+adminBrandingName:
+  en: Instance name
+  ru: Название сервера
+  desc: Label of the instance name field.
+
+adminBrandingTagline:
+  en: Tagline
+  ru: Подпись
+  desc: Label of the one-line instance description field.
+
+adminBrandingLogo:
+  en: Logo URL
+  ru: Адрес логотипа
+  desc: Label of the absolute logo URL field.
+
+adminBrandingColor:
+  en: Accent colour
+  ru: Акцентный цвет
+  desc: Label of the accent colour field.
+
+adminBrandingColorHint:
+  en: Stored and reported, but not applied to the interface — the theme's colour pairs are contrast-checked at build time and a custom value would bypass that gate.
+  ru: "Сохраняется и отдаётся по API, но не применяется к интерфейсу: цветовые пары темы проверяются на контраст при сборке, а произвольное значение обошло бы эту проверку."
+  desc: Hint under the accent colour field explaining why the value is not applied to the UI.
+
+adminRegistrationTitle:
+  en: Registration
+  ru: Регистрация
+  desc: Heading of the registration policy section of the settings form.
+
+adminRegistrationBody:
+  en: Who may create an account on this instance.
+  ru: Кто может завести аккаунт на этом сервере.
+  desc: Subtitle of the registration settings section.
+
+adminRegistrationMode:
+  en: Mode
+  ru: Режим
+  desc: Label of the registration mode select.
+
+adminAllowedDomains:
+  en: Allowed email domains
+  ru: Разрешённые почтовые домены
+  desc: Label of the sign-in email domain allowlist textarea.
+
+adminAllowedDomainsHint:
+  en: One per line. Empty allows every domain — a typo here is a lockout, not a filter.
+  ru: По одному в строке. Пустой список разрешает все домены; опечатка здесь блокирует вход, а не фильтрует.
+  desc: Hint under the email domain allowlist.
+
+adminLimitsTitle:
+  en: Rate limits
+  ru: Ограничения частоты
+  desc: Heading of the rate limit section of the settings form.
+
+adminLimitsBody:
+  en: Every value must be at least 1 — a zero would lock this instance out of its own sign-in.
+  ru: "Каждое значение должно быть не меньше 1: ноль заблокировал бы вход на сам сервер."
+  desc: Subtitle of the rate limit settings section.
+
+adminLimitOtpEmail:
+  en: Sign-in codes per email, per hour
+  ru: Кодов входа на адрес в час
+  desc: Label of the per-email OTP request limit.
+
+adminLimitOtpIp:
+  en: Sign-in codes per IP, per hour
+  ru: Кодов входа с IP в час
+  desc: Label of the per-IP OTP request limit.
+
+adminLimitLoginIp:
+  en: Credential attempts per IP, per minute
+  ru: Попыток входа с IP в минуту
+  desc: Label of the per-IP credential redemption limit.
+
+adminLimitTokenFail:
+  en: Failed token authentications per IP, per minute
+  ru: Неудачных проверок токена с IP в минуту
+  desc: Label of the per-IP failed CLI token authentication limit.
+
+adminLimitPublish:
+  en: Publishes per organization, per hour
+  ru: Публикаций от организации в час
+  desc: Label of the per-organization publish limit.
+
+adminSmtpTitle:
+  en: Outgoing mail
+  ru: Исходящая почта
+  desc: Heading of the SMTP section of the settings form.
+
+adminSmtpBody:
+  en: Used for sign-in codes, invitations, and high-importance notifications.
+  ru: Используется для кодов входа, приглашений и важных уведомлений.
+  desc: Subtitle of the SMTP settings section.
+
+adminSmtpHost:
+  en: Host
+  ru: Хост
+  desc: Label of the SMTP hostname field.
+
+adminSmtpHostHint:
+  en: Empty disables runtime SMTP; the instance then falls back to its boot configuration.
+  ru: Пустое значение отключает SMTP времени выполнения — сервер вернётся к настройкам из конфигурации запуска.
+  desc: Hint under the SMTP hostname field.
+
+adminSmtpPort:
+  en: Port
+  ru: Порт
+  desc: Label of the SMTP port field.
+
+adminSmtpUsername:
+  en: Username
+  ru: Пользователь
+  desc: Label of the SMTP login field.
+
+adminSmtpFrom:
+  en: From address
+  ru: Адрес отправителя
+  desc: Label of the SMTP From mailbox field.
+
+adminSmtpSecurity:
+  en: Transport security
+  ru: Защита соединения
+  desc: Label of the SMTP transport security select.
+
+adminSmtpPasswordSet:
+  en: Password stored
+  ru: Пароль сохранён
+  desc: Badge shown when a SMTP password is stored on the server.
+
+adminSmtpPasswordUnset:
+  en: No password stored
+  ru: Пароль не сохранён
+  desc: Badge shown when no SMTP password is stored on the server.
+
+adminSmtpSetPassword:
+  en: Set a new password
+  ru: Задать новый пароль
+  desc: Checkbox that opts the SMTP password field into the settings patch; unchecked keeps the stored secret.
+
+adminSmtpPassword:
+  en: New password
+  ru: Новый пароль
+  desc: Label of the write-only SMTP password field.
+
+adminSmtpPasswordHint:
+  en: Never returned by the API. Leave the field empty to clear the stored password instead of replacing it.
+  ru: API никогда не возвращает пароль. Пустое поле удалит сохранённый пароль вместо замены.
+  desc: Hint under the SMTP password field explaining the write-only contract.
+
+adminUpstreamTitle:
+  en: Upstream proxy
+  ru: Прокси к upstream
+  desc: Heading of the upstream section of the settings form.
+
+adminUpstreamBody:
+  en: Whether unclaimed names may resolve through the upstream registry, and what new organizations start with.
+  ru: Могут ли незанятые имена разрешаться через внешний реестр и с какой политикой создаются новые организации.
+  desc: Subtitle of the upstream settings section.
+
+adminUpstreamEnabled:
+  en: Proxy enabled instance-wide
+  ru: Прокси включён на всём сервере
+  desc: Checkbox toggling the instance-wide upstream proxy.
+
+adminUpstreamDefault:
+  en: Default policy for new organizations
+  ru: Политика по умолчанию для новых организаций
+  desc: Label of the default upstream policy select.
+
+adminUsersTitle:
+  en: Accounts
+  ru: Аккаунты
+  desc: Accessible name of the admin user table.
+
+adminUsersEmpty:
+  en: No accounts match
+  ru: Подходящих аккаунтов нет
+  desc: Empty state of the admin user table.
+
+adminUserSearch:
+  en: Email or name
+  ru: Почта или имя
+  desc: Label of the admin user search field.
+
+adminUserStatus:
+  en: Status
+  ru: Статус
+  desc: Label and column header for an account's lifecycle status.
+
+adminAnyStatus:
+  en: Any status
+  ru: Любой статус
+  desc: Option of the account status filter that applies no narrowing.
+
+adminApplyFilters:
+  en: Apply
+  ru: Применить
+  desc: Submit button of a table filter form.
+
+adminUserCreated:
+  en: Created
+  ru: Создан
+  desc: Column header for an account's creation date.
+
+adminUserAdmin:
+  en: Instance admin
+  ru: Администратор сервера
+  desc: Badge marking an account that administers the instance.
+
+adminUserSuspend:
+  en: Suspend
+  ru: Заблокировать
+  desc: Button that suspends an account and revokes its sessions.
+
+adminUserUnsuspend:
+  en: Unsuspend
+  ru: Разблокировать
+  desc: Button that lifts a suspension.
+
+adminUserSuspended:
+  en: Account suspended; its sessions were revoked.
+  ru: Аккаунт заблокирован, его сеансы завершены.
+  desc: Toast confirming a suspension.
+
+adminUserUnsuspended:
+  en: Account unsuspended.
+  ru: Аккаунт разблокирован.
+  desc: Toast confirming that a suspension was lifted.
+
+adminOrgsTitle:
+  en: Organizations
+  ru: Организации
+  desc: Accessible name of the admin organization table.
+
+adminOrgsEmpty:
+  en: No organizations
+  ru: Организаций нет
+  desc: Empty state of the admin organization table.
+
+adminOrgMembers:
+  en: Members
+  ru: Участники
+  desc: Column header for an organization's member count.
+
+adminOrgPackages:
+  en: Packages
+  ru: Пакеты
+  desc: Column header for an organization's package count.
+
+adminOrgCreated:
+  en: Created
+  ru: Создана
+  desc: Column header for an organization's creation date.
+
+adminAuditTitle:
+  en: Audit log
+  ru: Журнал аудита
+  desc: Accessible name of the audit log table.
+
+adminAuditEmpty:
+  en: No audit events match
+  ru: Подходящих записей нет
+  desc: Empty state of the audit log viewer.
+
+adminAuditWhen:
+  en: When
+  ru: Когда
+  desc: Column header for an audit event's timestamp.
+
+adminAuditAction:
+  en: Action
+  ru: Действие
+  desc: Label and column header for an audit event's dot-namespaced action.
+
+adminAuditActionHint:
+  en: Matched as a prefix, so org.member. covers every membership action.
+  ru: "Сопоставляется как префикс: org.member. охватывает все действия с участниками."
+  desc: Hint under the audit action filter explaining prefix matching.
+
+adminAuditOrg:
+  en: Organization id
+  ru: Идентификатор организации
+  desc: Label of the audit filter narrowing to one organization.
+
+adminAuditActor:
+  en: Actor id
+  ru: Идентификатор субъекта
+  desc: Label and column header for the account or token behind an audit event.
+
+adminAuditTarget:
+  en: Target
+  ru: Объект
+  desc: Column header for what an audit event acted on.
+
+adminAuditResult:
+  en: Result
+  ru: Результат
+  desc: Column header for whether an audited action succeeded.
+
+adminAuditFrom:
+  en: From
+  ru: С
+  desc: Label of the audit filter's inclusive start timestamp.
+
+adminAuditUntil:
+  en: Until
+  ru: По
+  desc: Label of the audit filter's exclusive end timestamp.
+
+adminAuditClear:
+  en: Clear filters
+  ru: Сбросить фильтры
+  desc: Button that removes every audit log filter.
+
+adminAuditContext:
+  en: Context
+  ru: Контекст
+  desc: Column header for an audit event's structured metadata.
+
+adminAuditShowContext:
+  en: Show context
+  ru: Показать контекст
+  desc: Disclosure that reveals an audit event's metadata document.
+
+adminStatsRegistry:
+  en: Registry
+  ru: Реестр
+  desc: Heading of the registry totals on the admin dashboard.
+
+adminStatsAccounts:
+  en: Accounts
+  ru: Аккаунты
+  desc: Heading of the account counts on the admin dashboard.
+
+adminStatsUpstream:
+  en: Upstream cache
+  ru: Кэш upstream
+  desc: Heading of the proxy cache figures on the admin dashboard.
+
+adminStatPackages:
+  en: Packages
+  ru: Пакеты
+  desc: Admin statistic — total package rows.
+
+adminStatPublic:
+  en: Public
+  ru: Публичных
+  desc: Admin statistic — how many packages are public.
+
+adminStatVersions:
+  en: Live versions
+  ru: Активных версий
+  desc: Admin statistic — total live version rows.
+
+adminStatRetracted:
+  en: Retracted
+  ru: Отозванных
+  desc: Admin statistic — how many versions are currently retracted.
+
+adminStatTombstoned:
+  en: Burned numbers
+  ru: Занятых номеров
+  desc: Admin statistic — hard-deleted versions kept as tombstones so the number cannot be reused.
+
+adminStatStorage:
+  en: Archive storage
+  ru: Объём архивов
+  desc: Admin statistic — summed archive size of the live versions.
+
+adminStatUsers:
+  en: Accounts
+  ru: Аккаунтов
+  desc: Admin statistic — every account row.
+
+adminStatActive:
+  en: Active
+  ru: Активных
+  desc: Admin statistic — accounts that can sign in.
+
+adminStatSuspended:
+  en: Suspended
+  ru: Заблокированных
+  desc: Admin statistic — suspended accounts.
+
+adminStatAdmins:
+  en: Administrators
+  ru: Администраторов
+  desc: Admin statistic — instance administrators.
+
+adminStatDeleted:
+  en: Deletion tombstones
+  ru: Удалённых
+  desc: Admin statistic — anonymized account deletion tombstones.
+
+adminStatOrgs:
+  en: Organizations
+  ru: Организаций
+  desc: Admin statistic — organizations on the instance.
+
+adminStatCachedPackages:
+  en: Cached packages
+  ru: Пакетов в кэше
+  desc: Admin statistic — upstream packages we hold a snapshot for.
+
+adminStatCachedVersions:
+  en: Cached versions
+  ru: Версий в кэше
+  desc: Admin statistic — upstream versions whose bytes are held.
+
+adminStatCachedBytes:
+  en: Cached bytes
+  ru: Объём кэша
+  desc: Admin statistic — size of the cached upstream archives.
+
+adminStatShadowingActive:
+  en: Open shadowing alarms
+  ru: Открытых оповещений о затенении
+  desc: Admin statistic — unacknowledged shadowing alarms.
+
+adminShadowingTitle:
+  en: Shadowing alarms
+  ru: Оповещения о затенении имён
+  desc: Heading of the shadowing alarm table on the admin dashboard.
+
+adminShadowingBody:
+  en: An upstream registry publishes these names too. Local packages always win resolution, so nothing broke — but somebody may be squatting a name your organization uses.
+  ru: Внешний реестр публикует те же имена. Локальные пакеты всегда выигрывают разрешение, так что ничего не сломано — но кто-то мог занять имя, которое использует ваша организация.
+  desc: Alert above the shadowing alarm table explaining what the alarm means.
+
+adminShadowingName:
+  en: Name
+  ru: Имя
+  desc: Column header for the shadowed package name.
+
+adminShadowingUpstream:
+  en: Upstream
+  ru: Внешний реестр
+  desc: Column header for the upstream base URL where a shadowing was observed.
+
+adminShadowingSeen:
+  en: Last seen
+  ru: Замечено
+  desc: Column header for the most recent observation of an alarm.
+
+adminShadowingActive:
+  en: Sightings
+  ru: Наблюдений
+  desc: Column header for how many times a shadowing was observed.
+
+adminQuarantineTitle:
+  en: Quarantined upstream archives
+  ru: Изолированные архивы upstream
+  desc: Heading of the quarantine table on the admin dashboard.
+
+adminQuarantineBody:
+  en: The bytes upstream served did not match the checksum it advertised, so they were refused rather than cached.
+  ru: Байты, отданные внешним реестром, не совпали с заявленной контрольной суммой — они отклонены, а не сохранены в кэш.
+  desc: Alert above the quarantine table explaining the refusal.
+
+adminQuarantineExpected:
+  en: Advertised
+  ru: Заявлено
+  desc: Column header for the checksum upstream advertised.
+
+adminQuarantineActual:
+  en: Received
+  ru: Получено
+  desc: Column header for the checksum of the bytes upstream actually served.
+
+adminJobsIntro:
+  en: Jobs run on a schedule behind a cluster-wide lock. Triggering one here runs it now, on this instance, under the same lock.
+  ru: Задачи выполняются по расписанию под общекластерной блокировкой. Запуск отсюда выполняет задачу сейчас, на этом сервере, под той же блокировкой.
+  desc: Introductory alert on the admin jobs tab.
+
+adminJobsNone:
+  en: This instance runs no jobs on demand
+  ru: На этом сервере нет задач, запускаемых вручную
+  desc: Empty state when the instance reports no runnable jobs.
+
+adminJobRun:
+  en: Run {job}
+  ru: Запустить {job}
+  desc: Button that triggers a background job; {job} is the job name.
+
+adminJobRunning:
+  en: Running {job}…
+  ru: Выполняется {job}…
+  desc: Label of a job trigger button while its run is in flight; {job} is the job name.
+
+adminJobRan:
+  en: Job {job} finished.
+  ru: Задача {job} завершена.
+  desc: Toast confirming a manual job run; {job} is the job name.
+
+adminJobSummary:
+  en: Summary of {job}
+  ru: Итог задачи {job}
+  desc: Heading of the panel showing a finished job's own summary document; {job} is the job name.
+
+adminJobName:
+  en: Job
+  ru: Задача
+  desc: Column header for a background job's name.
+
+adminJobLastSuccess:
+  en: Last success
+  ru: Последний успех
+  desc: Column header for when a job last completed successfully.
+
+adminJobNever:
+  en: Never
+  ru: Никогда
+  desc: Cell value for a job that has never succeeded.
+
+adminJobRuns:
+  en: Runs
+  ru: Запусков
+  desc: Column header for how many times a job has started.
+
+adminJobProcessed:
+  en: Processed
+  ru: Обработано
+  desc: Column header for how many work items a job has processed in total.
+
+adminJobFailures:
+  en: Failures
+  ru: Сбоев
+  desc: Column header for how many job runs failed.
+
+resourceNotFoundTitle:
+  en: Not found
+  ru: Не найдено
+  desc: Title of the 404 state a screen shows when the API answers 404 for the thing it was loading (an unknown name, or one the caller may not read).
+
+resourceNotFoundBody:
+  en: This name does not exist here, or it is not visible to you. Signing in to the owning organization may show it.
+  ru: Такого имени здесь нет либо оно вам не видно. Возможно, оно откроется после входа в организацию-владельца.
+  desc: Body of the 404 state a screen shows when the API answers 404 for the thing it was loading.
+
+resourceForbiddenTitle:
+  en: You do not have access
+  ru: Доступ закрыт
+  desc: Title of the 403 state a screen shows when the API refuses because the caller's role is too low.
+
+resourceForbiddenBody:
+  en: This screen needs a higher role than you have here. Ask an administrator of this organization or instance if you need it.
+  ru: Для этого экрана нужна более высокая роль, чем у вас есть. Обратитесь к администратору организации или инстанса, если доступ действительно нужен.
+  desc: Body of the 403 state a screen shows when the caller's role is too low; deliberately offers no retry.

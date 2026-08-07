@@ -149,8 +149,10 @@ describe("locale dictionaries", () => {
 
   test("the Russian app dictionary differs from English on every key", async () => {
     // A ru value identical to en is almost always a forgotten translation.
-    // Product name and the email placeholder are deliberately identical.
-    const KEPT_IDENTICAL = new Set(["app.loginEmailPlaceholder"]);
+    // Two are deliberately identical: the email placeholder, and the Readme
+    // tab — "Readme" names the FILE in the archive, and translating a filename
+    // would stop it matching what the package author actually shipped.
+    const KEPT_IDENTICAL = new Set(["app.loginEmailPlaceholder", "app.pkgTabReadme"]);
     const en = (await Bun.file(join(LOCALES_DIR, "en", "app.json")).json()) as Record<
       string,
       unknown

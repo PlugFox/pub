@@ -60,12 +60,53 @@ async fn index_html_is_served_at_root() {
     assert!(html.contains("<title>Pub</title>"), "placeholder index.html must be served");
 }
 
+/// Every client-routed path under `/app` must reach the **app shell** — the document that
+/// mounts the SolidJS island — and not the landing page. Astro emits the shell as
+/// `app/index.html`, so a resolver that only tries the literal request path answers a
+/// marketing page for every deep link and reload, and the app never boots.
 #[tokio::test]
-async fn unknown_non_api_path_falls_back_to_index_html() {
-    let (status, headers, body) = get("/app/orgs/acme/packages").await;
+async fn client_routed_app_paths_serve_the_app_shell() {
+    for path in
+        ["/app", "/app/", "/app/orgs/acme/packages", "/app/packages/foo/versions/1.0.0", "/app/auth/callback/google"]
+    {
+        let (status, headers, body) = get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(headers[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"), "{path}");
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("app shell"), "{path} did not resolve to app/index.html:\n{html}");
+    }
+}
+
+/// The build is directory-style (`/app/search` → `app/search/index.html`); the resolver has to
+/// try the directory index before it gives up, or every prerendered route below the root is a
+/// miss.
+#[tokio::test]
+async fn a_directory_path_resolves_to_its_index_html() {
+    // In the placeholder tree `app/` is the only directory, which is exactly the shape this
+    // rule has to handle: the trailing slash must not defeat the lookup.
+    let (status, _headers, body) = get("/app/").await;
     assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8(body).unwrap().contains("app shell"));
+}
+
+/// A typo outside the app is not the landing page. Serving `index.html` with 200 tells
+/// crawlers, link checkers, and the service worker that a nonexistent path is a real page.
+#[tokio::test]
+async fn unknown_non_app_path_answers_404_with_the_static_page() {
+    let (status, headers, body) = get("/no-such-page").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(headers[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
-    assert!(String::from_utf8(body).unwrap().contains("<title>Pub</title>"));
+    assert!(String::from_utf8(body).unwrap().contains("<title>404 — Pub</title>"));
+}
+
+/// rust-embed refuses to escape its folder on its own; the resolver refuses to *ask*, so a
+/// traversal attempt is a plain 404 rather than a lookup with a hopeful outcome.
+#[tokio::test]
+async fn traversal_segments_never_resolve() {
+    for path in ["/../Cargo.toml", "/app/../../Cargo.toml", "/./index.html"] {
+        let (status, _headers, _body) = get(path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
 }
 
 #[tokio::test]

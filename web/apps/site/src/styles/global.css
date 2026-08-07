@@ -1,6 +1,7 @@
 @import "./fonts.css";
 @import "tailwindcss";
 @import "@pub/tokens/theme.css";
+@import "./prose.css";
 
 /*
  * Workspace packages live outside apps/site, so Tailwind's automatic source

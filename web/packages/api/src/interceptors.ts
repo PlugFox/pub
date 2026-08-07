@@ -38,6 +38,17 @@ export type AuthInterceptor = {
   reset(): void;
   /** Whether the latch is closed (further refresh attempts short-circuit). */
   isDenied(): boolean;
+  /**
+   * Rotates the pair now, outside any request, and reports whether a new one
+   * landed. Shares the single-flight promise and the denial latch with the
+   * automatic refresh, which is the whole reason it lives here: a hand-rolled
+   * second refresh call could race an in-flight one and present a rotated-out
+   * token, which the S-08 reuse detector answers by killing the session.
+   *
+   * Rejects with `NetworkError` (offline is not a denial); every other failure
+   * resolves `false` after the latch has already reported the loss.
+   */
+  renew(): Promise<boolean>;
 };
 
 /**
@@ -132,6 +143,9 @@ export function createAuthInterceptor(options: AuthInterceptorOptions): AuthInte
     },
     isDenied(): boolean {
       return denied;
+    },
+    async renew(): Promise<boolean> {
+      return (await refreshOnce()) !== null;
     },
   };
 }

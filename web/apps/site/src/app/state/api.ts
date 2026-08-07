@@ -3,6 +3,7 @@ import { createPubApi, loginTokenPair, type PubApi } from "@pub/api/pub-api";
 import type { LoginDto } from "@pub/api/types";
 import { t } from "@pub/i18n";
 import { app } from "@pub/i18n/generated/app";
+import { setUnreadCount } from "./notification-store";
 import { adoptLogin, clearSession, hydrateSession } from "./session-store";
 import { promptStepUp, requestStepUp } from "./step-up-store";
 import { pushToast } from "./toast-store";
@@ -52,6 +53,48 @@ export async function signOut(): Promise<void> {
   }
   clearSession(api.storage);
   api.resetAuth();
+}
+
+/**
+ * Reads the authoritative unread count into the badge store.
+ *
+ * `limit: 1` because only the `unread` total is wanted — the field is the
+ * whole inbox's count, not this page's, so the cheapest page answers it. The
+ * failure is swallowed on purpose: a badge is an ornament, and a signed-in
+ * reader must not meet an error toast because a count could not be fetched.
+ */
+export async function seedUnreadCount(): Promise<void> {
+  try {
+    const feed = await api.notifications.list({ limit: 1 });
+    setUnreadCount(feed.unread);
+  } catch {
+    // Offline, or a session that just died: the badge stays at its last value.
+  }
+}
+
+/**
+ * Rotates the access token so a membership the caller just gained is in its
+ * `orgs` claim.
+ *
+ * A membership GRANT deliberately leaves sessions alone (S-09.a): the token
+ * that predates it carries no claim for the org and therefore fails closed, so
+ * revoking would cost the user every device for no security gain. The cost is
+ * that the grant is invisible to every claim-derived surface — the org's
+ * private packages, its member list, the SSE audience — until the next
+ * rotation. This is that rotation, and it belongs next to the actions that
+ * create the situation: creating an organization, accepting an invitation.
+ *
+ * Best-effort by construction. A refused refresh has already signalled the
+ * session loss through `onAuthLost`, and being offline must not turn "you
+ * joined an org" into an error the user has to act on — the claim lands on the
+ * next automatic refresh either way.
+ */
+export async function renewMemberships(): Promise<void> {
+  try {
+    await api.renewAuth();
+  } catch {
+    // Offline: the membership is durable on the server; the claim catches up.
+  }
 }
 
 /**

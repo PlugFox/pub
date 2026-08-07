@@ -1,0 +1,137 @@
+/*
+ * `.pub-prose` — the long-form container for BACKEND-RENDERED package
+ * documentation (README, CHANGELOG).
+ *
+ * Why a stylesheet and not a component recipe: the HTML arrives from the
+ * server with no classes on it, so the only way to style it is descendant
+ * selectors. Writing those as Tailwind arbitrary variants (`[&_h2]:mt-8`)
+ * would put `[` inside class strings, which web/DESIGN.md §7/§9 bans; `@apply`
+ * of the same semantic utilities keeps every value on the token scale and out
+ * of the components.
+ *
+ * It lives in the app rather than in `packages/ui` because it is app CSS: a
+ * package cannot import the app's Tailwind entry, and the app importing a
+ * package's stylesheet would put the token pipeline in two places.
+ *
+ * Layered in `components` so ordinary utilities still win: a caller can add
+ * `max-w-none` or a text colour to the container without fighting specificity.
+ */
+
+@layer components {
+  .pub-prose {
+    @apply text-base leading-relaxed text-ink;
+  }
+
+  /* Vertical rhythm is owned by the flow, not by each element's own margin
+     stack: `* + *` gives every sibling one gap and leaves the first child
+     flush with the container's top edge. */
+  .pub-prose > * + * {
+    @apply mt-4;
+  }
+
+  .pub-prose h1,
+  .pub-prose h2,
+  .pub-prose h3,
+  .pub-prose h4,
+  .pub-prose h5,
+  .pub-prose h6 {
+    @apply font-semibold tracking-tight text-ink;
+  }
+
+  .pub-prose > * + :is(h1, h2, h3, h4, h5, h6) {
+    @apply mt-8;
+  }
+
+  .pub-prose h1 {
+    @apply text-2xl;
+  }
+
+  .pub-prose h2 {
+    @apply border-b border-line pb-2 text-xl;
+  }
+
+  .pub-prose h3 {
+    @apply text-lg;
+  }
+
+  .pub-prose h4,
+  .pub-prose h5,
+  .pub-prose h6 {
+    @apply text-base;
+  }
+
+  .pub-prose a {
+    @apply rounded-sm text-accent underline underline-offset-2 outline-none;
+    @apply hover:text-accent-strong focus-visible:ring-2 focus-visible:ring-accent;
+  }
+
+  .pub-prose strong {
+    @apply font-semibold text-ink;
+  }
+
+  .pub-prose ul,
+  .pub-prose ol {
+    @apply flex flex-col gap-2 pl-6;
+  }
+
+  .pub-prose ul {
+    @apply list-disc;
+  }
+
+  .pub-prose ol {
+    @apply list-decimal;
+  }
+
+  .pub-prose li::marker {
+    @apply text-ink-muted;
+  }
+
+  /* GFM task lists render a disabled checkbox; it is a status marker, not a
+     control, so it never takes focus. */
+  .pub-prose li > input[type="checkbox"] {
+    @apply mr-2 accent-accent;
+  }
+
+  .pub-prose code {
+    @apply rounded-sm bg-accent-soft px-1.5 py-0.5 font-mono text-sm text-ink;
+  }
+
+  .pub-prose pre {
+    @apply overflow-x-auto rounded-lg border border-line bg-canvas p-4;
+  }
+
+  .pub-prose pre code {
+    @apply bg-transparent p-0 text-sm;
+  }
+
+  .pub-prose blockquote {
+    @apply border-l-2 border-line pl-4 text-ink-muted italic;
+  }
+
+  .pub-prose hr {
+    @apply border-line;
+  }
+
+  /* A README table can be arbitrarily wide; it scrolls inside its own box
+     rather than widening the page (web/DESIGN.md §8). */
+  .pub-prose table {
+    @apply block w-full max-w-full overflow-x-auto border-collapse text-sm;
+  }
+
+  .pub-prose th,
+  .pub-prose td {
+    @apply border border-line px-3 py-2 text-left align-top;
+  }
+
+  .pub-prose th {
+    @apply bg-canvas font-medium text-ink-muted;
+  }
+
+  .pub-prose img {
+    @apply max-w-full rounded-md;
+  }
+
+  .pub-prose p:empty {
+    @apply hidden;
+  }
+}

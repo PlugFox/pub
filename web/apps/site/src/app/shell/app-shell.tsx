@@ -1,4 +1,4 @@
-import { t } from "@pub/i18n";
+import { t, tp } from "@pub/i18n";
 import { app } from "@pub/i18n/generated/app";
 import { common } from "@pub/i18n/generated/common";
 import { buttonVariants } from "@pub/ui/button";
@@ -8,9 +8,12 @@ import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } fr
 import { ThemeToggle } from "@pub/ui/theme-toggle";
 import { ToastRegion } from "@pub/ui/toast";
 import { A, createAsync, query, useLocation, useNavigate } from "@solidjs/router";
-import { For, type JSX, Show, Suspense } from "solid-js";
-import { api, signOut } from "../state/api";
+import { createEffect, For, type JSX, Show, Suspense } from "solid-js";
+import { api, seedUnreadCount, signOut } from "../state/api";
+import { instanceName, primeInstance } from "../state/instance-store";
+import { resetUnread, unreadCount } from "../state/notification-store";
 import { currentUser, isAuthenticated } from "../state/session-store";
+import { startEventStream, stopEventStream } from "../state/sse";
 import { dismissToast, toasts } from "../state/toast-store";
 import { StepUpDialog } from "./step-up-dialog";
 
@@ -18,34 +21,39 @@ import { StepUpDialog } from "./step-up-dialog";
  * The app chrome: header (wordmark, search, org switcher, user menu) plus the
  * primary navigation, the toast region, and the one global step-up prompt.
  *
- * BRANDING (decision 17): instances rebrand the wordmark, logo, and accent at
- * runtime through admin settings. This constant is the product default and is
- * a KNOWN STUB — a white-labelled instance still reads "Pub" in the app
- * header. The instance identity now exists on the wire as `InstanceDto`
- * (`name`, `logo_url`, `primary_color`) inside `GET /api/v1/home`; wiring it
- * here is a follow-up, not a missing endpoint.
+ * BRANDING (decision 17) comes from `GET /api/v1/home`. The shell primes that
+ * query on mount — not the landing screen, which would leave every deep link
+ * showing the product default for the rest of the session — and reads the
+ * result out of `instance-store`. It never suspends on it: until the payload
+ * lands the wordmark reads "Pub", which is the product default rather than a
+ * placeholder, so there is nothing to show a skeleton for.
+ *
+ * THE EVENT STREAM'S LIFECYCLE LIVES HERE, in one effect keyed on
+ * authentication. It is the one place that sees every transition — sign-in,
+ * sign-out, and a refresh the server refused (which clears the session store
+ * from an interceptor callback that has no component around it). Putting it in
+ * `state/api.ts` instead would make the api module import the SSE module,
+ * which imports the api module.
  */
-const INSTANCE_NAME = "Pub";
 
 const orgsQuery = query(() => api.orgs.list(), "shell-orgs");
 
 type NavEntry = {
   readonly href: string;
   readonly label: { readonly id: string; readonly en: string };
-  /** Areas whose backend does not exist yet are still linked, but marked. */
-  readonly placeholder?: boolean;
+  /** Renders the unread badge next to the label. */
+  readonly badge?: boolean;
 };
 
 const NAV: readonly NavEntry[] = [
   { href: "/", label: app.navOverview },
-  { href: "/packages", label: app.navPackages, placeholder: true },
-  { href: "/search", label: app.navSearch, placeholder: true },
+  { href: "/search", label: app.navSearch },
   { href: "/orgs", label: app.navOrgs },
   { href: "/tokens", label: app.navTokens },
   { href: "/sessions", label: app.navSessions },
-  { href: "/notifications", label: app.navNotifications, placeholder: true },
+  { href: "/notifications", label: app.navNotifications, badge: true },
   { href: "/account", label: app.navAccount },
-  { href: "/admin", label: app.navAdmin, placeholder: true },
+  { href: "/admin", label: app.navAdmin },
 ];
 
 function initials(name: string): string {
@@ -92,7 +100,7 @@ function UserMenu(): JSX.Element {
       <MenuTrigger
         aria-label={t(app.userMenu)}
         class={cn(
-          "inline-flex size-8 cursor-pointer items-center justify-center rounded-full",
+          "relative inline-flex size-8 cursor-pointer items-center justify-center rounded-full",
           "bg-accent-soft text-sm font-medium text-accent outline-none transition-colors",
           "hover:bg-accent hover:text-on-accent focus-visible:ring-2 focus-visible:ring-accent",
         )}
@@ -102,6 +110,7 @@ function UserMenu(): JSX.Element {
       <MenuContent>
         <MenuLabel>{currentUser()?.email ?? currentUser()?.display_name ?? ""}</MenuLabel>
         <MenuItem onSelect={() => navigate("/account")}>{t(app.navAccount)}</MenuItem>
+        <MenuItem onSelect={() => navigate("/notifications")}>{t(app.navNotifications)}</MenuItem>
         <MenuSeparator />
         {/*
           The theme toggle sits INSIDE the menu item rather than being one:
@@ -146,6 +155,24 @@ function SearchField(): JSX.Element {
   );
 }
 
+/** Unread count as a pill. Hidden at zero — an empty badge is noise. */
+function UnreadBadge(): JSX.Element {
+  return (
+    <Show when={unreadCount() > 0}>
+      <span
+        class={cn(
+          "ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full",
+          "bg-accent px-1.5 py-0.5 text-xs font-medium text-on-accent",
+        )}
+      >
+        {/* The number is decorative next to the label the sr-only text spells out. */}
+        <span aria-hidden="true">{unreadCount() > 99 ? "99+" : unreadCount()}</span>
+        <span class="sr-only">{tp(app.notifUnreadCount, unreadCount())}</span>
+      </span>
+    </Show>
+  );
+}
+
 function PrimaryNav(): JSX.Element {
   const location = useLocation();
   const isActive = (href: string): boolean =>
@@ -155,7 +182,7 @@ function PrimaryNav(): JSX.Element {
       <ul class="flex gap-1 overflow-x-auto pb-2 lg:flex-col lg:overflow-visible lg:pb-0">
         <For each={NAV}>
           {(entry) => (
-            <li class="shrink-0">
+            <li class="shrink-0 lg:w-full">
               <A
                 href={entry.href}
                 aria-current={isActive(entry.href) ? "page" : undefined}
@@ -167,18 +194,8 @@ function PrimaryNav(): JSX.Element {
                 )}
               >
                 {t(entry.label)}
-                <Show when={entry.placeholder === true}>
-                  {/*
-                    The dot is a hover hint for sighted users; a screen reader
-                    gets the same fact as text, or "coming soon" would be
-                    information only one kind of user receives.
-                  */}
-                  <span
-                    aria-hidden="true"
-                    class="size-1.5 shrink-0 rounded-full bg-warning"
-                    title={t(app.comingSoon)}
-                  />
-                  <span class="sr-only">{t(app.comingSoon)}</span>
+                <Show when={entry.badge === true}>
+                  <UnreadBadge />
                 </Show>
               </A>
             </li>
@@ -192,6 +209,26 @@ function PrimaryNav(): JSX.Element {
 export type AppShellProps = { readonly children?: JSX.Element };
 
 export function AppShell(props: AppShellProps): JSX.Element {
+  // The instance's identity is needed by the header on EVERY screen, so the
+  // shell asks for it rather than the landing screen (decision 17). It does not
+  // suspend on the answer: the wordmark's fallback is the product default.
+  primeInstance();
+
+  // One subscription per session, torn down the moment the credential goes.
+  createEffect(() => {
+    if (isAuthenticated()) {
+      startEventStream(() => api.storage.read()?.accessToken ?? null);
+      // Seed the badge from the server. The stream only reports what happens
+      // from now on, so without this a reader who signs in with a full inbox
+      // sees a blank badge until they open the feed — which is precisely the
+      // trip the badge exists to save them.
+      void seedUnreadCount();
+    } else {
+      stopEventStream();
+      resetUnread();
+    }
+  });
+
   return (
     <div class="flex min-h-dvh flex-col">
       <a
@@ -208,11 +245,21 @@ export function AppShell(props: AppShellProps): JSX.Element {
         <div class="mx-auto flex w-full max-w-6xl items-center gap-3 px-6 py-3">
           <A href="/" class="flex shrink-0 items-center gap-2 font-semibold text-ink">
             <img src="/icons/icon.svg" alt="" class="size-6" />
-            <span class="hidden sm:inline">{INSTANCE_NAME}</span>
+            <span class="hidden sm:inline">{instanceName()}</span>
           </A>
           <SearchField />
           <div class="ml-auto flex items-center gap-2">
-            <Show when={isAuthenticated()} fallback={<ThemeToggle />}>
+            <Show
+              when={isAuthenticated()}
+              fallback={
+                <>
+                  <ThemeToggle />
+                  <A href="/login" class={buttonVariants({ intent: "outline", size: "sm" })}>
+                    {t(app.loginTitle)}
+                  </A>
+                </>
+              }
+            >
               <OrgSwitcher />
               <UserMenu />
             </Show>

@@ -10,6 +10,7 @@
     "build": "bun run --filter @pub/site build",
     "test": "bun test",
     "i18n:gen": "bun packages/i18n/scripts/i18n-gen.ts",
+    "gen:api": "bun packages/api/scripts/gen-api.ts",
     "fix": "biome check --write ."
   },
   "devDependencies": {

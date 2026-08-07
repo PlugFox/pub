@@ -54,6 +54,7 @@ type Harness = {
   now: number;
   reset(): void;
   isDenied(): boolean;
+  renew(): Promise<boolean>;
 };
 
 type HarnessOptions = {
@@ -126,6 +127,7 @@ function harness(options: HarnessOptions): Harness {
     },
     reset: auth.reset,
     isDenied: auth.isDenied,
+    renew: auth.renew,
   };
 }
 
@@ -332,6 +334,79 @@ describe("denial latch", () => {
     h.reset();
     expect(h.isDenied()).toBe(false);
     await expect(h.client.request<string>("/b")).resolves.toBe("back in");
+  });
+});
+
+/*
+ * `renew()` exists for one situation: the caller was just granted a membership,
+ * which by S-09.a does NOT revoke the session, so the access token keeps an
+ * `orgs` claim that predates the grant. It must share the single-flight promise
+ * and the denial latch with the automatic refresh — a second, independent
+ * refresh call is exactly what trips the S-08 reuse detector.
+ */
+describe("explicit renew", () => {
+  test("rotates the pair on demand and reports success", async () => {
+    const h = harness({ responses: [() => ok("fine")] });
+    const before = h.storage.read();
+    expect(await h.renew()).toBe(true);
+    expect(h.refreshCalls).toBe(1);
+    expect(h.storage.read()?.refreshToken).toBe("r1");
+    expect(h.storage.read()?.accessToken).not.toBe(before?.accessToken);
+    // The next ordinary request rides the NEW token, with no second refresh.
+    await h.client.request("/anything");
+    expect(h.requests[0]?.headers.get("authorization")).toBe(
+      `Bearer ${h.storage.read()?.accessToken}`,
+    );
+    expect(h.refreshCalls).toBe(1);
+  });
+
+  test("shares one flight with a concurrent automatic refresh", async () => {
+    // The refresh is held open until both callers are waiting on it, which is
+    // the only way to observe that they queue on ONE promise rather than
+    // firing two rotations at a server that treats the second as reuse.
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = harness({
+      responses: [() => errorResponse(401, "unauthorized"), () => ok("retried")],
+      refresh: async (_token, call) => {
+        await gate;
+        return { accessToken: jwt(2_000_000), refreshToken: `r${call}` };
+      },
+    });
+    const renewing = h.renew();
+    const requesting = h.client.request<string>("/thing");
+    // Let the request reach its 401 and join the in-flight rotation.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release?.();
+    expect(await renewing).toBe(true);
+    expect(await requesting).toBe("retried");
+    expect(h.refreshCalls).toBe(1);
+  });
+
+  test("a refused renewal reports the lost session once and then short-circuits", async () => {
+    const h = harness({
+      responses: [() => ok("unused")],
+      refresh: () => Promise.reject(new ApiError("unauthorized", "no", 401)),
+    });
+    expect(await h.renew()).toBe(false);
+    expect(h.authLost).toEqual(["refresh_denied"]);
+    expect(h.storage.read()).toBeNull();
+    expect(await h.renew()).toBe(false);
+    expect(h.refreshCalls).toBe(1);
+    expect(h.authLost).toEqual(["refresh_denied"]);
+  });
+
+  test("offline REJECTS rather than reporting a denial — the session is intact", async () => {
+    const h = harness({
+      responses: [() => ok("unused")],
+      refresh: () => Promise.reject(new NetworkError("offline")),
+    });
+    await expect(h.renew()).rejects.toBeInstanceOf(NetworkError);
+    expect(h.authLost).toEqual([]);
+    expect(h.isDenied()).toBe(false);
+    expect(h.storage.read()?.refreshToken).toBe("r0");
   });
 });
 
