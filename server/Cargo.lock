@@ -136,6 +136,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arcstr"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2480,6 +2489,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pub-admin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "pub-auth",
+ "pub-core",
+ "pub-registry",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pub-api"
 version = "0.1.0"
 dependencies = [
@@ -2495,11 +2520,13 @@ dependencies = [
  "http",
  "http-body-util",
  "mime_guess",
+ "pub-admin",
  "pub-auth",
  "pub-blob",
  "pub-config",
  "pub-core",
  "pub-db-sqlite",
+ "pub-events",
  "pub-jobs",
  "pub-kv",
  "pub-mail",
@@ -2513,6 +2540,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http 0.7.0",
  "tracing",
@@ -2581,6 +2609,7 @@ dependencies = [
 name = "pub-core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -2590,6 +2619,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "url",
  "uuid",
 ]
@@ -2633,6 +2663,24 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "pub-events"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "pub-config",
+ "pub-core",
+ "pub-db-sqlite",
+ "pub-kv",
+ "pub-mail",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2728,6 +2776,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "futures",
+ "pub-admin",
  "pub-api",
  "pub-auth",
  "pub-blob",
@@ -2735,6 +2785,7 @@ dependencies = [
  "pub-core",
  "pub-db-postgres",
  "pub-db-sqlite",
+ "pub-events",
  "pub-jobs",
  "pub-kv",
  "pub-mail",

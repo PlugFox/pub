@@ -26,7 +26,7 @@ use std::time::Duration as StdDuration;
 use axum::body::Body;
 use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::{DefaultBodyLimit, Multipart, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -36,7 +36,7 @@ use pub_core::package::{Package, Resolution, Version, Visibility};
 use pub_core::token::TokenScope;
 use pub_core::traits::{ByteStream, DownloadPlan};
 use pub_core::{Format, OrgId, PackageId, SemVer, TokenId, UserId};
-use pub_registry::{ActorMeta, PublishRequest, RegistryService, validate_package_name};
+use pub_registry::{ActorMeta, PublishRequest, RegistryService, latest_index, validate_package_name};
 use serde::{Deserialize, Serialize};
 use tower_http::compression::CompressionLayer;
 use utoipa::ToSchema;
@@ -463,13 +463,14 @@ pub async fn publish_finalize(
 )]
 pub async fn archive(
     State(state): State<AppState>,
+    method: Method,
     principal: Principal,
     base: Base,
     params: PathParams,
 ) -> Result<Response, ProtocolError> {
     let file = params.require("file")?;
     let (name, version) = parse_archive_file(file)?;
-    serve_archive(&state, &base, &principal, &name, &version).await
+    serve_archive(&state, &method, &base, &principal, &name, &version).await
 }
 
 /// Legacy per-version metadata (pre-Dart-2.8 clients) — docs/protocol.md endpoint 6.
@@ -533,6 +534,7 @@ pub async fn legacy_version(
 )]
 pub async fn legacy_archive(
     State(state): State<AppState>,
+    method: Method,
     principal: Principal,
     base: Base,
     params: PathParams,
@@ -544,7 +546,7 @@ pub async fn legacy_archive(
         .ok_or_else(|| ProtocolError::not_found(format!("archive {} of package {}", clip(file), clip(&name))))?;
     let version = SemVer::parse(raw)
         .map_err(|_| ProtocolError::not_found(format!("version {} of package {}", clip(raw), clip(&name))))?;
-    serve_archive(&state, &base, &principal, &name, &version).await
+    serve_archive(&state, &method, &base, &principal, &name, &version).await
 }
 
 // ----------------------------------------------------------------------------------- helpers
@@ -606,7 +608,16 @@ async fn resolve_target<'a>(
 /// "blocked" status would tell a caller that the name exists upstream (S-04).
 ///
 /// The public root has no org and therefore no org policy; it follows the instance switch.
+///
+/// The instance switch has **two halves** since the admin surface landed: the boot config
+/// decides whether a proxy service exists at all (`None` = no upstream branch in the process,
+/// which is what an air-gapped deployment buys), and the runtime setting decides whether the
+/// existing one may be used. An operator stopping egress during an incident should not need a
+/// restart, and a restart should not be what re-enables it.
 fn upstream_for<'a>(state: &'a AppState, base: &Base) -> Option<&'a pub_registry::UpstreamService> {
+    if !state.runtime.current().upstream.enabled {
+        return None;
+    }
     let allowed = match &base.org {
         Some(org) => org.upstream_policy.allows_upstream(),
         None => true,
@@ -653,6 +664,7 @@ async fn live_version(state: &AppState, package: PackageId, version: &SemVer) ->
 /// would have to be stored under a key that is not its own hash.
 async fn serve_archive(
     state: &AppState,
+    method: &Method,
     base: &Base,
     principal: &Principal,
     name: &str,
@@ -661,6 +673,7 @@ async fn serve_archive(
     let (sha256, size) = match resolve_target(state, base, principal, name).await? {
         Target::Local(package) => {
             let found = live_version(state, package.id, version).await?;
+            count_download(state, method, package.id, found.id);
             (found.archive_sha256, Some(found.archive_size))
         }
         Target::Upstream(upstream) => {
@@ -686,6 +699,26 @@ async fn serve_archive(
         }
         Err(other) => Err(ProtocolError::from_domain(other)),
     }
+}
+
+/// Counts one served archive download, unless this is the client's cache probe.
+///
+/// **`HEAD` must not count.** The pub client issues a `HEAD` before every archive `GET` to
+/// decide whether its `PUB_CACHE` copy is current, and axum routes `HEAD` to the `GET` handler
+/// with the body discarded — so without this check every download would be counted twice, and
+/// a fully cached `pub get` (which only ever HEADs) would be counted as a download nobody made.
+///
+/// Fire-and-forget by construction: the recorder is an in-process buffer with no I/O
+/// (`pub_registry::stats`), so a statistic can neither slow a download nor fail one.
+///
+/// Only **local** versions are counted. A proxied archive's version row lives in
+/// `upstream_versions`, and `download_stats` is keyed on `versions` — mixing the two would
+/// attribute somebody else's package to a row that does not exist here.
+fn count_download(state: &AppState, method: &Method, package: PackageId, version: pub_core::VersionId) {
+    if method != Method::GET {
+        return;
+    }
+    state.downloads.record(package, version, (state.clock)());
 }
 
 /// 307 to a presigned URL (decision 10). 307 rather than 302: the method must not change,
@@ -770,7 +803,9 @@ async fn charge_publish_budget(
     use pub_auth::ratelimit::{self, Decision};
 
     let now = (state.clock)();
-    let limit = state.settings.registry.rate_limit.publish_per_hour_org;
+    // Runtime setting (decision 09): an operator can tighten or loosen the publish budget
+    // without a restart.
+    let limit = state.runtime.current().rate_limits.publish_per_hour_org;
     let key = format!("rl:publish:org:{}", org.id);
     match ratelimit::hit(state.kv.as_ref(), &key, limit, chrono::Duration::hours(1), now).await {
         Ok(Decision::Allowed) => Ok(()),
@@ -900,22 +935,6 @@ fn build_proxied_version(base: &Base, name: &str, version: &pub_registry::Proxie
         archive_sha256: version.archive_sha256.clone(),
         pubspec: version.pubspec.clone(),
     }
-}
-
-/// Index of the version a fresh `pub add` should pick, given `(retracted, pre_release)` flags
-/// in ascending precedence order.
-///
-/// Highest live stable, else highest live pre-release, else the highest version there is —
-/// a package whose every version is retracted still has to report *something*, and reporting
-/// the newest keeps `latest` consistent with the array's tail. One rule for local and proxied
-/// listings alike: a client must not be able to tell them apart by how `latest` is chosen.
-fn latest_index(versions: &[(bool, bool)]) -> usize {
-    debug_assert!(!versions.is_empty(), "callers must reject empty listings first");
-    versions
-        .iter()
-        .rposition(|(retracted, pre_release)| !retracted && !pre_release)
-        .or_else(|| versions.iter().rposition(|(retracted, _)| !retracted))
-        .unwrap_or(versions.len() - 1)
 }
 
 /// Splits `{name}-{version}.tar.gz`.

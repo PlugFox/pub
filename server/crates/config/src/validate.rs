@@ -48,6 +48,45 @@ impl Settings {
         self.validate_registry()?;
         self.validate_upstream()?;
         self.validate_jobs()?;
+        self.validate_realtime()?;
+        Ok(())
+    }
+
+    /// Realtime invariants (decision 20, S-32).
+    fn validate_realtime(&self) -> Result<(), ConfigError> {
+        let realtime = &self.realtime;
+        if realtime.heartbeat_secs == 0 {
+            return Err(invalid("realtime.heartbeat_secs must be greater than 0"));
+        }
+        // S-32: "streams … terminate within one access TTL of session revocation". The
+        // heartbeat is where a stream re-checks revocation, so a heartbeat longer than the
+        // access TTL would silently break that requirement — the config is refused rather than
+        // left to be discovered by a security review.
+        let access_ttl_secs = self.auth.access_ttl_minutes.saturating_mul(60);
+        if realtime.heartbeat_secs >= access_ttl_secs {
+            return Err(invalid(format!(
+                "realtime.heartbeat_secs = {} must be below auth.access_ttl_minutes = {} ({access_ttl_secs}s): \
+                 the heartbeat is where an SSE stream re-checks revocation (S-32)",
+                realtime.heartbeat_secs, self.auth.access_ttl_minutes
+            )));
+        }
+        if realtime.max_connections_per_user == 0 {
+            // Zero would refuse every stream while looking like a configured limit; switching
+            // the feature off is not something this knob expresses.
+            return Err(invalid("realtime.max_connections_per_user must be greater than 0"));
+        }
+        if realtime.replay_buffer == 0 {
+            return Err(invalid("realtime.replay_buffer must be greater than 0"));
+        }
+        // The fan-out asks the repositories for one batched preference lookup per event, and
+        // those bound how many ids a single `IN (…)`/`ANY(…)` may carry. Refusing the config is
+        // better than a fan-out that starts failing once an org crosses the bound.
+        const MAX_RECIPIENTS: usize = 500;
+        if realtime.max_notification_recipients == 0 || realtime.max_notification_recipients > MAX_RECIPIENTS {
+            return Err(invalid(format!(
+                "realtime.max_notification_recipients must be between 1 and {MAX_RECIPIENTS}"
+            )));
+        }
         Ok(())
     }
 
@@ -90,6 +129,29 @@ impl Settings {
                  for an hour with nothing referencing it",
                 gc.min_age_secs
             )));
+        }
+
+        let reindex = &self.jobs.reindex;
+        if reindex.interval_secs == 0 || reindex.resweep_after_secs == 0 {
+            return Err(invalid("jobs.reindex.interval_secs and jobs.reindex.resweep_after_secs must be > 0"));
+        }
+        if reindex.chunk == 0 {
+            // Zero would be a scheduled sweep that can never advance its cursor — a job that
+            // looks configured and rebuilds nothing. Turning it off is `enabled = false`.
+            return Err(invalid("jobs.reindex.chunk must be greater than 0"));
+        }
+
+        let downloads = &self.jobs.downloads;
+        if downloads.interval_secs == 0 {
+            return Err(invalid("jobs.downloads.interval_secs must be greater than 0"));
+        }
+        if downloads.recent_window_days <= 0 {
+            return Err(invalid("jobs.downloads.recent_window_days must be greater than 0"));
+        }
+        if downloads.buffer_capacity == 0 {
+            // The buffer is the whole write path: a zero-capacity one silently discards every
+            // download instead of counting it.
+            return Err(invalid("jobs.downloads.buffer_capacity must be greater than 0"));
         }
         Ok(())
     }
@@ -285,6 +347,15 @@ impl Settings {
             || auth.rate_limit.token_auth_fail_per_ip_minute == 0
         {
             return Err(invalid("auth.rate_limit values must be at least 1 (S-24)"));
+        }
+
+        // A typo in the admin bootstrap list is a silent lockout: the instance comes up with
+        // nobody able to reach `/api/v1/admin/*`, and the "first account" fallback has already
+        // been spent by whoever signed in first. Fail at startup instead.
+        for admin in &auth.instance_admins {
+            if !admin.contains('@') || admin.trim() != admin || admin.chars().any(char::is_whitespace) {
+                return Err(invalid(format!("auth.instance_admins entry '{admin}' is not an email address")));
+            }
         }
         Ok(())
     }

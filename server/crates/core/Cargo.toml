@@ -8,6 +8,8 @@ publish.workspace = true
 
 # NOTE: zero infrastructure dependencies (no sqlx / object_store / redis / axum) — docs/rules/rust.md.
 [dependencies]
+# arc-swap: the runtime-settings snapshot (settings.rs). Pure-Rust leaf crate, not infrastructure.
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 # base64: opaque keyset cursors (page.rs). A pure-Rust leaf crate — not infrastructure.
 base64 = { workspace = true }
@@ -17,6 +19,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 

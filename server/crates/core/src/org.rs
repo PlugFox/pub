@@ -72,12 +72,29 @@ pub struct Org {
     pub name: String,
     /// URL slug used in virtual registry bases (`/o/{slug}/pub`); unique case-insensitively.
     pub slug: String,
+    /// Free-text description shown on the org profile; empty = none.
+    pub description: String,
     /// Whether this org's registry may fall through to the upstream proxy (decision 01).
     pub upstream_policy: UpstreamPolicy,
+    /// When the org was archived — the terminal state of a *forced* deletion, used when the
+    /// org still owns packages and therefore cannot be erased (decision 06 keeps name claims
+    /// and version rows alive forever). `None` = a normal, live org.
+    ///
+    /// An archived org has no members, no invitations, and no live tokens, and every package
+    /// it owns was flipped private + unlisted + discontinued, so it serves nothing and
+    /// discloses nothing — but its slug stays taken and its claims stay burned.
+    pub archived_at: Option<DateTime<Utc>>,
     /// Creation time (UTC).
     pub created_at: DateTime<Utc>,
     /// Last update time (UTC).
     pub updated_at: DateTime<Utc>,
+}
+
+impl Org {
+    /// Whether the org is archived (see [`Org::archived_at`]).
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
 }
 
 /// Payload for creating an org (id and timestamps are assigned by the repo; the creator
@@ -88,6 +105,57 @@ pub struct NewOrg {
     pub name: String,
     /// URL slug; must be unique on the instance (case-insensitive).
     pub slug: String,
+    /// Free-text description; empty = none.
+    pub description: String,
+    /// Initial upstream policy — the instance default from runtime settings (decision 09),
+    /// not a hardcoded column default, so an operator who blocks upstream by policy does not
+    /// have to re-block every new org.
+    pub upstream_policy: UpstreamPolicy,
+}
+
+impl NewOrg {
+    /// A new org with the default (empty) description and the default upstream policy.
+    pub fn new(name: impl Into<String>, slug: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            slug: slug.into(),
+            description: String::new(),
+            upstream_policy: UpstreamPolicy::default(),
+        }
+    }
+}
+
+/// The mutable profile fields of an org (`PATCH /api/v1/orgs/{slug}`).
+///
+/// A *replace* payload like [`crate::package::PackageOptions`], for the same reason: the API
+/// layer resolves "unset field = keep current" against the loaded row, so the repository never
+/// has to reason about partial updates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgProfile {
+    /// Display name.
+    pub name: String,
+    /// Free-text description; empty = none.
+    pub description: String,
+    /// Upstream proxy policy (decision 01, S-16).
+    pub upstream_policy: UpstreamPolicy,
+}
+
+impl From<&Org> for OrgProfile {
+    fn from(org: &Org) -> Self {
+        Self { name: org.name.clone(), description: org.description.clone(), upstream_policy: org.upstream_policy }
+    }
+}
+
+/// One row of the admin org listing: the org plus the two numbers that decide whether it can
+/// be deleted and who to talk to about it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgOverview {
+    /// The org.
+    pub org: Org,
+    /// How many members it has.
+    pub members: i64,
+    /// How many packages it owns (any visibility).
+    pub packages: i64,
 }
 
 /// A membership row: one user's role in one org.
@@ -196,6 +264,13 @@ mod tests {
         let inv = NewInvitation::new(OrgId::new(), "dev@corp.com", UserId::new(), "hash", expires);
         assert_eq!(inv.role, RoleLevel::READ);
         assert_eq!(inv.expires_at, expires);
+    }
+
+    #[test]
+    fn new_org_defaults_are_empty_description_and_allow() {
+        let new = NewOrg::new("Acme", "acme");
+        assert!(new.description.is_empty());
+        assert_eq!(new.upstream_policy, UpstreamPolicy::Allow);
     }
 
     #[test]

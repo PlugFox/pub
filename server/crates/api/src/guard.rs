@@ -105,13 +105,15 @@ fn origin_of(raw: &str) -> Option<(String, String, Option<u16>)> {
 /// KV outage → the error propagates as 503: auth-abuse limiting fails **closed** (S-24).
 pub async fn auth_rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let is_post = request.method() == Method::POST;
-    let policy = state.auth.policy();
+    // Runtime settings (decision 09), read per request: an admin lowering a limit takes effect
+    // on the next request, not on the next restart.
+    let limits = state.runtime.current().rate_limits;
     let bucket = match request.uri().path() {
         "/api/v1/auth/otp/request" if is_post => {
-            Some(("otp_per_ip", "otp", policy.otp_per_ip_hour, Duration::hours(1)))
+            Some(("otp_per_ip", "otp", limits.otp_per_ip_hour, Duration::hours(1)))
         }
         path if is_post && is_credential_redemption(path) => {
-            Some(("login_per_ip", "login", policy.login_per_ip_minute, Duration::minutes(1)))
+            Some(("login_per_ip", "login", limits.login_per_ip_minute, Duration::minutes(1)))
         }
         _ => None,
     };

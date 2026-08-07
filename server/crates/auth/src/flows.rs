@@ -25,6 +25,7 @@ use chrono::{DateTime, Duration, Utc};
 use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::authorize::{Action, ActorContext, Resource, authorize};
 use pub_core::session::{NewSession, Session, SessionLimits};
+use pub_core::settings::{RegistrationMode, RuntimeSettings, SettingsCache};
 use pub_core::token::{NewToken, Token, TokenScope};
 use pub_core::traits::{Kv, Mailer, Repositories};
 use pub_core::user::{NewUser, User, UserStatus};
@@ -48,9 +49,13 @@ pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
 /// `pub get` would issue dozens of writes to one row.
 const TOKEN_LAST_USED_THROTTLE: StdDuration = StdDuration::from_secs(5 * 60);
 
-/// Instance auth policy, resolved from boot config (and later from runtime settings — the
-/// registration/domain knobs are instance settings per S-31; they live here so the flows
-/// need no settings plumbing yet).
+/// Instance auth policy, resolved from **boot** configuration only.
+///
+/// Everything an administrator may change at runtime — the registration mode, the S-31 domain
+/// allowlist, and every S-24 rate-limit number — lives in [`SettingsCache`] instead, and is
+/// read per request. What stays here is what S-25 makes boot-only (the pepper, the KEK, the
+/// signing plane's TTLs) plus [`AuthPolicy::instance_admins`], the administration bootstrap,
+/// which must not be editable by the surface it grants access to.
 ///
 /// [`Debug`] is hand-written: this struct carries the OTP pepper, and a stray `{:?}` on it
 /// (config dump, `#[instrument]` field, panic message) would put that secret in a log line
@@ -65,20 +70,14 @@ pub struct AuthPolicy {
     pub otp_pepper: Vec<u8>,
     /// CLI token prefix incl. the underscore, e.g. `pub_` (decision 17).
     pub token_prefix: String,
-    /// Whether a successful first OTP login may create an account.
-    pub allow_registration: bool,
-    /// Sign-in email-domain allowlist, lowercase; empty = every domain allowed (S-31).
-    pub allowed_email_domains: Vec<String>,
-    /// OTP requests per email per hour (S-24: 5).
-    pub otp_per_email_hour: u32,
-    /// OTP requests per IP per hour (S-24: 20) — enforced by the API rate-limit layer.
-    pub otp_per_ip_hour: u32,
-    /// Credential redemptions (OTP verify, refresh) per IP per minute (S-24: 10) — enforced
-    /// by the API rate-limit layer.
-    pub login_per_ip_minute: u32,
-    /// Failed CLI-token authentications per IP per minute (S-24: 30) — enforced by
-    /// [`AuthService::authenticate_cli_token`].
-    pub token_auth_fail_per_ip_minute: u32,
+    /// Email addresses promoted to instance administrator at startup and at registration
+    /// (decision 09 bootstrap), lowercase.
+    ///
+    /// Boot config, deliberately: the admin surface is what grants and revokes every other
+    /// runtime setting, so a list that lived *in* the settings table would let one compromised
+    /// admin session make itself permanent. The other bootstrap path — "the first account on
+    /// an instance with no admin" — needs no configuration at all.
+    pub instance_admins: Vec<String>,
     /// 32-byte key-encryption key sealing TOTP seeds at rest (S-05/S-25).
     pub kek: Vec<u8>,
     /// How long a step-up (fresh second factor / fresh login) stays valid (S-06; default
@@ -96,12 +95,7 @@ impl std::fmt::Debug for AuthPolicy {
             .field("session_limits", &self.session_limits)
             .field("otp_pepper", &"<redacted>")
             .field("token_prefix", &self.token_prefix)
-            .field("allow_registration", &self.allow_registration)
-            .field("allowed_email_domains", &self.allowed_email_domains)
-            .field("otp_per_email_hour", &self.otp_per_email_hour)
-            .field("otp_per_ip_hour", &self.otp_per_ip_hour)
-            .field("login_per_ip_minute", &self.login_per_ip_minute)
-            .field("token_auth_fail_per_ip_minute", &self.token_auth_fail_per_ip_minute)
+            .field("instance_admins", &self.instance_admins)
             .field("kek", &"<redacted>")
             .field("step_up_window", &self.step_up_window)
             .field("totp_issuer", &self.totp_issuer)
@@ -177,27 +171,36 @@ pub struct AuthService {
     mailer: Arc<dyn Mailer>,
     keyring: Keyring,
     policy: AuthPolicy,
+    /// Runtime settings (decision 09): registration mode, S-31 domain allowlist, S-24 limits.
+    runtime: Arc<SettingsCache>,
     rng: Arc<dyn RandomSource>,
     oidc: OidcClient,
 }
 
 impl AuthService {
     /// Bundles the dependencies. All backends arrive as trait handles (decision 09).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repos: Repositories,
         kv: Arc<dyn Kv>,
         mailer: Arc<dyn Mailer>,
         keyring: Keyring,
         policy: AuthPolicy,
+        runtime: Arc<SettingsCache>,
         rng: Arc<dyn RandomSource>,
         oidc: OidcClient,
     ) -> Self {
-        Self { repos, kv, mailer, keyring, policy, rng, oidc }
+        Self { repos, kv, mailer, keyring, policy, runtime, rng, oidc }
     }
 
-    /// The effective auth policy (the API layer reads rate-limit numbers from here).
+    /// The boot-only half of the auth policy (TTLs, pepper, KEK, token prefix).
     pub fn policy(&self) -> &AuthPolicy {
         &self.policy
+    }
+
+    /// The current runtime-settings snapshot (decision 09).
+    pub fn settings(&self) -> Arc<RuntimeSettings> {
+        self.runtime.current()
     }
 
     // --- OTP sign-in (S-03) ---
@@ -214,7 +217,7 @@ impl AuthService {
         let email_limit = ratelimit::hit(
             self.kv.as_ref(),
             &format!("rl:otp:email:{email}"),
-            self.policy.otp_per_email_hour,
+            self.settings().rate_limits.otp_per_email_hour,
             Duration::hours(1),
             now,
         )
@@ -260,9 +263,12 @@ impl AuthService {
         // a blocked address must never actually receive a redeemable code.
         let known_account = self.repos.users.find_by_email(&email).await?.is_some();
         let rendered = pub_mail::render_otp_email(&code, meta.ip.as_deref(), otp::PENDING_TTL.num_minutes())?;
+        // The registration probe runs for every address too, so an open-registration
+        // instance and an invite-only one do the same work per request (S-04.a).
+        let may_register = self.registration_allowed(&email, now).await?;
         let rejection = if !self.domain_allowed(&email) {
             Some("domain_blocked")
-        } else if !self.policy.allow_registration && !known_account {
+        } else if !may_register && !known_account {
             Some("registration_closed")
         } else {
             None
@@ -354,8 +360,9 @@ impl AuthService {
             Some(user) if user.status == UserStatus::Active => user,
             Some(_) => return Err(self.login_failure(&email, meta, "account_disabled", now).await),
             None => {
-                // First login creates the account — behind the instance registration gate.
-                if !self.policy.allow_registration {
+                // First login creates the account — behind the instance registration gate
+                // (decision 09 runtime setting: open / invite-only / closed).
+                if !self.registration_allowed(&email, now).await? {
                     return Err(self.login_failure(&email, meta, "registration_denied", now).await);
                 }
                 let display_name = email.split('@').next().unwrap_or("user").to_owned();
@@ -369,6 +376,7 @@ impl AuthService {
                     Err(other) => return Err(other),
                 };
                 self.repos.credentials.create_email_identity(user.id, &email, now).await?;
+                self.bootstrap_instance_admin(user.id, &email, meta, now).await;
                 registered = true;
                 user
             }
@@ -496,7 +504,7 @@ impl AuthService {
                         return Err(self.oidc_failure(&provider_id, Some(email), meta, "account_disabled", now).await);
                     }
                     None => {
-                        if !self.policy.allow_registration {
+                        if !self.registration_allowed(&email, now).await? {
                             return Err(self
                                 .oidc_failure(&provider_id, Some(email), meta, "registration_denied", now)
                                 .await);
@@ -516,6 +524,7 @@ impl AuthService {
                         };
                         self.repos.credentials.create_email_identity(user.id, &email, now).await?;
                         self.repos.credentials.upsert_oidc(user.id, &identity.issuer, &identity.subject, now).await?;
+                        self.bootstrap_instance_admin(user.id, &email, meta, now).await;
                         (user, false, true)
                     }
                 }
@@ -861,18 +870,48 @@ impl AuthService {
 
     /// Revokes every live session of the user (S-09 revoke-all); returns the count.
     pub async fn revoke_all_sessions(&self, user: UserId, meta: &ClientMeta, now: DateTime<Utc>) -> Result<u64> {
+        self.revoke_all_for(user, AuditActor::User(user), "revoke_all", meta, now).await
+    }
+
+    /// Revokes every live session of a user whose **authority just changed** (S-09).
+    ///
+    /// The distinct entry point exists so the reason reaches the audit log and so the actor is
+    /// the *system* rather than the affected user — the person losing their sessions is not
+    /// the person who acted. Callers: the org membership service (role change, removal) and
+    /// the admin user surface (suspension, admin-flag change). See
+    /// [S-09.a](../../../../docs/security.md) for which changes must revoke and why.
+    pub async fn revoke_sessions_after_authority_change(
+        &self,
+        user: UserId,
+        reason: &str,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        self.revoke_all_for(user, AuditActor::System, reason, meta, now).await
+    }
+
+    /// The one implementation behind both revoke-everything paths: durable revocation first,
+    /// KV blocklist second (S-09 fast path), audit last.
+    async fn revoke_all_for(
+        &self,
+        user: UserId,
+        actor: AuditActor,
+        reason: &str,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
         let live: Vec<SessionId> = self.repos.sessions.list_for_user(user).await?.iter().map(|s| s.id).collect();
         let count = self.repos.sessions.revoke_all_for_user(user, now).await?;
         for sid in live {
             self.blocklist_sid(sid).await?;
         }
         self.audit_as(
-            AuditActor::User(user),
+            actor,
             meta,
             "session.revoked",
-            None,
+            Some(user.to_string()),
             AuditResult::Success,
-            serde_json::json!({ "reason": "revoke_all", "count": count }),
+            serde_json::json!({ "reason": reason, "count": count }),
             now,
         )
         .await;
@@ -1060,7 +1099,8 @@ impl AuthService {
         let ip = meta.ip.as_deref().unwrap_or("unknown");
         let key = format!("rl:token_auth:ip:{ip}");
         let window = Duration::minutes(1);
-        match ratelimit::hit(self.kv.as_ref(), &key, self.policy.token_auth_fail_per_ip_minute, window, now).await {
+        let limit = self.settings().rate_limits.token_auth_fail_per_ip_minute;
+        match ratelimit::hit(self.kv.as_ref(), &key, limit, window, now).await {
             Ok(ratelimit::Decision::Allowed) => {}
             Ok(ratelimit::Decision::Limited { retry_after_secs }) => {
                 self.audit_as(
@@ -1331,14 +1371,60 @@ impl AuthService {
     }
 
     /// S-31 gate: is this (normalized) email's domain allowed to sign in?
+    ///
+    /// Read from the **runtime** settings on every call, so an admin tightening the allowlist
+    /// takes effect on the next sign-in rather than on the next restart.
     fn domain_allowed(&self, email: &str) -> bool {
-        if self.policy.allowed_email_domains.is_empty() {
-            return true;
+        self.settings().registration.domain_allowed(email)
+    }
+
+    /// Whether an account may be **created** for `email` right now (decision 09 registration
+    /// mode, evaluated on top of the already-checked S-31 domain gate).
+    ///
+    /// `Open` admits anyone; `Invite` admits only an address holding a live invitation, which
+    /// is what makes "invite-only instance" a real posture rather than a label; `Closed`
+    /// admits nobody. Existing accounts sign in in every mode — this gate is about creation.
+    async fn registration_allowed(&self, email: &str, now: DateTime<Utc>) -> Result<bool> {
+        match self.settings().registration.mode {
+            RegistrationMode::Open => Ok(true),
+            RegistrationMode::Invite => self.repos.orgs.has_pending_invitation(email, now).await,
+            // A mode this build does not know is treated as the most restrictive one: a
+            // rolling upgrade must never widen registration by accident.
+            RegistrationMode::Closed | _ => Ok(false),
         }
-        let Some((_, domain)) = email.rsplit_once('@') else {
-            return false;
+    }
+
+    /// Applies the instance-admin bootstrap to a freshly created account (decision 09).
+    ///
+    /// Two paths, in order: the configured email list, then "the first account on an instance
+    /// that has no administrator yet" — the latter atomically, so two concurrent first
+    /// registrations cannot both win it. Best-effort: a bootstrap failure must not fail a
+    /// sign-in that has otherwise succeeded, and the next registration retries the claim.
+    async fn bootstrap_instance_admin(&self, user: UserId, email: &str, meta: &ClientMeta, now: DateTime<Utc>) {
+        let configured = self.policy.instance_admins.iter().any(|listed| listed.eq_ignore_ascii_case(email));
+        let promoted = if configured {
+            self.repos.users.set_instance_admin(user, true, now).await.map(|_| true)
+        } else {
+            self.repos.users.claim_first_admin(user, now).await
         };
-        self.policy.allowed_email_domains.iter().any(|allowed| allowed.eq_ignore_ascii_case(domain))
+        match promoted {
+            Ok(true) => {
+                let reason = if configured { "configured" } else { "first_account" };
+                tracing::info!(user = %user, reason, "granted instance administrator rights");
+                self.audit_as(
+                    AuditActor::System,
+                    meta,
+                    "admin.granted",
+                    Some(user.to_string()),
+                    AuditResult::Success,
+                    serde_json::json!({ "reason": reason }),
+                    now,
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(err) => tracing::error!(user = %user, error = %err, "instance-admin bootstrap failed"),
+        }
     }
 
     /// Audits a login failure and returns the uniform error (S-04). The reason lives only in
@@ -1474,9 +1560,9 @@ mod tests {
 
     #[test]
     fn scope_role_mapping_matches_decision_19() {
-        assert_eq!(action_for_scope(TokenScope::Read).required_level(), RoleLevel::READ);
-        assert_eq!(action_for_scope(TokenScope::Publish).required_level(), RoleLevel::WRITE);
-        assert_eq!(action_for_scope(TokenScope::Retract).required_level(), RoleLevel::WRITE);
-        assert_eq!(action_for_scope(TokenScope::Admin).required_level(), RoleLevel::ADMIN);
+        assert_eq!(action_for_scope(TokenScope::Read).required_level(), Some(RoleLevel::READ));
+        assert_eq!(action_for_scope(TokenScope::Publish).required_level(), Some(RoleLevel::WRITE));
+        assert_eq!(action_for_scope(TokenScope::Retract).required_level(), Some(RoleLevel::WRITE));
+        assert_eq!(action_for_scope(TokenScope::Admin).required_level(), Some(RoleLevel::ADMIN));
     }
 }

@@ -379,6 +379,42 @@ pub struct UpstreamCacheEntry {
     pub fetched_at: DateTime<Utc>,
 }
 
+/// Instance-wide registry totals for the admin dashboard.
+///
+/// `archive_bytes` sums the **live** versions' archive sizes, which is the storage a
+/// content-addressed store would hold if nothing were shared; it deliberately over-counts
+/// byte-identical uploads rather than pretending to know the blob store's own accounting.
+/// Tombstoned versions contribute nothing: their bytes are gone (or shared, in which case the
+/// live sharer already counted them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryStats {
+    /// Package rows, any visibility.
+    pub packages: i64,
+    /// Of those, packages visible to anyone (`visibility = 'public'`).
+    pub public_packages: i64,
+    /// Live (non-tombstone) version rows.
+    pub versions: i64,
+    /// Of those, versions currently retracted.
+    pub retracted_versions: i64,
+    /// Hard-deleted version rows kept as burned numbers (S-18).
+    pub tombstoned_versions: i64,
+    /// Summed archive size of the live versions, in bytes.
+    pub archive_bytes: i64,
+}
+
+/// Instance-wide proxy-cache totals for the admin dashboard (decision 07).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamCacheStats {
+    /// Upstream packages we hold a listing snapshot for.
+    pub packages: i64,
+    /// Upstream versions those snapshots know about.
+    pub versions: i64,
+    /// Of those, versions whose archive bytes are in our blob store.
+    pub cached_versions: i64,
+    /// Total size of those bytes.
+    pub cached_bytes: i64,
+}
+
 /// A refused upstream archive, kept so the admin UI can list what the proxy is rejecting
 /// (S-19: hash mismatch ⇒ never stored, never served).
 ///

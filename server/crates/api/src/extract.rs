@@ -4,19 +4,50 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{ConnectInfo, FromRequestParts, Query};
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, header};
 use pub_auth::flows::ClientMeta;
 use pub_auth::jwt::Claims;
-use pub_core::RoleLevel;
-use pub_core::authorize::ActorContext;
+use pub_core::authorize::{Action, ActorContext, Resource, authorize};
+use pub_core::{Error, RoleLevel};
+use serde::de::DeserializeOwned;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
 /// Maximum stored user-agent length — coarse UA only (S-10).
 const MAX_USER_AGENT: usize = 256;
+
+/// Longest rejection detail echoed back from a query-string failure.
+const MAX_QUERY_DETAIL: usize = 200;
+
+/// Typed query parameters that reject **in the app API envelope**.
+///
+/// Axum's own `Query` rejection is a plain-text body, which would make `?limit=x` the one client
+/// error on `/api/…` that does not answer `{"status":"error","error":{"code","message"}}`
+/// (docs/rules/api.md). A generated client parses one shape, so this wrapper maps the rejection
+/// onto [`pub_core::Error::Invalid`] and the detail is length-capped before it is echoed —
+/// the message is built from caller-supplied text.
+pub struct QueryParams<T>(pub T);
+
+impl<T: DeserializeOwned> FromRequestParts<AppState> for QueryParams<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError(Error::Invalid { message: query_message(&rejection) })),
+        }
+    }
+}
+
+/// Turns an axum query rejection into a bounded, caller-facing message.
+fn query_message(rejection: &QueryRejection) -> String {
+    let detail: String = rejection.body_text().chars().take(MAX_QUERY_DETAIL).collect();
+    format!("invalid query parameters: {detail}")
+}
 
 /// Authenticated request context: verified claims plus the derived [`ActorContext`] for the
 /// `authorize()` chokepoint (decision 19).
@@ -55,6 +86,37 @@ impl FromRequestParts<AppState> for AuthContext {
     }
 }
 
+/// Optional authentication for the public read model.
+///
+/// The distinction that matters is between *absent* and *broken* credentials: no
+/// `Authorization` header at all is an anonymous caller (decision 05 default), while a header
+/// we cannot verify is still a 401 — silently degrading a rejected token to "anonymous" would
+/// answer 404 for a package the caller can actually read, and they would have no way to tell
+/// that their session had expired.
+pub struct MaybeAuth(pub Option<AuthContext>);
+
+impl MaybeAuth {
+    /// The actor for `authorize()` / [`pub_core::search::SearchView`]; anonymous holds no roles.
+    pub fn actor(&self) -> &ActorContext {
+        static ANONYMOUS: std::sync::LazyLock<ActorContext> = std::sync::LazyLock::new(ActorContext::anonymous);
+        match &self.0 {
+            Some(auth) => &auth.actor,
+            None => &ANONYMOUS,
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for MaybeAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        if parts.headers.get(header::AUTHORIZATION).is_none() {
+            return Ok(Self(None));
+        }
+        AuthContext::from_request_parts(parts, state).await.map(|auth| Self(Some(auth)))
+    }
+}
+
 /// S-06 step-up guard: an [`AuthContext`] whose session is additionally step-up-fresh —
 /// either a login within the step-up window (a login runs the account's strongest factor
 /// chain, TOTP included) or an explicit `POST /api/v1/auth/step-up` within it.
@@ -82,6 +144,43 @@ pub async fn require_step_up(state: &AppState, auth: &AuthContext) -> Result<(),
         Ok(())
     } else {
         Err(ApiError(pub_core::Error::StepUpRequired))
+    }
+}
+
+/// Instance-administrator guard: an [`AuthContext`] whose **durable user row** carries the
+/// instance-admin flag, and whose account is still active.
+///
+/// Resolved from the database on every admin request rather than from a JWT claim, for two
+/// reasons. [S-07](../../../docs/security.md) limits access-token claims to `sub`, `sid`, org
+/// role levels, and timestamps — an `is_admin` claim would be a deviation from a normative
+/// requirement for no gain. And a demotion or a suspension has to be effective *now*, not
+/// within one access TTL: this surface changes settings, suspends accounts, and deletes data.
+///
+/// The cost is one indexed read per admin request, on a surface nobody calls in a hot loop.
+///
+/// A caller who is authenticated but not an administrator gets **403**, not 404: the existence
+/// of an admin API is not a secret (it is in the OpenAPI document), and a 404 here would only
+/// make a legitimate operator's misconfiguration harder to diagnose.
+pub struct InstanceAdmin(pub AuthContext);
+
+impl FromRequestParts<AppState> for InstanceAdmin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let mut auth = AuthContext::from_request_parts(parts, state).await?;
+        let user = state
+            .repos
+            .users
+            .get(auth.claims.sub)
+            .await
+            .map_err(ApiError)?
+            .filter(|user| user.status == pub_core::user::UserStatus::Active)
+            .ok_or_else(|| ApiError::unauthorized("account unavailable"))?;
+        auth.actor.is_instance_admin = user.is_instance_admin;
+        // One chokepoint, one call (decision 19): the flag is *data*, the decision is
+        // `authorize`, and nothing here compares it inline.
+        authorize(&auth.actor, Action::AdministerInstance, &Resource::Instance).map_err(ApiError)?;
+        Ok(Self(auth))
     }
 }
 

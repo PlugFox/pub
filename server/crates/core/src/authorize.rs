@@ -9,6 +9,15 @@
 //! - **Role ladder only.** Token scopes (`read`/`publish`/`retract`/`admin`) are the second,
 //!   non-linear permission plane; scope checks join this chokepoint when the token auth flow
 //!   lands. The `Action` set will grow with those flows — adding variants is additive.
+//! - **Instance administration is a second, orthogonal plane.** [`Action::AdministerInstance`]
+//!   on [`Resource::Instance`] is decided by [`ActorContext::is_instance_admin`], a flag on the
+//!   *user row* — not by any org role, and not by a JWT claim. An org Owner is not an instance
+//!   admin and an instance admin holds no org role they were not granted: the two ladders never
+//!   imply each other, so "owner of one org" can never become "reads every org's private
+//!   inventory". Deliberately resolved from the durable row on the admin routes rather than
+//!   carried in the access token ([S-07](../../../docs/security.md) keeps claims to `sub`/`sid`/
+//!   org levels/timestamps), which also makes a demotion effective immediately instead of
+//!   within one access TTL.
 //! - **Visibility is decided elsewhere.** Public-package reads by anonymous principals
 //!   (decision 05) are resolution policy, applied before `authorize` is ever consulted;
 //!   `authorize` answers questions about org-scoped capabilities.
@@ -35,6 +44,11 @@ pub struct ActorContext {
     pub user_id: Option<UserId>,
     /// The actor's role level per org (JWT `{org_id: level}` claims — decision 03).
     pub org_roles: BTreeMap<OrgId, RoleLevel>,
+    /// Whether the acting user carries the instance-admin flag on their user row.
+    ///
+    /// Defaults to `false` and is set **only** where the durable row was read: the admin
+    /// extractor. Nothing derives it from an org role, and nothing reads it from a token.
+    pub is_instance_admin: bool,
 }
 
 impl ActorContext {
@@ -45,7 +59,14 @@ impl ActorContext {
 
     /// An authenticated actor with the given per-org role levels.
     pub fn user(user_id: UserId, org_roles: BTreeMap<OrgId, RoleLevel>) -> Self {
-        Self { user_id: Some(user_id), org_roles }
+        Self { user_id: Some(user_id), org_roles, is_instance_admin: false }
+    }
+
+    /// The same actor, marked (or unmarked) as an instance admin.
+    #[must_use]
+    pub fn with_instance_admin(mut self, is_instance_admin: bool) -> Self {
+        self.is_instance_admin = is_instance_admin;
+        self
     }
 
     /// The actor's level in `org`; [`RoleLevel::NONE`] when not a member.
@@ -68,27 +89,33 @@ pub enum Action {
     /// Org lifecycle and danger zone (rename, delete, ownership transfer) — requires
     /// Owner (250).
     ManageOrg,
+    /// Instance administration: runtime settings, user/org moderation, the audit viewer,
+    /// instance statistics, manual job runs. Not an org role — see the module docs.
+    AdministerInstance,
 }
 
 impl Action {
-    /// The minimum role level this action demands.
-    pub const fn required_level(self) -> RoleLevel {
+    /// The minimum org role level this action demands, or `None` for actions that are not
+    /// decided by the org ladder at all ([`Action::AdministerInstance`]).
+    pub const fn required_level(self) -> Option<RoleLevel> {
         match self {
-            Self::ReadPackages => RoleLevel::READ,
-            Self::PublishPackages => RoleLevel::WRITE,
-            Self::ManageMembers => RoleLevel::ADMIN,
-            Self::ManageOrg => RoleLevel::OWNER,
+            Self::ReadPackages => Some(RoleLevel::READ),
+            Self::PublishPackages => Some(RoleLevel::WRITE),
+            Self::ManageMembers => Some(RoleLevel::ADMIN),
+            Self::ManageOrg => Some(RoleLevel::OWNER),
+            Self::AdministerInstance => None,
         }
     }
 }
 
-/// What the action targets. Only org resources exist in this phase; instance-level resources
-/// (admin settings, …) join with their features.
+/// What the action targets.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resource {
     /// An organization (and, transitively, everything it owns).
     Org(OrgId),
+    /// The instance itself: runtime settings, users, orgs, audit, jobs.
+    Instance,
 }
 
 /// Grants or denies `action` on `resource` for `actor` — the single chokepoint.
@@ -97,11 +124,15 @@ pub enum Resource {
 /// required level, [`Error::Forbidden`](crate::Error::Forbidden) otherwise. Anonymous actors
 /// hold no roles and are always denied here (their public-read path never reaches this
 /// function — see the module docs).
+///
+/// Action and resource must **agree**: an org action against [`Resource::Instance`], or
+/// [`Action::AdministerInstance`] against an org, is a denial rather than a fallthrough. The
+/// two ladders are orthogonal, and a mismatched pair is a programming error that must not
+/// silently succeed on the other plane's authority.
 pub fn authorize(actor: &ActorContext, action: Action, resource: &Resource) -> Result<()> {
-    match resource {
-        Resource::Org(org) => {
+    match (resource, action.required_level()) {
+        (Resource::Org(org), Some(required)) => {
             let held = actor.role_in(*org);
-            let required = action.required_level();
             if held.satisfies(required) {
                 Ok(())
             } else {
@@ -113,6 +144,15 @@ pub fn authorize(actor: &ActorContext, action: Action, resource: &Resource) -> R
                     ),
                 })
             }
+        }
+        (Resource::Instance, None) if actor.is_instance_admin => Ok(()),
+        (Resource::Instance, None) => {
+            Err(Error::Forbidden { message: "this action requires instance administrator rights".to_owned() })
+        }
+        // Mismatched plane: an org action aimed at the instance, or the instance action aimed
+        // at an org. Never satisfiable, never an accident that grants anything.
+        (Resource::Org(_), None) | (Resource::Instance, Some(_)) => {
+            Err(Error::Forbidden { message: format!("{action:?} does not apply to {resource:?}") })
         }
     }
 }
@@ -159,6 +199,29 @@ mod tests {
         for action in [Action::ReadPackages, Action::PublishPackages, Action::ManageMembers, Action::ManageOrg] {
             assert!(allowed(RoleLevel::OWNER.level(), action), "owner denied {action:?}");
         }
+    }
+
+    #[test]
+    fn instance_administration_is_a_separate_plane_from_the_org_ladder() {
+        let org = OrgId::new();
+        // An org Owner is not an instance admin.
+        let owner = actor_with_level(org, RoleLevel::OWNER.level());
+        assert!(authorize(&owner, Action::AdministerInstance, &Resource::Instance).is_err());
+        // An instance admin holding no org role administers the instance and nothing else.
+        let admin = ActorContext::user(UserId::new(), BTreeMap::new()).with_instance_admin(true);
+        assert!(authorize(&admin, Action::AdministerInstance, &Resource::Instance).is_ok());
+        assert!(authorize(&admin, Action::ReadPackages, &Resource::Org(org)).is_err());
+        // Anonymous never administers anything.
+        assert!(authorize(&ActorContext::anonymous(), Action::AdministerInstance, &Resource::Instance).is_err());
+    }
+
+    #[test]
+    fn a_mismatched_action_and_resource_is_always_a_denial() {
+        let org = OrgId::new();
+        let admin = actor_with_level(org, RoleLevel::OWNER.level()).with_instance_admin(true);
+        // Even for a principal who holds *both* authorities, the planes do not cross-apply.
+        assert!(authorize(&admin, Action::AdministerInstance, &Resource::Org(org)).is_err());
+        assert!(authorize(&admin, Action::ManageOrg, &Resource::Instance).is_err());
     }
 
     #[test]

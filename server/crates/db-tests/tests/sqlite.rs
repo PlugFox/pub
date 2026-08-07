@@ -102,3 +102,43 @@ async fn supply_chain_registers_contract_s17_s19() {
 async fn job_repo_contract() {
     pub_db_tests::contract::job_repo(&fresh_repos().await).await;
 }
+
+#[tokio::test]
+async fn package_search_contract_decision11() {
+    pub_db_tests::contract::package_search(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn search_visibility_contract_s04() {
+    pub_db_tests::contract::search_visibility(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn download_stats_contract() {
+    pub_db_tests::contract::download_stats(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn instance_admins_contract() {
+    pub_db_tests::contract::instance_admins(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn org_management_contract() {
+    pub_db_tests::contract::org_management(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn org_deletion_contract_s18() {
+    pub_db_tests::contract::org_deletion(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn package_transfer_and_stats_contract() {
+    pub_db_tests::contract::package_transfer_and_stats(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn notifications_contract_decision20() {
+    pub_db_tests::contract::notifications(&fresh_repos().await).await;
+}

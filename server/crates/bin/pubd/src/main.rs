@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use base64::Engine as _;
 use clap::{CommandFactory as _, FromArgMatches as _};
+use pub_admin::{AdminService, OrgPolicy, OrgService};
 use pub_api::AppState;
 use pub_auth::flows::{AuthPolicy, AuthService};
 use pub_auth::jwt::Keyring;
@@ -18,21 +19,24 @@ use pub_auth::random::{OsRandom, RandomSource as _};
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, MirrorModeConfig, Settings, SmtpSecurityMode};
 use pub_core::Format;
-use pub_core::event::{EventSink, NoopEventSink};
+use pub_core::event::EventSink;
 use pub_core::session::SessionLimits;
-use pub_core::traits::JobLock;
-use pub_core::traits::{BlobStore, Kv, Mailer, Repositories};
+use pub_core::settings::{SETTINGS_TOPIC, SettingsCache};
+use pub_core::traits::{BlobStore, JobLock, JobTrigger, Kv, Mailer, Repositories};
 use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
+use pub_events::{EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationPolicy};
 use pub_jobs::{
-    BLOB_GC_JOB, BlobGc, GcPolicy, InMemoryJobLock, MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorWorker, Scheduler,
+    BLOB_GC_JOB, BlobGc, DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, GcPolicy, InMemoryJobLock,
+    JobRegistry, MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorWorker, REINDEX_JOB, ReindexPolicy, Reindexer, Scheduler,
     SchedulerHandle,
 };
 use pub_kv::{MemoryKv, RedisKv};
 use pub_mail::{InMemoryMailer, SmtpMailer, SmtpSecurity, SmtpSettings};
 use pub_registry::upstream::http::{HttpUpstream, HttpUpstreamConfig};
 use pub_registry::{
-    ArchiveLimits, RegistryPolicy, RegistryService, UpstreamClient, UpstreamService, UpstreamServicePolicy,
+    ArchiveLimits, DownloadRecorder, RegistryPolicy, RegistryService, UpstreamClient, UpstreamService,
+    UpstreamServicePolicy,
 };
 use pub_telemetry::LogFormat;
 
@@ -56,17 +60,68 @@ async fn main() -> anyhow::Result<()> {
     let blob = build_blob(&settings)?;
     let kv = build_kv(&settings)?;
     let mailer = build_mailer(&settings)?;
-    let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer))?;
-    let registry = build_registry(&settings, repos.clone(), Arc::clone(&blob));
-    let upstream = build_upstream(&settings, repos.clone(), Arc::clone(&blob))?;
+
+    // Runtime settings (decision 09) before anything that reads them: the cache is seeded from
+    // boot config, then loaded from the database so this process starts on the instance's
+    // current policy rather than on the operator's defaults.
+    let runtime = Arc::new(SettingsCache::new(settings.runtime_defaults()));
+    let version = runtime.reload(repos.settings.as_ref()).await.context("failed to load runtime settings")?;
+    tracing::info!(version, "runtime settings loaded");
+
+    let auth = build_auth(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer), Arc::clone(&runtime))?;
+    bootstrap_admins(&settings, &repos).await?;
+
+    // The domain event bus (decision 22) is built before every service that emits into it, so
+    // there is exactly one bus per process: the SSE stream this instance serves and the
+    // notification rows it writes come from the same fan-out.
+    let events = build_events(&settings, repos.clone(), Arc::clone(&kv), Arc::clone(&mailer));
+    events.spawn_broker_subscription();
+    let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
+
+    let registry = build_registry(&settings, repos.clone(), Arc::clone(&blob), Arc::clone(&sink));
+    let upstream = build_upstream(&settings, repos.clone(), Arc::clone(&blob), Arc::clone(&sink))?;
+
+    // One buffer, shared by the download handler that fills it and the rollup job that drains
+    // it: two of them would mean counting into a map nothing ever writes out.
+    let downloads = Arc::new(DownloadRecorder::new(settings.jobs.downloads.buffer_capacity));
 
     // The scheduler owns its tasks and aborts them when the handle drops, so it must outlive
     // `serve` — a mirror sweep that stops the moment the binding is dropped would be a very
-    // confusing bug.
-    let _jobs = spawn_jobs(&settings, repos.clone(), Arc::clone(&blob), upstream.clone());
+    // confusing bug. The registry it hands back is the same job set, reachable on demand from
+    // the admin surface under the same leader lock.
+    let (_jobs, triggers) =
+        spawn_jobs(&settings, repos.clone(), Arc::clone(&blob), upstream.clone(), Arc::clone(&downloads));
+
+    let orgs = Arc::new(OrgService::new(
+        repos.clone(),
+        Arc::clone(&auth),
+        Arc::clone(&registry),
+        Arc::clone(&mailer),
+        Arc::clone(&sink),
+        Arc::new(OsRandom),
+        OrgPolicy::default(),
+    ));
+    let admin = Arc::new(AdminService::new(
+        repos.clone(),
+        Arc::clone(&kv),
+        Arc::clone(&runtime),
+        Arc::clone(&auth),
+        Arc::clone(&sink),
+        triggers,
+        Arc::new(OsRandom),
+        kek(&settings)?,
+    ));
+
+    // Cross-instance settings invalidation: the broker subscription is the fast path and the
+    // version poll is the reconciliation fallback for messages lost across a reconnect
+    // (decision 09). Both are best-effort by design — the durable rows are the truth.
+    spawn_settings_watch(Arc::clone(&runtime), repos.clone(), Arc::clone(&kv));
 
     let listen = settings.server.listen.clone();
-    let state = AppState::new(settings, repos, blob, kv, auth, registry).with_upstream(upstream);
+    let state = AppState::new(settings, runtime, repos, blob, kv, auth, registry, orgs, admin)
+        .with_upstream(upstream)
+        .with_downloads(downloads)
+        .with_events(events);
     let app = pub_api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("failed to bind {listen}"))?;
@@ -118,10 +173,15 @@ fn build_blob(settings: &Settings) -> anyhow::Result<Arc<dyn BlobStore>> {
 /// decision 06 restore window).
 ///
 /// The publish lock is the in-process [`JobLock`] for now; the Redis-backed implementation
-/// arrives with the multi-instance tier (decision 03), and the event sink is a no-op until
-/// the domain event bus lands (decision 22). Both are `Arc<dyn …>` seams, so swapping them is
-/// a wiring change here and nowhere else.
-fn build_registry(settings: &Settings, repos: Repositories, blob: Arc<dyn BlobStore>) -> Arc<RegistryService> {
+/// arrives with the multi-instance tier (decision 03). The event sink is the process-wide bus
+/// (decision 22), so a publish reaches the SSE stream and the notification center through the
+/// same seam the audit log already uses.
+fn build_registry(
+    settings: &Settings,
+    repos: Repositories,
+    blob: Arc<dyn BlobStore>,
+    events: Arc<dyn EventSink>,
+) -> Arc<RegistryService> {
     let cfg = &settings.registry;
     let policy = RegistryPolicy {
         archive: ArchiveLimits {
@@ -135,7 +195,6 @@ fn build_registry(settings: &Settings, repos: Repositories, blob: Arc<dyn BlobSt
         ..RegistryPolicy::default()
     };
     let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
-    let events: Arc<dyn EventSink> = Arc::new(NoopEventSink);
     Arc::new(RegistryService::new(repos, blob, lock, events, policy))
 }
 
@@ -149,6 +208,7 @@ fn build_upstream(
     settings: &Settings,
     repos: Repositories,
     blob: Arc<dyn BlobStore>,
+    events: Arc<dyn EventSink>,
 ) -> anyhow::Result<Option<Arc<UpstreamService>>> {
     let cfg = &settings.upstream;
     if !cfg.enabled {
@@ -175,9 +235,6 @@ fn build_upstream(
         .map_err(|err| anyhow::anyhow!("{err}"))?,
     );
 
-    // The event sink is a no-op until the domain event bus lands (decision 22); the S-19
-    // alarms it will carry are audit-logged unconditionally in the meantime.
-    let events: Arc<dyn EventSink> = Arc::new(NoopEventSink);
     let policy = UpstreamServicePolicy {
         listing_ttl: chrono::Duration::seconds(cfg.listing_ttl_secs as i64),
         max_archive_bytes: cfg.max_archive_bytes,
@@ -204,9 +261,13 @@ fn spawn_jobs(
     repos: Repositories,
     blob: Arc<dyn BlobStore>,
     upstream: Option<Arc<pub_registry::UpstreamService>>,
-) -> Option<SchedulerHandle> {
+    downloads: Arc<DownloadRecorder>,
+) -> (Option<SchedulerHandle>, Arc<dyn JobTrigger>) {
     let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
-    let mut scheduler = Scheduler::new(lock);
+    let mut scheduler = Scheduler::new(Arc::clone(&lock));
+    // The same lock, so an operator's "run now" and a scheduled tick can never both hold one
+    // job's durable cursor.
+    let mut triggers = JobRegistry::new(lock);
     let mut registered = Vec::new();
 
     let mirror_cfg = settings.upstream.mirror;
@@ -227,6 +288,7 @@ fn spawn_jobs(
         };
         let interval = policy.interval;
         let worker = Arc::new(MirrorWorker::new(repos.clone(), upstream, Format::Pub, policy));
+        triggers = triggers.with_mirror(Arc::clone(&worker));
         scheduler.add(MIRROR_JOB, interval, move || {
             let worker = Arc::clone(&worker);
             async move {
@@ -235,6 +297,47 @@ fn spawn_jobs(
             }
         });
         registered.push(MIRROR_JOB);
+    }
+
+    let reindex_cfg = settings.jobs.reindex;
+    if reindex_cfg.enabled {
+        let policy = ReindexPolicy {
+            enabled: true,
+            interval: Duration::from_secs(reindex_cfg.interval_secs),
+            chunk: reindex_cfg.chunk,
+            resweep_after: chrono::Duration::seconds(reindex_cfg.resweep_after_secs as i64),
+        };
+        let interval = policy.interval;
+        let worker = Arc::new(Reindexer::new(repos.clone(), policy));
+        triggers = triggers.with_reindex(Arc::clone(&worker));
+        scheduler.add(REINDEX_JOB, interval, move || {
+            let worker = Arc::clone(&worker);
+            async move {
+                worker.run_once(chrono::Utc::now()).await?;
+                Ok(())
+            }
+        });
+        registered.push(REINDEX_JOB);
+    }
+
+    let downloads_cfg = settings.jobs.downloads;
+    if downloads_cfg.enabled {
+        let policy = DownloadRollupPolicy {
+            enabled: true,
+            interval: Duration::from_secs(downloads_cfg.interval_secs),
+            recent_window: chrono::Duration::days(downloads_cfg.recent_window_days),
+        };
+        let interval = policy.interval;
+        let rollup = Arc::new(DownloadRollup::new(repos.clone(), downloads, policy));
+        triggers = triggers.with_downloads(Arc::clone(&rollup));
+        scheduler.add(DOWNLOAD_ROLLUP_JOB, interval, move || {
+            let rollup = Arc::clone(&rollup);
+            async move {
+                rollup.run_once(chrono::Utc::now()).await?;
+                Ok(())
+            }
+        });
+        registered.push(DOWNLOAD_ROLLUP_JOB);
     }
 
     let gc_cfg = settings.jobs.blob_gc;
@@ -247,6 +350,7 @@ fn spawn_jobs(
         };
         let interval = policy.interval;
         let gc = Arc::new(BlobGc::new(repos, blob, vec![Format::Pub], policy));
+        triggers = triggers.with_blob_gc(Arc::clone(&gc));
         scheduler.add(BLOB_GC_JOB, interval, move || {
             let gc = Arc::clone(&gc);
             async move {
@@ -257,12 +361,106 @@ fn spawn_jobs(
         registered.push(BLOB_GC_JOB);
     }
 
+    let triggers: Arc<dyn JobTrigger> = Arc::new(triggers);
     if registered.is_empty() {
         tracing::info!("no background jobs enabled");
-        return None;
+        return (None, triggers);
     }
     tracing::info!(jobs = ?registered, "background jobs scheduled");
-    Some(scheduler.spawn())
+    (Some(scheduler.spawn()), triggers)
+}
+
+/// Grants instance-administrator rights to the configured email list (decision 09 bootstrap).
+///
+/// Runs at every startup and is idempotent: an operator adding an address to the list gets it
+/// promoted on the next restart without touching the database, and removing one does **not**
+/// demote — revoking administration is an audited action on the admin surface, not a silent
+/// side effect of an edit to a config file somebody may have reverted by accident.
+async fn bootstrap_admins(settings: &Settings, repos: &Repositories) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    for email in &settings.auth.instance_admins {
+        match repos.users.find_by_email(email).await.context("admin bootstrap lookup failed")? {
+            Some(user) if user.is_instance_admin => {}
+            Some(user) => {
+                repos.users.set_instance_admin(user.id, true, now).await.context("admin bootstrap failed")?;
+                tracing::info!(user = %user.id, "granted instance administrator rights from auth.instance_admins");
+            }
+            // The account does not exist yet: the auth flow promotes it when it registers.
+            None => tracing::info!(
+                "auth.instance_admins lists an address with no account yet; it is promoted at registration"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Keeps this instance's settings cache current (decision 09).
+///
+/// Two independent mechanisms, because neither is sufficient alone: the broker delivers a
+/// change in milliseconds but guarantees nothing across a reconnect, and the poll always
+/// converges but only within its interval.
+fn spawn_settings_watch(cache: Arc<SettingsCache>, repos: Repositories, kv: Arc<dyn Kv>) {
+    let broker = Arc::clone(&cache);
+    let broker_repos = repos.clone();
+    tokio::spawn(async move {
+        let mut stream = match kv.subscribe(SETTINGS_TOPIC).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "settings invalidation subscription failed; the version poll still converges");
+                return;
+            }
+        };
+        use futures::StreamExt as _;
+        while let Some(message) = stream.next().await {
+            tracing::debug!(payload = %message.payload, "settings invalidation received");
+            if let Err(error) = broker.reload(broker_repos.settings.as_ref()).await {
+                tracing::warn!(%error, "settings reload after an invalidation failed");
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let period = pub_admin::instance::SETTINGS_POLL_INTERVAL.to_std().expect("poll interval is positive");
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            match pub_admin::instance::poll_settings(&cache, &repos).await {
+                Ok(true) => tracing::info!(version = cache.version(), "runtime settings reconciled"),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "runtime settings poll failed"),
+            }
+        }
+    });
+}
+
+/// Builds the domain event bus and its consumers ([decision 22](../../../docs/decisions.md#22)).
+///
+/// The KV handle is attached unconditionally, including with the in-memory backend: the bridge
+/// filters this instance's own messages out by origin, so a single-node deployment pays one
+/// no-op publish per event and a Redis deployment gets cross-instance fan-out with no
+/// configuration difference — the property decision 20 needs for "any instance can serve any
+/// client's stream".
+fn build_events(settings: &Settings, repos: Repositories, kv: Arc<dyn Kv>, mailer: Arc<dyn Mailer>) -> Arc<EventBus> {
+    let realtime = settings.realtime;
+    let bus = Arc::new(
+        EventBus::new(EventBusPolicy {
+            replay_buffer: realtime.replay_buffer,
+            max_connections_per_user: realtime.max_connections_per_user,
+        })
+        .with_broker(kv),
+    );
+    let center = NotificationCenter::new(
+        repos,
+        mailer,
+        NotificationPolicy {
+            max_recipients: realtime.max_notification_recipients,
+            email_enabled: realtime.notification_email,
+        },
+        settings.branding.name.clone(),
+    );
+    bus.add_consumer(Arc::new(center) as Arc<dyn EventConsumer>);
+    bus
 }
 
 /// Selects the KV backend by config kind (decision 09; redis is mandatory for replicas > 1).
@@ -314,6 +512,7 @@ fn build_auth(
     repos: Repositories,
     kv: Arc<dyn Kv>,
     mailer: Arc<dyn Mailer>,
+    runtime: Arc<SettingsCache>,
 ) -> anyhow::Result<Arc<AuthService>> {
     let rng = Arc::new(OsRandom);
     let auth_cfg = &settings.auth;
@@ -350,23 +549,7 @@ fn build_auth(
         }
     };
 
-    // The KEK seals TOTP seeds at rest (S-05). The config validator guarantees base64 of
-    // exactly 32 bytes whenever it is set, and requires it in production mode (S-25).
-    let kek = match &auth_cfg.kek {
-        Some(kek) => base64::engine::general_purpose::STANDARD
-            .decode(kek.expose())
-            .map_err(|_| anyhow::anyhow!("auth.kek is not valid base64"))?,
-        None => {
-            tracing::warn!(
-                "auth.kek is not configured — generated an EPHEMERAL dev KEK: \
-                 enrolled TOTP second factors become undecryptable when this process exits \
-                 (dev mode only, S-25)"
-            );
-            let mut kek = [0u8; 32];
-            rng.fill(&mut kek);
-            kek.to_vec()
-        }
-    };
+    let kek = kek(settings)?;
 
     let providers: Vec<ProviderConfig> = auth_cfg
         .oidc
@@ -396,17 +579,36 @@ fn build_auth(
         },
         otp_pepper,
         token_prefix: auth_cfg.token_prefix.clone(),
-        allow_registration: auth_cfg.allow_registration,
-        allowed_email_domains: auth_cfg.allowed_email_domains.iter().map(|d| d.to_ascii_lowercase()).collect(),
-        otp_per_email_hour: auth_cfg.rate_limit.otp_per_email_hour,
-        otp_per_ip_hour: auth_cfg.rate_limit.otp_per_ip_hour,
-        login_per_ip_minute: auth_cfg.rate_limit.login_per_ip_minute,
-        token_auth_fail_per_ip_minute: auth_cfg.rate_limit.token_auth_fail_per_ip_minute,
+        instance_admins: auth_cfg.instance_admins.iter().map(|email| email.to_ascii_lowercase()).collect(),
         kek,
         step_up_window: Duration::from_secs(auth_cfg.step_up_minutes * 60),
         totp_issuer: "Pub".to_owned(),
     };
-    Ok(Arc::new(AuthService::new(repos, kv, mailer, keyring, policy, rng, oidc)))
+    Ok(Arc::new(AuthService::new(repos, kv, mailer, keyring, policy, runtime, rng, oidc)))
+}
+
+/// The 32-byte key-encryption key sealing data at rest (S-05 TOTP seeds, S-26 SMTP password).
+///
+/// The config validator guarantees base64 of exactly 32 bytes whenever it is set, and requires
+/// it in production mode (S-25). Dev mode falls back to an ephemeral value with a loud warning:
+/// everything sealed under it becomes undecryptable when the process exits, which is the right
+/// outcome for a value nobody configured.
+fn kek(settings: &Settings) -> anyhow::Result<Vec<u8>> {
+    match &settings.auth.kek {
+        Some(kek) => base64::engine::general_purpose::STANDARD
+            .decode(kek.expose())
+            .map_err(|_| anyhow::anyhow!("auth.kek is not valid base64")),
+        None => {
+            tracing::warn!(
+                "auth.kek is not configured — generated an EPHEMERAL dev KEK: \
+                 enrolled TOTP second factors and the stored SMTP password become undecryptable \
+                 when this process exits (dev mode only, S-25)"
+            );
+            let mut kek = [0u8; 32];
+            OsRandom.fill(&mut kek);
+            Ok(kek.to_vec())
+        }
+    }
 }
 
 /// Resolves on SIGINT (Ctrl+C) or SIGTERM (orchestrator stop).

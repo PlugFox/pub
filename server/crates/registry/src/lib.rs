@@ -28,6 +28,11 @@
 //!   worker in `pub-jobs` warms this same pipeline through
 //!   [`upstream::UpstreamService::refresh`] — decision 07's "mirror mode is read-through warmed
 //!   by a job", not a second implementation.
+//! - [`index`] — the search-index projection (decision 11): one document per package, derived
+//!   from the package row plus its newest live version, refreshed by every lifecycle change and
+//!   rebuildable in full by the reindex job.
+//! - [`stats`] — the download counter's write path: an in-process buffer the rollup job drains
+//!   into `download_stats`, so counting a download costs no I/O.
 //! - [`shadow`] — S-17 shadowing alarms: a name claimed here observed upstream. Called from
 //!   both arrival orders (a publish claiming a name we proxy; the mirror finding a name we
 //!   claim), and never from the read path, which structurally never asks upstream about a
@@ -37,19 +42,23 @@
 //! behind [`upstream::UpstreamClient`] — everything here builds against `pub-core` traits only.
 
 pub mod archive;
+pub mod index;
 pub mod markdown;
 pub mod publish;
 pub mod pubspec;
 pub mod shadow;
+pub mod stats;
 pub mod upstream;
 
 pub use archive::{ArchiveContents, ArchiveError, ArchiveLimits, validate_archive};
+pub use index::{PackageIndexer, ReindexPage, build_document, latest_index};
 pub use publish::{
     ActorMeta, HardDeleteOutcome, HardDeleteRequest, PublishOutcome, PublishRequest, RegistryPolicy, RegistryService,
-    RetractRequest, hex_sha256,
+    RetractRequest, TransferRequest, hex_sha256,
 };
 pub use pubspec::{Pubspec, PubspecError, validate_package_name};
 pub use shadow::{ShadowObservation, ShadowOutcome};
+pub use stats::{DEFAULT_BUFFER_CAPACITY, DownloadRecorder, FlushReport};
 pub use upstream::{
     ProxiedArchive, ProxiedListing, ProxiedVersion, RefreshOutcome, UpstreamArchive, UpstreamClient, UpstreamError,
     UpstreamListing, UpstreamNamePage, UpstreamService, UpstreamServicePolicy, UpstreamVersionEntry,

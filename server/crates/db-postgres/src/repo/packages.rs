@@ -281,6 +281,31 @@ impl PackageRepo for PgPackageRepo {
         Ok(Page { items, cursor, has_more })
     }
 
+    async fn list_all(&self, cursor: Option<&str>, limit: u32) -> Result<Page<Package>> {
+        let limit = limit.clamp(1, MAX_PAGE) as i64;
+        let mut query: QueryBuilder<Postgres> = QueryBuilder::new(format!("SELECT {PKG_COLS} FROM packages"));
+        if let Some(cursor) = cursor {
+            // `(format, name)` is unique instance-wide, so it is a total order on its own — no
+            // id tiebreaker is needed or wanted here.
+            let parts = decode_cursor(cursor, 2)?;
+            query.push(" WHERE (format > ").push_bind(parts[0].clone());
+            query.push(" OR (format = ").push_bind(parts[0].clone());
+            query.push(" AND name > ").push_bind(parts[1].clone()).push("))");
+        }
+        query.push(" ORDER BY format, name LIMIT ").push_bind(limit + 1);
+
+        let rows: Vec<PackageRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<Package> =
+            rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
+        let cursor = if has_more {
+            items.last().map(|package| encode_cursor(&[package.format.as_str(), &package.name]))
+        } else {
+            None
+        };
+        Ok(Page { items, cursor, has_more })
+    }
+
     async fn set_options(&self, id: PackageId, options: &PackageOptions, now: DateTime<Utc>) -> Result<Package> {
         let row: Option<PackageRow> = sqlx::query_as(q!(
             "UPDATE packages SET visibility = $1, discontinued = $2, replaced_by = $3, unlisted = $4, \
@@ -414,6 +439,33 @@ impl PackageRepo for PgPackageRepo {
         Ok(Page { items, cursor, has_more })
     }
 
+    async fn list_versions_desc(&self, package: PackageId, cursor: Option<&str>, limit: u32) -> Result<Page<Version>> {
+        let limit = limit.clamp(1, MAX_PAGE) as i64;
+        let mut query: QueryBuilder<Postgres> =
+            QueryBuilder::new(format!("SELECT {VER_COLS} FROM versions WHERE NOT tombstone AND package_id = "));
+        query.push_bind(*package.as_uuid());
+        if let Some(cursor) = cursor {
+            let parts = decode_cursor(cursor, 2)?;
+            let id: Uuid =
+                parts[1].parse().map_err(|_| Error::Invalid { message: format!("malformed cursor: {cursor}") })?;
+            query.push(" AND (version_sort < ").push_bind(parts[0].clone());
+            query.push(" OR (version_sort = ").push_bind(parts[0].clone());
+            query.push(" AND id < ").push_bind(id).push("))");
+        }
+        query.push(" ORDER BY version_sort DESC, id DESC LIMIT ").push_bind(limit + 1);
+
+        let rows: Vec<VersionRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<Version> =
+            rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
+        let cursor = if has_more {
+            items.last().map(|version| encode_cursor(&[&version.version.sort_key(), &version.id.to_string()]))
+        } else {
+            None
+        };
+        Ok(Page { items, cursor, has_more })
+    }
+
     async fn set_retracted(&self, id: VersionId, retracted: bool, now: DateTime<Utc>) -> Result<Version> {
         // COALESCE keeps the original retraction instant when re-retracting (idempotent).
         let row: Option<VersionRow> = sqlx::query_as(q!(
@@ -448,6 +500,15 @@ impl PackageRepo for PgPackageRepo {
         }
     }
 
+    async fn count_versions(&self, package: PackageId) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM versions WHERE package_id = $1 AND NOT tombstone")
+            .bind(*package.as_uuid())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(count)
+    }
+
     async fn count_versions_with_sha256(&self, sha256: &str) -> Result<u64> {
         let row: PgRow = sqlx::query("SELECT COUNT(*) AS n FROM versions WHERE archive_sha256 = $1 AND NOT tombstone")
             .bind(sha256)
@@ -456,6 +517,80 @@ impl PackageRepo for PgPackageRepo {
             .map_err(db_err)?;
         let count: i64 = row.get("n");
         Ok(count.max(0) as u64)
+    }
+
+    async fn transfer(&self, id: PackageId, to_org: OrgId, now: DateTime<Utc>) -> Result<Package> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // `FOR UPDATE` on the package row: the claim update below reads its `(format, name)`
+        // from this row, and a concurrent transfer of the same package must serialize here.
+        let current: Option<PackageRow> =
+            sqlx::query_as(q!("SELECT {PKG_COLS} FROM packages WHERE id = $1 FOR UPDATE"))
+                .bind(*id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let current: Package = current.ok_or_else(|| Error::NotFound { what: format!("package {id}") })?.try_into()?;
+        if current.org_id == to_org {
+            return Ok(current);
+        }
+        let row: PackageRow =
+            sqlx::query_as(q!("UPDATE packages SET org_id = $1, updated_at = $2 WHERE id = $3 RETURNING {PKG_COLS}"))
+                .bind(*to_org.as_uuid())
+                .bind(now)
+                .bind(*id.as_uuid())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|err| write_err(err, "package already exists in the target org", "target org"))?;
+        // The claim moves with the package, in the same transaction: a claim pointing at the
+        // old owner would stop the new one publishing the name they now hold, and would page
+        // the wrong admins on a shadowing alarm (S-17).
+        sqlx::query("UPDATE name_claims SET org_id = $1 WHERE format = $2 AND name = $3")
+            .bind(*to_org.as_uuid())
+            .bind(current.format.as_str())
+            .bind(&current.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| write_err(err, "name claim conflict", "target org"))?;
+        tx.commit().await.map_err(db_err)?;
+        row.try_into()
+    }
+
+    async fn count_for_org(&self, org: OrgId) -> Result<i64> {
+        let row: PgRow = sqlx::query("SELECT COUNT(*) AS n FROM packages WHERE org_id = $1")
+            .bind(*org.as_uuid())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("n"))
+    }
+
+    async fn stats(&self) -> Result<pub_core::package::RegistryStats> {
+        let packages: PgRow = sqlx::query(
+            "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE visibility = 'public') AS public FROM packages",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        // The `::bigint` cast is load-bearing: `SUM()` over a `BIGINT` column answers `NUMERIC`
+        // in Postgres, which does not decode into `i64`. SQLite's `SUM` is already an integer,
+        // so this is exactly the kind of dialect difference the contract suite exists to catch.
+        let versions: PgRow = sqlx::query(
+            "SELECT COUNT(*) FILTER (WHERE NOT tombstone) AS live, \
+             COUNT(*) FILTER (WHERE NOT tombstone AND retracted_at IS NOT NULL) AS retracted, \
+             COUNT(*) FILTER (WHERE tombstone) AS tombstoned, \
+             COALESCE(SUM(archive_size) FILTER (WHERE NOT tombstone), 0)::bigint AS bytes FROM versions",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(pub_core::package::RegistryStats {
+            packages: packages.get("total"),
+            public_packages: packages.get("public"),
+            versions: versions.get("live"),
+            retracted_versions: versions.get("retracted"),
+            tombstoned_versions: versions.get("tombstoned"),
+            archive_bytes: versions.get("bytes"),
+        })
     }
 
     async fn claim_name(&self, format: Format, name: &str, org: OrgId, now: DateTime<Utc>) -> Result<NameClaim> {

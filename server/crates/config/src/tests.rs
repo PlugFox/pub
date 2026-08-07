@@ -832,3 +832,27 @@ fn nonsensical_job_settings_are_startup_errors() {
     );
     assert!(load_from(&CliArgs::default(), env(&[("PUB_UPSTREAM__MIRROR__ARCHIVE_VERSIONS", "0")])).is_ok());
 }
+
+#[test]
+fn nonsensical_realtime_settings_are_startup_errors() {
+    let cases = [
+        ("PUB_REALTIME__HEARTBEAT_SECS", "0"),
+        // S-32: a stream re-checks revocation on its heartbeat, so a heartbeat at or above the
+        // access TTL silently breaks "terminate within one access TTL of revocation". The
+        // default TTL is 15 minutes.
+        ("PUB_REALTIME__HEARTBEAT_SECS", "900"),
+        ("PUB_REALTIME__HEARTBEAT_SECS", "1000"),
+        ("PUB_REALTIME__MAX_CONNECTIONS_PER_USER", "0"),
+        ("PUB_REALTIME__REPLAY_BUFFER", "0"),
+        ("PUB_REALTIME__MAX_NOTIFICATION_RECIPIENTS", "0"),
+        // Above what a single batched preference lookup may carry.
+        ("PUB_REALTIME__MAX_NOTIFICATION_RECIPIENTS", "501"),
+    ];
+    for (key, value) in cases {
+        assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
+    }
+    // A heartbeat comfortably under the access TTL is fine.
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_REALTIME__HEARTBEAT_SECS", "30")])).expect("valid");
+    assert_eq!(settings.realtime.heartbeat_secs, 30);
+    assert!(settings.summary().contains("realtime.sse"), "the effective-config summary lists the realtime knobs");
+}

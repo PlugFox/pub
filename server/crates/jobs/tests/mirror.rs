@@ -478,12 +478,7 @@ async fn a_shadowed_name_alarms_once_and_is_never_mirrored() {
         )
         .await
         .expect("user");
-    let org = harness
-        .repos
-        .orgs
-        .create(pub_core::org::NewOrg { name: "Acme".to_owned(), slug: "acme".to_owned() }, alice.id, t0())
-        .await
-        .expect("org");
+    let org = harness.repos.orgs.create(pub_core::org::NewOrg::new("Acme", "acme"), alice.id, t0()).await.expect("org");
     harness.repos.packages.claim_name(Format::Pub, "acme_core", org.id, t0()).await.expect("claim");
 
     // Upstream carries the name too — the dependency-confusion precondition.

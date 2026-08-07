@@ -134,11 +134,7 @@ impl Harness {
             )
             .await
             .expect("seed user");
-        let org = repos
-            .orgs
-            .create(NewOrg { name: "Acme".to_owned(), slug: "acme".to_owned() }, user.id, t0())
-            .await
-            .expect("seed org");
+        let org = repos.orgs.create(NewOrg::new("Acme", "acme"), user.id, t0()).await.expect("seed org");
 
         let blob = Arc::new(MemoryBlob::default());
         let events = Arc::new(RecordingEvents::default());
@@ -185,12 +181,7 @@ impl Harness {
             )
             .await
             .expect("second user");
-        self.repos
-            .orgs
-            .create(NewOrg { name: "Other".to_owned(), slug: "other".to_owned() }, user.id, t0())
-            .await
-            .expect("second org")
-            .id
+        self.repos.orgs.create(NewOrg::new("Other", "other"), user.id, t0()).await.expect("second org").id
     }
 
     async fn audit_actions(&self) -> Vec<(String, AuditResult)> {
@@ -548,6 +539,7 @@ async fn hard_delete_burns_the_number_and_removes_the_bytes() {
         .hard_delete(
             HardDeleteRequest {
                 format: Format::Pub,
+                reason: Some("leaked credential".to_owned()),
                 org_id: h.org,
                 name: "acme_core".to_owned(),
                 version: semver("1.0.0"),
@@ -613,6 +605,7 @@ async fn hard_delete_keeps_bytes_another_live_version_still_references() {
         .hard_delete(
             HardDeleteRequest {
                 format: Format::Pub,
+                reason: Some("leaked credential".to_owned()),
                 org_id: h.org,
                 name: "acme_core".to_owned(),
                 version: semver("1.0.0"),
@@ -633,6 +626,7 @@ async fn hard_deleting_twice_is_a_conflict_and_unknown_versions_are_not_found() 
     h.service.publish(h.request(package("acme_core", "1.0.0", &[])), t0()).await.expect("publish");
     let request = |version: &str| HardDeleteRequest {
         format: Format::Pub,
+        reason: Some("leaked credential".to_owned()),
         org_id: h.org,
         name: "acme_core".to_owned(),
         version: semver(version),

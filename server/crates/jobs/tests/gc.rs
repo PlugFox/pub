@@ -67,12 +67,7 @@ impl Harness {
             .await
             .expect("user")
             .id;
-        let org = repos
-            .orgs
-            .create(NewOrg { name: "Acme".to_owned(), slug: "acme".to_owned() }, user, t0())
-            .await
-            .expect("org")
-            .id;
+        let org = repos.orgs.create(NewOrg::new("Acme", "acme"), user, t0()).await.expect("org").id;
         Self { repos, blob: Arc::new(ObjectStoreBlob::memory()), org, user }
     }
 

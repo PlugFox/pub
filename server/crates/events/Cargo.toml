@@ -1,0 +1,25 @@
+[package]
+name = "pub-events"
+description = "The domain event bus (decision 22): in-process fan-out, KV-broker bridge, notification center."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+pub-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# "sync" for the broadcast fan-out, "rt"/"time" for the broker subscription task.
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pub-db-sqlite = { workspace = true }
+pub-config = { workspace = true }
+pub-kv = { workspace = true }
+pub-mail = { workspace = true }
+tokio = { workspace = true }

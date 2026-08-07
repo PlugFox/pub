@@ -27,7 +27,8 @@ use pub_core::package::{
 use pub_core::page::{decode_cursor, encode_cursor};
 use pub_core::traits::UpstreamRepo;
 use pub_core::{Error, Format, OrgId, PackageId, Page, Result, SemVer, VersionId};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::postgres::PgRow;
+use sqlx::{PgPool, Postgres, QueryBuilder, Row as _};
 use uuid::Uuid;
 
 use super::{db_err, parse_col, q, write_err};
@@ -382,6 +383,26 @@ impl UpstreamRepo for PgUpstreamRepo {
             rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
         let cursor = if has_more { items.last().map(|entry| encode_cursor(&[&entry.name])) } else { None };
         Ok(Page { items, cursor, has_more })
+    }
+
+    async fn cache_stats(&self, format: Format) -> Result<pub_core::package::UpstreamCacheStats> {
+        let row: PgRow = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM upstream_packages WHERE format = $1) AS packages, \
+             COUNT(v.id) AS versions, \
+             COUNT(*) FILTER (WHERE v.cached) AS cached_versions, \
+             COALESCE(SUM(v.archive_size) FILTER (WHERE v.cached), 0)::bigint AS cached_bytes \
+             FROM upstream_versions v JOIN upstream_packages p ON p.id = v.upstream_package_id WHERE p.format = $1",
+        )
+        .bind(format.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(pub_core::package::UpstreamCacheStats {
+            packages: row.get("packages"),
+            versions: row.get("versions"),
+            cached_versions: row.get("cached_versions"),
+            cached_bytes: row.get("cached_bytes"),
+        })
     }
 
     async fn count_cached_with_sha256(&self, sha256: &str) -> Result<u64> {

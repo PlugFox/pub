@@ -16,6 +16,8 @@ axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
+pub-admin = { workspace = true }
 pub-api = { workspace = true }
 pub-auth = { workspace = true }
 pub-blob = { workspace = true }
@@ -24,6 +26,7 @@ pub-config = { workspace = true }
 pub-core = { workspace = true }
 pub-db-postgres = { workspace = true }
 pub-db-sqlite = { workspace = true }
+pub-events = { workspace = true }
 pub-jobs = { workspace = true }
 pub-kv = { workspace = true }
 pub-registry = { workspace = true }

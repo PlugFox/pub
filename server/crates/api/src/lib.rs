@@ -62,7 +62,12 @@ impl Modify for SecurityAddon {
         (name = "auth", description = "Sign-in (email OTP, OIDC), TOTP second factor, step-up, refresh, logout"),
         (name = "sessions", description = "Web session management"),
         (name = "tokens", description = "CLI/API tokens"),
-        (name = "orgs", description = "Organizations"),
+        (name = "orgs", description = "Organizations: profile, members, invitations, danger zone"),
+        (name = "packages", description = "Package read model and management: search, pages, options, retraction, transfer"),
+        (name = "home", description = "Landing dashboard: instance identity, counters, package rails"),
+        (name = "events", description = "Server-Sent Events stream of domain events (decision 20, S-32)"),
+        (name = "notifications", description = "Notification center: feed, unread count, mark-read, per-category preferences"),
+        (name = "admin", description = "Instance administration: runtime settings, users, orgs, audit, stats, jobs"),
         (name = "pub", description = "Hosted Pub Repository Spec v2 (docs/protocol.md) — spec shapes, no envelope"),
     )
 )]
@@ -92,6 +97,42 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::tokens::create, routes::tokens::list))
         .routes(routes!(routes::tokens::revoke))
         .routes(routes!(routes::orgs::create, routes::orgs::list))
+        .routes(routes!(routes::orgs::profile, routes::orgs::update, routes::orgs::delete))
+        // Org management (decision 19; S-06 step-up gates, S-09 session revocation).
+        .routes(routes!(routes::members::list, routes::members::add))
+        .routes(routes!(routes::members::update_role, routes::members::remove))
+        .routes(routes!(routes::members::list_invitations, routes::members::invite))
+        .routes(routes!(routes::members::revoke_invitation))
+        .routes(routes!(routes::members::accept))
+        // Package management (decisions 06/19).
+        .routes(routes!(routes::manage::set_options))
+        .routes(routes!(routes::manage::retract))
+        .routes(routes!(routes::manage::unretract))
+        .routes(routes!(routes::manage::transfer))
+        // Instance administration.
+        .routes(routes!(routes::admin::get_settings, routes::admin::update_settings))
+        .routes(routes!(routes::admin::list_users))
+        .routes(routes!(routes::admin::suspend_user))
+        .routes(routes!(routes::admin::unsuspend_user))
+        .routes(routes!(routes::admin::list_orgs))
+        .routes(routes!(routes::admin::list_audit))
+        .routes(routes!(routes::admin::stats))
+        .routes(routes!(routes::admin::run_job))
+        // Public read model (decision 11 search + the package/org/home screens of
+        // docs/product.md). All GET, all anonymous-reachable, all visibility-filtered.
+        .routes(routes!(routes::packages::search))
+        .routes(routes!(routes::packages::detail))
+        .routes(routes!(routes::packages::versions))
+        // `version_detail` (GET) and `hard_delete` (DELETE) share one path, so they share one
+        // `routes!` group — utoipa merges the methods onto a single OpenAPI path item.
+        .routes(routes!(routes::packages::version_detail, routes::manage::hard_delete))
+        .routes(routes!(routes::packages::dependents))
+        .routes(routes!(routes::home::home))
+        // Realtime: the SSE stream (S-32) and the notification center it announces.
+        .routes(routes!(routes::events::stream))
+        .routes(routes!(routes::notifications::list))
+        .routes(routes!(routes::notifications::mark_read))
+        .routes(routes!(routes::notifications::preferences, routes::notifications::update_preferences))
         // Pub protocol on both virtual bases (decision 01); spec shapes, never the envelope.
         .merge(protocol::router(&state))
         .split_for_parts();

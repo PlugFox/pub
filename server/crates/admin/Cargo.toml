@@ -1,0 +1,26 @@
+[package]
+name = "pub-admin"
+description = "Management services: org lifecycle and membership (S-09 chokepoint), instance administration."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+# Session revocation on every authority change (S-09) and KEK sealing of the runtime SMTP
+# password (S-26) both live in the auth crate; duplicating either here is how the two copies
+# drift apart.
+pub-auth = { workspace = true }
+pub-core = { workspace = true }
+# Package moderation reuses the registry's own service methods, so a forced org archive
+# refreshes the search index exactly like a package-settings change does.
+pub-registry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -27,20 +27,26 @@ use crate::audit::{AuditEvent, AuditFilter, NewAuditEvent};
 use crate::authorize::{Action, ActorContext, Resource, authorize};
 use crate::credential::Credential;
 use crate::jobs::{JobOutcome, JobProgress, JobState};
-use crate::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, UpstreamPolicy};
+use crate::notification::{NewNotification, Notification, NotificationCategory, NotificationPreference};
+use crate::org::{
+    Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, OrgOverview, OrgProfile, UpstreamPolicy,
+};
 use crate::package::{
     BaseScope, NameClaim, NewPackage, NewQuarantineEntry, NewShadowingAlarm, NewVersion, Package, PackageOptions,
-    PublishedVersion, QuarantineEntry, Resolution, ShadowingAlarm, UpstreamCacheEntry, UpstreamPackage,
-    UpstreamSnapshot, UpstreamVersion, Version, Visibility,
+    PublishedVersion, QuarantineEntry, RegistryStats, Resolution, ShadowingAlarm, UpstreamCacheEntry,
+    UpstreamCacheStats, UpstreamPackage, UpstreamSnapshot, UpstreamVersion, Version, Visibility,
 };
 use crate::page::Page;
+use crate::search::{InstanceCounters, SearchDocument, SearchFacets, SearchHit, SearchQuery, SearchView};
 use crate::semver::SemVer;
 use crate::session::{NewSession, Session, SessionLimits};
 use crate::settings::SettingEntry;
+use crate::stats::{DownloadDelta, DownloadTotals, PackageDownloads};
 use crate::token::{NewToken, Token};
-use crate::user::{NewUser, User, UserStatus};
+use crate::user::{NewUser, User, UserCounts, UserFilter, UserStatus};
 use crate::{
-    CredentialId, Format, InvitationId, OrgId, PackageId, Result, RoleLevel, SessionId, TokenId, UserId, VersionId,
+    CredentialId, Format, InvitationId, NotificationId, OrgId, PackageId, Result, RoleLevel, SessionId, TokenId,
+    UserId, VersionId,
 };
 
 /// Stream of archive bytes, e.g. a package tarball body.
@@ -115,9 +121,32 @@ pub trait PackageRepo: Send + Sync {
     /// malformed `cursor` is [`crate::Error::Invalid`].
     async fn list_for_org(&self, org: OrgId, cursor: Option<&str>, limit: u32) -> Result<Page<Package>>;
 
+    /// Every package on the instance, ordered by `(format, name)` and keyset-paginated over
+    /// that pair — the reindex job's work queue.
+    ///
+    /// Deliberately unfiltered by visibility, org, or listing state: the search index must be
+    /// rebuildable in full from this walk, and a filtered enumeration would silently make some
+    /// packages unindexable. Callers other than the indexer should not exist.
+    async fn list_all(&self, cursor: Option<&str>, limit: u32) -> Result<Page<Package>>;
+
     /// Replaces the package's mutable options (visibility, discontinued, replaced_by,
     /// unlisted) and bumps `updated_at`. Unknown id → `NotFound`.
     async fn set_options(&self, id: PackageId, options: &PackageOptions, now: DateTime<Utc>) -> Result<Package>;
+
+    /// Moves a package to another org — the package row **and its name claim**, in one
+    /// transaction.
+    ///
+    /// Both or neither: a claim left pointing at the old org would make the new owner unable
+    /// to publish the name they now hold, and the shadowing alarm would page the wrong
+    /// admins (S-17). Unknown id → `NotFound`; an unknown target org → `NotFound`; moving a
+    /// package to the org that already owns it is a no-op that returns the row.
+    async fn transfer(&self, id: PackageId, to_org: OrgId, now: DateTime<Utc>) -> Result<Package>;
+
+    /// How many packages the org owns, any visibility — the org-deletion guard.
+    async fn count_for_org(&self, org: OrgId) -> Result<i64>;
+
+    /// Instance-wide registry totals for the admin dashboard.
+    async fn stats(&self) -> Result<RegistryStats>;
 
     /// Publishes a version — atomically, per contract 1 above.
     ///
@@ -130,6 +159,13 @@ pub trait PackageRepo: Send + Sync {
     /// "never existed" from "burned"); `None` when unknown.
     async fn get_version(&self, package: PackageId, version: &SemVer) -> Result<Option<Version>>;
 
+    /// How many **live** (non-tombstone) versions the package has.
+    ///
+    /// Exists so the package page can report `versions_count` without walking the listing: a
+    /// package with thousands of versions would otherwise cost one query per hundred on an
+    /// anonymous-reachable route.
+    async fn count_versions(&self, package: PackageId) -> Result<i64>;
+
     /// The package's live versions in ascending semver precedence order, keyset-paginated
     /// over `(sort key, id)`.
     ///
@@ -137,6 +173,16 @@ pub trait PackageRepo: Send + Sync {
     /// downloadable for lockfile-pinned builds (docs/protocol.md sharp edge 9). Tombstoned
     /// versions are excluded: their metadata and bytes are gone.
     async fn list_versions(&self, package: PackageId, cursor: Option<&str>, limit: u32) -> Result<Page<Version>>;
+
+    /// The same listing in **descending** precedence order — newest first.
+    ///
+    /// A separate method rather than a flag because the two have different callers with
+    /// different needs: the pub protocol re-emits the whole listing ascending (the spec's
+    /// order, and the order `latest` is derived from), while the web UI shows the newest
+    /// release first and pages backwards from there. Reversing a page in the API layer would
+    /// give newest-first *within* a page while paging from the oldest, which is worse than
+    /// either order.
+    async fn list_versions_desc(&self, package: PackageId, cursor: Option<&str>, limit: u32) -> Result<Page<Version>>;
 
     /// Sets or clears the retraction flag; returns the updated row. Idempotent — retracting a
     /// retracted version keeps the original `retracted_at`. Unknown id → `NotFound`; a
@@ -325,6 +371,10 @@ pub trait UpstreamRepo: Send + Sync {
     /// keyset-paginated over the name.
     async fn list_cached(&self, format: Format, cursor: Option<&str>, limit: u32) -> Result<Page<UpstreamCacheEntry>>;
 
+    /// Instance-wide proxy-cache totals for the admin dashboard: how many upstream packages
+    /// and versions are known, how many are held as bytes, and how much that costs.
+    async fn cache_stats(&self, format: Format) -> Result<UpstreamCacheStats>;
+
     /// How many **cached** upstream versions reference this content hash.
     ///
     /// The proxy stores its archives under the same content-addressed keys a local publish
@@ -404,6 +454,14 @@ pub trait UserRepo: Send + Sync {
     /// The user with this id; `None` when unknown.
     async fn get(&self, id: UserId) -> Result<Option<User>>;
 
+    /// The users with these ids, in **unspecified** order, unknown ids simply absent.
+    ///
+    /// The batch form exists to kill N+1 reads in listings that show a person per row (org
+    /// members, a package's version history). Callers index the result by id rather than by
+    /// position — a missing account is a deleted one, not an error. An empty input is an empty
+    /// result and performs no query.
+    async fn get_many(&self, ids: &[UserId]) -> Result<Vec<User>>;
+
     /// The user holding this email **verified** (S-01: unverified emails never identify an
     /// account); matching is case-insensitive. `None` when no verified match exists.
     async fn find_by_email(&self, email: &str) -> Result<Option<User>>;
@@ -414,6 +472,29 @@ pub trait UserRepo: Send + Sync {
     /// (freeing it for re-registration) and the display name is blanked; the row itself
     /// survives as the attribution tombstone for published versions.
     async fn update_status(&self, id: UserId, status: UserStatus, now: DateTime<Utc>) -> Result<User>;
+
+    /// The admin user listing, **newest account first**, keyset-paginated over the UUID v7 id
+    /// (which is time-ordered, so the id alone is the cursor). Filters combine with AND.
+    async fn list(&self, filter: &UserFilter, cursor: Option<&str>, limit: u32) -> Result<Page<User>>;
+
+    /// Account counts for the admin dashboard.
+    async fn counts(&self) -> Result<UserCounts>;
+
+    /// Sets or clears the instance-admin flag. Unknown id → `NotFound`.
+    ///
+    /// Deliberately separate from [`UserRepo::update_status`]: promoting an administrator and
+    /// suspending an account are different privileges with different audit actions, and a
+    /// combined "update user" call is how one of them rides along with the other by accident.
+    async fn set_instance_admin(&self, id: UserId, is_admin: bool, now: DateTime<Utc>) -> Result<User>;
+
+    /// **Atomically** makes `id` an instance admin *iff the instance currently has none*;
+    /// returns whether this call promoted them (decision 09 bootstrap).
+    ///
+    /// The condition is checked inside the same statement, so two accounts registering at the
+    /// same moment on two instances cannot both become the first admin. `false` means somebody
+    /// already holds the flag — including the caller themselves, which makes the call
+    /// idempotent.
+    async fn claim_first_admin(&self, id: UserId, now: DateTime<Utc>) -> Result<bool>;
 }
 
 /// Credential persistence — one polymorphic table over every identity proof (decision 12).
@@ -504,6 +585,14 @@ pub trait OrgRepo: Send + Sync {
     /// The org with this slug (case-insensitive); `None` when unknown.
     async fn get_by_slug(&self, slug: &str) -> Result<Option<Org>>;
 
+    /// Replaces the org's mutable profile (name, description, upstream policy) and bumps
+    /// `updated_at`. Unknown id → `NotFound`.
+    ///
+    /// The slug is **not** in the payload: it is the org's virtual registry base
+    /// (`/o/{slug}/pub`), so renaming it would silently break every `PUB_HOSTED_URL`, every
+    /// `pubspec.yaml` that names it, and every stored `archive_url` (decision 01).
+    async fn update_profile(&self, id: OrgId, profile: &OrgProfile, now: DateTime<Utc>) -> Result<Org>;
+
     /// Sets the org's upstream-proxy policy (decision 01, S-16) and bumps `updated_at`.
     /// Unknown id → `NotFound`.
     ///
@@ -512,11 +601,38 @@ pub trait OrgRepo: Send + Sync {
     /// so it gets its own audited call site instead of riding along with a rename.
     async fn set_upstream_policy(&self, id: OrgId, policy: UpstreamPolicy, now: DateTime<Utc>) -> Result<Org>;
 
+    /// Every org on the instance with its member and package counts, ordered by slug and
+    /// keyset-paginated over it — the instance-admin org table.
+    async fn list_all(&self, cursor: Option<&str>, limit: u32) -> Result<Page<OrgOverview>>;
+
+    /// How many orgs exist (archived ones included).
+    async fn count(&self) -> Result<i64>;
+
+    /// Erases the org and everything that exists only to describe it: memberships,
+    /// invitations, and org-bound CLI tokens, in one transaction.
+    ///
+    /// Refuses with [`crate::Error::Conflict`] when anything **durable** still references the
+    /// org — a package row or a name claim — because decision 06 and S-18 keep those forever
+    /// and an org row is what they hang from. The caller's escape hatch for that case is
+    /// [`OrgRepo::archive`], not a cascade.
+    async fn delete(&self, id: OrgId) -> Result<()>;
+
+    /// Archives an org that cannot be erased: stamps `archived_at` and, in the same
+    /// transaction, removes every membership and invitation and revokes every org-bound token.
+    ///
+    /// Idempotent — re-archiving keeps the original `archived_at`. Unknown id → `NotFound`.
+    /// Making the org's packages unreachable is the service layer's job (they go private +
+    /// unlisted + discontinued through the registry service, so the search index follows).
+    async fn archive(&self, id: OrgId, now: DateTime<Utc>) -> Result<Org>;
+
     /// Every org the user is a member of, with the user's role, oldest org first.
     async fn list_for_user(&self, user: UserId) -> Result<Vec<OrgMembership>>;
 
     /// The membership row for `(org, user)` incl. role level; `None` when not a member.
     async fn get_member(&self, org: OrgId, user: UserId) -> Result<Option<OrgMember>>;
+
+    /// Every member of the org, highest role first then oldest membership — the members table.
+    async fn list_members(&self, org: OrgId) -> Result<Vec<OrgMember>>;
 
     /// Adds a member with the given role (must be `> 0`; level 0 is "not a member").
     /// An existing membership is [`crate::Error::Conflict`] — use `update_member_role`.
@@ -559,6 +675,17 @@ pub trait OrgRepo: Send + Sync {
     /// Every invitation of the org (all lifecycle states — the UI shows pending/expired/
     /// accepted/revoked), newest first.
     async fn list_invitations(&self, org: OrgId) -> Result<Vec<Invitation>>;
+
+    /// Whether `email` holds at least one invitation that is still redeemable at `now`
+    /// (pending, not revoked, not expired) — the `invite`-only registration gate
+    /// ([`crate::settings::RegistrationMode::Invite`], S-31).
+    ///
+    /// Matching is case-insensitive, like every other email lookup.
+    async fn has_pending_invitation(&self, email: &str, now: DateTime<Utc>) -> Result<bool>;
+
+    /// How many invitations the org sent inside `[since, now]` — the S-24 per-org invitation
+    /// budget (≤20/day/org).
+    async fn count_invitations_since(&self, org: OrgId, since: DateTime<Utc>) -> Result<i64>;
 }
 
 /// Web refresh-session persistence (decision 03, S-08..S-10).
@@ -698,6 +825,75 @@ pub trait SettingsRepo: Send + Sync {
     async fn get_version(&self) -> Result<i64>;
 }
 
+/// The notification center's persistence (decision 20): a per-user feed plus per-category
+/// delivery preferences.
+///
+/// Two contracts are load-bearing and are asserted by the shared contract suite against every
+/// backend:
+///
+/// 1. **Every read and every write is scoped to one user.** There is no method that can return
+///    or touch another account's notification — the `user` parameter is not a filter the caller
+///    may omit, and [`NotificationRepo::mark_read`] silently ignores ids belonging to somebody
+///    else rather than reporting them (which would be an existence oracle).
+/// 2. **Marking read is idempotent and monotonic.** Re-marking a read notification keeps the
+///    original `read_at`, so the returned count is "how many this call changed", which is what
+///    an unread badge needs.
+#[async_trait]
+pub trait NotificationRepo: Send + Sync {
+    /// Cheap connectivity probe used by `/healthz`.
+    async fn ping(&self) -> Result<()>;
+
+    /// Files one notification and returns the stored row.
+    async fn create(&self, new: NewNotification, now: DateTime<Utc>) -> Result<Notification>;
+
+    /// The user's feed, newest first, keyset-paginated over the UUID v7 id (time-ordered, so
+    /// the id alone is the cursor). `unread_only` narrows to unread rows.
+    ///
+    /// A malformed cursor is [`crate::Error::Invalid`]; `limit` is clamped to a sane range.
+    async fn list(
+        &self,
+        user: UserId,
+        unread_only: bool,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<Notification>>;
+
+    /// How many of the user's notifications are unread.
+    async fn unread_count(&self, user: UserId) -> Result<i64>;
+
+    /// Marks the listed notifications read; returns how many rows this call changed. Ids the
+    /// user does not own, unknown ids, and already-read ids are all no-ops (contract 1 and 2).
+    async fn mark_read(&self, user: UserId, ids: &[NotificationId], now: DateTime<Utc>) -> Result<u64>;
+
+    /// Marks every unread notification of the user read; returns how many rows changed.
+    async fn mark_all_read(&self, user: UserId, now: DateTime<Utc>) -> Result<u64>;
+
+    /// The user's stored preference rows — categories they never touched are absent, and
+    /// [`crate::notification::NotificationPreferences::from_rows`] fills them in.
+    async fn preferences(&self, user: UserId) -> Result<Vec<NotificationPreference>>;
+
+    /// The **stored** preference for one category across a batch of users, as
+    /// `(user, preference)` pairs; users with no row for that category are simply absent and
+    /// take the default.
+    ///
+    /// The batch form exists because fan-out asks this question once per recipient: an org
+    /// event with two hundred members would otherwise be two hundred queries before the first
+    /// notification is written.
+    async fn stored_preferences(
+        &self,
+        users: &[UserId],
+        category: NotificationCategory,
+    ) -> Result<Vec<(UserId, NotificationPreference)>>;
+
+    /// Upserts the given preference rows (one per category) and returns the full stored set.
+    async fn set_preferences(
+        &self,
+        user: UserId,
+        prefs: &[NotificationPreference],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<NotificationPreference>>;
+}
+
 /// Content-addressed blob storage (decision 10). Keys are derived from the content sha256;
 /// stored bytes are immutable and served verbatim forever.
 #[async_trait]
@@ -813,14 +1009,86 @@ pub trait Kv: Send + Sync {
     async fn subscribe(&self, topic: &str) -> Result<MessageStream>;
 }
 
-/// Full-text package search (decision 11): PG tsvector+pg_trgm or SQLite FTS5.
+/// Full-text package search and the public read model over it (decision 11): PG
+/// `tsvector` + GIN + `pg_trgm`, or SQLite FTS5 with sync triggers.
+///
+/// The index is **derived data**: every document can be rebuilt from `packages` + `versions`
+/// by the reindex job, which is why an indexing failure is logged rather than propagated into
+/// a publish. Three contracts are load-bearing and are asserted by the shared contract suite
+/// against every backend:
+///
+/// 1. **Visibility is enforced inside the implementation.** Every read here takes a
+///    [`SearchView`] and must apply `visibility = 'public' OR org_id ∈ view` as a *mandatory*
+///    predicate — no query text, filter, or cursor may widen it. The view is built through the
+///    [`crate::authorize`] chokepoint, so this is the same policy resolution uses rather than a
+///    second copy of it (S-04: a principal must never learn that a private package exists).
+///    `unlisted` packages additionally never leave their own org, because "hidden from
+///    discovery" is what the flag means.
+/// 2. **A document exists only while the package has a live version.** Publishing creates or
+///    refreshes it; retraction, hard delete, and option changes refresh it; losing the last
+///    live version removes it. A search result therefore always carries a version.
+/// 3. **Cursors are ordering-bound.** A cursor produced under one [`SearchSort`](crate::search::SearchSort) is
+///    [`crate::Error::Invalid`] under another — the sort key it carries means nothing there,
+///    and silently reshuffling the page would skip results.
 #[async_trait]
 pub trait PackageSearch: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.
     async fn ping(&self) -> Result<()>;
 
-    /// Searches package names in the given format; returns matching package ids.
-    async fn search(&self, format: Format, query: &str) -> Result<Vec<PackageId>>;
+    /// Creates or replaces one package's search document (contract 2).
+    async fn index(&self, document: &SearchDocument) -> Result<()>;
+
+    /// Removes a package from the index; removing an absent package is not an error.
+    async fn remove(&self, package: PackageId) -> Result<()>;
+
+    /// Runs a search, keyset-paginated in [`SearchQuery::effective_sort`] order.
+    ///
+    /// A malformed cursor — or one produced under a different ordering — is
+    /// [`crate::Error::Invalid`]; `limit` is clamped to a sane range.
+    async fn search(
+        &self,
+        query: &SearchQuery,
+        view: &SearchView,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<SearchHit>>;
+
+    /// Aggregates over the **same** filtered set [`PackageSearch::search`] would return: total
+    /// match count plus the top owning orgs, capped at `facet_limit` buckets.
+    async fn facets(&self, query: &SearchQuery, view: &SearchView, facet_limit: u32) -> Result<SearchFacets>;
+
+    /// Instance counters for the landing dashboard, scoped to the caller's view.
+    async fn counters(&self, view: &SearchView) -> Result<InstanceCounters>;
+
+    /// Writes back the download totals the rollup job computed, so `sort:downloads` reads one
+    /// indexed column instead of an aggregate join on the hot path. Unknown package → no-op.
+    async fn set_downloads(&self, package: PackageId, totals: DownloadTotals) -> Result<()>;
+}
+
+/// Daily download rollups (docs/architecture.md `download_stats`; see [`crate::stats`]).
+///
+/// Two contracts:
+///
+/// 1. **`add_downloads` is additive** per `(package, version, date)`. Every instance flushes
+///    its own counts, so a write that *set* the value would make the last flush win and
+///    silently discard its peers'.
+/// 2. **Reads are bounded aggregates.** Per-package totals are one indexed scan, and the job's
+///    write-back onto the search index keeps them off the search path entirely.
+#[async_trait]
+pub trait StatsRepo: Send + Sync {
+    /// Cheap connectivity probe used by `/healthz`.
+    async fn ping(&self) -> Result<()>;
+
+    /// Folds a batch of deltas into the daily rollup (contract 1). Returns how many rows were
+    /// inserted or updated; an empty batch is a no-op.
+    async fn add_downloads(&self, deltas: &[DownloadDelta]) -> Result<u64>;
+
+    /// All-time and trailing-window totals for one package (`since` inclusive).
+    async fn package_totals(&self, package: PackageId, since: NaiveDate) -> Result<DownloadTotals>;
+
+    /// The same totals for a bounded set of packages — the rollup job's write-back input.
+    /// Packages with nothing recorded are omitted.
+    async fn totals_for(&self, packages: &[PackageId], since: NaiveDate) -> Result<Vec<PackageDownloads>>;
 }
 
 /// Outbound email delivery (OTP codes, invitations, notifications).
@@ -845,6 +1113,12 @@ pub trait Mailer: Send + Sync {
 /// Constructed once at startup by the selected database crate (`SqliteDb::repositories()` /
 /// `PostgresDb::repositories()`) and carried in `AppState`; the contract test suite runs
 /// against this bundle, so every backend is exercised through the same trait surface.
+///
+/// [`Repositories::search`] rides along even though decision 11 leaves room for a search
+/// implementation that is *not* the database (tantivy, Meilisearch): today both implementations
+/// are SQL over the same pool, and bundling them keeps every consumer — the publish pipeline,
+/// the read-model routes, the reindex job, the contract suite — on one handle. A future
+/// non-SQL implementation replaces this one field after the bundle is built.
 #[derive(Clone)]
 pub struct Repositories {
     /// Packages, versions, and name claims.
@@ -867,6 +1141,49 @@ pub struct Repositories {
     pub settings: Arc<dyn SettingsRepo>,
     /// Durable background-job state (decision 03, decision 07 mirror).
     pub jobs: Arc<dyn JobRepo>,
+    /// Package search index and the read model over it (decision 11).
+    pub search: Arc<dyn PackageSearch>,
+    /// Daily download rollups.
+    pub stats: Arc<dyn StatsRepo>,
+    /// The notification center's feed and preferences (decision 20).
+    pub notifications: Arc<dyn NotificationRepo>,
+}
+
+/// Manual, out-of-schedule execution of a background job (`POST /api/v1/admin/jobs/{job}/run`).
+///
+/// The seam lives in `core` so the API crate can offer the button without depending on the
+/// jobs crate, and so a deployment that registered no jobs has a real implementation
+/// ([`NoJobs`]) rather than an `Option` every handler has to unwrap.
+///
+/// Implementations must take the same [`JobLock`] the scheduler uses: a manual run that
+/// overlapped a scheduled tick would have two writers on one durable cursor.
+#[async_trait]
+pub trait JobTrigger: Send + Sync {
+    /// The jobs that can be triggered right now, sorted. A job the operator disabled is
+    /// **not** listed — the admin UI shows what exists on this instance, not what could.
+    fn names(&self) -> Vec<String>;
+
+    /// Runs `name` once, now, and returns the job's own summary document.
+    ///
+    /// Unknown or disabled job → [`crate::Error::NotFound`]; a run that could not take the
+    /// leader lock → [`crate::Error::Conflict`], because "somebody else is already running it"
+    /// is a state the operator should see rather than a silent no-op.
+    async fn run_now(&self, name: &str, now: DateTime<Utc>) -> Result<serde_json::Value>;
+}
+
+/// The trigger for an instance with no registered jobs: nothing to list, nothing to run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoJobs;
+
+#[async_trait]
+impl JobTrigger for NoJobs {
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    async fn run_now(&self, name: &str, _now: DateTime<Utc>) -> Result<serde_json::Value> {
+        Err(crate::Error::NotFound { what: format!("job {name}") })
+    }
 }
 
 /// Leader-election lock guarding single-instance background jobs (PG advisory lock / Redis

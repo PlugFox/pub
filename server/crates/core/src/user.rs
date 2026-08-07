@@ -70,10 +70,43 @@ pub struct User {
     pub display_name: String,
     /// Lifecycle status.
     pub status: UserStatus,
+    /// Whether this account administers the **instance** (not an org role — decision 19's
+    /// ladder and this flag are orthogonal planes; see [`crate::authorize`]).
+    ///
+    /// Lives on the row rather than in the access token on purpose: the admin routes read it
+    /// per request, so a demotion is effective immediately and [S-07](../../../docs/security.md)
+    /// keeps claims to `sub`/`sid`/org levels/timestamps.
+    pub is_instance_admin: bool,
     /// Creation time (UTC).
     pub created_at: DateTime<Utc>,
     /// Last profile/status update time (UTC).
     pub updated_at: DateTime<Utc>,
+}
+
+/// Instance-wide account counts for the admin dashboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserCounts {
+    /// Every account row, anonymized tombstones included.
+    pub total: i64,
+    /// Accounts that can sign in.
+    pub active: i64,
+    /// Accounts an admin has suspended.
+    pub suspended: i64,
+    /// Anonymized deletion tombstones (S-29).
+    pub deleted: i64,
+    /// Accounts carrying the instance-admin flag.
+    pub admins: i64,
+}
+
+/// Filters for the admin user listing; fields combine with AND.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserFilter {
+    /// Case-insensitive substring of the email or display name.
+    pub query: Option<String>,
+    /// Only accounts in this lifecycle status.
+    pub status: Option<UserStatus>,
+    /// Only accounts carrying the instance-admin flag.
+    pub admins_only: bool,
 }
 
 /// Payload for creating a user account (id, status, and timestamps are assigned by the repo).

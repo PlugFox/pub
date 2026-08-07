@@ -191,3 +191,59 @@ async fn job_repo_contract() {
     pub_db_tests::contract::job_repo(&db.repos()).await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn package_search_contract_decision11() {
+    let Some(db) = TestDb::create("package_search_contract_decision11").await else { return };
+    pub_db_tests::contract::package_search(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_visibility_contract_s04() {
+    let Some(db) = TestDb::create("search_visibility_contract_s04").await else { return };
+    pub_db_tests::contract::search_visibility(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn download_stats_contract() {
+    let Some(db) = TestDb::create("download_stats_contract").await else { return };
+    pub_db_tests::contract::download_stats(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn instance_admins_contract() {
+    let Some(db) = TestDb::create("instance_admins_contract").await else { return };
+    pub_db_tests::contract::instance_admins(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn org_management_contract() {
+    let Some(db) = TestDb::create("org_management_contract").await else { return };
+    pub_db_tests::contract::org_management(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn org_deletion_contract_s18() {
+    let Some(db) = TestDb::create("org_deletion_contract_s18").await else { return };
+    pub_db_tests::contract::org_deletion(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn package_transfer_and_stats_contract() {
+    let Some(db) = TestDb::create("package_transfer_and_stats_contract").await else { return };
+    pub_db_tests::contract::package_transfer_and_stats(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn notifications_contract_decision20() {
+    let Some(db) = TestDb::create("notifications_contract_decision20").await else { return };
+    pub_db_tests::contract::notifications(&db.repos()).await;
+    db.cleanup().await;
+}

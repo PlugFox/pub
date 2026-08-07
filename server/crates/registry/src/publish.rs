@@ -30,13 +30,14 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::event::{DomainEvent, EventSink};
-use pub_core::package::{NewVersion, Package, Publisher, Version, Visibility};
+use pub_core::package::{NewVersion, Package, PackageOptions, Publisher, Version, Visibility};
 use pub_core::token::patterns_allow;
 use pub_core::traits::{BlobStore, JobLock, Repositories};
 use pub_core::{Error, Format, OrgId, Result, SemVer, TokenId, UserId};
 use sha2::{Digest as _, Sha256};
 
 use crate::archive::{ArchiveContents, ArchiveError, ArchiveLimits, validate_archive};
+use crate::index::PackageIndexer;
 use crate::markdown;
 use crate::pubspec::Pubspec;
 
@@ -162,6 +163,28 @@ pub struct HardDeleteRequest {
     pub name: String,
     /// Version to delete.
     pub version: SemVer,
+    /// Why the bytes are being destroyed — recorded in the audit event (S-22).
+    ///
+    /// Required by the API layer rather than optional here: hard delete is the one operation
+    /// that removes something the ecosystem may already depend on, and "who did it" without
+    /// "why" is not an answer anybody can act on months later.
+    pub reason: Option<String>,
+    /// Actor.
+    pub actor: ActorMeta,
+}
+
+/// A package-transfer request (decision 19 danger zone: Owner of both orgs + step-up,
+/// enforced by the API layer).
+#[derive(Clone, Debug)]
+pub struct TransferRequest {
+    /// Artifact format.
+    pub format: Format,
+    /// The org that currently owns the package.
+    pub from_org: OrgId,
+    /// The org that will own it.
+    pub to_org: OrgId,
+    /// Package name.
+    pub name: String,
     /// Actor.
     pub actor: ActorMeta,
 }
@@ -182,6 +205,7 @@ pub struct RegistryService {
     blob: Arc<dyn BlobStore>,
     lock: Arc<dyn JobLock>,
     events: Arc<dyn EventSink>,
+    indexer: PackageIndexer,
     policy: RegistryPolicy,
 }
 
@@ -210,7 +234,8 @@ impl RegistryService {
         events: Arc<dyn EventSink>,
         policy: RegistryPolicy,
     ) -> Self {
-        Self { repos, blob, lock, events, policy }
+        let indexer = PackageIndexer::new(repos.clone());
+        Self { repos, blob, lock, events, indexer, policy }
     }
 
     /// The active policy (limits surfaced by the protocol layer, e.g. upload size checks).
@@ -402,12 +427,26 @@ impl RegistryService {
             self.observe_shadowing(request.format, name, now).await;
         }
 
+        self.reindex(&published.package).await;
+
         Ok(PublishOutcome {
             package: published.package,
             version: published.version,
             package_created: published.package_created,
             blob_key,
         })
+    }
+
+    /// Rebuilds the package's search document after a lifecycle change (decision 11).
+    ///
+    /// **Best-effort, deliberately.** The index is a projection of `packages` + `versions`
+    /// (see [`crate::index`]), so a failure here costs discoverability until the reindex job
+    /// runs — while propagating it would fail a publish whose bytes, row, and audit record are
+    /// already committed, and there is nothing to roll back to. Loud in the log instead.
+    async fn reindex(&self, package: &Package) {
+        if let Err(err) = self.indexer.refresh(package).await {
+            tracing::error!(package = %package.name, error = %err, "search index update failed");
+        }
     }
 
     /// Raises an S-17 alarm when the freshly claimed name is one the proxy already caches.
@@ -524,7 +563,67 @@ impl RegistryService {
             })
             .await;
 
+        // Retraction moves `latest` and flips `is:retracted-latest`, so the document has to be
+        // rebuilt even though no version was added or removed.
+        self.reindex(&package).await;
+
         Ok(version)
+    }
+
+    /// Replaces a package's mutable options (visibility, discontinued/replaced-by, unlisted)
+    /// and rebuilds its search document.
+    ///
+    /// The index refresh is the reason this is a service method rather than a repository call
+    /// from a handler: all four flags are *search* facets — flipping a package to private has
+    /// to remove it from everybody else's results in the same breath, and an admin UI that
+    /// wrote the row directly would leave the index advertising it.
+    ///
+    /// Authorization (org Admin — decision 19) belongs to the API layer; ownership is checked
+    /// here, and a package owned elsewhere is `NotFound`, never `Forbidden` (S-04).
+    pub async fn set_options(
+        &self,
+        format: Format,
+        org: OrgId,
+        name: &str,
+        options: &PackageOptions,
+        actor: &ActorMeta,
+        now: DateTime<Utc>,
+    ) -> Result<Package> {
+        let current = self.owned_package(format, name, org).await?;
+        let before = PackageOptions::from(&current);
+        let package = self.repos.packages.set_options(current.id, options, now).await?;
+
+        self.audit(
+            actor,
+            Some(org),
+            "package.options",
+            Some(name.to_owned()),
+            AuditResult::Success,
+            serde_json::json!({
+                "format": format.as_str(),
+                "package": name,
+                "before": before,
+                "after": options,
+            }),
+            now,
+        )
+        .await;
+
+        self.events
+            .emit(DomainEvent::PackageOptionsChanged {
+                format,
+                org_id: org,
+                package_id: package.id,
+                name: name.to_owned(),
+                visibility: package.visibility.as_str().to_owned(),
+                discontinued: package.discontinued,
+                unlisted: package.unlisted,
+                at: now,
+            })
+            .await;
+
+        self.reindex(&package).await;
+        Ok(package)
     }
 
     /// Hard-deletes a version: tombstone the row, then remove the bytes **iff** no live
@@ -570,6 +669,7 @@ impl RegistryService {
                 "version": request.version.to_string(),
                 "sha256": tombstone.archive_sha256,
                 "blob_removed": blob_removed,
+                "reason": request.reason,
             }),
             now,
         )
@@ -588,7 +688,58 @@ impl RegistryService {
             })
             .await;
 
+        // A hard delete can remove the last live version, in which case the document goes away
+        // entirely — `refresh` handles both cases.
+        self.reindex(&package).await;
+
         Ok(HardDeleteOutcome { version: tombstone, blob_removed })
+    }
+
+    /// Moves a package (and its name claim) to another org.
+    ///
+    /// Authorization — Owner in **both** orgs plus step-up (S-06) — belongs to the API layer.
+    /// What belongs here is everything that has to move with the row: the claim (so the new
+    /// owner can publish the name and the S-17 alarm pages the right admins) and the search
+    /// document (whose `org` field is a filter dimension and a facet bucket).
+    ///
+    /// The package keeps its visibility. Flipping a private package public because it changed
+    /// hands, or public private, would be a disclosure decision made by a side effect.
+    pub async fn transfer(&self, request: TransferRequest, now: DateTime<Utc>) -> Result<Package> {
+        let current = self.owned_package(request.format, &request.name, request.from_org).await?;
+        if request.from_org == request.to_org {
+            return Err(Error::Invalid { message: "the package already belongs to that organization".to_owned() });
+        }
+        let package = self.repos.packages.transfer(current.id, request.to_org, now).await?;
+
+        self.audit(
+            &request.actor,
+            Some(request.from_org),
+            "package.transfer",
+            Some(request.name.clone()),
+            AuditResult::Success,
+            serde_json::json!({
+                "format": request.format.as_str(),
+                "package": request.name,
+                "from_org": request.from_org.to_string(),
+                "to_org": request.to_org.to_string(),
+            }),
+            now,
+        )
+        .await;
+
+        self.events
+            .emit(DomainEvent::PackageTransferred {
+                format: request.format,
+                from_org_id: request.from_org,
+                to_org_id: request.to_org,
+                package_id: package.id,
+                name: request.name.clone(),
+                at: now,
+            })
+            .await;
+
+        self.reindex(&package).await;
+        Ok(package)
     }
 
     /// Loads a package and asserts it belongs to `org`.

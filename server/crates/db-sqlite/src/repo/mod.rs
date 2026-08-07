@@ -25,8 +25,10 @@ use sqlx::SqlitePool;
 mod audit;
 mod credentials;
 mod jobs;
+mod notifications;
 mod orgs;
 mod packages;
+mod search;
 mod sessions;
 mod settings;
 mod tokens;
@@ -36,8 +38,10 @@ mod users;
 pub use audit::SqliteAuditRepo;
 pub use credentials::SqliteCredentialRepo;
 pub use jobs::SqliteJobRepo;
+pub use notifications::SqliteNotificationRepo;
 pub use orgs::SqliteOrgRepo;
 pub use packages::SqlitePackageRepo;
+pub use search::{SqlitePackageSearch, SqliteStatsRepo};
 pub use sessions::SqliteSessionRepo;
 pub use settings::SqliteSettingsRepo;
 pub use tokens::SqliteTokenRepo;
@@ -66,7 +70,10 @@ pub fn repositories(pool: SqlitePool) -> Repositories {
         tokens: Arc::new(SqliteTokenRepo::new(pool.clone())),
         audit: Arc::new(SqliteAuditRepo::new(pool.clone())),
         settings: Arc::new(SqliteSettingsRepo::new(pool.clone())),
-        jobs: Arc::new(SqliteJobRepo::new(pool)),
+        jobs: Arc::new(SqliteJobRepo::new(pool.clone())),
+        search: Arc::new(SqlitePackageSearch::new(pool.clone())),
+        stats: Arc::new(SqliteStatsRepo::new(pool.clone())),
+        notifications: Arc::new(SqliteNotificationRepo::new(pool)),
     }
 }
 

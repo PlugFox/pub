@@ -20,7 +20,8 @@ use pub_core::package::{
 use pub_core::page::{decode_cursor, encode_cursor};
 use pub_core::traits::UpstreamRepo;
 use pub_core::{Error, Format, PackageId, Page, Result, SemVer, VersionId};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{QueryBuilder, Row as _, Sqlite, SqlitePool};
 
 use super::{db_err, parse_col, parse_ts, parse_ts_opt, q, write_err};
 
@@ -371,6 +372,27 @@ impl UpstreamRepo for SqliteUpstreamRepo {
             rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
         let cursor = if has_more { items.last().map(|entry| encode_cursor(&[&entry.name])) } else { None };
         Ok(Page { items, cursor, has_more })
+    }
+
+    async fn cache_stats(&self, format: Format) -> Result<pub_core::package::UpstreamCacheStats> {
+        let row: SqliteRow = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM upstream_packages WHERE format = ?) AS packages, \
+             COUNT(v.id) AS versions, \
+             COALESCE(SUM(CASE WHEN v.cached THEN 1 ELSE 0 END), 0) AS cached_versions, \
+             COALESCE(SUM(CASE WHEN v.cached THEN COALESCE(v.archive_size, 0) ELSE 0 END), 0) AS cached_bytes \
+             FROM upstream_versions v JOIN upstream_packages p ON p.id = v.upstream_package_id WHERE p.format = ?",
+        )
+        .bind(format.as_str())
+        .bind(format.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(pub_core::package::UpstreamCacheStats {
+            packages: row.get("packages"),
+            versions: row.get("versions"),
+            cached_versions: row.get("cached_versions"),
+            cached_bytes: row.get("cached_bytes"),
+        })
     }
 
     async fn count_cached_with_sha256(&self, sha256: &str) -> Result<u64> {

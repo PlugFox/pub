@@ -10,6 +10,8 @@
 //!   (S-05/S-06);
 //! - [`token`] — CLI/API token format `<prefix>_<base62×30><crc32-base62×6>` (S-13,
 //!   decisions 13/17);
+//! - [`secretbox`] — AES-256-GCM envelope encryption under the boot KEK, shared by the TOTP
+//!   seed (S-05) and the runtime SMTP password (S-26);
 //! - [`ratelimit`] — fixed-window counters over the [`pub_core::traits::Kv`] seam (S-24);
 //! - [`flows`] — the sign-in / MFA / step-up / session / token orchestrations over the core
 //!   traits;
@@ -23,6 +25,7 @@ pub mod oidc;
 pub mod otp;
 pub mod random;
 pub mod ratelimit;
+pub mod secretbox;
 pub mod token;
 pub mod totp;
 

@@ -2,19 +2,93 @@
 //!
 //! Domain services emit events here; the consumers (SSE stream — decision 20, notification
 //! center, outbound webhooks, and any future integration) subscribe behind [`EventSink`].
-//! Only the registry lifecycle events exist in this phase; membership, invitation, and
-//! shadowing events join as their flows land. The enum is `#[non_exhaustive]` so that is
-//! additive.
+//! The enum is `#[non_exhaustive]`, so new events are additive.
 //!
 //! Emission is **fire-and-forget and infallible by contract**: the event bus is a hint
 //! channel (clients reconcile through the REST API), so a broken consumer must never fail a
 //! publish. Durable truth stays in the database and the audit log.
+//!
+//! Every event answers one authorization question — [`DomainEvent::audience`] — and the SSE
+//! fan-out is allowed to consult **nothing else** (S-32). Making the audience part of the
+//! event rather than a lookup table in the stream is what keeps a new variant from defaulting
+//! to "everybody" by omission: adding one without extending the match does not compile.
+
+use std::fmt;
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Format, OrgId, PackageId, VersionId};
+use crate::id::{ulid_canonical, ulid_generate};
+use crate::notification::NotificationCategory;
+use crate::{Error, Format, NotificationId, OrgId, PackageId, UserId, VersionId};
+
+/// ULID identifier of one event on the bus — also its SSE `id:` field and the value a client
+/// replays from with `Last-Event-ID`.
+///
+/// A ULID rather than a per-instance counter: ids are minted wherever the event originates, so
+/// a client that reconnects to a *different* instance still presents something that compares in
+/// time order against that instance's ring buffer (decision 20 cross-instance fan-out).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(String);
+
+impl EventId {
+    /// Mints a fresh time-ordered id.
+    pub fn generate() -> Self {
+        Self(ulid_generate())
+    }
+
+    /// The id as its canonical 26-char uppercase string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for EventId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ulid_canonical(s, "event id").map(Self)
+    }
+}
+
+/// Who is allowed to see an event (S-32).
+///
+/// The fan-out filter is a total function of this value plus the subscriber's identity — there
+/// is no per-variant special case anywhere downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventAudience {
+    /// Members of this org holding at least [`crate::RoleLevel::READ`].
+    Org(OrgId),
+    /// Instance administrators only (`users.is_instance_admin`).
+    Instance,
+    /// Exactly one account — a personal notification.
+    User(UserId),
+}
+
+/// One event as it travels: a domain event plus the id it is replayed by.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    /// Time-ordered id, minted by the instance that emitted the event.
+    pub id: EventId,
+    /// The event itself.
+    pub event: DomainEvent,
+}
+
+impl EventEnvelope {
+    /// Wraps an event with a fresh id.
+    pub fn new(event: DomainEvent) -> Self {
+        Self { id: EventId::generate(), event }
+    }
+}
 
 /// One domain event.
 ///
@@ -63,6 +137,30 @@ pub enum DomainEvent {
         /// Event time (UTC).
         at: DateTime<Utc>,
     },
+    /// A package's mutable options changed — visibility, discontinued/replaced-by, unlisted
+    /// (`package.options`).
+    ///
+    /// Carries the new visibility because that is the one field a consumer must react to
+    /// rather than merely display: flipping a package to private has to remove it from every
+    /// cached public listing a client is holding.
+    PackageOptionsChanged {
+        /// Artifact format.
+        format: Format,
+        /// Owning org.
+        org_id: OrgId,
+        /// The package.
+        package_id: PackageId,
+        /// Package name.
+        name: String,
+        /// Visibility after the change (`public` / `private`).
+        visibility: String,
+        /// Whether the package is now discontinued.
+        discontinued: bool,
+        /// Whether the package is now hidden from discovery.
+        unlisted: bool,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
     /// A version was hard-deleted; the number stays burned (`package.hard_delete`,
     /// decision 06).
     PackageVersionDeleted {
@@ -81,6 +179,73 @@ pub enum DomainEvent {
         /// Whether the archive bytes were removed from the blob store (they survive when
         /// another live version references the same content hash).
         blob_removed: bool,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
+    /// A package changed owning org (`package.transfer`).
+    ///
+    /// Carries both orgs because both audiences care: the losing org's members stop seeing it
+    /// in their listings, and the gaining org's start. [`DomainEvent::org_id`] reports the
+    /// **new** owner — the org the package belongs to from now on.
+    PackageTransferred {
+        /// Artifact format.
+        format: Format,
+        /// The org that gave the package up.
+        from_org_id: OrgId,
+        /// The org that now owns it.
+        to_org_id: OrgId,
+        /// The package.
+        package_id: PackageId,
+        /// Package name.
+        name: String,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
+    /// A membership was created, re-roled, or removed (`org.member`).
+    ///
+    /// `role` is the level the user now holds, or `None` when the membership is gone. Every
+    /// emission of this event is accompanied by a session revocation for `user_id` whenever
+    /// the change withdrew or redefined authority (S-09) — the service layer owns that pairing.
+    OrgMembershipChanged {
+        /// The org.
+        org_id: OrgId,
+        /// The affected member.
+        user_id: UserId,
+        /// New role level, or `None` when the member was removed.
+        role: Option<u8>,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
+    /// An org's profile or upstream policy changed (`org.updated`).
+    OrgUpdated {
+        /// The org.
+        org_id: OrgId,
+        /// Upstream policy after the change.
+        upstream_policy: String,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
+    /// An org was erased, or archived because it still owned packages (`org.deleted`).
+    OrgDeleted {
+        /// The org.
+        org_id: OrgId,
+        /// The org's slug — the only handle a consumer has left once the row is gone.
+        slug: String,
+        /// `true` when the org row survives as an archive (it still owned packages).
+        archived: bool,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
+    /// Runtime instance settings changed (`admin.settings`, decision 09).
+    ///
+    /// Instance-scoped: the audience is admin UIs, which re-read the settings document. The
+    /// event carries the *keys* and the new version, never any value — one of those values is
+    /// a sealed SMTP password (S-26).
+    InstanceSettingsChanged {
+        /// Section keys the write touched.
+        keys: Vec<String>,
+        /// The instance settings version after the write.
+        version: i64,
         /// Event time (UTC).
         at: DateTime<Utc>,
     },
@@ -141,6 +306,30 @@ pub enum DomainEvent {
         /// Event time (UTC).
         at: DateTime<Utc>,
     },
+    /// A notification was filed for one account (`notification.new`, decision 20).
+    ///
+    /// Emitted by the notification center *after* the row is committed, so a client that acts
+    /// on it always finds the notification in `GET /api/v1/notifications`. It is the one
+    /// user-scoped event: it carries no org, because the recipient is the audience.
+    ///
+    /// It deliberately reports no [`DomainEvent::notification_category`] of its own — feeding
+    /// it back into the notification center would be an infinite loop, and the absence is what
+    /// makes that structural rather than a guard somebody can delete.
+    UserNotified {
+        /// The recipient.
+        user_id: UserId,
+        /// The stored notification.
+        notification_id: NotificationId,
+        /// Category of the notification that was filed.
+        category: NotificationCategory,
+        /// One-line summary, already rendered.
+        title: String,
+        /// Unread count for this user **after** the notification was filed, so a badge needs
+        /// no follow-up request.
+        unread: i64,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent {
@@ -154,9 +343,33 @@ impl DomainEvent {
         match self {
             Self::PackagePublished { org_id, .. }
             | Self::PackageRetracted { org_id, .. }
+            | Self::PackageOptionsChanged { org_id, .. }
             | Self::PackageVersionDeleted { org_id, .. }
-            | Self::PackageShadowed { org_id, .. } => Some(*org_id),
-            Self::UpstreamQuarantined { .. } | Self::UpstreamDrifted { .. } => None,
+            | Self::PackageShadowed { org_id, .. }
+            | Self::OrgMembershipChanged { org_id, .. }
+            | Self::OrgUpdated { org_id, .. }
+            | Self::OrgDeleted { org_id, .. } => Some(*org_id),
+            Self::PackageTransferred { to_org_id, .. } => Some(*to_org_id),
+            Self::UpstreamQuarantined { .. }
+            | Self::UpstreamDrifted { .. }
+            | Self::InstanceSettingsChanged { .. }
+            | Self::UserNotified { .. } => None,
+        }
+    }
+
+    /// Who may receive this event (S-32) — the **only** input the SSE fan-out filter takes.
+    ///
+    /// An org-scoped event goes to that org's Read+ members and to nobody else, *including*
+    /// for a public package: the stream is a member's channel over their own organizations,
+    /// and the public read model is the REST API. Widening it would mean a package flipped to
+    /// private mid-stream could still announce its next publish to strangers.
+    pub fn audience(&self) -> EventAudience {
+        match self {
+            Self::UserNotified { user_id, .. } => EventAudience::User(*user_id),
+            other => match other.org_id() {
+                Some(org) => EventAudience::Org(org),
+                None => EventAudience::Instance,
+            },
         }
     }
 
@@ -166,10 +379,17 @@ impl DomainEvent {
         match self {
             Self::PackagePublished { .. } => "package.publish",
             Self::PackageRetracted { .. } => "package.retract",
+            Self::PackageOptionsChanged { .. } => "package.options",
             Self::PackageVersionDeleted { .. } => "package.hard_delete",
+            Self::PackageTransferred { .. } => "package.transfer",
+            Self::OrgMembershipChanged { .. } => "org.member",
+            Self::OrgUpdated { .. } => "org.updated",
+            Self::OrgDeleted { .. } => "org.deleted",
+            Self::InstanceSettingsChanged { .. } => "admin.settings",
             Self::UpstreamQuarantined { .. } => "upstream.quarantine",
             Self::UpstreamDrifted { .. } => "upstream.drift",
             Self::PackageShadowed { .. } => "upstream.shadowing",
+            Self::UserNotified { .. } => "notification.new",
         }
     }
 
@@ -181,15 +401,64 @@ impl DomainEvent {
     /// table in the notification center. `security` is the high-importance tier: a shadowing
     /// alarm and a refused upstream archive are the two things an admin must not be able to
     /// miss by having muted "packages".
-    pub const fn notification_category(&self) -> Option<&'static str> {
+    pub const fn notification_category(&self) -> Option<NotificationCategory> {
         match self {
-            Self::PackagePublished { .. } | Self::PackageRetracted { .. } => Some("package"),
-            Self::PackageVersionDeleted { .. } => Some("security"),
+            Self::PackagePublished { .. } | Self::PackageRetracted { .. } | Self::PackageOptionsChanged { .. } => {
+                Some(NotificationCategory::Package)
+            }
+            Self::PackageVersionDeleted { .. } => Some(NotificationCategory::Security),
+            // A package changing hands moves it between two orgs' inventories — the same
+            // category as any other package-lifecycle change.
+            Self::PackageTransferred { .. } => Some(NotificationCategory::Package),
+            // Membership and org lifecycle: who may do what changed, which is a security
+            // fact for everybody in the org, not a "packages" newsletter item.
+            Self::OrgMembershipChanged { .. } | Self::OrgUpdated { .. } | Self::OrgDeleted { .. } => {
+                Some(NotificationCategory::Org)
+            }
+            // Instance admins only; routed by the absent `org_id()`, like the S-19 alarms.
+            Self::InstanceSettingsChanged { .. } => Some(NotificationCategory::Security),
             // Org admins: their name is the one being shadowed (S-17).
-            Self::PackageShadowed { .. } => Some("security"),
+            Self::PackageShadowed { .. } => Some(NotificationCategory::Security),
             // Instance admins: these carry no org, so the notification center routes them by
             // the absent `org_id()`, not by this category.
-            Self::UpstreamQuarantined { .. } | Self::UpstreamDrifted { .. } => Some("security"),
+            Self::UpstreamQuarantined { .. } | Self::UpstreamDrifted { .. } => Some(NotificationCategory::Security),
+            // The notification center's *own* output. Feeding it back in would loop; the
+            // absence of a category is what makes that impossible rather than merely avoided.
+            Self::UserNotified { .. } => None,
+        }
+    }
+
+    /// A one-line, already-rendered summary for the notification feed and its email.
+    ///
+    /// Lives on the event because the notification center must not have to re-derive facts
+    /// from ids: everything in the sentence is already in the payload, and a lookup here would
+    /// be a database round trip per recipient.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::PackagePublished { name, version, .. } => format!("{name} {version} was published"),
+            Self::PackageRetracted { name, version, retracted, .. } => {
+                let verb = if *retracted { "retracted" } else { "restored" };
+                format!("{name} {version} was {verb}")
+            }
+            Self::PackageOptionsChanged { name, visibility, .. } => format!("{name} is now {visibility}"),
+            Self::PackageVersionDeleted { name, version, .. } => format!("{name} {version} was permanently deleted"),
+            Self::PackageTransferred { name, .. } => format!("{name} changed organization"),
+            Self::OrgMembershipChanged { role: Some(_), .. } => "an organization membership changed".to_owned(),
+            Self::OrgMembershipChanged { role: None, .. } => "an organization membership was removed".to_owned(),
+            Self::OrgUpdated { .. } => "organization settings changed".to_owned(),
+            Self::OrgDeleted { slug, archived, .. } => {
+                let verb = if *archived { "archived" } else { "deleted" };
+                format!("organization {slug} was {verb}")
+            }
+            Self::InstanceSettingsChanged { keys, .. } => format!("instance settings changed: {}", keys.join(", ")),
+            Self::UpstreamQuarantined { name, version, .. } => {
+                format!("upstream archive {name} {version} failed its hash check and was refused")
+            }
+            Self::UpstreamDrifted { name, version, .. } => {
+                format!("upstream changed the hash of {name} {version}; the cached bytes are still served")
+            }
+            Self::PackageShadowed { name, upstream, .. } => format!("{name} is now also published on {upstream}"),
+            Self::UserNotified { title, .. } => title.clone(),
         }
     }
 }
@@ -273,7 +542,46 @@ mod tests {
         };
         assert_eq!(event.org_id(), Some(org));
         assert_eq!(event.name(), "upstream.shadowing");
-        assert_eq!(event.notification_category(), Some("security"));
+        assert_eq!(event.notification_category(), Some(NotificationCategory::Security));
+    }
+
+    #[test]
+    fn a_transfer_is_addressed_to_the_new_owner() {
+        // Both orgs are in the payload, but fan-out has to pick one audience, and the package
+        // belongs to the receiving org from this moment on (S-32).
+        let from = OrgId::new();
+        let to = OrgId::new();
+        let event = DomainEvent::PackageTransferred {
+            format: Format::Pub,
+            from_org_id: from,
+            to_org_id: to,
+            package_id: PackageId::new(),
+            name: "acme_core".to_owned(),
+            at: Utc::now(),
+        };
+        assert_eq!(event.org_id(), Some(to));
+        assert_eq!(event.name(), "package.transfer");
+    }
+
+    #[test]
+    fn settings_changes_are_instance_scoped_and_carry_no_values() {
+        let event = DomainEvent::InstanceSettingsChanged { keys: vec!["smtp".to_owned()], version: 4, at: Utc::now() };
+        assert_eq!(event.org_id(), None);
+        assert_eq!(event.name(), "admin.settings");
+        // One of the values is a sealed SMTP password (S-26) — the event must not be able to
+        // carry any value at all, which is a property of the variant's fields.
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json.as_object().unwrap().keys().count(), 4, "type + keys + version + at only: {json}");
+    }
+
+    #[test]
+    fn membership_removal_reports_no_role() {
+        let org = OrgId::new();
+        let event =
+            DomainEvent::OrgMembershipChanged { org_id: org, user_id: UserId::new(), role: None, at: Utc::now() };
+        assert_eq!(event.org_id(), Some(org));
+        assert_eq!(event.name(), "org.member");
+        assert_eq!(event.notification_category(), Some(NotificationCategory::Org));
     }
 
     #[test]

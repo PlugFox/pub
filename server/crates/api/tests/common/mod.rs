@@ -15,6 +15,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use http_body_util::BodyExt as _;
+use pub_admin::{AdminService, OrgPolicy, OrgService};
 use pub_api::AppState;
 use pub_auth::flows::{AuthPolicy, AuthService};
 use pub_auth::jwt::Keyring;
@@ -22,13 +23,14 @@ use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::OsRandom;
 use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings};
-use pub_core::event::{EventSink, NoopEventSink};
+use pub_core::event::EventSink;
 use pub_core::session::SessionLimits;
+use pub_core::settings::SettingsCache;
 use pub_core::token::{NewToken, TokenScope};
-use pub_core::traits::JobLock;
-use pub_core::traits::{BlobStore, Kv, Mailer, Repositories};
+use pub_core::traits::{BlobStore, JobLock, JobTrigger, Kv, Mailer, NoJobs, Repositories};
 use pub_core::{OrgId, UserId};
 use pub_db_sqlite::SqliteDb;
+use pub_events::{EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationPolicy};
 use pub_jobs::InMemoryJobLock;
 use pub_kv::MemoryKv;
 use pub_mail::InMemoryMailer;
@@ -82,6 +84,11 @@ pub struct TestOptions {
     pub blob: Option<Arc<dyn BlobStore>>,
     /// S-24 failed-token-auth budget per IP per minute.
     pub token_auth_fail_per_ip_minute: u32,
+    /// Emails promoted to instance administrator at registration (decision 09 bootstrap).
+    pub instance_admins: Vec<String>,
+    /// Builds the jobs the admin surface can trigger, over the app's **own** repositories;
+    /// `None` = an instance with none registered.
+    pub jobs: Option<JobFactory>,
     /// S-24 publish-upload budget per org per hour.
     pub publish_per_hour_org: u32,
     /// Decision 07: attach the read-through proxy over a scripted upstream. `false` leaves
@@ -95,6 +102,13 @@ pub struct TestOptions {
     pub upstream_circuit_failure_threshold: u32,
     /// How long the breaker stays open before letting a probe through.
     pub upstream_circuit_open_secs: i64,
+    /// Seconds between SSE heartbeats — the realtime suite drives this down so a revocation
+    /// re-check happens inside a test's patience rather than inside a production interval.
+    pub sse_heartbeat_secs: u64,
+    /// S-32 concurrent-stream cap per account.
+    pub max_sse_connections: u32,
+    /// How many events the replay ring keeps.
+    pub replay_buffer: usize,
 }
 
 impl Default for TestOptions {
@@ -111,15 +125,23 @@ impl Default for TestOptions {
             require_auth_for_read: false,
             blob: None,
             token_auth_fail_per_ip_minute: 30,
+            instance_admins: Vec::new(),
+            jobs: None,
             publish_per_hour_org: 30,
             upstream: false,
             upstream_listing_ttl_secs: 300,
             upstream_max_archive_bytes: 100 * 1024 * 1024,
             upstream_circuit_failure_threshold: 5,
             upstream_circuit_open_secs: 30,
+            sse_heartbeat_secs: 20,
+            max_sse_connections: 5,
+            replay_buffer: 256,
         }
     }
 }
+
+/// Builds the manual-run job set once the app's repositories exist.
+pub type JobFactory = Box<dyn FnOnce(&Repositories) -> Arc<dyn JobTrigger> + Send>;
 
 /// A [`Kv`] that answers every operation with [`Error::Kv`], simulating a Redis outage.
 ///
@@ -176,6 +198,10 @@ pub struct TestApp {
     pub state: AppState,
     /// The scripted upstream, when the scenario enabled the proxy.
     pub upstream: Option<Arc<MockUpstream>>,
+    /// The runtime-settings cache this app serves from (decision 09).
+    pub runtime: Arc<SettingsCache>,
+    /// The domain event bus every service in this app emits into (decision 22).
+    pub events: Arc<EventBus>,
     clock: Arc<Mutex<DateTime<Utc>>>,
 }
 
@@ -186,7 +212,8 @@ impl TestApp {
     }
 
     /// App with scenario-specific policy knobs.
-    pub async fn with_options(options: TestOptions) -> Self {
+    pub async fn with_options(mut options: TestOptions) -> Self {
+        let job_factory = options.jobs.take();
         let mut settings = Settings {
             database: DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned() },
             ..Settings::default()
@@ -202,6 +229,16 @@ impl TestApp {
         db.run_migrations().await.expect("migrate");
         let repos = db.repositories();
 
+        settings.auth.allow_registration = options.allow_registration;
+        settings.auth.allowed_email_domains = options.allowed_email_domains.clone();
+        settings.auth.rate_limit.login_per_ip_minute = options.login_per_ip_minute;
+        settings.auth.rate_limit.token_auth_fail_per_ip_minute = options.token_auth_fail_per_ip_minute;
+        settings.auth.instance_admins = options.instance_admins.clone();
+        settings.upstream.enabled = options.upstream;
+        settings.realtime.heartbeat_secs = options.sse_heartbeat_secs;
+        settings.realtime.max_connections_per_user = options.max_sse_connections;
+        settings.realtime.replay_buffer = options.replay_buffer;
+
         let kv = Arc::new(MemoryKv::new());
         let kv_handle: Arc<dyn Kv> = options.kv.clone().unwrap_or_else(|| Arc::clone(&kv) as Arc<dyn Kv>);
         let mailer = Arc::new(InMemoryMailer::new());
@@ -211,16 +248,15 @@ impl TestApp {
             session_limits: SessionLimits::DEFAULT,
             otp_pepper: TEST_PEPPER.to_vec(),
             token_prefix: "pub_".to_owned(),
-            allow_registration: options.allow_registration,
-            allowed_email_domains: options.allowed_email_domains,
-            otp_per_email_hour: 5,
-            otp_per_ip_hour: 20,
-            login_per_ip_minute: options.login_per_ip_minute,
-            token_auth_fail_per_ip_minute: options.token_auth_fail_per_ip_minute,
+            instance_admins: options.instance_admins.clone(),
             kek: TEST_KEK.to_vec(),
             step_up_window: StdDuration::from_secs(options.step_up_minutes * 60),
             totp_issuer: "Pub".to_owned(),
         };
+        // The runtime cache is seeded from the same boot config the binary uses, then loaded
+        // from the (empty) settings table — exactly the startup sequence of `pubd`.
+        let runtime = Arc::new(SettingsCache::new(settings.runtime_defaults()));
+        runtime.reload(repos.settings.as_ref()).await.expect("load runtime settings");
         let oidc = OidcClient::new(options.oidc_providers, INSTANCE_ORIGIN).expect("oidc client");
         let auth = Arc::new(AuthService::new(
             repos.clone(),
@@ -228,6 +264,7 @@ impl TestApp {
             Arc::clone(&mailer) as Arc<dyn Mailer>,
             keyring,
             policy,
+            Arc::clone(&runtime),
             Arc::new(OsRandom),
             oidc,
         ));
@@ -236,11 +273,17 @@ impl TestApp {
         let clock_handle = Arc::clone(&clock);
         let blob: Arc<dyn BlobStore> =
             options.blob.clone().unwrap_or_else(|| Arc::new(ObjectStoreBlob::memory()) as Arc<dyn BlobStore>);
+
+        // One bus per app, exactly as `pubd` wires it: the notification center is a real
+        // consumer, so the integration suite exercises the same fan-out production runs.
+        let events = build_bus(&settings, &repos, Arc::clone(&kv_handle), Arc::clone(&mailer));
+        let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
+
         let registry = Arc::new(RegistryService::new(
             repos.clone(),
             Arc::clone(&blob),
             Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
-            Arc::new(NoopEventSink) as Arc<dyn EventSink>,
+            Arc::clone(&sink),
             RegistryPolicy::default(),
         ));
         let mock_upstream = options.upstream.then(|| Arc::new(MockUpstream::default()));
@@ -249,7 +292,7 @@ impl TestApp {
                 repos.clone(),
                 Arc::clone(&blob),
                 Arc::clone(mock) as Arc<dyn UpstreamClient>,
-                Arc::new(NoopEventSink) as Arc<dyn EventSink>,
+                Arc::clone(&sink),
                 UpstreamServicePolicy {
                     listing_ttl: Duration::seconds(options.upstream_listing_ttl_secs),
                     max_archive_bytes: options.upstream_max_archive_bytes,
@@ -260,10 +303,45 @@ impl TestApp {
             ))
         });
 
-        let state = AppState::new(settings, repos.clone(), blob, kv_handle, auth, registry)
-            .with_upstream(proxy)
-            .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
-        Self { router: pub_api::router(state.clone()), repos, kv, mailer, state, upstream: mock_upstream, clock }
+        let orgs = Arc::new(OrgService::new(
+            repos.clone(),
+            Arc::clone(&auth),
+            Arc::clone(&registry),
+            Arc::clone(&mailer) as Arc<dyn Mailer>,
+            Arc::clone(&sink),
+            Arc::new(OsRandom),
+            OrgPolicy::default(),
+        ));
+        let admin = Arc::new(AdminService::new(
+            repos.clone(),
+            Arc::clone(&kv_handle),
+            Arc::clone(&runtime),
+            Arc::clone(&auth),
+            Arc::clone(&sink),
+            match job_factory {
+                Some(build) => build(&repos),
+                None => Arc::new(NoJobs) as Arc<dyn JobTrigger>,
+            },
+            Arc::new(OsRandom),
+            TEST_KEK.to_vec(),
+        ));
+
+        let state =
+            AppState::new(settings, Arc::clone(&runtime), repos.clone(), blob, kv_handle, auth, registry, orgs, admin)
+                .with_upstream(proxy)
+                .with_events(Arc::clone(&events))
+                .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
+        Self {
+            router: pub_api::router(state.clone()),
+            repos,
+            kv,
+            mailer,
+            state,
+            upstream: mock_upstream,
+            runtime,
+            events,
+            clock,
+        }
     }
 
     /// The scripted upstream; panics when the scenario did not enable the proxy.
@@ -278,23 +356,28 @@ impl TestApp {
     /// byte-stability conformance test publishes on one instance and downloads from another.
     pub fn restart(&self) -> Self {
         let settings = (*self.state.settings).clone();
+        let runtime = Arc::clone(&self.state.runtime);
         let registry = Arc::new(RegistryService::new(
             self.state.repos.clone(),
             Arc::clone(&self.state.blob),
             Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
-            Arc::new(NoopEventSink) as Arc<dyn EventSink>,
+            Arc::clone(&self.state.events) as Arc<dyn EventSink>,
             RegistryPolicy::default(),
         ));
         let clock_handle = Arc::clone(&self.clock);
         let state = AppState::new(
             settings,
+            Arc::clone(&runtime),
             self.state.repos.clone(),
             Arc::clone(&self.state.blob),
             Arc::clone(&self.state.kv),
             Arc::clone(&self.state.auth),
             registry,
+            Arc::clone(&self.state.orgs),
+            Arc::clone(&self.state.admin),
         )
         .with_upstream(self.state.upstream.clone())
+        .with_events(Arc::clone(&self.state.events))
         .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
         Self {
             router: pub_api::router(state.clone()),
@@ -303,6 +386,8 @@ impl TestApp {
             mailer: Arc::clone(&self.mailer),
             state,
             upstream: self.upstream.clone(),
+            runtime,
+            events: Arc::clone(&self.state.events),
             clock: Arc::clone(&self.clock),
         }
     }
@@ -412,6 +497,22 @@ impl TestApp {
     /// DELETE.
     pub async fn delete(&self, path: &str, bearer: Option<&str>) -> ApiResponse {
         self.send(self.request(Method::DELETE, path, bearer, None, DEFAULT_IP)).await
+    }
+
+    /// Requests an OTP and returns `(pending_id, code)`, where the code is `None` when no mail
+    /// was sent.
+    ///
+    /// A policy-rejected address (blocked domain, closed registration) gets the same response
+    /// shape and the same server-side work, but never a redeemable code (S-04.a) — so "was a
+    /// mail sent" is the observable a test has, and it is exactly the one the design promises.
+    pub async fn request_otp_raw(&self, email: &str) -> (String, Option<String>) {
+        let sent_before = self.mailer.sent().len();
+        let response = self.post("/api/v1/auth/otp/request", None, serde_json::json!({ "email": email })).await;
+        assert_eq!(response.status, StatusCode::OK, "otp request failed: {:?}", response.json);
+        let pending_id = response.json["data"]["pending_id"].as_str().expect("pending_id").to_owned();
+        let sent = self.mailer.sent();
+        let code = (sent.len() > sent_before).then(|| extract_code(&sent.last().expect("mail").text));
+        (pending_id, code)
     }
 
     /// Requests an OTP for `email` and returns `(pending_id, code)` — the code is read from
@@ -592,6 +693,209 @@ impl TestApp {
     pub async fn user_of(&self, email: &str) -> UserId {
         self.repos.users.find_by_email(email).await.expect("lookup").expect("user exists").id
     }
+
+    /// Grants instance-administrator rights straight through the repository.
+    ///
+    /// The bootstrap paths (config list, first account) are covered by their own tests; this
+    /// is the "an admin already exists" precondition every other admin scenario needs.
+    pub async fn make_instance_admin(&self, email: &str) -> UserId {
+        let id = self.user_of(email).await;
+        self.repos.users.set_instance_admin(id, true, self.now()).await.expect("promote");
+        id
+    }
+
+    /// PATCH with a JSON body from the default test IP.
+    pub async fn patch(&self, path: &str, bearer: Option<&str>, body: serde_json::Value) -> ApiResponse {
+        self.send(self.request(Method::PATCH, path, bearer, Some(body), DEFAULT_IP)).await
+    }
+
+    /// DELETE with a JSON body (org deletion and hard delete both carry a confirmation).
+    pub async fn delete_with(&self, path: &str, bearer: Option<&str>, body: serde_json::Value) -> ApiResponse {
+        self.send(self.request(Method::DELETE, path, bearer, Some(body), DEFAULT_IP)).await
+    }
+
+    /// The audit actions recorded so far, newest first — the S-22 assertion helper.
+    pub async fn audit_actions(&self) -> Vec<String> {
+        self.repos
+            .audit
+            .list(&pub_core::audit::AuditFilter::default(), None, 200)
+            .await
+            .expect("audit list")
+            .items
+            .iter()
+            .map(|event| event.action.clone())
+            .collect()
+    }
+
+    /// The newest audit event with this action, if any.
+    pub async fn audit_event(&self, action: &str) -> Option<pub_core::audit::AuditEvent> {
+        self.repos
+            .audit
+            .list(&pub_core::audit::AuditFilter::default(), None, 200)
+            .await
+            .expect("audit list")
+            .items
+            .into_iter()
+            .find(|event| event.action == action)
+    }
+}
+
+/// Builds the app's event bus with its real consumers, mirroring `pubd::build_events`.
+fn build_bus(settings: &Settings, repos: &Repositories, kv: Arc<dyn Kv>, mailer: Arc<InMemoryMailer>) -> Arc<EventBus> {
+    let realtime = settings.realtime;
+    let bus = Arc::new(
+        EventBus::new(EventBusPolicy {
+            replay_buffer: realtime.replay_buffer,
+            max_connections_per_user: realtime.max_connections_per_user,
+        })
+        .with_broker(kv),
+    );
+    bus.add_consumer(Arc::new(NotificationCenter::new(
+        repos.clone(),
+        mailer as Arc<dyn Mailer>,
+        NotificationPolicy {
+            max_recipients: realtime.max_notification_recipients,
+            email_enabled: realtime.notification_email,
+        },
+        settings.branding.name.clone(),
+    )) as Arc<dyn EventConsumer>);
+    bus
+}
+
+/// An open Server-Sent-Events response: the head, plus a body that is still streaming.
+///
+/// `oneshot` normally collects the whole body, which never returns for a stream — so the SSE
+/// suite keeps the `Body` and pulls frames off it one at a time, exactly as a fetch-streaming
+/// browser client does.
+pub struct SseStream {
+    /// Status of the response head.
+    pub status: StatusCode,
+    /// Response headers.
+    pub headers: HeaderMap,
+    body: Option<axum::body::Body>,
+    buffer: String,
+}
+
+/// One parsed SSE frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SseFrame {
+    /// `id:` — the value a client replays from.
+    pub id: Option<String>,
+    /// `event:` — the dot-namespaced type.
+    pub event: Option<String>,
+    /// `data:` lines, joined with newlines.
+    pub data: String,
+    /// `:comment` lines (heartbeats).
+    pub comments: Vec<String>,
+}
+
+impl SseFrame {
+    /// The `data` payload parsed as JSON (`null` when there is none).
+    pub fn json(&self) -> serde_json::Value {
+        if self.data.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&self.data)
+                .unwrap_or_else(|err| panic!("frame data is not JSON ({err}): {}", self.data))
+        }
+    }
+
+    /// Whether this frame is only a keep-alive.
+    pub fn is_heartbeat(&self) -> bool {
+        self.event.is_none() && self.data.is_empty() && !self.comments.is_empty()
+    }
+}
+
+impl SseStream {
+    /// The next frame, or `None` when nothing arrives inside `within` (or the stream ended).
+    pub async fn next_frame(&mut self, within: StdDuration) -> Option<SseFrame> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(frame) = self.take_buffered() {
+                return Some(frame);
+            }
+            let body = self.body.as_mut()?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let frame = match tokio::time::timeout(remaining, http_body_util::BodyExt::frame(body)).await {
+                Err(_elapsed) => return None,
+                Ok(None) => {
+                    self.body = None;
+                    return self.take_buffered();
+                }
+                Ok(Some(Ok(frame))) => frame,
+                Ok(Some(Err(_))) => {
+                    self.body = None;
+                    return self.take_buffered();
+                }
+            };
+            if let Some(chunk) = frame.data_ref() {
+                self.buffer.push_str(&String::from_utf8_lossy(chunk));
+            }
+        }
+    }
+
+    /// The next frame that is not a keep-alive comment.
+    pub async fn next_event(&mut self, within: StdDuration) -> Option<SseFrame> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let frame = self.next_frame(remaining).await?;
+            if !frame.is_heartbeat() {
+                return Some(frame);
+            }
+        }
+    }
+
+    /// Pops one complete `\n\n`-terminated block out of the buffer.
+    fn take_buffered(&mut self) -> Option<SseFrame> {
+        let end = self.buffer.find("\n\n")?;
+        let block: String = self.buffer.drain(..end + 2).collect();
+        let mut frame = SseFrame::default();
+        let mut data_lines: Vec<String> = Vec::new();
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("id:") {
+                frame.id = Some(rest.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix("event:") {
+                frame.event = Some(rest.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix(':') {
+                frame.comments.push(rest.trim().to_owned());
+            }
+        }
+        frame.data = data_lines.join("\n");
+        Some(frame)
+    }
+}
+
+impl TestApp {
+    /// Opens `GET /api/v1/events` and returns the still-streaming response.
+    pub async fn open_stream(&self, bearer: &str, last_event_id: Option<&str>) -> SseStream {
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/events")
+            .header("x-forwarded-for", DEFAULT_IP)
+            .header(header::USER_AGENT, "pub-tests/1.0")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        if let Some(id) = last_event_id {
+            builder = builder.header("last-event-id", id);
+        }
+        let request = builder.body(Body::empty()).expect("build request");
+        let response = self.router.clone().oneshot(request).await.expect("infallible router");
+        let (parts, body) = response.into_parts();
+        SseStream { status: parts.status, headers: parts.headers, body: Some(body), buffer: String::new() }
+    }
+
+    /// Opens the stream expecting the head to fail, and returns the parsed error envelope.
+    pub async fn open_stream_expecting_error(&self, bearer: Option<&str>) -> ApiResponse {
+        self.send(self.request(Method::GET, "/api/v1/events", bearer, None, DEFAULT_IP)).await
+    }
 }
 
 /// A response whose body was not parsed.
@@ -606,9 +910,22 @@ pub struct RawResponse {
 
 /// Builds a `.tar.gz` package archive with a minimal valid pubspec.
 pub fn package_archive(name: &str, version: &str) -> Vec<u8> {
+    package_archive_with(
+        name,
+        version,
+        "description: Conformance fixture.\n",
+        &format!("# {name}\n\nFixture package.\n"),
+    )
+}
+
+/// Builds a `.tar.gz` package archive with extra pubspec YAML and a chosen README.
+///
+/// The read-model suite needs pubspecs with descriptions, topics, and dependencies — they are
+/// what the search index projects — and a README whose rendered HTML it can assert on.
+pub fn package_archive_with(name: &str, version: &str, extra_yaml: &str, readme: &str) -> Vec<u8> {
     use std::io::Write as _;
 
-    let pubspec = format!("name: {name}\nversion: {version}\ndescription: Conformance fixture.\n");
+    let pubspec = format!("name: {name}\nversion: {version}\n{extra_yaml}");
     let mut builder = tar::Builder::new(Vec::new());
     let mut append = |path: &str, content: &str| {
         let mut header = tar::Header::new_gnu();
@@ -618,7 +935,8 @@ pub fn package_archive(name: &str, version: &str) -> Vec<u8> {
         builder.append_data(&mut header, path, content.as_bytes()).expect("append");
     };
     append("pubspec.yaml", &pubspec);
-    append("README.md", &format!("# {name}\n\nFixture package.\n"));
+    append("README.md", readme);
+    append("CHANGELOG.md", &format!("## {version}\n\n- Released.\n"));
     let tar = builder.into_inner().expect("finish tar");
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(&tar).expect("gzip");

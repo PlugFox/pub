@@ -9,16 +9,19 @@ use chrono::{DateTime, TimeZone as _, Utc};
 use pub_core::audit::{AuditActor, AuditFilter, AuditResult, NewAuditEvent};
 use pub_core::authorize::ActorContext;
 use pub_core::credential::CredentialType;
-use pub_core::org::{NewInvitation, NewOrg, UpstreamPolicy};
+use pub_core::notification::{NewNotification, NotificationCategory, NotificationPreference, NotificationPreferences};
+use pub_core::org::{NewInvitation, NewOrg, OrgProfile, UpstreamPolicy};
 use pub_core::package::{
     BaseScope, NewPackage, NewUpstreamVersion, NewVersion, PackageOptions, Publisher, Resolution, UpstreamSnapshot,
     Visibility,
 };
+use pub_core::search::{SearchDocument, SearchHit, SearchSort, SearchView, parse_query};
 use pub_core::session::{NewSession, SessionLimits};
+use pub_core::stats::{DownloadDelta, DownloadTotals};
 use pub_core::token::{NewToken, TokenScope};
 use pub_core::traits::Repositories;
-use pub_core::user::{NewUser, UserStatus};
-use pub_core::{Format, OrgId, RoleLevel, SemVer, UserId};
+use pub_core::user::{NewUser, UserFilter, UserStatus};
+use pub_core::{Format, OrgId, PackageId, RoleLevel, SemVer, UserId};
 
 /// Deterministic base instant for every scenario (no wall clock in tests).
 fn t0() -> DateTime<Utc> {
@@ -44,7 +47,7 @@ async fn seed_user(repos: &Repositories, email: &str, name: &str) -> pub_core::u
 
 /// Creates an org owned by `owner`.
 async fn seed_org(repos: &Repositories, slug: &str, owner: UserId) -> pub_core::org::Org {
-    repos.orgs.create(NewOrg { name: slug.to_uppercase(), slug: slug.to_owned() }, owner, t0()).await.expect("seed org")
+    repos.orgs.create(NewOrg::new(slug.to_uppercase(), slug), owner, t0()).await.expect("seed org")
 }
 
 /// `UserRepo`: create/get/find_by_email/update_status incl. case-insensitive uniqueness and
@@ -99,6 +102,16 @@ pub async fn user_repo(repos: &Repositories) {
         .create(NewUser { email: None, email_verified: false, display_name: "Ghost 2".to_owned() }, t0())
         .await
         .expect("second email-less user must not collide on NULL email");
+
+    // `get_many` is the N+1 killer for listings that show a person per row. Order is
+    // unspecified and unknown ids are simply absent — a deleted account is a gap, not an error.
+    let batch = repos.users.get_many(&[alice.id, bob.id, UserId::new()]).await.expect("batch");
+    let mut ids: Vec<UserId> = batch.iter().map(|user| user.id).collect();
+    ids.sort_unstable();
+    let mut expected = vec![alice.id, bob.id];
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "known ids come back, unknown ones are absent");
+    assert!(repos.users.get_many(&[]).await.expect("empty batch").is_empty());
 
     // Status updates bump updated_at.
     let suspended = repos.users.update_status(bob.id, UserStatus::Suspended, t0() + hours(1)).await.expect("suspend");
@@ -268,11 +281,7 @@ pub async fn org_repo(repos: &Repositories) {
     assert_eq!(repos.orgs.get_by_slug("nope").await.expect("slug unknown"), None);
 
     // Duplicate slug differing only by case conflicts.
-    let err = repos
-        .orgs
-        .create(NewOrg { name: "Acme 2".to_owned(), slug: "AcMe".to_owned() }, alice.id, t0())
-        .await
-        .expect_err("duplicate slug");
+    let err = repos.orgs.create(NewOrg::new("Acme 2", "AcMe"), alice.id, t0()).await.expect_err("duplicate slug");
     assert_eq!(err.code(), "conflict");
 
     // Decision 01: a fresh org inherits the instance's proxy posture, and the policy is a
@@ -1089,6 +1098,48 @@ pub async fn package_repo(repos: &Repositories) {
     let one = repos.packages.list_for_org(org.id, None, 0).await.expect("clamped limit");
     assert_eq!(one.items.len(), 1);
     assert!(one.has_more);
+
+    // `list_all` is the reindex job's work queue: every package on the instance, ordered by
+    // (format, name), keyset-paginated over that pair — and deliberately unfiltered, because a
+    // filtered enumeration would make some package permanently unindexable.
+    repos
+        .packages
+        .create_package(
+            NewPackage {
+                format: Format::Pub,
+                name: "zz_other".to_owned(),
+                org_id: other.id,
+                visibility: Visibility::Private,
+            },
+            t0(),
+        )
+        .await
+        .expect("second package");
+    let all = repos.packages.list_all(None, 100).await.expect("list all");
+    assert_eq!(
+        all.items.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+        vec![
+            "acme_core".to_owned(),
+            "acme_db".to_owned(),
+            "acme_net".to_owned(),
+            "acme_ui".to_owned(),
+            "zz_other".to_owned()
+        ],
+        "ordered by (format, name), across orgs and visibilities"
+    );
+    let mut walked = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = repos.packages.list_all(cursor.as_deref(), 2).await.expect("page");
+        assert_eq!(page.cursor.is_some(), page.has_more);
+        walked.extend(page.items.iter().map(|p| p.name.clone()));
+        if !page.has_more {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(walked, all.items.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), "no skips or duplicates");
+    assert_eq!(repos.packages.list_all(Some("%%%"), 10).await.expect_err("bad cursor").code(), "invalid_argument");
 }
 
 /// `PackageRepo` version ordering: semver precedence (pre-releases included), retraction
@@ -1193,6 +1244,27 @@ pub async fn version_ordering(repos: &Repositories) {
 
     let err = repos.packages.list_versions(package_id, Some("%%%"), 10).await.expect_err("bad cursor");
     assert_eq!(err.code(), "invalid_argument");
+
+    // The web UI's ordering: the exact reverse, paginated the same way. Reversing a page in the
+    // API layer instead would give newest-first *within* a page while paging from the oldest.
+    let mut descending = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = repos.packages.list_versions_desc(package_id, cursor.as_deref(), 5).await.expect("page");
+        assert_eq!(page.cursor.is_some(), page.has_more, "cursor is Some iff has_more");
+        descending.extend(page.items.iter().map(|v| v.version.to_string()));
+        if !page.has_more {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    let mut expected: Vec<&str> = ordered.to_vec();
+    expected.reverse();
+    assert_eq!(descending, expected, "descending pagination must be the exact reverse, gaps included");
+    assert_eq!(
+        repos.packages.list_versions_desc(package_id, Some("%%%"), 10).await.expect_err("bad cursor").code(),
+        "invalid_argument"
+    );
 }
 
 /// `PackageRepo` publish invariants: claim ownership, duplicate rejection, tombstones burning
@@ -1248,6 +1320,11 @@ pub async fn publish_invariants(repos: &Repositories) {
     let err = repos.packages.set_retracted(pub_core::VersionId::new(), true, t0()).await.expect_err("unknown version");
     assert_eq!(err.code(), "not_found");
 
+    // `count_versions` is what keeps the package page off a full version walk: it counts live
+    // rows only, so a tombstone stops being counted the moment it is burned (asserted below).
+    assert_eq!(repos.packages.count_versions(published.package.id).await.expect("count"), 1);
+    assert_eq!(repos.packages.count_versions(PackageId::new()).await.expect("count unknown"), 0);
+
     // Blob reference counting: two versions may share one content hash.
     let shared = published.version.archive_sha256.clone();
     assert_eq!(repos.packages.count_versions_with_sha256(&shared).await.expect("count"), 1);
@@ -1268,6 +1345,7 @@ pub async fn publish_invariants(repos: &Repositories) {
     assert!(listed.items.is_empty());
     // …stops counting as a blob reference…
     assert_eq!(repos.packages.count_versions_with_sha256(&shared).await.expect("count"), 1);
+    assert_eq!(repos.packages.count_versions(published.package.id).await.expect("count"), 0, "tombstones are not live");
     // …but remains findable by exact version, so callers can tell "burned" from "never was".
     let found = repos
         .packages
@@ -1845,4 +1923,909 @@ pub async fn job_repo(repos: &Repositories) {
     let listed: Vec<String> = repos.jobs.list().await.expect("list").into_iter().map(|job| job.name).collect();
     assert_eq!(listed, ["blob-gc", "mirror-sync"]);
     assert_eq!(repos.jobs.finish_run("never-ran", JobOutcome::Success, t0()).await.unwrap_err().code(), "not_found");
+}
+
+// ---------------------------------------------------------------- search & statistics (11)
+
+/// Builds a search document for `package` with deterministic, distinguishable content.
+fn document(package: &pub_core::package::Package, org_slug: &str, latest: &str) -> SearchDocument {
+    SearchDocument {
+        package_id: package.id,
+        format: package.format,
+        name: package.name.clone(),
+        org_id: package.org_id,
+        org_slug: org_slug.to_owned(),
+        visibility: package.visibility,
+        discontinued: package.discontinued,
+        replaced_by: package.replaced_by.clone(),
+        unlisted: package.unlisted,
+        description: String::new(),
+        readme_text: String::new(),
+        topics: Vec::new(),
+        dependencies: Vec::new(),
+        dev_dependencies: Vec::new(),
+        latest_version: latest.to_owned(),
+        latest_version_sort: SemVer::parse(latest).expect("version").sort_key(),
+        latest_retracted: false,
+        versions_count: 1,
+        published_at: t0(),
+        created_at: t0(),
+        updated_at: t0(),
+    }
+}
+
+/// Creates a package and indexes it, returning the document that was written.
+async fn seed_indexed(
+    repos: &Repositories,
+    org: &pub_core::org::Org,
+    name: &str,
+    visibility: Visibility,
+    build: impl FnOnce(&mut SearchDocument),
+) -> SearchDocument {
+    let package = repos
+        .packages
+        .create_package(NewPackage { format: Format::Pub, name: name.to_owned(), org_id: org.id, visibility }, t0())
+        .await
+        .unwrap_or_else(|err| panic!("seed package {name}: {err}"));
+    let mut doc = document(&package, &org.slug, "1.0.0");
+    build(&mut doc);
+    repos.search.index(&doc).await.unwrap_or_else(|err| panic!("index {name}: {err}"));
+    doc
+}
+
+/// The names on a search page, in order.
+fn names(page: &pub_core::Page<SearchHit>) -> Vec<String> {
+    page.items.iter().map(|hit| hit.name.clone()).collect()
+}
+
+/// Runs a query string for a view and returns the matching names in result order.
+async fn run(repos: &Repositories, raw: &str, view: &SearchView) -> Vec<String> {
+    let query = parse_query(raw, SearchSort::Relevance);
+    let page = repos.search.search(&query, view, None, 50).await.unwrap_or_else(|err| panic!("search {raw:?}: {err}"));
+    names(&page)
+}
+
+/// `PackageSearch`: indexing, text relevance, the filter vocabulary, ordering, and cursors.
+pub async fn package_search(repos: &Repositories) {
+    repos.search.ping().await.expect("ping");
+
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let acme = seed_org(repos, "acme", alice.id).await;
+    let other = seed_org(repos, "other", alice.id).await;
+    let anonymous = SearchView::anonymous();
+
+    seed_indexed(repos, &acme, "bloc", Visibility::Public, |doc| {
+        doc.description = "Predictable state management library".to_owned();
+        doc.topics = vec!["state-management".to_owned()];
+        doc.dependencies = vec!["meta".to_owned()];
+        doc.updated_at = t0() + hours(3);
+        doc.published_at = t0() + hours(3);
+    })
+    .await;
+    seed_indexed(repos, &acme, "flutter_bloc", Visibility::Public, |doc| {
+        doc.description = "Flutter widgets for the bloc state management library".to_owned();
+        doc.topics = vec!["state-management".to_owned(), "widgets".to_owned()];
+        doc.dependencies = vec!["bloc".to_owned(), "meta".to_owned()];
+        doc.updated_at = t0() + hours(2);
+        doc.published_at = t0() + hours(2);
+    })
+    .await;
+    seed_indexed(repos, &other, "other_http", Visibility::Public, |doc| {
+        doc.description = "A composable HTTP client".to_owned();
+        doc.readme_text = "Send requests over the network with a tiny bloc of code".to_owned();
+        doc.dev_dependencies = vec!["bloc".to_owned()];
+        doc.discontinued = true;
+        doc.replaced_by = Some("other_http2".to_owned());
+        doc.updated_at = t0() + hours(1);
+        doc.published_at = t0() + hours(1);
+    })
+    .await;
+
+    // --- free text: the exact name wins, and every field is searchable ---
+    let hits = run(repos, "bloc", &anonymous).await;
+    assert_eq!(hits.first().map(String::as_str), Some("bloc"), "an exact name match must rank first: {hits:?}");
+    assert!(hits.contains(&"flutter_bloc".to_owned()), "a description match must be found: {hits:?}");
+    assert!(hits.contains(&"other_http".to_owned()), "a README match must be found: {hits:?}");
+    assert!(run(repos, "composable", &anonymous).await.contains(&"other_http".to_owned()));
+    // Prefix matching: the search box is used while typing.
+    assert!(run(repos, "compos", &anonymous).await.contains(&"other_http".to_owned()));
+    // A phrase is an adjacency constraint, not two words.
+    assert!(run(repos, "\"state management\"", &anonymous).await.contains(&"bloc".to_owned()));
+    assert!(run(repos, "\"management state\"", &anonymous).await.is_empty(), "a phrase must respect word order");
+    // Nothing matches nothing — and does not error.
+    assert!(run(repos, "zzzznotapackage", &anonymous).await.is_empty());
+
+    // --- text that cannot become a term is an empty result, never an error or a full listing ---
+    for junk in ["%%%", "***", "'; DROP TABLE packages; --", "\") OR 1=1 --"] {
+        assert!(run(repos, junk, &anonymous).await.is_empty(), "{junk:?} must match nothing");
+    }
+    // Engine operators inside a term are data.
+    assert!(run(repos, "bloc OR other_http", &anonymous).await.len() <= 1, "OR must not be an operator");
+
+    // --- filters ---
+    let mut listed = run(repos, "org:acme", &anonymous).await;
+    listed.sort();
+    assert_eq!(listed, vec!["bloc".to_owned(), "flutter_bloc".to_owned()]);
+    assert_eq!(run(repos, "org:nosuchorg", &anonymous).await, Vec::<String>::new());
+    assert_eq!(run(repos, "topic:widgets", &anonymous).await, vec!["flutter_bloc".to_owned()]);
+    assert_eq!(run(repos, "is:discontinued", &anonymous).await, vec!["other_http".to_owned()]);
+    let mut live = run(repos, "-is:discontinued", &anonymous).await;
+    live.sort();
+    assert_eq!(live, vec!["bloc".to_owned(), "flutter_bloc".to_owned()], "negation excludes");
+    assert_eq!(run(repos, "format:pub -org:acme", &anonymous).await, vec!["other_http".to_owned()]);
+    // `dependency:` reads both dependency kinds from the stored pubspecs.
+    let mut dependents = run(repos, "dependency:bloc", &anonymous).await;
+    dependents.sort();
+    assert_eq!(dependents, vec!["flutter_bloc".to_owned(), "other_http".to_owned()]);
+    // Two values of one dimension are OR; two dimensions are AND.
+    let mut either = run(repos, "org:acme org:other", &anonymous).await;
+    either.sort();
+    assert_eq!(either.len(), 3);
+    assert_eq!(run(repos, "org:acme topic:widgets", &anonymous).await, vec!["flutter_bloc".to_owned()]);
+    // Text and filters compose.
+    assert_eq!(run(repos, "bloc org:other", &anonymous).await, vec!["other_http".to_owned()]);
+    // An unknown filter is ignored, not searched as text — the whole set comes back.
+    assert_eq!(run(repos, "license:mit", &anonymous).await.len(), 3);
+
+    // --- ordering ---
+    let updated = parse_query("sort:updated", SearchSort::Relevance);
+    assert_eq!(
+        names(&repos.search.search(&updated, &anonymous, None, 50).await.expect("updated")),
+        vec!["bloc".to_owned(), "flutter_bloc".to_owned(), "other_http".to_owned()],
+        "sort:updated is newest first"
+    );
+    let by_name = parse_query("sort:name", SearchSort::Relevance);
+    assert_eq!(
+        names(&repos.search.search(&by_name, &anonymous, None, 50).await.expect("name")),
+        vec!["bloc".to_owned(), "flutter_bloc".to_owned(), "other_http".to_owned()]
+    );
+
+    // --- cursors ---
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = repos.search.search(&by_name, &anonymous, cursor.as_deref(), 1).await.expect("page");
+        assert!(page.items.len() <= 1);
+        assert_eq!(page.cursor.is_some(), page.has_more, "cursor is Some iff has_more");
+        seen.extend(names(&page));
+        if !page.has_more {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(seen, vec!["bloc".to_owned(), "flutter_bloc".to_owned(), "other_http".to_owned()], "no gaps or repeats");
+
+    // A cursor is bound to the ordering that produced it (contract 3).
+    let first = repos.search.search(&by_name, &anonymous, None, 1).await.expect("first");
+    let cursor = first.cursor.expect("cursor");
+    let err = repos.search.search(&updated, &anonymous, Some(&cursor), 1).await.expect_err("wrong ordering");
+    assert_eq!(err.code(), "invalid_argument");
+    for bad in ["%%%", "", "Zm9v"] {
+        assert_eq!(
+            repos.search.search(&by_name, &anonymous, Some(bad), 1).await.expect_err("bad cursor").code(),
+            "invalid_argument",
+            "{bad:?}"
+        );
+    }
+    // Relevance pages too, and its cursor is ordering-bound as well.
+    let text = parse_query("bloc", SearchSort::Relevance);
+    let page = repos.search.search(&text, &anonymous, None, 1).await.expect("relevance page");
+    assert!(page.has_more, "three documents mention bloc");
+    let next = repos.search.search(&text, &anonymous, page.cursor.as_deref(), 5).await.expect("relevance page 2");
+    assert!(!names(&next).contains(&page.items[0].name), "keyset must not repeat the previous page");
+
+    // --- facets and counters agree with the listing ---
+    let facets = repos.search.facets(&parse_query("", SearchSort::Relevance), &anonymous, 10).await.expect("facets");
+    assert_eq!(facets.total, 3);
+    let mut buckets: Vec<(String, i64)> = facets.orgs.iter().map(|f| (f.value.clone(), f.count)).collect();
+    buckets.sort();
+    assert_eq!(buckets, vec![("acme".to_owned(), 2), ("other".to_owned(), 1)]);
+    // Facets respect the same filters as the page they describe.
+    let filtered = repos.search.facets(&parse_query("org:acme", SearchSort::Relevance), &anonymous, 10).await.unwrap();
+    assert_eq!(filtered.total, 2);
+
+    let counters = repos.search.counters(&anonymous).await.expect("counters");
+    assert_eq!(counters.packages, 3);
+    assert_eq!(counters.versions, 3, "one live version per seeded document");
+    assert_eq!(counters.orgs, 2);
+
+    // --- index maintenance ---
+    let package = repos.packages.get_by_name(Format::Pub, "bloc").await.unwrap().unwrap();
+    let mut updated_doc = document(&package, "acme", "2.0.0");
+    updated_doc.description = "Renamed description".to_owned();
+    updated_doc.versions_count = 7;
+    repos.search.index(&updated_doc).await.expect("reindex");
+    let hit = repos
+        .search
+        .search(&parse_query("renamed", SearchSort::Relevance), &anonymous, None, 5)
+        .await
+        .expect("search")
+        .items
+        .pop()
+        .expect("hit");
+    assert_eq!(hit.name, "bloc");
+    assert_eq!(hit.latest_version, "2.0.0");
+    assert_eq!(hit.versions_count, 7);
+    // Re-indexing replaces the old text rather than adding to it.
+    assert!(run(repos, "predictable", &anonymous).await.is_empty(), "the previous description must be gone");
+    assert_eq!(repos.search.counters(&anonymous).await.unwrap().versions, 9);
+
+    // Downloads are written back by the rollup job and are what `sort:downloads` reads.
+    repos.search.set_downloads(package.id, DownloadTotals { total: 500, recent: 42 }).await.expect("set downloads");
+    let popular = parse_query("sort:downloads", SearchSort::Relevance);
+    let page = repos.search.search(&popular, &anonymous, None, 5).await.expect("downloads");
+    assert_eq!(page.items[0].name, "bloc");
+    assert_eq!(page.items[0].downloads_total, 500);
+    assert_eq!(page.items[0].downloads_recent, 42);
+    // An unknown package is a no-op, not an error (the job races a hard delete).
+    repos.search.set_downloads(pub_core::PackageId::new(), DownloadTotals::default()).await.expect("no-op");
+
+    // Removal takes the package out of every surface at once.
+    repos.search.remove(package.id).await.expect("remove");
+    assert!(!run(repos, "sort:name", &anonymous).await.contains(&"bloc".to_owned()));
+    assert_eq!(repos.search.counters(&anonymous).await.unwrap().packages, 2);
+    repos.search.remove(package.id).await.expect("removing twice is not an error");
+}
+
+/// **S-04**: the search index never reveals a package the principal cannot read.
+///
+/// The matrix is the point: three visibility states × four principals, asserted on the listing,
+/// on a text query, on an explicit `is:` filter that tries to ask for the hidden rows, on the
+/// facet counts, and on the instance counters — every surface that could leak a name.
+pub async fn search_visibility(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let acme = seed_org(repos, "acme", alice.id).await;
+    let other = seed_org(repos, "other", bob.id).await;
+
+    seed_indexed(repos, &acme, "acme_public", Visibility::Public, |doc| {
+        doc.description = "shared secretword library".to_owned();
+    })
+    .await;
+    seed_indexed(repos, &acme, "acme_private", Visibility::Private, |doc| {
+        doc.description = "internal secretword library".to_owned();
+    })
+    .await;
+    seed_indexed(repos, &acme, "acme_hidden", Visibility::Public, |doc| {
+        doc.description = "unlisted secretword library".to_owned();
+        doc.unlisted = true;
+    })
+    .await;
+    seed_indexed(repos, &other, "other_private", Visibility::Private, |doc| {
+        doc.description = "foreign secretword library".to_owned();
+    })
+    .await;
+
+    let anonymous = SearchView::anonymous();
+    let member = SearchView::for_actor(&ActorContext::user(alice.id, BTreeMap::from([(acme.id, RoleLevel::READ)])));
+    let outsider = SearchView::for_actor(&ActorContext::user(bob.id, BTreeMap::from([(other.id, RoleLevel::OWNER)])));
+    // A membership below Read is not a membership for this purpose (decision 19 boundary).
+    let too_low = SearchView::for_actor(&ActorContext::user(bob.id, BTreeMap::from([(acme.id, RoleLevel::new(49))])));
+
+    // (view, expected visible names) — everything else must be invisible on every surface.
+    let matrix: [(&str, &SearchView, Vec<&str>); 4] = [
+        ("anonymous", &anonymous, vec!["acme_public"]),
+        ("acme member", &member, vec!["acme_hidden", "acme_private", "acme_public"]),
+        ("other org's owner", &outsider, vec!["acme_public", "other_private"]),
+        ("below Read in acme", &too_low, vec!["acme_public"]),
+    ];
+
+    for (label, view, expected) in &matrix {
+        // 1. The plain listing.
+        let mut listed = run(repos, "sort:name", view).await;
+        listed.sort();
+        assert_eq!(&listed, expected, "listing for {label}");
+
+        // 2. A text query that matches every document — the index must not widen visibility.
+        let mut text = run(repos, "secretword", view).await;
+        text.sort();
+        assert_eq!(&text, expected, "text search for {label}");
+
+        // 3. Asking for the hidden rows explicitly must not produce them.
+        for probe in ["is:private", "is:unlisted", "org:acme is:private", "org:other is:private"] {
+            for name in run(repos, probe, view).await {
+                assert!(expected.contains(&name.as_str()), "{label} saw {name} through {probe:?}");
+            }
+        }
+        // 4. An exact-name query for a package the principal cannot read finds nothing.
+        for hidden in ["acme_private", "other_private", "acme_hidden"] {
+            if !expected.contains(&hidden) {
+                assert!(!run(repos, hidden, view).await.contains(&hidden.to_owned()), "{label} found {hidden} by name");
+            }
+        }
+
+        // 5. Facet totals and counters must agree with the listing, or the count leaks what the
+        // listing hides.
+        let facets = repos.search.facets(&parse_query("", SearchSort::Relevance), view, 10).await.expect("facets");
+        assert_eq!(facets.total as usize, expected.len(), "facet total for {label}");
+        let counted: i64 = facets.orgs.iter().map(|bucket| bucket.count).sum();
+        assert_eq!(counted as usize, expected.len(), "facet buckets for {label}");
+        let counters = repos.search.counters(view).await.expect("counters");
+        assert_eq!(counters.packages as usize, expected.len(), "counters for {label}");
+    }
+
+    // Unlisted is a *discovery* flag, not an access-control one: a member finds their own
+    // unlisted package, and everybody else — including callers who ask for it by name — does
+    // not. (Resolution by name through the pub protocol is unaffected; that is `resolve`.)
+    assert!(run(repos, "is:unlisted", &member).await.contains(&"acme_hidden".to_owned()));
+    assert!(run(repos, "is:unlisted", &anonymous).await.is_empty());
+
+    // Visibility follows the document: reindexing the private package as public opens it, and
+    // no cursor or filter had to change.
+    let package = repos.packages.get_by_name(Format::Pub, "acme_private").await.unwrap().unwrap();
+    let mut doc = document(&package, "acme", "1.0.0");
+    doc.visibility = Visibility::Public;
+    doc.description = "internal secretword library".to_owned();
+    repos.search.index(&doc).await.expect("reindex public");
+    assert!(run(repos, "secretword", &anonymous).await.contains(&"acme_private".to_owned()));
+}
+
+/// `StatsRepo`: additive daily rollups, trailing-window totals, and the job's write-back read.
+pub async fn download_stats(repos: &Repositories) {
+    repos.stats.ping().await.expect("ping");
+
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    let first = repos
+        .packages
+        .create_version(new_version(org.id, "acme_core", "1.0.0", alice.id), t0())
+        .await
+        .expect("publish 1.0.0");
+    let second = repos
+        .packages
+        .create_version(new_version(org.id, "acme_core", "1.1.0", alice.id), t0() + hours(1))
+        .await
+        .expect("publish 1.1.0");
+    let package = first.package.id;
+
+    let day = |offset: i64| (t0() + days(offset)).date_naive();
+    assert_eq!(repos.stats.add_downloads(&[]).await.expect("empty batch"), 0);
+
+    repos
+        .stats
+        .add_downloads(&[
+            DownloadDelta { package_id: package, version_id: first.version.id, date: day(0), count: 3 },
+            DownloadDelta { package_id: package, version_id: second.version.id, date: day(0), count: 2 },
+            DownloadDelta { package_id: package, version_id: first.version.id, date: day(40), count: 10 },
+        ])
+        .await
+        .expect("first flush");
+
+    // The contract that matters: a second flush **adds** rather than replacing, because every
+    // instance in a cluster writes its own counts.
+    repos
+        .stats
+        .add_downloads(&[DownloadDelta { package_id: package, version_id: first.version.id, date: day(0), count: 5 }])
+        .await
+        .expect("second flush");
+
+    let totals = repos.stats.package_totals(package, day(30)).await.expect("totals");
+    assert_eq!(totals.total, 20, "3 + 2 + 10 + 5");
+    assert_eq!(totals.recent, 10, "only the day-40 row is inside a window starting at day 30");
+    // A window that covers everything sees everything; `since` is inclusive.
+    assert_eq!(repos.stats.package_totals(package, day(0)).await.unwrap().recent, 20);
+
+    // Non-positive deltas are ignored rather than corrupting a counter.
+    repos
+        .stats
+        .add_downloads(&[DownloadDelta { package_id: package, version_id: first.version.id, date: day(0), count: 0 }])
+        .await
+        .expect("zero delta");
+    assert_eq!(repos.stats.package_totals(package, day(0)).await.unwrap().total, 20);
+
+    // A package with nothing recorded reports zeroes, not an error.
+    assert_eq!(
+        repos.stats.package_totals(pub_core::PackageId::new(), day(0)).await.expect("unknown"),
+        DownloadTotals::default()
+    );
+
+    // The job's write-back input: bounded, and silent about packages with no downloads.
+    assert!(repos.stats.totals_for(&[], day(0)).await.expect("empty").is_empty());
+    let unknown = pub_core::PackageId::new();
+    let batch = repos.stats.totals_for(&[package, unknown], day(30)).await.expect("totals_for");
+    assert_eq!(batch.len(), 1, "packages with nothing recorded are omitted");
+    assert_eq!(batch[0].package_id, package);
+    assert_eq!(batch[0].totals, DownloadTotals { total: 20, recent: 10 });
+}
+
+// ------------------------------------------------------- management & administration (0008)
+
+/// `UserRepo` administration surface: the instance-admin flag and its atomic bootstrap, the
+/// filtered/keyset user listing, and the dashboard counts.
+pub async fn instance_admins(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let carol = seed_user(repos, "carol@other.com", "Carol").await;
+
+    // A fresh account is never an administrator.
+    assert!(!alice.is_instance_admin);
+
+    // `claim_first_admin` is the empty-instance bootstrap: the *first* caller wins and every
+    // later one is a no-op, because the condition is inside the UPDATE. Two accounts racing on
+    // two instances therefore cannot both become the first administrator.
+    assert!(repos.users.claim_first_admin(alice.id, t0()).await.expect("claim"));
+    assert!(!repos.users.claim_first_admin(bob.id, t0()).await.expect("second claim"));
+    // Idempotent for the holder too — a re-run of the bootstrap must not report a new grant.
+    assert!(!repos.users.claim_first_admin(alice.id, t0()).await.expect("repeat claim"));
+    assert!(repos.users.get(alice.id).await.expect("get").expect("alice").is_instance_admin);
+    assert!(!repos.users.get(bob.id).await.expect("get").expect("bob").is_instance_admin);
+
+    // The explicit setter grants and revokes, and bumps updated_at.
+    let promoted = repos.users.set_instance_admin(bob.id, true, t0() + hours(1)).await.expect("promote");
+    assert!(promoted.is_instance_admin);
+    assert_eq!(promoted.updated_at, t0() + hours(1));
+    let demoted = repos.users.set_instance_admin(bob.id, false, t0() + hours(2)).await.expect("demote");
+    assert!(!demoted.is_instance_admin);
+    let err = repos.users.set_instance_admin(UserId::new(), true, t0()).await.expect_err("unknown user");
+    assert_eq!(err.code(), "not_found");
+
+    // Counts.
+    repos.users.update_status(carol.id, UserStatus::Suspended, t0()).await.expect("suspend");
+    let counts = repos.users.counts().await.expect("counts");
+    assert_eq!(counts.total, 3);
+    assert_eq!(counts.active, 2);
+    assert_eq!(counts.suspended, 1);
+    assert_eq!(counts.deleted, 0);
+    assert_eq!(counts.admins, 1);
+
+    // Listing: newest account first, keyset over the (time-ordered) id.
+    let page = repos.users.list(&UserFilter::default(), None, 2).await.expect("page 1");
+    assert_eq!(page.items.len(), 2);
+    assert!(page.has_more);
+    assert_eq!(page.items[0].id, carol.id, "newest first");
+    let rest = repos.users.list(&UserFilter::default(), page.cursor.as_deref(), 10).await.expect("page 2");
+    assert_eq!(rest.items.iter().map(|u| u.id).collect::<Vec<_>>(), vec![alice.id]);
+    assert!(!rest.has_more);
+    assert_eq!(rest.cursor, None);
+
+    // Filters combine with AND.
+    let admins = repos.users.list(&UserFilter { admins_only: true, ..Default::default() }, None, 10).await.expect("a");
+    assert_eq!(admins.items.iter().map(|u| u.id).collect::<Vec<_>>(), vec![alice.id]);
+    let suspended = repos
+        .users
+        .list(&UserFilter { status: Some(UserStatus::Suspended), ..Default::default() }, None, 10)
+        .await
+        .expect("s");
+    assert_eq!(suspended.items.iter().map(|u| u.id).collect::<Vec<_>>(), vec![carol.id]);
+
+    // Text search matches email or display name, case-insensitively on both backends.
+    let by_email =
+        repos.users.list(&UserFilter { query: Some("OTHER.com".to_owned()), ..Default::default() }, None, 10).await;
+    assert_eq!(by_email.expect("by email").items.len(), 1);
+    let by_name = repos.users.list(&UserFilter { query: Some("ali".to_owned()), ..Default::default() }, None, 10).await;
+    assert_eq!(by_name.expect("by name").items.len(), 1);
+
+    // LIKE metacharacters in the query are data, not wildcards: `%` must match nothing here.
+    let wildcard = repos.users.list(&UserFilter { query: Some("%".to_owned()), ..Default::default() }, None, 10).await;
+    assert!(wildcard.expect("wildcard").items.is_empty(), "a literal % must not match every account");
+
+    // A malformed cursor is a clean invalid_argument, never a reset listing.
+    let err = repos.users.list(&UserFilter::default(), Some("!!!"), 10).await.expect_err("bad cursor");
+    assert_eq!(err.code(), "invalid_argument");
+}
+
+/// `OrgRepo` management surface: profile updates, member listing, the admin org table,
+/// invitation lookups behind the registration gate and the S-24 budget.
+pub async fn org_management(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    seed_org(repos, "zeta", alice.id).await;
+    assert_eq!(repos.orgs.count().await.expect("count"), 2);
+
+    // A new org carries the payload's policy and description rather than a column default.
+    let created = repos
+        .orgs
+        .create(
+            NewOrg {
+                name: "Blocked".to_owned(),
+                slug: "blocked".to_owned(),
+                description: "no upstream".to_owned(),
+                upstream_policy: UpstreamPolicy::Block,
+            },
+            alice.id,
+            t0(),
+        )
+        .await
+        .expect("create with policy");
+    assert_eq!(created.upstream_policy, UpstreamPolicy::Block);
+    assert_eq!(created.description, "no upstream");
+    assert!(!created.is_archived());
+
+    // Profile replace: name, description, policy — and the slug is untouched by construction.
+    let profile = OrgProfile {
+        name: "Acme Inc".to_owned(),
+        description: "The Acme organization".to_owned(),
+        upstream_policy: UpstreamPolicy::Block,
+    };
+    let updated = repos.orgs.update_profile(org.id, &profile, t0() + hours(1)).await.expect("update");
+    assert_eq!(updated.name, "Acme Inc");
+    assert_eq!(updated.description, "The Acme organization");
+    assert_eq!(updated.upstream_policy, UpstreamPolicy::Block);
+    assert_eq!(updated.slug, "acme");
+    assert_eq!(updated.updated_at, t0() + hours(1));
+    let err = repos.orgs.update_profile(OrgId::new(), &profile, t0()).await.expect_err("unknown org");
+    assert_eq!(err.code(), "not_found");
+
+    // Members: highest role first.
+    repos.orgs.add_member(org.id, bob.id, RoleLevel::WRITE, t0()).await.expect("add member");
+    let members = repos.orgs.list_members(org.id).await.expect("members");
+    assert_eq!(members.iter().map(|m| m.role).collect::<Vec<_>>(), vec![RoleLevel::OWNER, RoleLevel::WRITE]);
+    assert_eq!(members[0].user_id, alice.id);
+    assert!(repos.orgs.list_members(OrgId::new()).await.expect("unknown org").is_empty());
+
+    // The admin org table pages over the slug and carries the counts the delete guard uses.
+    let page = repos.orgs.list_all(None, 2).await.expect("orgs page 1");
+    assert_eq!(page.items.iter().map(|row| row.org.slug.as_str()).collect::<Vec<_>>(), vec!["acme", "blocked"]);
+    assert!(page.has_more);
+    assert_eq!(page.items[0].members, 2);
+    assert_eq!(page.items[0].packages, 0);
+    let rest = repos.orgs.list_all(page.cursor.as_deref(), 10).await.expect("orgs page 2");
+    assert_eq!(rest.items.iter().map(|row| row.org.slug.as_str()).collect::<Vec<_>>(), vec!["zeta"]);
+
+    // Invitation lookups: the `invite`-only registration gate and the S-24 per-org budget.
+    assert!(!repos.orgs.has_pending_invitation("bob@corp.com", t0()).await.expect("none yet"));
+    repos
+        .orgs
+        .create_invitation(NewInvitation::new(org.id, "New.Hire@corp.com", alice.id, "inv-1", t0() + days(7)), t0())
+        .await
+        .expect("invite");
+    // Case-insensitive, like every other email lookup.
+    assert!(repos.orgs.has_pending_invitation("new.hire@CORP.com", t0()).await.expect("pending"));
+    // Expiry is a fact about the row, not about when somebody asks.
+    assert!(!repos.orgs.has_pending_invitation("new.hire@corp.com", t0() + days(8)).await.expect("expired"));
+    assert_eq!(repos.orgs.count_invitations_since(org.id, t0() - days(1)).await.expect("count"), 1);
+    assert_eq!(repos.orgs.count_invitations_since(org.id, t0() + hours(1)).await.expect("window"), 0);
+
+    // A revoked invitation stops being redeemable, so it stops opening the registration gate.
+    let pending = repos.orgs.find_invitation_by_token_hash("inv-1").await.expect("find").expect("row");
+    repos.orgs.revoke_invitation(pending.id, t0() + hours(1)).await.expect("revoke");
+    assert!(!repos.orgs.has_pending_invitation("new.hire@corp.com", t0() + hours(2)).await.expect("revoked"));
+}
+
+/// Org deletion and the archive fallback: an org that owns packages cannot be erased, because
+/// decision 06 / S-18 keep its name claims and version rows forever.
+pub async fn org_deletion(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let empty = seed_org(repos, "empty", alice.id).await;
+    let owning = seed_org(repos, "owning", alice.id).await;
+
+    // An org with nothing durable behind it is erased outright, memberships, invitations, and
+    // org-bound tokens with it.
+    repos.orgs.add_member(empty.id, bob.id, RoleLevel::READ, t0()).await.expect("member");
+    repos
+        .orgs
+        .create_invitation(NewInvitation::new(empty.id, "x@corp.com", alice.id, "inv-e", t0() + days(7)), t0())
+        .await
+        .expect("invitation");
+    repos
+        .tokens
+        .create(
+            NewToken {
+                user_id: alice.id,
+                org_id: empty.id,
+                name: "ci".to_owned(),
+                token_hash: "tok-empty".to_owned(),
+                display_hint: "pub_aaaa".to_owned(),
+                scopes: vec![TokenScope::Read],
+                package_patterns: vec![],
+                expires_at: None,
+            },
+            t0(),
+        )
+        .await
+        .expect("token");
+    repos.orgs.delete(empty.id).await.expect("delete empty org");
+    assert_eq!(repos.orgs.get(empty.id).await.expect("gone"), None);
+    assert!(repos.orgs.list_members(empty.id).await.expect("members").is_empty());
+    assert!(repos.orgs.list_invitations(empty.id).await.expect("invitations").is_empty());
+    assert!(repos.tokens.list_for_org(empty.id).await.expect("tokens").is_empty());
+    assert_eq!(repos.orgs.delete(empty.id).await.expect_err("already gone").code(), "not_found");
+
+    // An org that owns a package refuses erasure — before touching anything.
+    repos
+        .packages
+        .create_version(new_version(owning.id, "owning_pkg", "1.0.0", alice.id), t0())
+        .await
+        .expect("publish");
+    let err = repos.orgs.delete(owning.id).await.expect_err("owns packages");
+    assert_eq!(err.code(), "conflict");
+    assert!(repos.orgs.get(owning.id).await.expect("still there").is_some());
+
+    // Archiving is the fallback: authority is stripped, the row and its claims survive.
+    repos.orgs.add_member(owning.id, bob.id, RoleLevel::ADMIN, t0()).await.expect("member");
+    repos
+        .tokens
+        .create(
+            NewToken {
+                user_id: alice.id,
+                org_id: owning.id,
+                name: "ci".to_owned(),
+                token_hash: "tok-owning".to_owned(),
+                display_hint: "pub_bbbb".to_owned(),
+                scopes: vec![TokenScope::Publish],
+                package_patterns: vec![],
+                expires_at: None,
+            },
+            t0(),
+        )
+        .await
+        .expect("token");
+    let archived = repos.orgs.archive(owning.id, t0() + hours(3)).await.expect("archive");
+    assert_eq!(archived.archived_at, Some(t0() + hours(3)));
+    assert!(archived.is_archived());
+    assert!(repos.orgs.list_members(owning.id).await.expect("members").is_empty());
+    assert!(repos.tokens.list_for_org(owning.id).await.expect("tokens").is_empty(), "org tokens are revoked");
+    // The package and its claim are untouched: the number stays burned (S-18).
+    assert!(repos.packages.get_by_name(Format::Pub, "owning_pkg").await.expect("package").is_some());
+    assert!(repos.packages.lookup_claim(Format::Pub, "owning_pkg").await.expect("claim").is_some());
+
+    // Idempotent: re-archiving keeps the first stamp.
+    let again = repos.orgs.archive(owning.id, t0() + days(1)).await.expect("re-archive");
+    assert_eq!(again.archived_at, Some(t0() + hours(3)));
+    assert_eq!(repos.orgs.archive(OrgId::new(), t0()).await.expect_err("unknown").code(), "not_found");
+}
+
+/// Package transfer and the instance statistics the admin dashboard reads.
+pub async fn package_transfer_and_stats(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let from = seed_org(repos, "from", alice.id).await;
+    let to = seed_org(repos, "to", alice.id).await;
+
+    let published = repos
+        .packages
+        .create_version(new_version(from.id, "moving_pkg", "1.0.0", alice.id), t0())
+        .await
+        .expect("publish");
+    repos.packages.create_version(new_version(from.id, "staying_pkg", "1.0.0", alice.id), t0()).await.expect("second");
+    assert_eq!(repos.packages.count_for_org(from.id).await.expect("count"), 2);
+    assert_eq!(repos.packages.count_for_org(to.id).await.expect("count"), 0);
+
+    // The claim moves with the package, in one transaction — otherwise the new owner could not
+    // publish the name they now hold, and an S-17 alarm would page the wrong admins.
+    let moved = repos.packages.transfer(published.package.id, to.id, t0() + hours(1)).await.expect("transfer");
+    assert_eq!(moved.org_id, to.id);
+    assert_eq!(moved.updated_at, t0() + hours(1));
+    let claim = repos.packages.lookup_claim(Format::Pub, "moving_pkg").await.expect("claim").expect("row");
+    assert_eq!(claim.org_id, to.id);
+    assert_eq!(repos.packages.count_for_org(from.id).await.expect("count"), 1);
+    assert_eq!(repos.packages.count_for_org(to.id).await.expect("count"), 1);
+
+    // Transferring to the current owner is a no-op that still answers with the row.
+    let same = repos.packages.transfer(published.package.id, to.id, t0() + hours(2)).await.expect("no-op");
+    assert_eq!(same.org_id, to.id);
+    assert_eq!(same.updated_at, t0() + hours(1), "a no-op must not bump updated_at");
+    let err = repos.packages.transfer(PackageId::new(), to.id, t0()).await.expect_err("unknown package");
+    assert_eq!(err.code(), "not_found");
+
+    // Instance statistics.
+    repos.packages.create_version(new_version(to.id, "moving_pkg", "2.0.0", alice.id), t0()).await.expect("v2");
+    let v1 = repos
+        .packages
+        .get_version(published.package.id, &SemVer::parse("1.0.0").unwrap())
+        .await
+        .expect("get")
+        .expect("row");
+    repos.packages.set_retracted(v1.id, true, t0() + hours(3)).await.expect("retract");
+    let public =
+        PackageOptions { visibility: Visibility::Public, discontinued: false, replaced_by: None, unlisted: false };
+    repos.packages.set_options(published.package.id, &public, t0()).await.expect("publicize");
+
+    let stats = repos.packages.stats().await.expect("stats");
+    assert_eq!(stats.packages, 2);
+    assert_eq!(stats.public_packages, 1);
+    assert_eq!(stats.versions, 3);
+    assert_eq!(stats.retracted_versions, 1);
+    assert_eq!(stats.tombstoned_versions, 0);
+    assert_eq!(stats.archive_bytes, 3 * 1024, "the fixture stores 1 KiB per version");
+
+    // A hard delete moves a version from live to tombstoned and stops counting its bytes.
+    repos.packages.hard_delete_version(v1.id).await.expect("hard delete");
+    let after = repos.packages.stats().await.expect("stats after");
+    assert_eq!(after.versions, 2);
+    assert_eq!(after.retracted_versions, 0, "a tombstone is no longer a live retracted version");
+    assert_eq!(after.tombstoned_versions, 1);
+    assert_eq!(after.archive_bytes, 2 * 1024);
+
+    // The proxy cache reports its own totals; an untouched cache is all zeroes rather than an
+    // error, so a fresh instance's dashboard renders.
+    let empty_cache = repos.upstream.cache_stats(Format::Pub).await.expect("cache stats");
+    assert_eq!(empty_cache, pub_core::package::UpstreamCacheStats::default());
+    repos
+        .upstream
+        .save_snapshot(
+            UpstreamSnapshot {
+                format: Format::Pub,
+                name: "http".to_owned(),
+                upstream: "https://pub.dev".to_owned(),
+                discontinued: false,
+                replaced_by: None,
+                advisories_updated: None,
+                listing: None,
+                versions: vec![
+                    NewUpstreamVersion {
+                        version: SemVer::parse("1.0.0").unwrap(),
+                        pubspec: serde_json::json!({"name": "http"}),
+                        archive_sha256: "a".repeat(64),
+                        archive_size: None,
+                        retracted: false,
+                        published_at: None,
+                    },
+                    NewUpstreamVersion {
+                        version: SemVer::parse("1.1.0").unwrap(),
+                        pubspec: serde_json::json!({"name": "http"}),
+                        archive_sha256: "b".repeat(64),
+                        archive_size: None,
+                        retracted: false,
+                        published_at: None,
+                    },
+                ],
+            },
+            t0(),
+        )
+        .await
+        .expect("snapshot");
+    let snapshot = repos.upstream.get_package(Format::Pub, "http").await.expect("get").expect("row");
+    let cached_version = repos.upstream.list_versions(snapshot.id).await.expect("versions")[0].id;
+    repos.upstream.mark_cached(cached_version, &"a".repeat(64), 2048, t0()).await.expect("mark cached");
+    let cache = repos.upstream.cache_stats(Format::Pub).await.expect("cache stats");
+    assert_eq!(cache.packages, 1);
+    assert_eq!(cache.versions, 2);
+    assert_eq!(cache.cached_versions, 1);
+    assert_eq!(cache.cached_bytes, 2048);
+}
+
+/// `NotificationRepo`: the per-user feed, the unread badge, mark-read semantics, and
+/// per-category preferences (decision 20).
+///
+/// The load-bearing assertion is the scoping one: every method takes a user, and a foreign id
+/// handed to `mark_read` changes nothing and reports nothing — anything else would be an
+/// existence oracle over another account's notification ids.
+pub async fn notifications(repos: &Repositories) {
+    repos.notifications.ping().await.expect("ping");
+
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+
+    let file = async |user: UserId, title: &str, at: DateTime<Utc>| {
+        repos
+            .notifications
+            .create(
+                NewNotification {
+                    user_id: user,
+                    category: NotificationCategory::Package,
+                    event: "package.publish".to_owned(),
+                    title: title.to_owned(),
+                    org_id: Some(org.id),
+                    payload: serde_json::json!({ "type": "package_published", "name": title }),
+                },
+                at,
+            )
+            .await
+            .expect("file notification")
+    };
+
+    let first = file(alice.id, "acme_core 1.0.0", t0()).await;
+    assert_eq!(first.user_id, alice.id);
+    assert_eq!(first.category, NotificationCategory::Package);
+    assert_eq!(first.org_id, Some(org.id));
+    assert_eq!(first.created_at, t0());
+    assert!(first.is_unread());
+    assert_eq!(first.payload["name"], "acme_core 1.0.0", "the payload round-trips verbatim");
+
+    let second = file(alice.id, "acme_core 1.1.0", t0() + hours(1)).await;
+    let foreign = file(bob.id, "acme_core 1.2.0", t0() + hours(2)).await;
+
+    // The feed is newest first and never crosses accounts.
+    let page = repos.notifications.list(alice.id, false, None, 50).await.expect("feed");
+    assert_eq!(
+        page.items.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![second.id, first.id],
+        "newest first, and bob's row is invisible"
+    );
+    assert!(!page.has_more);
+    assert_eq!(repos.notifications.unread_count(alice.id).await.expect("unread"), 2);
+    assert_eq!(repos.notifications.unread_count(bob.id).await.expect("unread"), 1);
+
+    // Keyset pagination walks the whole feed without skips or duplicates.
+    let mut walked = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = repos.notifications.list(alice.id, false, cursor.as_deref(), 1).await.expect("page");
+        assert_eq!(page.cursor.is_some(), page.has_more);
+        walked.extend(page.items.iter().map(|n| n.id));
+        if !page.has_more {
+            break;
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(walked, vec![second.id, first.id]);
+    assert_eq!(
+        repos.notifications.list(alice.id, false, Some("%%%"), 10).await.expect_err("bad cursor").code(),
+        "invalid_argument"
+    );
+
+    // mark_read is scoped, idempotent, and monotonic.
+    let marked =
+        repos.notifications.mark_read(alice.id, &[first.id, foreign.id], t0() + hours(3)).await.expect("mark read");
+    assert_eq!(marked, 1, "bob's notification is not alice's to mark");
+    assert_eq!(repos.notifications.unread_count(bob.id).await.expect("unread"), 1, "and it stayed unread for bob");
+    let again = repos
+        .notifications
+        .mark_read(alice.id, std::slice::from_ref(&first.id), t0() + hours(4))
+        .await
+        .expect("mark again");
+    assert_eq!(again, 0, "re-marking changes nothing");
+    let read_row = repos
+        .notifications
+        .list(alice.id, false, None, 50)
+        .await
+        .expect("feed")
+        .items
+        .into_iter()
+        .find(|n| n.id == first.id)
+        .expect("row");
+    assert_eq!(read_row.read_at, Some(t0() + hours(3)), "the original read instant survives");
+    assert_eq!(repos.notifications.mark_read(alice.id, &[], t0()).await.expect("empty"), 0);
+
+    // unread_only narrows to the unread rows.
+    let unread = repos.notifications.list(alice.id, true, None, 50).await.expect("unread feed");
+    assert_eq!(unread.items.iter().map(|n| n.id).collect::<Vec<_>>(), vec![second.id]);
+
+    // mark_all_read touches only this account's unread rows.
+    assert_eq!(repos.notifications.mark_all_read(alice.id, t0() + hours(5)).await.expect("all"), 1);
+    assert_eq!(repos.notifications.unread_count(alice.id).await.expect("unread"), 0);
+    assert_eq!(repos.notifications.unread_count(bob.id).await.expect("unread"), 1, "bob is untouched");
+    assert_eq!(repos.notifications.mark_all_read(alice.id, t0() + hours(6)).await.expect("all again"), 0);
+
+    // Preferences: nothing stored means nothing returned; the defaults live in core.
+    assert!(repos.notifications.preferences(alice.id).await.expect("prefs").is_empty());
+    let stored = repos
+        .notifications
+        .set_preferences(
+            alice.id,
+            &[
+                NotificationPreference { category: NotificationCategory::Package, in_app: false, email: false },
+                NotificationPreference { category: NotificationCategory::Security, in_app: true, email: false },
+            ],
+            t0() + hours(7),
+        )
+        .await
+        .expect("set prefs");
+    assert_eq!(stored.len(), 2);
+    let effective = NotificationPreferences::from_rows(&stored);
+    assert!(!effective.for_category(NotificationCategory::Package).in_app);
+    assert!(!effective.for_category(NotificationCategory::Security).email);
+    assert!(effective.for_category(NotificationCategory::Org).email, "an untouched category keeps its default");
+
+    // Upsert, not insert: a second write replaces the row rather than conflicting.
+    let updated = repos
+        .notifications
+        .set_preferences(
+            alice.id,
+            &[NotificationPreference { category: NotificationCategory::Package, in_app: true, email: true }],
+            t0() + hours(8),
+        )
+        .await
+        .expect("update prefs");
+    assert_eq!(updated.len(), 2, "the untouched stored row survives");
+    let effective = NotificationPreferences::from_rows(&updated);
+    assert!(effective.for_category(NotificationCategory::Package).email);
+
+    // The batch lookup the fan-out uses returns stored rows only, for the asked category only.
+    let batch = repos
+        .notifications
+        .stored_preferences(&[alice.id, bob.id], NotificationCategory::Package)
+        .await
+        .expect("batch prefs");
+    assert_eq!(batch.len(), 1, "bob stored nothing, so bob is absent and takes the default");
+    assert_eq!(batch[0].0, alice.id);
+    assert!(batch[0].1.email);
+    assert!(repos.notifications.stored_preferences(&[], NotificationCategory::Org).await.expect("empty").is_empty());
+    assert_eq!(
+        repos.notifications.stored_preferences(&[bob.id], NotificationCategory::Org).await.expect("miss").len(),
+        0
+    );
 }

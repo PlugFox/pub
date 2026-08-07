@@ -2,16 +2,22 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pub_core::org::{Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, UpstreamPolicy};
+use pub_core::org::{
+    Invitation, NewInvitation, NewOrg, Org, OrgMember, OrgMembership, OrgOverview, OrgProfile, UpstreamPolicy,
+};
+use pub_core::page::{Page, decode_cursor, encode_cursor};
 use pub_core::traits::OrgRepo;
 use pub_core::{Error, InvitationId, OrgId, Result, RoleLevel, UserId};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row as _, SqlitePool};
+use sqlx::{QueryBuilder, Row as _, Sqlite, SqlitePool};
 
 use super::{db_err, parse_col, parse_ts, parse_ts_opt, q, write_err};
 
+/// Hard cap on page size; requests are clamped into `1..=MAX_PAGE`.
+const MAX_PAGE: u32 = 200;
+
 /// All org columns, in [`OrgRow`] order.
-const ORG_COLS: &str = "id, name, slug, upstream_policy, created_at, updated_at";
+const ORG_COLS: &str = "id, name, slug, description, upstream_policy, archived_at, created_at, updated_at";
 /// All membership columns, in [`MemberRow`] order.
 const MEMBER_COLS: &str = "org_id, user_id, role_level, created_at, updated_at";
 /// All invitation columns, in [`InvitationRow`] order.
@@ -36,7 +42,9 @@ struct OrgRow {
     id: String,
     name: String,
     slug: String,
+    description: String,
     upstream_policy: String,
+    archived_at: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -49,7 +57,9 @@ impl TryFrom<OrgRow> for Org {
             id: parse_col(&row.id)?,
             name: row.name,
             slug: row.slug,
+            description: row.description,
             upstream_policy: parse_col::<UpstreamPolicy>(&row.upstream_policy)?,
+            archived_at: parse_ts_opt(row.archived_at.as_deref())?,
             created_at: parse_ts(&row.created_at)?,
             updated_at: parse_ts(&row.updated_at)?,
         })
@@ -147,14 +157,18 @@ impl OrgRepo for SqliteOrgRepo {
     async fn create(&self, new: NewOrg, creator: UserId, now: DateTime<Utc>) -> Result<Org> {
         let stamp = super::ts(now);
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // `upstream_policy` is left to its column default (`allow`, decision 01): a new org
-        // inherits the instance's proxy posture rather than carrying an opinion from creation.
+        // The upstream policy arrives on the payload (from runtime settings — decision 09)
+        // rather than defaulting in the column: an operator who blocks upstream by policy must
+        // not have to re-block every org somebody creates afterwards.
         let row: OrgRow = sqlx::query_as(q!(
-            "INSERT INTO orgs (id, name, slug, created_at, updated_at) VALUES (?, ?, ?, ?, ?) RETURNING {ORG_COLS}"
+            "INSERT INTO orgs (id, name, slug, description, upstream_policy, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING {ORG_COLS}"
         ))
         .bind(OrgId::new().to_string())
         .bind(&new.name)
         .bind(&new.slug)
+        .bind(&new.description)
+        .bind(new.upstream_policy.as_str())
         .bind(&stamp)
         .bind(&stamp)
         .fetch_one(&mut *tx)
@@ -195,6 +209,134 @@ impl OrgRepo for SqliteOrgRepo {
             .await
             .map_err(db_err)?;
         row.map(TryInto::try_into).transpose()
+    }
+
+    async fn update_profile(&self, id: OrgId, profile: &OrgProfile, now: DateTime<Utc>) -> Result<Org> {
+        let row: Option<OrgRow> =
+            sqlx::query_as(q!("UPDATE orgs SET name = ?, description = ?, upstream_policy = ?, updated_at = ? \
+             WHERE id = ? RETURNING {ORG_COLS}"))
+            .bind(&profile.name)
+            .bind(&profile.description)
+            .bind(profile.upstream_policy.as_str())
+            .bind(super::ts(now))
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?.try_into()
+    }
+
+    async fn list_all(&self, cursor: Option<&str>, limit: u32) -> Result<Page<OrgOverview>> {
+        #[derive(sqlx::FromRow)]
+        struct OverviewRow {
+            #[sqlx(flatten)]
+            org: OrgRow,
+            members: i64,
+            packages: i64,
+        }
+
+        let limit = limit.clamp(1, MAX_PAGE) as i64;
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+            "SELECT {}, \
+             (SELECT COUNT(*) FROM org_members m WHERE m.org_id = o.id) AS members, \
+             (SELECT COUNT(*) FROM packages p WHERE p.org_id = o.id) AS packages \
+             FROM orgs o",
+            ORG_COLS.replace(", ", ", o.").replace("id,", "o.id,")
+        ));
+        if let Some(cursor) = cursor {
+            // The slug is unique instance-wide, so it is a total order on its own.
+            let parts = decode_cursor(cursor, 1)?;
+            query.push(" WHERE o.slug > ").push_bind(parts[0].clone());
+        }
+        query.push(" ORDER BY o.slug LIMIT ").push_bind(limit + 1);
+
+        let rows: Vec<OverviewRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<OrgOverview> = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| Ok(OrgOverview { org: row.org.try_into()?, members: row.members, packages: row.packages }))
+            .collect::<Result<_>>()?;
+        let cursor = has_more.then(|| items.last().map(|row| encode_cursor(&[&row.org.slug]))).flatten();
+        Ok(Page { items, cursor, has_more })
+    }
+
+    async fn count(&self) -> Result<i64> {
+        let row: SqliteRow =
+            sqlx::query("SELECT COUNT(*) AS n FROM orgs").fetch_one(&self.pool).await.map_err(db_err)?;
+        Ok(row.get("n"))
+    }
+
+    async fn delete(&self, id: OrgId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let key = id.to_string();
+        // Refuse before deleting anything: a package row or a name claim outlives its org by
+        // design (decision 06 / S-18), so erasing the org would either fail on the foreign key
+        // halfway through or, worse, un-burn a claimed name.
+        for (table, what) in [("packages", "packages"), ("name_claims", "name claims")] {
+            let row: SqliteRow = sqlx::query(super::q!("SELECT COUNT(*) AS n FROM {table} WHERE org_id = ?"))
+                .bind(&key)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            let count: i64 = row.get("n");
+            if count > 0 {
+                return Err(Error::Conflict {
+                    message: format!("org {id} still owns {count} {what}; archive it instead of deleting it"),
+                });
+            }
+        }
+        for statement in [
+            "DELETE FROM tokens WHERE org_id = ?",
+            "DELETE FROM invitations WHERE org_id = ?",
+            "DELETE FROM org_members WHERE org_id = ?",
+        ] {
+            sqlx::query(super::q!("{statement}")).bind(&key).execute(&mut *tx).await.map_err(db_err)?;
+        }
+        let deleted =
+            sqlx::query("DELETE FROM orgs WHERE id = ?").bind(&key).execute(&mut *tx).await.map_err(db_err)?;
+        if deleted.rows_affected() == 0 {
+            return Err(Error::NotFound { what: format!("org {id}") });
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn archive(&self, id: OrgId, now: DateTime<Utc>) -> Result<Org> {
+        let stamp = super::ts(now);
+        let key = id.to_string();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Idempotent: `archived_at IS NULL` keeps the first stamp on a repeat call.
+        sqlx::query("UPDATE orgs SET archived_at = ?, updated_at = ? WHERE id = ? AND archived_at IS NULL")
+            .bind(&stamp)
+            .bind(&stamp)
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        // Nobody is left holding authority over an archived org: memberships and invitations
+        // go, and org-bound CLI tokens are revoked rather than deleted so the audit trail can
+        // still name the credential that acted (S-22).
+        sqlx::query("UPDATE tokens SET revoked_at = ? WHERE org_id = ? AND revoked_at IS NULL")
+            .bind(&stamp)
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query("DELETE FROM invitations WHERE org_id = ? AND accepted_at IS NULL AND revoked_at IS NULL")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query("DELETE FROM org_members WHERE org_id = ?").bind(&key).execute(&mut *tx).await.map_err(db_err)?;
+
+        let row: Option<OrgRow> = sqlx::query_as(q!("SELECT {ORG_COLS} FROM orgs WHERE id = ?"))
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let row = row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?;
+        tx.commit().await.map_err(db_err)?;
+        row.try_into()
     }
 
     async fn set_upstream_policy(&self, id: OrgId, policy: UpstreamPolicy, now: DateTime<Utc>) -> Result<Org> {
@@ -241,6 +383,17 @@ impl OrgRepo for SqliteOrgRepo {
                 .await
                 .map_err(db_err)?;
         row.map(TryInto::try_into).transpose()
+    }
+
+    async fn list_members(&self, org: OrgId) -> Result<Vec<OrgMember>> {
+        let rows: Vec<MemberRow> = sqlx::query_as(q!(
+            "SELECT {MEMBER_COLS} FROM org_members WHERE org_id = ? ORDER BY role_level DESC, created_at, user_id"
+        ))
+        .bind(org.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn add_member(&self, org: OrgId, user: UserId, role: RoleLevel, now: DateTime<Utc>) -> Result<OrgMember> {
@@ -464,5 +617,29 @@ impl OrgRepo for SqliteOrgRepo {
                 .await
                 .map_err(db_err)?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn has_pending_invitation(&self, email: &str, now: DateTime<Utc>) -> Result<bool> {
+        // The email column carries COLLATE NOCASE, so `=` matches case-insensitively.
+        let row: Option<SqliteRow> = sqlx::query(
+            "SELECT 1 FROM invitations \
+             WHERE email = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ? LIMIT 1",
+        )
+        .bind(email)
+        .bind(super::ts(now))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
+    async fn count_invitations_since(&self, org: OrgId, since: DateTime<Utc>) -> Result<i64> {
+        let row: SqliteRow = sqlx::query("SELECT COUNT(*) AS n FROM invitations WHERE org_id = ? AND created_at >= ?")
+            .bind(org.to_string())
+            .bind(super::ts(since))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("n"))
     }
 }

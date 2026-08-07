@@ -9,8 +9,6 @@
 //! - Recovery codes: 10 single-use codes (`XXXXX-XXXXX`, Crockford-style alphabet without
 //!   look-alikes), argon2id-hashed at rest, shown exactly once at enrollment.
 
-use aes_gcm::aead::{Aead as _, KeyInit as _, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use chrono::{DateTime, Duration, Utc};
@@ -162,35 +160,12 @@ pub fn otpauth_url(issuer: &str, account: &str, secret: &[u8]) -> String {
     )
 }
 
-/// Seals `plaintext` with the 32-byte KEK: AES-256-GCM, fresh CSPRNG nonce, output
-/// `nonce ‖ ciphertext‖tag` (S-05: seed encrypted at rest; S-25: KEK is boot-only).
-pub fn seal(kek: &[u8], rng: &dyn RandomSource, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(kek)
-        .map_err(|_| Error::Config { message: "auth.kek must be exactly 32 bytes".to_owned() })?;
-    let mut nonce = [0u8; 12];
-    rng.fill(&mut nonce);
-    let ciphertext = cipher
-        .encrypt(&Nonce::from(nonce), Payload { msg: plaintext, aad: b"" })
-        .map_err(|_| Error::Internal { message: "totp seed sealing failed".to_owned() })?;
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-/// Opens a [`seal`]ed blob. Tampered or foreign-KEK material fails authentication.
-pub fn open(kek: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(kek)
-        .map_err(|_| Error::Config { message: "auth.kek must be exactly 32 bytes".to_owned() })?;
-    if sealed.len() < 12 {
-        return Err(Error::Internal { message: "sealed totp seed is truncated".to_owned() });
-    }
-    let (nonce, ciphertext) = sealed.split_at(12);
-    let nonce: [u8; 12] = nonce.try_into().expect("split_at(12) yields exactly 12 bytes");
-    cipher
-        .decrypt(&Nonce::from(nonce), Payload { msg: ciphertext, aad: b"" })
-        .map_err(|_| Error::Internal { message: "totp seed unsealing failed (wrong KEK or corrupt data)".to_owned() })
-}
+/// KEK sealing for the TOTP seed at rest (S-05) — the shared AEAD of [`crate::secretbox`].
+///
+/// Re-exported here rather than reimplemented: the settings table seals the runtime SMTP
+/// password with the same construction (S-26), and two copies of an AEAD framing is how two
+/// nonce policies appear.
+pub use crate::secretbox::{open, seal};
 
 /// Generates one `XXXXX-XXXXX` recovery code (50 bits, look-alike-free alphabet).
 pub fn generate_recovery_code(rng: &dyn RandomSource) -> String {

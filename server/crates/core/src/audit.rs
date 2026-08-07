@@ -11,10 +11,8 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::id::{ulid_canonical, ulid_generate};
 use crate::{Error, OrgId, TokenId, UserId};
-
-/// Crockford base32 alphabet (ULID spec): no I, L, O, U.
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// ULID identifier of an audit event: 26 Crockford-base32 chars over 128 bits.
 ///
@@ -27,16 +25,7 @@ pub struct AuditId(String);
 impl AuditId {
     /// Mints a fresh time-ordered id (UUID v7 bits, ULID encoding).
     pub fn generate() -> Self {
-        let n = u128::from_be_bytes(*uuid::Uuid::now_v7().as_bytes());
-        let mut out = [0u8; 26];
-        let mut rest = n;
-        for slot in out.iter_mut().rev() {
-            *slot = CROCKFORD[(rest & 0x1F) as usize];
-            rest >>= 5;
-        }
-        // 26 chars hold 130 bits; the top 2 bits of a 128-bit value are always zero, so the
-        // loop above consumed everything.
-        Self(String::from_utf8(out.to_vec()).expect("Crockford alphabet is ASCII"))
+        Self(ulid_generate())
     }
 
     /// The id as its canonical 26-char uppercase string.
@@ -57,21 +46,7 @@ impl FromStr for AuditId {
     /// Parses and canonicalizes (uppercases) a ULID string; rejects wrong length, characters
     /// outside the Crockford alphabet, and values that overflow 128 bits.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let invalid = || Error::Invalid { message: format!("invalid ULID: {s}") };
-        if s.len() != 26 {
-            return Err(invalid());
-        }
-        let canonical: String = s.to_ascii_uppercase();
-        let mut n: u128 = 0;
-        for byte in canonical.bytes() {
-            let value = CROCKFORD.iter().position(|&c| c == byte).ok_or_else(invalid)? as u128;
-            if n >> 123 != 0 {
-                // The next shift would push significant bits past 128.
-                return Err(invalid());
-            }
-            n = (n << 5) | value;
-        }
-        Ok(Self(canonical))
+        ulid_canonical(s, "ULID").map(Self)
     }
 }
 
@@ -225,7 +200,9 @@ mod tests {
         let a = AuditId::generate();
         let b = AuditId::generate();
         assert_eq!(a.as_str().len(), 26);
-        assert!(a.as_str().bytes().all(|c| CROCKFORD.contains(&c)));
+        // Crockford base32: uppercase alphanumerics minus I, L, O, U.
+        assert!(a.as_str().bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
+        assert!(!a.as_str().bytes().any(|c| matches!(c, b'I' | b'L' | b'O' | b'U')));
         assert_ne!(a, b);
         // UUID v7 ms-timestamp prefix: later ids never sort before earlier ones.
         assert!(a <= b);

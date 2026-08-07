@@ -275,6 +275,31 @@ impl PackageRepo for SqlitePackageRepo {
         Ok(Page { items, cursor, has_more })
     }
 
+    async fn list_all(&self, cursor: Option<&str>, limit: u32) -> Result<Page<Package>> {
+        let limit = limit.clamp(1, MAX_PAGE) as i64;
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!("SELECT {PKG_COLS} FROM packages"));
+        if let Some(cursor) = cursor {
+            // `(format, name)` is unique instance-wide, so it is a total order on its own — no
+            // id tiebreaker is needed or wanted here.
+            let parts = decode_cursor(cursor, 2)?;
+            query.push(" WHERE (format > ").push_bind(parts[0].clone());
+            query.push(" OR (format = ").push_bind(parts[0].clone());
+            query.push(" AND name > ").push_bind(parts[1].clone()).push("))");
+        }
+        query.push(" ORDER BY format, name LIMIT ").push_bind(limit + 1);
+
+        let rows: Vec<PackageRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<Package> =
+            rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
+        let cursor = if has_more {
+            items.last().map(|package| encode_cursor(&[package.format.as_str(), &package.name]))
+        } else {
+            None
+        };
+        Ok(Page { items, cursor, has_more })
+    }
+
     async fn set_options(&self, id: PackageId, options: &PackageOptions, now: DateTime<Utc>) -> Result<Package> {
         let row: Option<PackageRow> = sqlx::query_as(q!(
             "UPDATE packages SET visibility = ?, discontinued = ?, replaced_by = ?, unlisted = ?, updated_at = ? \
@@ -407,6 +432,31 @@ impl PackageRepo for SqlitePackageRepo {
         Ok(Page { items, cursor, has_more })
     }
 
+    async fn list_versions_desc(&self, package: PackageId, cursor: Option<&str>, limit: u32) -> Result<Page<Version>> {
+        let limit = limit.clamp(1, MAX_PAGE) as i64;
+        let mut query: QueryBuilder<Sqlite> =
+            QueryBuilder::new(format!("SELECT {VER_COLS} FROM versions WHERE tombstone = 0 AND package_id = "));
+        query.push_bind(package.to_string());
+        if let Some(cursor) = cursor {
+            let parts = decode_cursor(cursor, 2)?;
+            query.push(" AND (version_sort < ").push_bind(parts[0].clone());
+            query.push(" OR (version_sort = ").push_bind(parts[0].clone());
+            query.push(" AND id < ").push_bind(parts[1].clone()).push("))");
+        }
+        query.push(" ORDER BY version_sort DESC, id DESC LIMIT ").push_bind(limit + 1);
+
+        let rows: Vec<VersionRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<Version> =
+            rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
+        let cursor = if has_more {
+            items.last().map(|version| encode_cursor(&[&version.version.sort_key(), &version.id.to_string()]))
+        } else {
+            None
+        };
+        Ok(Page { items, cursor, has_more })
+    }
+
     async fn set_retracted(&self, id: VersionId, retracted: bool, now: DateTime<Utc>) -> Result<Version> {
         // COALESCE keeps the original retraction instant when re-retracting (idempotent).
         let row: Option<VersionRow> = sqlx::query_as(q!(
@@ -442,6 +492,15 @@ impl PackageRepo for SqlitePackageRepo {
         }
     }
 
+    async fn count_versions(&self, package: PackageId) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM versions WHERE package_id = ? AND tombstone = 0")
+            .bind(package.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(count)
+    }
+
     async fn count_versions_with_sha256(&self, sha256: &str) -> Result<u64> {
         let row: SqliteRow =
             sqlx::query("SELECT COUNT(*) AS n FROM versions WHERE archive_sha256 = ? AND tombstone = 0")
@@ -451,6 +510,74 @@ impl PackageRepo for SqlitePackageRepo {
                 .map_err(db_err)?;
         let count: i64 = row.get("n");
         Ok(count.max(0) as u64)
+    }
+
+    async fn transfer(&self, id: PackageId, to_org: OrgId, now: DateTime<Utc>) -> Result<Package> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let current: Option<PackageRow> = sqlx::query_as(q!("SELECT {PKG_COLS} FROM packages WHERE id = ?"))
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let current: Package = current.ok_or_else(|| Error::NotFound { what: format!("package {id}") })?.try_into()?;
+        if current.org_id == to_org {
+            return Ok(current);
+        }
+        let stamp = super::ts(now);
+        let row: PackageRow =
+            sqlx::query_as(q!("UPDATE packages SET org_id = ?, updated_at = ? WHERE id = ? RETURNING {PKG_COLS}"))
+                .bind(to_org.to_string())
+                .bind(&stamp)
+                .bind(id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|err| write_err(err, "package already exists in the target org", "target org"))?;
+        // The claim moves with the package, in the same transaction: a claim pointing at the
+        // old owner would stop the new one publishing the name they now hold, and would page
+        // the wrong admins on a shadowing alarm (S-17).
+        sqlx::query("UPDATE name_claims SET org_id = ? WHERE format = ? AND name = ?")
+            .bind(to_org.to_string())
+            .bind(current.format.as_str())
+            .bind(&current.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| write_err(err, "name claim conflict", "target org"))?;
+        tx.commit().await.map_err(db_err)?;
+        row.try_into()
+    }
+
+    async fn count_for_org(&self, org: OrgId) -> Result<i64> {
+        let row: SqliteRow = sqlx::query("SELECT COUNT(*) AS n FROM packages WHERE org_id = ?")
+            .bind(org.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("n"))
+    }
+
+    async fn stats(&self) -> Result<pub_core::package::RegistryStats> {
+        let packages: SqliteRow =
+            sqlx::query("SELECT COUNT(*) AS total, COALESCE(SUM(visibility = 'public'), 0) AS public FROM packages")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
+        let versions: SqliteRow = sqlx::query(
+            "SELECT COALESCE(SUM(tombstone = 0), 0) AS live, \
+             COALESCE(SUM(tombstone = 0 AND retracted_at IS NOT NULL), 0) AS retracted, \
+             COALESCE(SUM(tombstone = 1), 0) AS tombstoned, \
+             COALESCE(SUM(CASE WHEN tombstone = 0 THEN archive_size ELSE 0 END), 0) AS bytes FROM versions",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(pub_core::package::RegistryStats {
+            packages: packages.get("total"),
+            public_packages: packages.get("public"),
+            versions: versions.get("live"),
+            retracted_versions: versions.get("retracted"),
+            tombstoned_versions: versions.get("tombstoned"),
+            archive_bytes: versions.get("bytes"),
+        })
     }
 
     async fn claim_name(&self, format: Format, name: &str, org: OrgId, now: DateTime<Utc>) -> Result<NameClaim> {

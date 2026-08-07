@@ -129,6 +129,69 @@ pub struct Settings {
     pub upstream: UpstreamConfig,
     /// Background jobs (decision 03 leader-locked scheduler).
     pub jobs: JobsConfig,
+    /// White-label instance identity shown on the landing dashboard (decision 17).
+    pub branding: BrandingConfig,
+    /// The SSE stream and the notification center (decision 20).
+    pub realtime: RealtimeConfig,
+}
+
+/// Realtime settings: the SSE stream's budgets and the notification center's fan-out bound
+/// ([decision 20](../../../docs/decisions.md#20), [S-32](../../../docs/security.md#7-platform)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RealtimeConfig {
+    /// Seconds between stream heartbeats.
+    ///
+    /// The heartbeat is not only a keep-alive: it is where the stream re-checks session
+    /// revocation and the instance-admin flag, so this number *is* the S-32 bound on how long a
+    /// revoked session keeps receiving events. It must stay well below the access-token TTL,
+    /// which the validator enforces.
+    pub heartbeat_secs: u64,
+    /// Concurrent streams one account may hold on one instance (S-32 per-user cap).
+    pub max_connections_per_user: u32,
+    /// How many recent events the per-instance replay ring keeps for `Last-Event-ID`.
+    pub replay_buffer: usize,
+    /// Largest audience one event's notification fan-out may reach.
+    pub max_notification_recipients: usize,
+    /// Whether high-importance notification categories are emailed.
+    pub notification_email: bool,
+}
+
+impl Default for RealtimeConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_secs: 20,
+            max_connections_per_user: 5,
+            replay_buffer: 256,
+            max_notification_recipients: 200,
+            notification_email: true,
+        }
+    }
+}
+
+/// Instance identity — the white-label half of [decision 17](../../../docs/decisions.md#17).
+///
+/// Boot config for now, exactly like `registry.require_auth_for_read`: decision 09 files
+/// branding under *runtime* settings, and it moves into the `settings` table when the
+/// `ArcSwap` settings cache lands. Its semantics do not depend on where it is read from, and
+/// `GET /api/v1/home` is the only consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrandingConfig {
+    /// Instance name shown in the UI (decision 17 default: "Pub").
+    pub name: String,
+    /// One-line description under the name; empty = the UI shows none.
+    pub tagline: String,
+    /// Absolute URL of the instance logo; empty = the UI shows its own mark.
+    pub logo_url: String,
+    /// Accent colour as a CSS colour string; empty = the theme default.
+    pub primary_color: String,
+}
+
+impl Default for BrandingConfig {
+    fn default() -> Self {
+        Self { name: "Pub".to_owned(), tagline: String::new(), logo_url: String::new(), primary_color: String::new() }
+    }
 }
 
 /// Deployment mode: gates the dev-only secret fallbacks (S-25).
@@ -172,9 +235,24 @@ pub struct AuthConfig {
     /// CLI token prefix incl. the trailing underscore (decision 17 default: `pub_`).
     pub token_prefix: String,
     /// Whether a successful first OTP login may create an account.
+    ///
+    /// The **default** of the runtime `registration.mode` setting (decision 09): `true` seeds
+    /// `open`, `false` seeds `closed`. Once an administrator writes the setting, the stored
+    /// value wins and this field only matters again on an instance whose settings row was
+    /// never written.
     pub allow_registration: bool,
     /// Sign-in email-domain allowlist; empty = every domain allowed (S-31).
+    ///
+    /// Like `allow_registration`, the **default** of the runtime setting of the same name.
     pub allowed_email_domains: Vec<String>,
+    /// Email addresses granted instance-administrator rights (decision 09 bootstrap).
+    ///
+    /// Boot-only on purpose: the administration surface is what grants and revokes every other
+    /// runtime setting, so a list stored in the settings table would let one compromised admin
+    /// session make itself permanent. Leaving it empty is normal — the other bootstrap path is
+    /// "the first account created on an instance that has no administrator yet", which needs
+    /// no configuration at all.
+    pub instance_admins: Vec<String>,
     /// Step-up ("sudo mode") freshness window in minutes (S-06; default 15).
     pub step_up_minutes: u64,
     /// Ed25519 signing/verify keyring (S-07/S-27).
@@ -197,6 +275,7 @@ impl Default for AuthConfig {
             token_prefix: "pub_".to_owned(),
             allow_registration: true,
             allowed_email_domains: Vec::new(),
+            instance_admins: Vec::new(),
             step_up_minutes: 15,
             jwt: JwtConfig::default(),
             rate_limit: AuthRateLimitConfig::default(),
@@ -733,6 +812,59 @@ impl Default for MirrorConfig {
 pub struct JobsConfig {
     /// Unreferenced-blob garbage collection.
     pub blob_gc: BlobGcConfig,
+    /// Search-index rebuild (decision 11).
+    pub reindex: ReindexConfig,
+    /// Download-statistics rollup.
+    pub downloads: DownloadsConfig,
+}
+
+/// Search-index rebuild settings (decision 11).
+///
+/// Off by default because the index is maintained incrementally by the publish path: a sweep
+/// is the *repair* tool (a failed incremental write, a scoring change, migration 0007 landing
+/// on an instance that already has packages), not the normal way documents get written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReindexConfig {
+    /// Whether the job is scheduled at all.
+    pub enabled: bool,
+    /// Seconds between chunks.
+    pub interval_secs: u64,
+    /// Packages rebuilt per tick — the tick's cost bound and how long it holds the job lock.
+    pub chunk: u32,
+    /// Seconds after a completed sweep before the next one starts.
+    pub resweep_after_secs: u64,
+}
+
+impl Default for ReindexConfig {
+    fn default() -> Self {
+        Self { enabled: false, interval_secs: 300, chunk: 200, resweep_after_secs: 24 * 3600 }
+    }
+}
+
+/// Download-statistics rollup settings.
+///
+/// **On** by default, unlike every other job here: counting a download writes to an in-process
+/// buffer, and this job is the only thing that ever moves it into the database. Disabling it
+/// does not mean "no statistics", it means a buffer that fills up and starts dropping counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadsConfig {
+    /// Whether the job is scheduled at all.
+    pub enabled: bool,
+    /// Seconds between flushes — also the window a crash can lose.
+    pub interval_secs: u64,
+    /// Days behind the "recent downloads" figure shown on package cards.
+    pub recent_window_days: i64,
+    /// Distinct `(package, version, day)` buckets held between flushes; past this, counts for
+    /// *new* buckets are dropped rather than growing the buffer without bound.
+    pub buffer_capacity: usize,
+}
+
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        Self { enabled: true, interval_secs: 60, recent_window_days: 30, buffer_capacity: 50_000 }
+    }
 }
 
 /// Unreferenced-blob GC settings.
@@ -907,6 +1039,54 @@ pub fn load_from(cli: &CliArgs, env_override: Option<config::Map<String, String>
 }
 
 impl Settings {
+    /// Projects the boot configuration onto the **defaults** of the runtime-settings document
+    /// (decision 09).
+    ///
+    /// This is the seam between the two configuration planes: everything an administrator can
+    /// change at runtime still needs a value on an instance whose `settings` table has never
+    /// been written, and that value is the operator's boot config. Once a section is written
+    /// the stored one wins; a section that is cleared falls back here again.
+    ///
+    /// Secrets are **not** projected: the SMTP password is boot config *or* a runtime setting,
+    /// and mixing the two would make "which one is live" unanswerable. Whatever
+    /// `[smtp].password` holds keeps configuring the boot-time mailer; the runtime field is
+    /// what a future mailer rebuild will read (S-25/S-26).
+    pub fn runtime_defaults(&self) -> pub_core::settings::RuntimeSettings {
+        use pub_core::settings::{
+            BrandingSettings, RateLimitSettings, RegistrationMode, RegistrationSettings, RuntimeSettings, SmtpSettings,
+            UpstreamSettings,
+        };
+
+        RuntimeSettings {
+            registration: RegistrationSettings {
+                mode: if self.auth.allow_registration { RegistrationMode::Open } else { RegistrationMode::Closed },
+                allowed_email_domains: self.auth.allowed_email_domains.iter().map(|d| d.to_ascii_lowercase()).collect(),
+            },
+            rate_limits: RateLimitSettings {
+                otp_per_email_hour: self.auth.rate_limit.otp_per_email_hour,
+                otp_per_ip_hour: self.auth.rate_limit.otp_per_ip_hour,
+                login_per_ip_minute: self.auth.rate_limit.login_per_ip_minute,
+                token_auth_fail_per_ip_minute: self.auth.rate_limit.token_auth_fail_per_ip_minute,
+                publish_per_hour_org: self.registry.rate_limit.publish_per_hour_org,
+            },
+            smtp: SmtpSettings {
+                host: self.smtp.host.clone(),
+                port: self.smtp.port,
+                username: self.smtp.username.clone(),
+                from: self.smtp.from.clone(),
+                security: self.smtp.security.as_str().to_owned(),
+                password_sealed: None,
+            },
+            branding: BrandingSettings {
+                name: self.branding.name.clone(),
+                tagline: self.branding.tagline.clone(),
+                logo_url: self.branding.logo_url.clone(),
+                primary_color: self.branding.primary_color.clone(),
+            },
+            upstream: UpstreamSettings { enabled: self.upstream.enabled, default_org_policy: Default::default() },
+        }
+    }
+
     /// Multi-line effective-config summary for startup logs, with secrets masked.
     pub fn summary(&self) -> String {
         let mut out = String::from("effective configuration:\n");
@@ -956,8 +1136,29 @@ impl Settings {
         );
         let _ = writeln!(out, "  registry.unretract   = {} d", self.registry.unretract_window_days);
         let _ = writeln!(out, "  registry.auth_read   = {}", self.registry.require_auth_for_read);
+        let _ = writeln!(out, "  branding.name        = {}", self.branding.name);
+        let _ = writeln!(
+            out,
+            "  jobs.reindex         = {} (every {}s, chunk {})",
+            self.jobs.reindex.enabled, self.jobs.reindex.interval_secs, self.jobs.reindex.chunk
+        );
+        let _ = writeln!(
+            out,
+            "  jobs.downloads       = {} (every {}s, recent {}d)",
+            self.jobs.downloads.enabled, self.jobs.downloads.interval_secs, self.jobs.downloads.recent_window_days
+        );
         let _ =
             writeln!(out, "  registry.rate_limit  = publish {}/h/org", self.registry.rate_limit.publish_per_hour_org);
+        let _ = writeln!(
+            out,
+            "  realtime.sse         = heartbeat {}s, {} streams/user, replay {}",
+            self.realtime.heartbeat_secs, self.realtime.max_connections_per_user, self.realtime.replay_buffer
+        );
+        let _ = writeln!(
+            out,
+            "  realtime.notify      = ≤{} recipients/event, email {}",
+            self.realtime.max_notification_recipients, self.realtime.notification_email
+        );
 
         if self.upstream.enabled {
             let _ = writeln!(out, "  upstream.base_url    = {}", self.upstream.base_url);
@@ -1040,6 +1241,12 @@ impl Settings {
             self.auth.allowed_email_domains.join(", ")
         };
         let _ = writeln!(out, "  auth.email_domains   = {domains}");
+        let admins = if self.auth.instance_admins.is_empty() {
+            "<none configured — the first account bootstraps>".to_owned()
+        } else {
+            self.auth.instance_admins.join(", ")
+        };
+        let _ = writeln!(out, "  auth.instance_admins = {admins}");
         let _ = writeln!(out, "  auth.jwt.kid         = {}", opt(&self.auth.jwt.kid));
         let _ = writeln!(out, "  auth.jwt.signing_key = {}", mask_opt(&self.auth.jwt.signing_key));
         let verify_kids: Vec<&str> = self.auth.jwt.verify_keys.iter().map(|k| k.kid.as_str()).collect();
