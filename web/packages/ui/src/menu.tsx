@@ -59,6 +59,50 @@ export function MenuItem(props: MenuItemProps): JSX.Element {
   );
 }
 
+/**
+ * Single-choice group inside a menu (theme picker, sort order). Kobalte wires
+ * `role="menuitemradio"` + `aria-checked`; the checked item shows a check
+ * glyph in a fixed-width slot so labels stay aligned either way. Selecting an
+ * item closes the menu (Kobalte default), which is right for a picker.
+ */
+export const MenuRadioGroup = MenuPrimitive.RadioGroup;
+
+export type MenuRadioItemProps = JSX.HTMLAttributes<HTMLDivElement> & {
+  readonly value: string;
+  readonly onSelect?: () => void;
+  readonly disabled?: boolean;
+};
+
+export function MenuRadioItem(props: MenuRadioItemProps): JSX.Element {
+  const [local, rest] = splitProps(props, ["class", "children"]);
+  return (
+    <MenuPrimitive.RadioItem
+      {...rest}
+      class={cn(
+        "flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-sm outline-none",
+        "transition-colors select-none highlighted:bg-accent-soft highlighted:text-accent",
+        "aria-disabled:pointer-events-none aria-disabled:opacity-50",
+        local.class,
+      )}
+    >
+      <span class="flex w-4 shrink-0 justify-center" aria-hidden="true">
+        <MenuPrimitive.ItemIndicator>
+          <svg aria-hidden="true" viewBox="0 0 16 16" class="size-3.5" fill="none">
+            <path
+              d="M3 8.5l3.5 3.5L13 5"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </MenuPrimitive.ItemIndicator>
+      </span>
+      {local.children}
+    </MenuPrimitive.RadioItem>
+  );
+}
+
 /** Non-interactive group heading inside a menu (Kobalte renders a `<span>`). */
 export function MenuLabel(props: JSX.HTMLAttributes<HTMLSpanElement>): JSX.Element {
   const [local, rest] = splitProps(props, ["class"]);

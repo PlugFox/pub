@@ -23,17 +23,24 @@ const locale = Astro.currentLocale ?? "en";
     {/* Critical font: Inter latin subset, used by the first paint of every page. */}
     <link rel="preload" href={interLatinWoff2} as="font" type="font/woff2" crossorigin />
     <script is:inline>
-      // Anti-FOUC: resolve the persisted theme (localStorage "pub_theme":
-      // light | dark | anything-else = system) and stamp data-theme on <html>
-      // before first paint. This is the ONLY inline script in the product —
-      // the server will carry its hash/nonce in the CSP (decisions 03/14).
+      // Anti-FOUC: resolve the persisted theme mode (localStorage "pub_theme")
+      // and stamp data-theme on <html> before first paint. The theme list is
+      // the REGISTRY (packages/tokens/theme.css blocks, THEMES in
+      // packages/ui/src/theme.ts — keep all three in sync): a stored
+      // registered name wins; "system" or anything unknown resolves to
+      // light/dark by OS preference (amoled is only ever an explicit choice).
+      // This is the ONLY inline script in the product — the server will carry
+      // its hash/nonce in the CSP (decisions 03/14).
       (() => {
         try {
           const stored = localStorage.getItem("pub_theme");
-          const dark =
-            stored === "dark" ||
-            (stored !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
-          document.documentElement.dataset.theme = dark ? "dark" : "light";
+          const themes = ["light", "dark", "amoled"];
+          document.documentElement.dataset.theme =
+            stored !== null && themes.indexOf(stored) !== -1
+              ? stored
+              : matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
         } catch {
           // No storage / no matchMedia: keep the server-rendered light default.
         }

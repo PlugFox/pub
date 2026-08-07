@@ -13,7 +13,16 @@ import {
 import { EmptyState } from "@pub/ui/empty-state";
 import { Input } from "@pub/ui/input";
 import { Label } from "@pub/ui/label";
-import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "@pub/ui/menu";
+import {
+  Menu,
+  MenuContent,
+  MenuItem,
+  MenuLabel,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+  MenuTrigger,
+} from "@pub/ui/menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@pub/ui/popover";
 import { QrCode } from "@pub/ui/qr-code";
 import { Separator } from "@pub/ui/separator";
@@ -21,7 +30,7 @@ import { Skeleton } from "@pub/ui/skeleton";
 import { Spinner } from "@pub/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@pub/ui/tabs";
-import { ThemeToggle } from "@pub/ui/theme-toggle";
+import { ThemePicker } from "@pub/ui/theme-picker";
 import { Toast, ToastRegion } from "@pub/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@pub/ui/tooltip";
 import { createSignal, For, type JSX } from "solid-js";
@@ -32,7 +41,8 @@ import { createSignal, For, type JSX } from "solid-js";
  *
  * Registry pattern: every component in packages/ui adds one entry here
  * showing all variants, sizes, and states (docs/rules/web.md “Components”).
- * The page renders in both themes via the ThemeToggle in the header.
+ * The page renders in every registered theme via the ThemePicker in the
+ * header (light / dark / amoled + system).
  */
 
 type ShowcaseEntry = {
@@ -198,9 +208,9 @@ const registry: readonly ShowcaseEntry[] = [
     ),
   },
   {
-    name: "ThemeToggle",
-    note: "Cycles light → dark → system; persists to localStorage (pub_theme).",
-    render: () => <ThemeToggle />,
+    name: "ThemePicker",
+    note: "Theme menu over the registry: system + light + dark + AMOLED radio items; persists to localStorage (pub_theme), stamps the resolved data-theme.",
+    render: () => <ThemePicker />,
   },
   {
     name: "Alert",
@@ -301,22 +311,40 @@ const registry: readonly ShowcaseEntry[] = [
   },
   {
     name: "Menu",
-    note: "Kobalte dropdown: typeahead, roving focus, outside/escape dismissal; transient surface (shadow).",
-    render: () => (
-      <Menu>
-        <MenuTrigger class={buttonVariants({ intent: "outline", size: "md" })}>
-          Open menu
-        </MenuTrigger>
-        <MenuContent>
-          <MenuLabel>ada@example.com</MenuLabel>
-          <MenuItem>Account</MenuItem>
-          <MenuItem>Sessions</MenuItem>
-          <MenuSeparator />
-          <MenuItem disabled>Admin (no permission)</MenuItem>
-          <MenuItem>Sign out</MenuItem>
-        </MenuContent>
-      </Menu>
-    ),
+    note: "Kobalte dropdown: typeahead, roving focus, outside/escape dismissal; transient surface (shadow). MenuRadioGroup/MenuRadioItem for single-choice groups (menuitemradio + check indicator).",
+    render: () => {
+      const [sort, setSort] = createSignal("relevance");
+      return (
+        <div class="flex flex-wrap gap-3">
+          <Menu>
+            <MenuTrigger class={buttonVariants({ intent: "outline", size: "md" })}>
+              Open menu
+            </MenuTrigger>
+            <MenuContent>
+              <MenuLabel>ada@example.com</MenuLabel>
+              <MenuItem>Account</MenuItem>
+              <MenuItem>Sessions</MenuItem>
+              <MenuSeparator />
+              <MenuItem disabled>Admin (no permission)</MenuItem>
+              <MenuItem>Sign out</MenuItem>
+            </MenuContent>
+          </Menu>
+          <Menu>
+            <MenuTrigger class={buttonVariants({ intent: "outline", size: "md" })}>
+              Sort: {sort()}
+            </MenuTrigger>
+            <MenuContent>
+              <MenuLabel>Sort by</MenuLabel>
+              <MenuRadioGroup value={sort()} onChange={setSort}>
+                <MenuRadioItem value="relevance">Relevance</MenuRadioItem>
+                <MenuRadioItem value="updated">Recently updated</MenuRadioItem>
+                <MenuRadioItem value="downloads">Downloads</MenuRadioItem>
+              </MenuRadioGroup>
+            </MenuContent>
+          </Menu>
+        </div>
+      );
+    },
   },
   {
     name: "Popover",
@@ -466,10 +494,10 @@ export function UiKitPage(): JSX.Element {
           <h1 class="text-3xl font-bold tracking-tight">UI Kit</h1>
           <p class="mt-2 text-ink-muted">
             Internal showcase of <span class="font-mono text-sm">packages/ui</span> — every
-            component, every state, both themes.
+            component, every state, every theme.
           </p>
         </div>
-        <ThemeToggle />
+        <ThemePicker />
       </header>
       <div class="mt-10 flex flex-col gap-10">
         <For each={registry}>

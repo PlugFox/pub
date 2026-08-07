@@ -10,8 +10,16 @@ export const common = {
   navHome: { id: "common.navHome", en: "Home" },
   /** Button/link on the landing page that opens the web application under /app. */
   navApp: { id: "common.navApp", en: "Open app" },
-  /** Accessible label of the light/dark/system theme switcher button in the header. */
-  themeToggle: { id: "common.themeToggle", en: "Toggle theme" },
+  /** Accessible label and tooltip of the header button that opens the theme menu (system / light / dark / AMOLED). */
+  themePicker: { id: "common.themePicker", en: "Choose theme" },
+  /** Theme menu option that follows the operating system's light/dark preference. */
+  themeSystem: { id: "common.themeSystem", en: "System" },
+  /** Theme menu option selecting the light palette. */
+  themeLight: { id: "common.themeLight", en: "Light" },
+  /** Theme menu option selecting the dark palette. */
+  themeDark: { id: "common.themeDark", en: "Dark" },
+  /** Theme menu option selecting the true-black dark palette for OLED screens. "AMOLED" is a display-technology name — usually kept untranslated. */
+  themeAmoled: { id: "common.themeAmoled", en: "AMOLED" },
   /** Label of the interface language picker. */
   language: { id: "common.language", en: "Language" },
   /** Accessible label of dismiss buttons (dialog close, toast dismiss). */

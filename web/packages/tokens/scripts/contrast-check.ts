@@ -2,11 +2,16 @@
  * WCAG AA contrast gate for packages/tokens/theme.css. Run via `bun run check`
  * (root) or `bun packages/tokens/scripts/contrast-check.ts`.
  *
- * Parses the raw-palette blocks of theme.css (`:root` light values and the
- * `[data-theme="dark"]` overrides), converts each `--pub-*` OKLCH value to
- * sRGB, and asserts a WCAG 2.x contrast ratio of at least 4.5:1 for every
- * ink-on-surface pair the UI actually renders. Computation, not eyeballing:
- * a token edit that breaks AA fails the pipeline.
+ * The theme model is a REGISTRY, not a light/dark binary: `:root` carries the
+ * light palette, and every other theme is a `[data-theme="<name>"]` override
+ * block in theme.css. This script parses the `:root` block, DISCOVERS every
+ * theme block (no hardcoded theme list — registering a theme in CSS is enough
+ * to put it under the gate), and builds each theme's effective palette the way
+ * the CSS cascade does: light base values overlaid with the block's
+ * overrides. For every theme, each `--pub-*` OKLCH value is converted to sRGB
+ * and every ink-on-surface pair the UI actually renders is asserted at WCAG
+ * 2.x contrast ≥ 4.5:1. Computation, not eyeballing: a token edit that breaks
+ * AA in any registered theme fails the pipeline.
  */
 
 import { join } from "node:path";
@@ -17,7 +22,7 @@ const AA_NORMAL_TEXT = 4.5;
 type Oklch = { l: number; c: number; h: number };
 type Palette = Map<string, Oklch>;
 
-/** [foreground token, background token] — checked in BOTH themes at 4.5:1. */
+/** [foreground token, background token] — checked in EVERY theme at 4.5:1. */
 const TEXT_PAIRS: ReadonlyArray<readonly [string, string]> = [
   // Neutral text on the two base surfaces.
   ["ink", "canvas"],
@@ -46,7 +51,7 @@ const TEXT_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ["danger-ink", "canvas"],
   ["danger-ink", "surface"],
 
-  // The QR well is theme-independent by design; still asserted in both themes
+  // The QR well is theme-independent by design; still asserted in every theme
   // so a future "let's make dark mode consistent" edit trips the gate.
   ["qr-ink", "qr-surface"],
 ];
@@ -116,15 +121,37 @@ function contrastRatio(fg: Oklch, bg: Oklch): number {
 
 /*
  * Strip CSS comments before locating selectors: the header comment mentions
- * `:root` and `[data-theme="dark"]` as literal text, and a plain indexOf on
- * the raw source would match the mention instead of the rule (silently
- * re-parsing the light block as the dark palette).
+ * `:root` and `[data-theme="…"]` as literal text, and matching the raw source
+ * would pick up mentions instead of rules (silently re-parsing the light
+ * block as another theme's palette).
  */
 const source = (await Bun.file(THEME_CSS_PATH).text()).replace(/\/\*[\s\S]*?\*\//g, "");
-const themes: ReadonlyArray<readonly [string, Palette]> = [
-  ["light", parsePalette(blockBody(source, ":root"))],
-  ["dark", parsePalette(blockBody(source, '[data-theme="dark"]'))],
-];
+const lightPalette = parsePalette(blockBody(source, ":root"));
+if (lightPalette.size === 0) fail("no --pub-* oklch() declarations found in :root");
+
+/*
+ * Theme discovery. A theme is a `[data-theme="<name>"] { … }` rule with at
+ * least one raw-palette declaration; the `@custom-variant` selectors mention
+ * `[data-theme=…]` without a following brace and declare nothing, so they
+ * never match. A theme block may override any subset of the token set — the
+ * effective palette is light-base + overrides, exactly like the cascade.
+ */
+const themes = new Map<string, Palette>([["light", lightPalette]]);
+const themeBlock = /\[data-theme="([a-z][a-z0-9-]*)"\]\s*\{([^{}]*)\}/g;
+for (const match of source.matchAll(themeBlock)) {
+  const [, name, body] = match;
+  if (name === undefined || body === undefined) continue;
+  const overrides = parsePalette(body);
+  if (overrides.size === 0) continue;
+  if (name === "light")
+    fail(`theme "light" lives on :root — remove the [data-theme="light"] block`);
+  const palette = new Map(themes.get(name) ?? lightPalette);
+  for (const [token, value] of overrides) palette.set(token, value);
+  themes.set(name, palette);
+}
+if (!themes.has("dark")) {
+  fail(`no [data-theme="dark"] block found — "system" resolution depends on it`);
+}
 
 let failures = 0;
 let checked = 0;
@@ -150,4 +177,8 @@ for (const [themeName, palette] of themes) {
 if (failures > 0) {
   fail(`${failures} of ${checked} pairs below WCAG AA ${AA_NORMAL_TEXT}:1`);
 }
-console.log(`contrast-check: ${checked} pairs (2 themes) pass WCAG AA ${AA_NORMAL_TEXT}:1`);
+const themeNames = [...themes.keys()].join(", ");
+console.log(
+  `contrast-check: ${checked} pairs (${themes.size} themes: ${themeNames}) ` +
+    `pass WCAG AA ${AA_NORMAL_TEXT}:1`,
+);

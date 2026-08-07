@@ -1,11 +1,10 @@
 import { t, tp } from "@pub/i18n";
 import { app } from "@pub/i18n/generated/app";
-import { common } from "@pub/i18n/generated/common";
 import { buttonVariants } from "@pub/ui/button";
 import { cn } from "@pub/ui/cn";
 import { Input } from "@pub/ui/input";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "@pub/ui/menu";
-import { ThemeToggle } from "@pub/ui/theme-toggle";
+import { ThemePicker } from "@pub/ui/theme-picker";
 import { ToastRegion } from "@pub/ui/toast";
 import { A, createAsync, query, useLocation, useNavigate } from "@solidjs/router";
 import { createEffect, For, type JSX, Show, Suspense } from "solid-js";
@@ -111,16 +110,6 @@ function UserMenu(): JSX.Element {
         <MenuLabel>{currentUser()?.email ?? currentUser()?.display_name ?? ""}</MenuLabel>
         <MenuItem onSelect={() => navigate("/account")}>{t(app.navAccount)}</MenuItem>
         <MenuItem onSelect={() => navigate("/notifications")}>{t(app.navNotifications)}</MenuItem>
-        <MenuSeparator />
-        {/*
-          The theme toggle sits INSIDE the menu item rather than being one:
-          selecting a menu item closes the menu, and a theme switcher you have
-          to reopen for every step of light → dark → system is a broken cycle.
-        */}
-        <div class="flex items-center justify-between gap-3 px-3 py-2 text-sm">
-          <span>{t(common.themeToggle)}</span>
-          <ThemeToggle />
-        </div>
         <MenuSeparator />
         <MenuItem onSelect={() => void signOut().then(() => navigate("/login"))}>
           {t(app.signOut)}
@@ -249,15 +238,18 @@ export function AppShell(props: AppShellProps): JSX.Element {
           </A>
           <SearchField />
           <div class="ml-auto flex items-center gap-2">
+            {/*
+              The theme picker lives in the header for both branches: it is a
+              menu of its own now, and a menu nested inside the user menu
+              would fight its parent over focus and dismissal.
+            */}
+            <ThemePicker />
             <Show
               when={isAuthenticated()}
               fallback={
-                <>
-                  <ThemeToggle />
-                  <A href="/login" class={buttonVariants({ intent: "outline", size: "sm" })}>
-                    {t(app.loginTitle)}
-                  </A>
-                </>
+                <A href="/login" class={buttonVariants({ intent: "outline", size: "sm" })}>
+                  {t(app.loginTitle)}
+                </A>
               }
             >
               <OrgSwitcher />

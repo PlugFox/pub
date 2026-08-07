@@ -28,6 +28,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 21 | Multi-format artifact space: pub first; npm, cargo later                | accepted |
 | 22 | Domain event bus; webhooks + integrations on top                        | accepted |
 | 23 | Monitoring exports optional (Prometheus/OTLP off by default)            | accepted |
+| 24 | Theme registry, Patina palette, AMOLED variant, seed-theme seam         | accepted |
 
 ---
 
@@ -303,3 +304,14 @@ Branding for the landing dashboard (`GET /api/v1/home`) ships as boot config `[b
 ## 23 — Monitoring is optional
 
 **Decision.** Observability exports are config-gated and **off by default**: the Prometheus `/metrics` endpoint (optionally on its own listen address), OTLP trace export, and JSON log shipping are each enabled explicitly. `tracing` instrumentation and `/healthz` are always on — near-free and needed by orchestrators. No monitoring stack is required to run the product.
+
+## 24 — Theme registry, Patina palette
+
+> **Status: proposed.** The palette direction was chosen by the owner (2026-08-07); this entry's *wording* has not been reviewed yet.
+
+**Decision.** Four related choices, made together on 2026-08-07:
+
+- **Palette "Patina".** The product's default look is warm graphite neutrals (OKLCH hue 60–85 at whisper chroma) with a desaturated teal accent (hue 195), replacing the initial indigo/violet system. Chosen by the owner from three validated directions; the alternates — *iris* (refined indigo) and *nocturne* (night-blue/blurple) — are kept in `web/packages/tokens/candidates/` as future-theme material, each a complete palette that passes the contrast gate.
+- **Themes are a registry, not a light/dark binary.** A theme is a named `[data-theme="<name>"]` block in `packages/tokens/theme.css` overriding the raw `--pub-*` token set; `:root` carries light, which is also the SSR default and the fallback for unknown names. The registry has three synchronized members: the CSS blocks, `THEMES` in `packages/ui/src/theme.ts` (picker + persistence), and the theme list in the anti-FOUC inline script. The contrast gate **discovers** theme blocks by parsing `theme.css` and asserts the same WCAG AA pairs for every theme — registering a theme in CSS is enough to put it under the gate. `localStorage.pub_theme` holds `"system"` or a theme name; anything unknown counts as system, so stale stored values from removed themes degrade gracefully.
+- **AMOLED is the third theme.** True-black canvas (`oklch(0 0 0)` — an OLED panel switches those pixels off), surfaces barely lifted, the same Patina accent/status families as dark. It is a darkness variant of dark, not a second brand; `system` resolves only to light/dark — amoled is always an explicit choice. The `dark:` Tailwind variant matches the whole dark family (dark + amoled).
+- **Seed-theme seam (documented, not implemented).** A future Material-You-style adaptive theme derives the same raw token set from one seed color at runtime and attaches it under a new `data-theme` scope. The `--pub-*` token *names* are the generation contract; the semantic `@theme` layer needs no changes; a generated set must pass the same contrast pairs the static gate asserts, evaluated at generation time. No generator ships now.

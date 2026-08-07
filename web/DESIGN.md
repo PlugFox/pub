@@ -4,7 +4,7 @@ The visual source of truth for everything under `web/`. Component conventions
 (CVA, Kobalte, `cn()`, splitProps) live in [docs/rules/web.md](../docs/rules/web.md);
 this document decides how things **look** and why. The live gallery is
 [`/ui-kit`](apps/site/src/pages/ui-kit.astro) — every component, every state,
-both themes.
+every theme.
 
 > **Sync note:** the token tables below mirror
 > [`packages/tokens/theme.css`](packages/tokens/theme.css) — that file is the
@@ -19,48 +19,70 @@ that happens to sell infrastructure. The app area (`/app`) may be denser than
 the landing (tables, lists, monospace metadata), but it shares the same warmth:
 same tokens, same soft radii, same accent.
 
-- **Accent:** indigo/violet family (OKLCH hue ≈ 282–285). One accent; no
-  secondary brand color.
+- **Palette "Patina":** warm graphite neutrals (OKLCH hue 60–85 at whisper
+  chroma) with a desaturated teal accent (hue ≈ 195). One accent; no
+  secondary brand color. The alternate directions explored (iris, nocturne)
+  live in [`packages/tokens/candidates/`](packages/tokens/candidates/) as
+  future-theme material.
 - **Fonts:** Inter (variable) for UI text, JetBrains Mono for code, versions,
   and hashes. Cyrillic is first-class; CJK falls back to system fonts (§3).
-- **Theme:** system default; light and dark are both first-class. Every visual
-  decision is made twice — check `/ui-kit` in both before shipping.
+- **Themes are a registry, not a binary.** Three themes ship today — `light`
+  (the `:root` palette and SSR default), `dark` (warm charcoal), and `amoled`
+  (true-black for OLED screens) — and the model is open: a theme is a named
+  `[data-theme="…"]` block in `theme.css` over the same token set (the full
+  registration checklist lives in that file's header). The picker persists
+  `system` or an explicit theme name; `system` resolves to light/dark by OS
+  preference — amoled is only ever an explicit choice. Every visual decision
+  is checked in **every registered theme** on `/ui-kit` before shipping.
+- **Seed-theme seam (future):** a Material-You-style theme derived from one
+  seed color slots in by *generating* the same raw token set at runtime and
+  stamping it under a new `data-theme` name — the `--pub-*` token names are
+  the generation contract, and a generated set must pass the same contrast
+  pairs the static gate asserts. Documented in `theme.css`; not implemented.
 - **Restraint:** subtle accent-tinted gradients are allowed on hero/marketing
   surfaces only. The app's data UI is flat: solid surfaces, hairline borders.
 
 ## 2. Color tokens
 
 Three-layer system in `packages/tokens/theme.css`: raw `--pub-*` OKLCH values
-(light on `:root`, dark on `[data-theme="dark"]`) → semantic `@theme` mapping →
-Tailwind utilities (`bg-canvas`, `text-ink`, `border-line`, …). Components use
+(light on `:root`, every other registered theme as a named
+`[data-theme="…"]` override block) → semantic `@theme` mapping → Tailwind
+utilities (`bg-canvas`, `text-ink`, `border-line`, …). Components use
 utilities only — never `--pub-*` variables, never hex, never raw `oklch()`.
 
 Every pair listed in
 [`packages/tokens/scripts/contrast-check.ts`](packages/tokens/scripts/contrast-check.ts)
-is asserted ≥ 4.5:1 (WCAG AA normal text) in both themes on every `bun run
-check`. Adding a token that carries text? Add its pair to the script in the
+is asserted ≥ 4.5:1 (WCAG AA normal text) in **every registered theme** on
+every `bun run check` — the gate discovers the `[data-theme]` blocks by
+parsing `theme.css`, so registering a theme automatically puts it under the
+gate. Adding a token that carries text? Add its pair to the script in the
 same commit.
 
 ### Neutrals & accent
 
-| Token | Role | Light | Dark |
-|---|---|---|---|
-| `canvas` | page background | `oklch(0.982 0.005 285)` | `oklch(0.16 0.015 285)` |
-| `surface` | cards, headers, raised blocks | `oklch(1 0 0)` | `oklch(0.21 0.018 285)` |
-| `ink` | primary text | `oklch(0.24 0.02 285)` | `oklch(0.93 0.008 285)` |
-| `ink-muted` | secondary text | `oklch(0.47 0.022 285)` | `oklch(0.71 0.02 285)` |
-| `line` | borders, separators | `oklch(0.9 0.008 285)` | `oklch(0.31 0.02 285)` |
-| `accent` | interactive fill, links | `oklch(0.5 0.19 282)` | `oklch(0.74 0.13 285)` |
-| `accent-strong` | hover/active fill | `oklch(0.43 0.2 282)` | `oklch(0.79 0.115 285)` |
-| `on-accent` | text on accent fill | `oklch(0.99 0.005 282)` | `oklch(0.18 0.03 285)` |
-| `accent-soft` | tinted chips, hovers, hero | `oklch(0.95 0.03 282)` | `oklch(0.28 0.05 285)` |
-| `qr-surface` | QR well background | `oklch(1 0 0)` | `oklch(1 0 0)` |
-| `qr-ink` | QR modules | `oklch(0.15 0 0)` | `oklch(0.15 0 0)` |
+| Token | Role | Light | Dark | AMOLED |
+|---|---|---|---|---|
+| `canvas` | page background | `oklch(0.978 0.004 85)` | `oklch(0.19 0.008 75)` | `oklch(0 0 0)` |
+| `surface` | cards, headers, raised blocks | `oklch(0.995 0.002 85)` | `oklch(0.235 0.01 75)` | `oklch(0.15 0.006 75)` |
+| `ink` | primary text | `oklch(0.245 0.012 60)` | `oklch(0.93 0.006 85)` | `oklch(0.93 0.006 85)` |
+| `ink-muted` | secondary text | `oklch(0.47 0.015 60)` | `oklch(0.71 0.015 80)` | `oklch(0.72 0.015 80)` |
+| `line` | borders, separators | `oklch(0.9 0.007 75)` | `oklch(0.33 0.012 75)` | `oklch(0.28 0.01 75)` |
+| `accent` | interactive fill, links | `oklch(0.5 0.1 195)` | `oklch(0.75 0.1 195)` | `oklch(0.75 0.1 195)` |
+| `accent-strong` | hover/active fill | `oklch(0.43 0.1 195)` | `oklch(0.8 0.09 195)` | `oklch(0.8 0.09 195)` |
+| `on-accent` | text on accent fill | `oklch(0.985 0.005 195)` | `oklch(0.17 0.03 195)` | `oklch(0.15 0.03 195)` |
+| `accent-soft` | tinted chips, hovers, hero | `oklch(0.95 0.032 190)` | `oklch(0.28 0.045 195)` | `oklch(0.24 0.04 195)` |
+| `qr-surface` | QR well background | `oklch(1 0 0)` | `oklch(1 0 0)` | `oklch(1 0 0)` |
+| `qr-ink` | QR modules | `oklch(0.15 0 0)` | `oklch(0.15 0 0)` | `oklch(0.15 0 0)` |
+
+AMOLED is a **darkness variant of dark, not a second brand**: pure-black
+canvas (an OLED switches those pixels off), surfaces barely lifted above it,
+and the same accent/status families as dark — only `on-*` fills and soft
+tints shift slightly so the pairs keep AA margins on black.
 
 `qr-surface`/`qr-ink` are the **one pair that deliberately does not flip**: a QR
 reader expects dark modules on a light field, and an inverted code is
-unscannable on most phone cameras. Both themes carry identical values so the
-contrast gate still checks the pair twice.
+unscannable on most phone cameras. Every theme carries identical values so the
+contrast gate still checks the pair in each.
 
 ### Status colors
 
@@ -69,14 +91,14 @@ indicators only), `on-x` (text on the solid fill), `x-soft` (tinted background
 for badges/alerts), `x-ink` (text that passes AA on `x-soft`, `canvas`, and
 `surface`).
 
-| Token | Light | Dark |
-|---|---|---|
-| `success` / `on-success` | `oklch(0.52 0.13 152)` / `oklch(0.98 0.01 152)` | `oklch(0.72 0.13 152)` / `oklch(0.18 0.04 152)` |
-| `success-soft` / `success-ink` | `oklch(0.95 0.04 152)` / `oklch(0.42 0.1 152)` | `oklch(0.27 0.045 152)` / `oklch(0.8 0.13 152)` |
-| `warning` / `on-warning` | `oklch(0.76 0.15 75)` / `oklch(0.28 0.05 75)` | `oklch(0.78 0.13 80)` / `oklch(0.2 0.045 80)` |
-| `warning-soft` / `warning-ink` | `oklch(0.95 0.055 85)` / `oklch(0.44 0.09 70)` | `oklch(0.28 0.04 80)` / `oklch(0.82 0.12 85)` |
-| `danger` / `on-danger` | `oklch(0.5 0.19 27)` / `oklch(0.99 0.005 27)` | `oklch(0.68 0.15 25)` / `oklch(0.16 0.03 25)` |
-| `danger-soft` / `danger-ink` | `oklch(0.94 0.035 25)` / `oklch(0.45 0.16 27)` | `oklch(0.27 0.06 25)` / `oklch(0.78 0.11 25)` |
+| Token | Light | Dark | AMOLED |
+|---|---|---|---|
+| `success` / `on-success` | `oklch(0.52 0.13 150)` / `oklch(0.98 0.01 150)` | `oklch(0.72 0.13 150)` / `oklch(0.18 0.04 150)` | `oklch(0.72 0.13 150)` / `oklch(0.16 0.04 150)` |
+| `success-soft` / `success-ink` | `oklch(0.95 0.04 150)` / `oklch(0.42 0.1 150)` | `oklch(0.27 0.045 150)` / `oklch(0.8 0.13 150)` | `oklch(0.23 0.04 150)` / `oklch(0.8 0.13 150)` |
+| `warning` / `on-warning` | `oklch(0.76 0.15 75)` / `oklch(0.28 0.05 75)` | `oklch(0.78 0.13 80)` / `oklch(0.2 0.045 80)` | `oklch(0.78 0.13 80)` / `oklch(0.18 0.045 80)` |
+| `warning-soft` / `warning-ink` | `oklch(0.95 0.055 85)` / `oklch(0.44 0.09 70)` | `oklch(0.28 0.04 80)` / `oklch(0.82 0.12 85)` | `oklch(0.24 0.035 80)` / `oklch(0.82 0.12 85)` |
+| `danger` / `on-danger` | `oklch(0.51 0.18 30)` / `oklch(0.99 0.005 30)` | `oklch(0.68 0.15 28)` / `oklch(0.16 0.03 28)` | `oklch(0.68 0.15 28)` / `oklch(0.14 0.03 28)` |
+| `danger-soft` / `danger-ink` | `oklch(0.94 0.035 28)` / `oklch(0.45 0.16 30)` | `oklch(0.27 0.055 28)` / `oklch(0.78 0.11 28)` | `oklch(0.23 0.05 28)` / `oklch(0.78 0.11 28)` |
 
 Usage rules:
 
@@ -156,7 +178,7 @@ SaaS look; a terminal tool would use half of these):
 | `rounded-lg` | 12 px | buttons, icon wells, code chips |
 | `rounded-xl` | 16 px | cards, dialogs, showcase frames |
 | `rounded-2xl` | 24 px | hero/marketing surfaces |
-| `rounded-full` | pill | badges, ThemeToggle |
+| `rounded-full` | pill | badges, ThemePicker |
 
 Elevation has exactly three levels:
 
@@ -207,9 +229,13 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   AA-checked pair in both themes), `rounded-md px-3 py-1.5 text-xs
   shadow-md`, 300 ms open delay, arrow included. Content is a short hint —
   never interactive controls.
-- **ThemeToggle** — ghost pill (`rounded-full`, 32 px square) cycling
-  light → dark → system; persists `pub_theme`; stamps `data-theme` (contract
-  shared with the anti-FOUC script).
+- **ThemePicker** — ghost pill trigger (`rounded-full`, 32 px square) opening
+  a Menu of radio items: **system** plus one entry per registered theme
+  (light, dark, amoled). Persists `pub_theme` ("system" or a theme name;
+  unknown counts as system); stamps the *resolved* `data-theme` (contract
+  shared with the anti-FOUC script); follows OS changes live while in
+  system mode. The registry itself (`THEMES`, `resolveTheme`) is the pure
+  module `@pub/ui/theme` — DOM-free and unit-tested.
 - **Alert** — inline, layout-owned status block: `rounded-lg border p-4
   text-sm`, soft tints only (same palette rules as Badge). `danger` renders
   `role="alert"` (assertive), the rest `role="status"` (polite). Not a toast —
@@ -235,7 +261,11 @@ subpath imports. Every component has a `/ui-kit` registry entry.
   `MenuSeparator` a hairline that carries its own `my-1` — the **one
   sanctioned root margin** in the kit, because a separator's whole job is the
   gap around it and `MenuContent` cannot use `gap-*` without also spacing the
-  items it deliberately packs. Content is actions — never a form.
+  items it deliberately packs. Single-choice groups (theme picker, sort
+  order) use `MenuRadioGroup`/`MenuRadioItem` — Kobalte wires
+  `menuitemradio` + `aria-checked`, and the checked item shows a check glyph
+  in a fixed-width slot so labels stay aligned. Content is actions —
+  never a form.
 - **Popover** (Kobalte) — transient surface: `w-80 max-w-sm rounded-lg border
   bg-surface p-4 shadow-md`, arrow, a `text-sm font-semibold` title row and a
   built-in close button (i18n `common.close`). The line against Tooltip is
@@ -313,7 +343,8 @@ state keys off the native `aria-disabled:`/`disabled:` variants.
   `is:inline`, inline event handlers, or `javascript:` URLs.
 - ❌ No shadows on static surfaces; no gradients outside hero/marketing.
 - ❌ No `dark:` overrides for plain colors — the tokens flip automatically.
-  Reach for `dark:` only when the design genuinely differs structurally.
+  Reach for `dark:` only when the design genuinely differs structurally
+  (it matches the whole dark family: dark and amoled).
 - ❌ No new font files or weights without updating fonts.css subsets, the
   preload, and the bundle-size report.
 
@@ -357,12 +388,15 @@ Before committing any UI change, an AI contributor must verify:
    green. `check` includes the WCAG contrast gate over `theme.css`.
    **Motion:** any new animation is covered by the global reduced-motion reset
    (§7a) — do not add per-component `motion-*` variants.
-2. **Both themes:** open `/ui-kit` (and any touched screen) in light AND dark
-   via the ThemeToggle. No unreadable pairs, no invisible borders.
+2. **Every theme:** open `/ui-kit` (and any touched screen) in every
+   registered theme (light, dark, amoled) via the ThemePicker menu. No
+   unreadable pairs, no invisible borders — watch hairlines especially on
+   amoled's black canvas.
 3. **Tokens only:** grep your diff for `#`-hex, `oklch(`, `--pub-`, `[` inside
    class strings — all four should be absent from component code.
-4. **New tokens:** added to `theme.css` (both themes) + mapped in `@theme` +
-   contrast pair added to `contrast-check.ts` + table updated here.
+4. **New tokens:** added to `theme.css` (every theme block) + mapped in
+   `@theme` + contrast pair added to `contrast-check.ts` + table updated here.
+   **New themes:** follow the registry checklist in `theme.css`'s header.
 5. **New component:** CVA recipe exported, `class` via `cn()`, `splitProps`,
    no root margins, focus ring, `/ui-kit` registry entry with all
    variants/sizes/states, subpath export in `packages/ui/package.json`,

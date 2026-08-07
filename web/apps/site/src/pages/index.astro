@@ -3,7 +3,7 @@ import { t } from "@pub/i18n";
 import { common } from "@pub/i18n/generated/common";
 import { landing } from "@pub/i18n/generated/landing";
 import { buttonVariants } from "@pub/ui/button";
-import { ThemeToggle } from "@pub/ui/theme-toggle";
+import { ThemePicker } from "@pub/ui/theme-picker";
 import BaseLayout from "../layouts/base-layout.astro";
 
 // Marketing landing (web/DESIGN.md “Mood”): welcoming SaaS, generous
@@ -48,7 +48,7 @@ const features: Feature[] = [
         {t(common.siteTitle)}
       </a>
       <nav class="flex items-center gap-2">
-        <ThemeToggle client:load />
+        <ThemePicker client:load />
         <a href="/app" class={buttonVariants({ intent: "outline", size: "sm" })}>
           {t(common.navApp)}
         </a>

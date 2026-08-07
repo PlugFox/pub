@@ -2,6 +2,29 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-07 — design foundation: the Patina palette and a theme registry
+
+The visual identity settles: the owner chose the **"Patina"** direction (warm graphite neutrals at hue 60–85, desaturated teal accent at hue 195) from three validated candidates, and the theme model it lands in is generalized from a light/dark binary to a **registry** — recorded as [decision 24](docs/decisions.md#24--theme-registry-patina-palette-proposed--pending-user-review) (proposed, wording pending review).
+
+### Added
+
+- (web) **AMOLED theme** — the third registry entry in [`theme.css`](web/packages/tokens/theme.css): true-black canvas `oklch(0 0 0)` (an OLED switches those pixels off), surfaces barely lifted, the same Patina accent/status families as dark. All 23 contrast pairs pass WCAG AA on it, most with double-digit ratios.
+- (web) **Theme picker menu** — [`ThemePicker`](web/packages/ui/src/theme-picker.tsx) (renamed from `ThemeToggle` — it is a picker now) is no longer a 3-state cycle but an accessible Kobalte dropdown of radio items (system / light / dark / AMOLED), with the pure registry logic (`THEMES`, `resolveTheme`, `normalizeMode`) extracted to [`@pub/ui/theme`](web/packages/ui/src/theme.ts) and unit-tested (7 tests). Same `pub_theme` localStorage key; unknown stored values count as "system".
+- (web) **`MenuRadioGroup` / `MenuRadioItem`** in [`menu.tsx`](web/packages/ui/src/menu.tsx) — single-choice menu groups (`menuitemradio` + `aria-checked`, check glyph in a fixed-width slot), shown in the ui-kit Menu entry with a sort-order demo.
+- (web) [`packages/tokens/candidates/`](web/packages/tokens/candidates/) — the three explored palette directions (patina, iris, nocturne) kept as the repo record and future-theme material.
+
+### Changed
+
+- (web) **Patina palette** replaces the indigo default across all themes in [`theme.css`](web/packages/tokens/theme.css); token names, radii, fonts, and the semantic mapping are unchanged, so no component changed for the recolor.
+- (web) **Contrast gate generalized** — [`contrast-check.ts`](web/packages/tokens/scripts/contrast-check.ts) now *discovers* every `[data-theme]` block instead of hardcoding light/dark: registering a theme in CSS is enough to put its 23 pairs under the WCAG AA gate (69 pairs across 3 themes today).
+- (web) **Anti-FOUC script honors the registry** — a stored registered theme name (now including `amoled`) is stamped verbatim; `system` or anything unknown resolves to light/dark by OS preference. SSR default stays `light`; still the product's only inline script.
+- (web) The theme picker moved out of the authenticated user menu into the app header (it is a menu of its own now; nested menus fight over focus and dismissal).
+- (docs) [`web/DESIGN.md`](web/DESIGN.md) — §1 theme-registry model and seed-theme seam, §2 token tables with Light/Dark/AMOLED columns, §6 ThemePicker/Menu specs, §9 checklist now says "every theme".
+
+### Notes
+
+- (web) **i18n lazy-locale verification** (requested with this workstream): the generated message modules bundle **English only**; the per-locale dictionaries are emitted by `i18n:gen` as static `public/locales/<code>/<ns>.json` files and are designed to be fetched lazily per active locale. Today **no code loads them at all** — nothing calls `registerLocale`/`setLocale` outside tests, so nothing is eagerly bundled or fetched (verified in the built output: locale JSONs sit in `dist/locales/`, and no non-English dictionary text appears in any JS chunk). Wiring the per-locale fetch (current locale only) lands with the locale switcher.
+
 ## 2026-08-07 — release engineering: the version derives from the tag, images land on GHCR
 
 [Decision 18](docs/decisions.md#18--ops-release-model-image-registry-reference-orchestrator) is decided and wired (closes roadmap debt D6). Releases never commit version bumps from CI: the version derives from the git tag `vX.Y.Z`, flows through the `PUB_VERSION` Docker build arg into the binary at compile time, and is asserted end to end by the release smoke test before anything is tagged on the registry.

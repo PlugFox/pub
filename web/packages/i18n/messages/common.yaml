@@ -29,10 +29,30 @@ navApp:
   ru: Открыть приложение
   desc: Button/link on the landing page that opens the web application under /app.
 
-themeToggle:
-  en: Toggle theme
-  ru: Переключить тему
-  desc: Accessible label of the light/dark/system theme switcher button in the header.
+themePicker:
+  en: Choose theme
+  ru: Выбрать тему
+  desc: Accessible label and tooltip of the header button that opens the theme menu (system / light / dark / AMOLED).
+
+themeSystem:
+  en: System
+  ru: Системная
+  desc: Theme menu option that follows the operating system's light/dark preference.
+
+themeLight:
+  en: Light
+  ru: Светлая
+  desc: Theme menu option selecting the light palette.
+
+themeDark:
+  en: Dark
+  ru: Тёмная
+  desc: Theme menu option selecting the dark palette.
+
+themeAmoled:
+  en: AMOLED
+  ru: AMOLED
+  desc: Theme menu option selecting the true-black dark palette for OLED screens. "AMOLED" is a display-technology name — usually kept untranslated.
 
 language:
   en: Language

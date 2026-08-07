@@ -1,0 +1,158 @@
+/*
+ * Candidate palette — direction "Patina": warm graphite neutrals (hue 60-85
+ * at whisper chroma) with a desaturated teal accent (hue 195). Calm,
+ * paper-like light theme; warm charcoal dark theme. Status hues keep their
+ * families; danger warms slightly toward the neutrals. Drop-in replacement
+ * for packages/tokens/theme.css — token names, radii, fonts, and the
+ * semantic mapping are unchanged; only raw palette values differ.
+ */
+
+/* Layer 1 — raw palette (light). */
+:root {
+  /* Neutrals. */
+  --pub-canvas: oklch(0.978 0.004 85); /* page background */
+  --pub-surface: oklch(0.995 0.002 85); /* cards, headers, raised blocks */
+  --pub-ink: oklch(0.245 0.012 60); /* primary text */
+  --pub-ink-muted: oklch(0.47 0.015 60); /* secondary text */
+  --pub-line: oklch(0.9 0.007 75); /* borders, separators */
+
+  /* Accent. */
+  --pub-accent: oklch(0.5 0.1 195); /* interactive fill / links */
+  --pub-accent-strong: oklch(0.43 0.1 195); /* hover / active fill */
+  --pub-on-accent: oklch(0.985 0.005 195); /* text on accent fill */
+  --pub-accent-soft: oklch(0.95 0.032 190); /* tinted chips, hovers, hero */
+
+  /* Status: success (green). */
+  --pub-success: oklch(0.52 0.13 150); /* solid fill */
+  --pub-on-success: oklch(0.98 0.01 150); /* text on solid fill */
+  --pub-success-soft: oklch(0.95 0.04 150); /* tinted badge/alert background */
+  --pub-success-ink: oklch(0.42 0.1 150); /* text on soft/canvas/surface */
+
+  /* Status: warning (amber). */
+  --pub-warning: oklch(0.76 0.15 75); /* solid fill (dark text on it) */
+  --pub-on-warning: oklch(0.28 0.05 75); /* text on solid fill */
+  --pub-warning-soft: oklch(0.95 0.055 85); /* tinted badge/alert background */
+  --pub-warning-ink: oklch(0.44 0.09 70); /* text on soft/canvas/surface */
+
+  /* Status: danger (red). */
+  --pub-danger: oklch(0.51 0.18 30); /* solid fill (destructive actions) */
+  --pub-on-danger: oklch(0.99 0.005 30); /* text on solid fill */
+  --pub-danger-soft: oklch(0.94 0.035 28); /* tinted badge/alert background */
+  --pub-danger-ink: oklch(0.45 0.16 30); /* text on soft/canvas/surface */
+
+  /*
+   * QR well — the ONE pair that deliberately does NOT flip with the theme.
+   * A QR reader expects dark modules on a light field; identical values in
+   * both blocks keep the contrast gate checking the pair twice.
+   */
+  --pub-qr-surface: oklch(1 0 0);
+  --pub-qr-ink: oklch(0.15 0 0);
+
+  /* Radii — unchanged from the current system (theme independent). */
+  --pub-radius-sm: 0.375rem; /* 6px — badges, small chips */
+  --pub-radius-md: 0.5rem; /* 8px — inputs, small buttons */
+  --pub-radius-lg: 0.75rem; /* 12px — buttons, menu panels */
+  --pub-radius-xl: 1rem; /* 16px — cards, dialogs */
+  --pub-radius-2xl: 1.5rem; /* 24px — hero/marketing surfaces */
+
+  /* Font stacks — unchanged (Inter Variable + JetBrains Mono, self-hosted). */
+  --pub-font-sans:
+    "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", "Hiragino Kaku Gothic ProN", "Hiragino Sans",
+    "Yu Gothic UI", Meiryo, "Apple SD Gothic Neo", "Malgun Gothic", "PingFang SC",
+    "Microsoft YaHei", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+  --pub-font-mono:
+    "JetBrains Mono", ui-monospace, "SF Mono", sfmono-regular, Menlo, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+/* Layer 1 — dark overrides. Same token set, no new names. */
+[data-theme="dark"] {
+  /* Neutrals. */
+  --pub-canvas: oklch(0.19 0.008 75); /* page background */
+  --pub-surface: oklch(0.235 0.01 75); /* cards, headers, raised blocks */
+  --pub-ink: oklch(0.93 0.006 85); /* primary text */
+  --pub-ink-muted: oklch(0.71 0.015 80); /* secondary text */
+  --pub-line: oklch(0.33 0.012 75); /* borders, separators */
+
+  /* Accent. */
+  --pub-accent: oklch(0.75 0.1 195); /* interactive fill / links */
+  --pub-accent-strong: oklch(0.8 0.09 195); /* hover / active fill */
+  --pub-on-accent: oklch(0.17 0.03 195); /* text on accent fill */
+  --pub-accent-soft: oklch(0.28 0.045 195); /* tinted chips, hovers, hero */
+
+  /* Status: success (green). */
+  --pub-success: oklch(0.72 0.13 150); /* solid fill */
+  --pub-on-success: oklch(0.18 0.04 150); /* text on solid fill */
+  --pub-success-soft: oklch(0.27 0.045 150); /* tinted badge/alert background */
+  --pub-success-ink: oklch(0.8 0.13 150); /* text on soft/canvas/surface */
+
+  /* Status: warning (amber). */
+  --pub-warning: oklch(0.78 0.13 80); /* solid fill (dark text on it) */
+  --pub-on-warning: oklch(0.2 0.045 80); /* text on solid fill */
+  --pub-warning-soft: oklch(0.28 0.04 80); /* tinted badge/alert background */
+  --pub-warning-ink: oklch(0.82 0.12 85); /* text on soft/canvas/surface */
+
+  /* Status: danger (red). */
+  --pub-danger: oklch(0.68 0.15 28); /* solid fill (destructive actions) */
+  --pub-on-danger: oklch(0.16 0.03 28); /* text on solid fill */
+  --pub-danger-soft: oklch(0.27 0.055 28); /* tinted badge/alert background */
+  --pub-danger-ink: oklch(0.78 0.11 28); /* text on soft/canvas/surface */
+
+  /*
+   * QR well — the ONE pair that deliberately does NOT flip with the theme.
+   * A QR reader expects dark modules on a light field; identical values in
+   * both blocks keep the contrast gate checking the pair twice.
+   */
+  --pub-qr-surface: oklch(1 0 0);
+  --pub-qr-ink: oklch(0.15 0 0);
+}
+
+/* Layer 2 — semantic mapping consumed by Tailwind utilities. */
+@theme {
+  --color-canvas: var(--pub-canvas);
+  --color-surface: var(--pub-surface);
+  --color-ink: var(--pub-ink);
+  --color-ink-muted: var(--pub-ink-muted);
+  --color-line: var(--pub-line);
+
+  --color-accent: var(--pub-accent);
+  --color-accent-strong: var(--pub-accent-strong);
+  --color-on-accent: var(--pub-on-accent);
+  --color-accent-soft: var(--pub-accent-soft);
+
+  --color-success: var(--pub-success);
+  --color-on-success: var(--pub-on-success);
+  --color-success-soft: var(--pub-success-soft);
+  --color-success-ink: var(--pub-success-ink);
+
+  --color-warning: var(--pub-warning);
+  --color-on-warning: var(--pub-on-warning);
+  --color-warning-soft: var(--pub-warning-soft);
+  --color-warning-ink: var(--pub-warning-ink);
+
+  --color-danger: var(--pub-danger);
+  --color-on-danger: var(--pub-on-danger);
+  --color-danger-soft: var(--pub-danger-soft);
+  --color-danger-ink: var(--pub-danger-ink);
+
+  --color-qr-surface: var(--pub-qr-surface);
+  --color-qr-ink: var(--pub-qr-ink);
+
+  --radius-sm: var(--pub-radius-sm);
+  --radius-md: var(--pub-radius-md);
+  --radius-lg: var(--pub-radius-lg);
+  --radius-xl: var(--pub-radius-xl);
+  --radius-2xl: var(--pub-radius-2xl);
+
+  --font-sans: var(--pub-font-sans);
+  --font-mono: var(--pub-font-mono);
+}
+
+/* Layer 3 — `dark:` utilities follow the stamped attribute, not the OS. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Kobalte state variants (decision 14). */
+@custom-variant selected (&:where([data-selected]));
+@custom-variant expanded (&:where([data-expanded]));
+@custom-variant highlighted (&:where([data-highlighted]));
