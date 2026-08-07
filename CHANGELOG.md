@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-07 — roadmap
+
+### Added
+
+- (docs) [docs/roadmap.md](docs/roadmap.md): audited state of the project (foundation, configured tooling, verified behaviour), a ranked tech-debt register of 36 items with file references, the status of all 33 security requirements, and a five-phase plan from "installable" through multi-instance to the enterprise tier.
+
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
 ## 2026-08-07 — the first end-to-end pass: one binary, a real browser, the real `dart pub` client

@@ -13,6 +13,7 @@ Self-hosted, open-source package registry for Dart & Flutter — a private pub.d
 | [docs/decisions.md](docs/decisions.md) | Architecture decision log with rationale |
 | [docs/security.md](docs/security.md) | Normative security requirements (S-01…S-30) |
 | [docs/protocol.md](docs/protocol.md) | Hosted Pub Repository Spec v2 — sharp edges we must honor |
+| [docs/roadmap.md](docs/roadmap.md) | State of the project, tech debt, and the plan forward |
 
 ## Shape of the thing
 
