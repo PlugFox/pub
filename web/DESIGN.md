@@ -54,6 +54,13 @@ same commit.
 | `accent-strong` | hover/active fill | `oklch(0.43 0.2 282)` | `oklch(0.79 0.115 285)` |
 | `on-accent` | text on accent fill | `oklch(0.99 0.005 282)` | `oklch(0.18 0.03 285)` |
 | `accent-soft` | tinted chips, hovers, hero | `oklch(0.95 0.03 282)` | `oklch(0.28 0.05 285)` |
+| `qr-surface` | QR well background | `oklch(1 0 0)` | `oklch(1 0 0)` |
+| `qr-ink` | QR modules | `oklch(0.15 0 0)` | `oklch(0.15 0 0)` |
+
+`qr-surface`/`qr-ink` are the **one pair that deliberately does not flip**: a QR
+reader expects dark modules on a light field, and an inverted code is
+unscannable on most phone cameras. Both themes carry identical values so the
+contrast gate still checks the pair twice.
 
 ### Status colors
 
@@ -203,6 +210,56 @@ subpath imports. Every component has a `/ui-kit` registry entry.
 - **ThemeToggle** — ghost pill (`rounded-full`, 32 px square) cycling
   light → dark → system; persists `pub_theme`; stamps `data-theme` (contract
   shared with the anti-FOUC script).
+- **Alert** — inline, layout-owned status block: `rounded-lg border p-4
+  text-sm`, soft tints only (same palette rules as Badge). `danger` renders
+  `role="alert"` (assertive), the rest `role="status"` (polite). Not a toast —
+  an Alert stays until its condition changes. `AlertTitle` is an optional bold
+  first line.
+- **Spinner** — indeterminate busy indicator for actions of unknown duration
+  (`sm` 16 / `md` 20 / `lg` 32 px), `animate-spin`, `currentColor`, wrapper is
+  `role="status"` with a default `common.loading` name. Loading *content* of a
+  known shape uses Skeleton instead.
+- **Table** — the app's dense surface. Renders its own `overflow-x-auto`
+  scroll container as a named, focusable `<section>` (§8: tables scroll, they
+  do not reflow; a scroll region a keyboard cannot reach is a WCAG 2.1.1
+  failure). Slots `TableHead` (canvas, bottom hairline) / `TableBody`
+  (`divide-y`) / `TableRow` / `TableHeaderCell` (`text-ink-muted`,
+  `scope="col"`) / `TableCell`; `px-4 py-3` cells, `text-sm`.
+- **Tabs** (Kobalte) — underline skin: list is a bottom hairline, triggers are
+  `text-ink-muted` going `text-ink` when `selected`, and an accent
+  `TabsIndicator` slides under the active one. Kobalte owns roving focus and
+  arrow-key navigation.
+- **Menu** (Kobalte dropdown) — transient surface: `rounded-lg border bg-surface
+  p-1 shadow-md`, items `rounded-md px-3 py-2 text-sm` highlighting to
+  `bg-accent-soft text-accent`. `MenuLabel` is a muted `text-xs` heading,
+  `MenuSeparator` a hairline that carries its own `my-1` — the **one
+  sanctioned root margin** in the kit, because a separator's whole job is the
+  gap around it and `MenuContent` cannot use `gap-*` without also spacing the
+  items it deliberately packs. Content is actions — never a form.
+- **Toast** — transient message, `rounded-lg border p-4 shadow-md`, same four
+  intents as Alert, with a close button. `ToastRegion` is the fixed
+  bottom-right stack: `aria-live="polite"`, `pointer-events-none` on the
+  region so it never blocks the page. The queue is app state, not UI state —
+  `packages/ui` stays stateless.
+- **EmptyState** — a *hole* in the layout, so a dashed outline on the canvas
+  rather than a Card: `rounded-xl border border-dashed px-6 py-12 text-center`,
+  title + optional description + an action slot. Always offer the action that
+  fills it.
+- **CopyButton** — outline `sm` Button that writes `value` to the clipboard and
+  swaps its own label to `common.copied` for two seconds (`aria-live="polite"`).
+  A denied or unavailable clipboard fails silently: the value is always
+  rendered next to the button.
+- **QrCode** — SVG QR from the dependency-free encoder in
+  [`qr-encode.ts`](packages/ui/src/qr-encode.ts) (byte mode, level M, versions
+  1–9). One `<path>` of module sub-paths, `currentColor` on transparent, so
+  callers place it in a `bg-qr-surface text-qr-ink` well. `fallback` renders
+  when the payload exceeds capacity — 2FA enrollment degrades to manual secret
+  entry rather than to a blank box.
+
+**Kobalte state variants.** Primitives report state through data attributes;
+`theme.css` names them so component class strings stay free of arbitrary-value
+syntax: `selected:` (`[data-selected]`), `expanded:`, `highlighted:`. Disabled
+state keys off the native `aria-disabled:`/`disabled:` variants.
 
 ## 7. Do / Don't
 
@@ -232,6 +289,25 @@ subpath imports. Every component has a `/ui-kit` registry entry.
 - ❌ No new font files or weights without updating fonts.css subsets, the
   preload, and the bundle-size report.
 
+## 7a. Motion
+
+Motion in this product is decorative without exception: the Skeleton pulse,
+the Spinner rotation, `transition-colors` on interactive surfaces, and the
+sliding Tabs indicator. None of it encodes state a user could not read from the
+static frame, so `prefers-reduced-motion: reduce` switches **all** of it off in
+one place — [`apps/site/src/styles/global.css`](apps/site/src/styles/global.css)
+sets `animation: none; transition: none` on every element.
+
+Two consequences worth knowing before adding a component:
+
+- The block is **unlayered** on purpose. Tailwind 4 emits utilities inside
+  `@layer utilities`, and an unlayered rule outranks every layered one whatever
+  its specificity — that is what lets it beat `animate-spin` without the
+  `!important` §7 bans.
+- Because the reset is global, a component never writes `motion-safe:` /
+  `motion-reduce:` variants. If a future animation *does* carry meaning (a
+  progress bar, a diff highlight), it must opt back in explicitly and say why.
+
 ## 8. Responsive strategy
 
 Mobile-first with Tailwind's stock breakpoints (`sm` 640, `md` 768, `lg` 1024,
@@ -251,6 +327,8 @@ Before committing any UI change, an AI contributor must verify:
 
 1. **Gate:** `bun install && bun run check && bun run build && bun test` — all
    green. `check` includes the WCAG contrast gate over `theme.css`.
+   **Motion:** any new animation is covered by the global reduced-motion reset
+   (§7a) — do not add per-component `motion-*` variants.
 2. **Both themes:** open `/ui-kit` (and any touched screen) in light AND dark
    via the ThemeToggle. No unreadable pairs, no invisible borders.
 3. **Tokens only:** grep your diff for `#`-hex, `oklch(`, `--pub-`, `[` inside

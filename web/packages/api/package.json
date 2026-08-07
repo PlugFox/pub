@@ -5,7 +5,16 @@
   "type": "module",
   "exports": {
     "./client": "./src/client.ts",
-    "./errors": "./src/errors.ts"
+    "./errors": "./src/errors.ts",
+    "./types": "./src/types.ts",
+    "./storage": "./src/storage.ts",
+    "./jwt": "./src/jwt.ts",
+    "./interceptors": "./src/interceptors.ts",
+    "./auth": "./src/auth.ts",
+    "./sessions": "./src/sessions.ts",
+    "./tokens": "./src/tokens.ts",
+    "./orgs": "./src/orgs.ts",
+    "./pub-api": "./src/pub-api.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

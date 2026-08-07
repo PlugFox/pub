@@ -7,3 +7,27 @@
  * detection does not see their class names — register them explicitly.
  */
 @source "../../../../packages/ui/src";
+
+/*
+ * Reduced motion, once, globally.
+ *
+ * Every animation in the product is decorative — a pulsing Skeleton, a
+ * spinning Spinner, colour transitions, the sliding Tabs indicator. None of it
+ * encodes information, so the honest response to `prefers-reduced-motion` is
+ * to stop all of it rather than to sprinkle `motion-safe:` over component
+ * recipes and forget one.
+ *
+ * This block is deliberately UNLAYERED: Tailwind 4 emits its utilities inside
+ * `@layer utilities`, and any unlayered rule outranks every layered one no
+ * matter their specificity. That is what lets `animation: none` beat
+ * `animate-spin` without `!important`, which web/DESIGN.md §7 bans.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none;
+    transition: none;
+    scroll-behavior: auto;
+  }
+}

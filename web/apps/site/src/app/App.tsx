@@ -1,44 +1,134 @@
-import { t, tp } from "@pub/i18n";
-import { common } from "@pub/i18n/generated/common";
-import { A, Route, Router } from "@solidjs/router";
+import { Route, Router } from "@solidjs/router";
 import type { JSX } from "solid-js";
+import { AccountScreen } from "./screens/account";
+import { LoginScreen } from "./screens/login";
+import { OidcCallbackScreen } from "./screens/oidc-callback";
+import { OrgDetailScreen, OrgsScreen } from "./screens/orgs";
+import {
+  AdminScreen,
+  AppNotFoundScreen,
+  NotificationsScreen,
+  OverviewScreen,
+  PackagesScreen,
+  SearchScreen,
+} from "./screens/placeholders";
+import { SessionsScreen } from "./screens/sessions";
+import { TokensScreen } from "./screens/tokens";
+import { AppShell } from "./shell/app-shell";
+import { RequireAuth, ScreenBoundary } from "./shell/require-auth";
 
 /*
- * The single client:only SolidJS island (decision 14). Placeholder routes
- * only — feature folders (auth, orgs, packages, tokens, admin) mount here in
- * later roadmap steps, with data code written exclusively as
- * createAsync/query/action for the mechanical Solid 2.0 upgrade.
+ * The single client:only SolidJS island (decision 14), routed by
+ * @solidjs/router in browser mode with `/app` as the base.
+ *
+ * Two route classes:
+ *   - public: sign-in and the OIDC redirect landing. They must render for a
+ *     visitor with no credential, so they sit outside the guard.
+ *   - guarded: everything else, wrapped in `RequireAuth` (routing, not
+ *     security — the server authorizes every byte) and in a boundary that
+ *     owns the screen's loading and failure states.
+ *
+ * The catch-all is LAST and inside the shell, so an unknown `/app/*` path
+ * lands on the app's own 404 with its navigation intact rather than on the
+ * static site's 404.
  */
 
-function Dashboard(): JSX.Element {
+function Guarded(props: { readonly children: JSX.Element }): JSX.Element {
   return (
-    <main class="mx-auto w-full max-w-2xl px-6 py-16">
-      <h1 class="text-2xl font-semibold text-ink">{t(common.appDashboard)}</h1>
-      <p class="mt-2 text-ink-muted">{tp(common.packagesCount, 0)}</p>
-      <A href="/about" class="mt-6 inline-block text-accent underline">
-        {t(common.appAbout)}
-      </A>
-    </main>
-  );
-}
-
-function About(): JSX.Element {
-  return (
-    <main class="mx-auto w-full max-w-2xl px-6 py-16">
-      <h1 class="text-2xl font-semibold text-ink">{t(common.appAbout)}</h1>
-      <p class="mt-2 text-ink-muted">{t(common.tagline)}</p>
-      <A href="/" class="mt-6 inline-block text-accent underline">
-        {t(common.appDashboard)}
-      </A>
-    </main>
+    <RequireAuth>
+      <ScreenBoundary>{props.children}</ScreenBoundary>
+    </RequireAuth>
   );
 }
 
 export function App(): JSX.Element {
   return (
-    <Router base="/app">
-      <Route path="/" component={Dashboard} />
-      <Route path="/about" component={About} />
+    <Router base="/app" root={(props) => <AppShell>{props.children}</AppShell>}>
+      <Route path="/login" component={LoginScreen} />
+      <Route path="/auth/callback/:provider" component={OidcCallbackScreen} />
+
+      <Route
+        path="/"
+        component={() => (
+          <Guarded>
+            <OverviewScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/packages"
+        component={() => (
+          <Guarded>
+            <PackagesScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/search"
+        component={() => (
+          <Guarded>
+            <SearchScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/orgs"
+        component={() => (
+          <Guarded>
+            <OrgsScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/orgs/:slug"
+        component={() => (
+          <Guarded>
+            <OrgDetailScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/tokens"
+        component={() => (
+          <Guarded>
+            <TokensScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/sessions"
+        component={() => (
+          <Guarded>
+            <SessionsScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/notifications"
+        component={() => (
+          <Guarded>
+            <NotificationsScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/account"
+        component={() => (
+          <Guarded>
+            <AccountScreen />
+          </Guarded>
+        )}
+      />
+      <Route
+        path="/admin"
+        component={() => (
+          <Guarded>
+            <AdminScreen />
+          </Guarded>
+        )}
+      />
+
+      <Route path="*" component={AppNotFoundScreen} />
     </Router>
   );
 }

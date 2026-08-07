@@ -1,17 +1,26 @@
-import { ApiError, NetworkError } from "./errors";
+import { ApiError, NetworkError, parseRetryAfter } from "./errors";
 
 /*
- * Interceptor-chain fetch client skeleton (foxic-style, decision 14).
+ * Interceptor-chain fetch client (foxic-style, decision 14).
  *
  * Interceptors compose around a terminal fetch via reduceRight, so the FIRST
  * interceptor in the array is the OUTERMOST wrapper (sees the request first,
- * the response last). Auth/refresh/dedup interceptors arrive in a later
- * roadmap step; this file only fixes the seams.
+ * the response last). The concrete chain — mutation headers, bearer injection,
+ * proactive/reactive refresh, step-up detection — lives in `interceptors.ts`
+ * and is assembled by `createPubApi` in `pub-api.ts`.
  *
- * NOTE: request/response payload types will be generated from the server's
- * utoipa OpenAPI 3.1 document via openapi-typescript — `request<T>` is a
- * temporary, hand-typed placeholder until then.
+ * NOTE: request/response payload types are hand-written in `types.ts` for now;
+ * regenerate them from the server's utoipa OpenAPI 3.1 document via
+ * openapi-typescript once the app API stabilizes.
  */
+
+/** Per-request instructions for the interceptor chain (never sent on the wire). */
+export type RequestMeta = {
+  /** Skip bearer injection and the refresh dance (login, refresh, providers). */
+  readonly skipAuth?: boolean;
+  /** Marks the refresh call itself, so a 401 on it can never recurse. */
+  readonly isRefresh?: boolean;
+};
 
 export type RequestContext = {
   request: Request;
@@ -40,8 +49,16 @@ export type ClientOptions = {
 };
 
 export type ApiClient = {
-  request<T>(path: string, init?: RequestInit): Promise<T>;
+  request<T>(path: string, init?: RequestInit, meta?: RequestMeta): Promise<T>;
 };
+
+const META_KEY = "pub.meta";
+
+/** Reads the per-request meta an interceptor was handed (never mutate it). */
+export function requestMeta(ctx: RequestContext): RequestMeta {
+  const meta = ctx.state[META_KEY];
+  return typeof meta === "object" && meta !== null ? (meta as RequestMeta) : {};
+}
 
 /** Composes interceptors around `terminal`; index 0 becomes the outermost layer. */
 export function composeInterceptors(
@@ -69,16 +86,35 @@ export function createClient(options: ClientOptions = {}): ApiClient {
   const run = composeInterceptors(options.interceptors ?? [], terminal);
 
   return {
-    async request<T>(path: string, init?: RequestInit): Promise<T> {
+    async request<T>(path: string, init?: RequestInit, meta?: RequestMeta): Promise<T> {
       const request = new Request(`${options.baseUrl ?? ""}${path}`, init);
-      const response = await run({ request, state: {} });
+      const response = await run({ request, state: { [META_KEY]: meta ?? {} } });
       return unwrapEnvelope<T>(response);
     },
   };
 }
 
+/**
+ * JSON body + method, the shape every mutation in the API modules uses.
+ *
+ * The content type is declared HERE and not left to the interceptor, because
+ * `new Request(url, { body: "…" })` is not neutral: per Fetch ("extract a
+ * body"), a string body makes the constructor append
+ * `Content-Type: text/plain;charset=UTF-8` when the header is absent. The S-12
+ * guard answers 415 to anything that is not `application/json`, so a mutation
+ * built without an explicit type would be refused by the server in every real
+ * browser. Bun's `Request` does NOT add the implicit type, which is exactly why
+ * an offline test suite cannot see the failure — the interceptor keeps a second
+ * guard for bodies built elsewhere.
+ */
+export function jsonBody(method: string, body: unknown): RequestInit {
+  return { method, body: JSON.stringify(body), headers: { "content-type": "application/json" } };
+}
+
 /** Unwraps the server envelope: ok → data, error → ApiError, 204 → undefined. */
-async function unwrapEnvelope<T>(response: Response): Promise<T> {
+export async function unwrapEnvelope<T>(response: Response): Promise<T> {
+  // 429/503 carry Retry-After (S-24); the countdown UI needs it on the error.
+  const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
   if (response.status === 204) {
     return undefined as T;
   }
@@ -86,17 +122,49 @@ async function unwrapEnvelope<T>(response: Response): Promise<T> {
   try {
     envelope = (await response.json()) as Envelope<T>;
   } catch {
-    throw new ApiError("invalid_response", "response body is not a JSON envelope", response.status);
+    throw new ApiError(
+      "invalid_response",
+      "response body is not a JSON envelope",
+      response.status,
+      {
+        retryAfter,
+      },
+    );
   }
   if (envelope.status === "ok") {
     return envelope.data;
   }
   if (envelope.status === "error") {
-    throw new ApiError(envelope.error.code, envelope.error.message, response.status);
+    throw new ApiError(envelope.error.code, envelope.error.message, response.status, {
+      retryAfter,
+    });
   }
   throw new ApiError(
     "invalid_response",
     "envelope status is neither ok nor error",
     response.status,
+    {
+      retryAfter,
+    },
   );
+}
+
+/**
+ * Reads the error code out of a response without consuming it.
+ *
+ * Interceptors that need to branch on the code (step-up, refresh reuse) run
+ * before the envelope is unwrapped, so they must clone: a body read twice
+ * throws, and the caller still needs the original.
+ */
+export async function peekErrorCode(response: Response): Promise<string | null> {
+  try {
+    const parsed: unknown = await response.clone().json();
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const envelope = parsed as { status?: string; error?: { code?: unknown } };
+    if (envelope.status !== "error") return null;
+    const code = envelope.error?.code;
+    return typeof code === "string" ? code : null;
+  } catch {
+    return null;
+  }
 }

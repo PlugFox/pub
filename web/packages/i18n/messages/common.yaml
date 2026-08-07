@@ -44,6 +44,21 @@ close:
   ru: Закрыть
   desc: Accessible label of dismiss buttons (dialog close, toast dismiss).
 
+copy:
+  en: Copy
+  ru: Копировать
+  desc: Label of the CopyButton in its idle state; copies the adjacent value to the clipboard.
+
+copied:
+  en: Copied
+  ru: Скопировано
+  desc: Label the CopyButton shows for two seconds after a successful clipboard write.
+
+loading:
+  en: Loading…
+  ru: Загрузка…
+  desc: Accessible name of the Spinner while an action of unknown duration is running.
+
 notFound:
   en: Page not found
   ru: Страница не найдена

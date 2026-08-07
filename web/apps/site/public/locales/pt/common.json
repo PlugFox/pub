@@ -1,5 +1,5 @@
 {
-  "__todo__": "TODO: translate from English: siteTitle, tagline, navHome, navApp, themeToggle, language, close, notFound, appDashboard, appAbout, packagesCount",
+  "__todo__": "TODO: translate from English: siteTitle, tagline, navHome, navApp, themeToggle, language, close, copy, copied, loading, notFound, appDashboard, appAbout, packagesCount",
   "common.siteTitle": "Pub",
   "common.tagline": "Self-hosted package registry for Dart and Flutter",
   "common.navHome": "Home",
@@ -7,6 +7,9 @@
   "common.themeToggle": "Toggle theme",
   "common.language": "Language",
   "common.close": "Close",
+  "common.copy": "Copy",
+  "common.copied": "Copied",
+  "common.loading": "Loading…",
   "common.notFound": "Page not found",
   "common.appDashboard": "Dashboard",
   "common.appAbout": "About",

@@ -1,6 +1,8 @@
+import { Alert, AlertTitle } from "@pub/ui/alert";
 import { Badge } from "@pub/ui/badge";
 import { Button, buttonVariants } from "@pub/ui/button";
 import { Card, CardContent, CardFooter, CardHeader } from "@pub/ui/card";
+import { CopyButton } from "@pub/ui/copy-button";
 import {
   Dialog,
   DialogContent,
@@ -8,13 +10,20 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@pub/ui/dialog";
+import { EmptyState } from "@pub/ui/empty-state";
 import { Input } from "@pub/ui/input";
 import { Label } from "@pub/ui/label";
+import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "@pub/ui/menu";
+import { QrCode } from "@pub/ui/qr-code";
 import { Separator } from "@pub/ui/separator";
 import { Skeleton } from "@pub/ui/skeleton";
+import { Spinner } from "@pub/ui/spinner";
+import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@pub/ui/tabs";
 import { ThemeToggle } from "@pub/ui/theme-toggle";
+import { Toast, ToastRegion } from "@pub/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@pub/ui/tooltip";
-import { For, type JSX } from "solid-js";
+import { createSignal, For, type JSX } from "solid-js";
 
 /*
  * Internal component showcase (/ui-kit, robots-disallowed). English-only by
@@ -192,7 +201,230 @@ const registry: readonly ShowcaseEntry[] = [
     note: "Cycles light → dark → system; persists to localStorage (pub_theme).",
     render: () => <ThemeToggle />,
   },
+  {
+    name: "Alert",
+    note: "Inline status block; intents info / success / warning / danger (danger renders role=alert).",
+    render: () => (
+      <div class="flex w-full max-w-lg flex-col gap-3">
+        <For each={ALERT_INTENTS}>
+          {(intent) => (
+            <Alert intent={intent}>
+              <div class="flex flex-col gap-1">
+                <AlertTitle>{intent}</AlertTitle>
+                <span>Retry-After: 42 s. The bucket refills on its own.</span>
+              </div>
+            </Alert>
+          )}
+        </For>
+      </div>
+    ),
+  },
+  {
+    name: "Spinner",
+    note: "Indeterminate busy indicator; sizes sm / md / lg, role=status with an accessible name.",
+    render: () => (
+      <div class="flex items-center gap-6">
+        <For each={SPINNER_SIZES}>{(size) => <Spinner size={size} />}</For>
+        <Button disabled>
+          <Spinner />
+          Publishing…
+        </Button>
+      </div>
+    ),
+  },
+  {
+    name: "Table",
+    note: "Dense data surface; scrolls horizontally inside its own keyboard-reachable container.",
+    render: () => (
+      <Table label="Example tokens">
+        <TableHead>
+          <TableRow>
+            <TableHeaderCell>Token</TableHeaderCell>
+            <TableHeaderCell>Scopes</TableHeaderCell>
+            <TableHeaderCell>Expires</TableHeaderCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          <For each={TABLE_ROWS}>
+            {(row) => (
+              <TableRow>
+                <TableCell>
+                  <div class="flex flex-col">
+                    <span class="font-medium">{row.name}</span>
+                    <span class="font-mono text-xs text-ink-muted">{row.hint}…</span>
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div class="flex gap-1">
+                    <For each={row.scopes}>
+                      {(scope) => (
+                        <Badge
+                          variant={scope === "publish" ? "warning" : "neutral"}
+                          class="font-mono"
+                        >
+                          {scope}
+                        </Badge>
+                      )}
+                    </For>
+                  </div>
+                </TableCell>
+                <TableCell class="text-ink-muted">{row.expires}</TableCell>
+              </TableRow>
+            )}
+          </For>
+        </TableBody>
+      </Table>
+    ),
+  },
+  {
+    name: "Tabs",
+    note: "Kobalte-powered; roving focus, arrow-key navigation, animated underline indicator.",
+    render: () => (
+      <Tabs defaultValue="profile" class="w-full max-w-lg">
+        <TabsList>
+          <TabsTrigger value="profile">Profile</TabsTrigger>
+          <TabsTrigger value="security">Security</TabsTrigger>
+          <TabsTrigger value="disabled" disabled>
+            Disabled
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="profile">
+          <p class="text-sm text-ink-muted">Display name, email, member since.</p>
+        </TabsContent>
+        <TabsContent value="security">
+          <p class="text-sm text-ink-muted">Two-factor authentication and recovery codes.</p>
+        </TabsContent>
+        <TabsContent value="disabled">unreachable</TabsContent>
+      </Tabs>
+    ),
+  },
+  {
+    name: "Menu",
+    note: "Kobalte dropdown: typeahead, roving focus, outside/escape dismissal; transient surface (shadow).",
+    render: () => (
+      <Menu>
+        <MenuTrigger class={buttonVariants({ intent: "outline", size: "md" })}>
+          Open menu
+        </MenuTrigger>
+        <MenuContent>
+          <MenuLabel>ada@example.com</MenuLabel>
+          <MenuItem>Account</MenuItem>
+          <MenuItem>Sessions</MenuItem>
+          <MenuSeparator />
+          <MenuItem disabled>Admin (no permission)</MenuItem>
+          <MenuItem>Sign out</MenuItem>
+        </MenuContent>
+      </Menu>
+    ),
+  },
+  {
+    name: "Toast",
+    note: "Transient message; the queue lives in the app store, this is the presentational half.",
+    render: () => (
+      <div class="flex w-full max-w-md flex-col gap-3">
+        <For each={ALERT_INTENTS}>
+          {(intent) => (
+            <Toast intent={intent} onDismiss={() => undefined}>
+              Token revoked.
+            </Toast>
+          )}
+        </For>
+        <p class="text-xs text-ink-muted">
+          In the app these are stacked bottom-right by <span class="font-mono">ToastRegion</span>.
+          The live region below holds one example.
+        </p>
+        <ToastRegionDemo />
+      </div>
+    ),
+  },
+  {
+    name: "EmptyState",
+    note: "Dashed hole in the layout with the action that fills it — never a dead end.",
+    render: () => (
+      <EmptyState
+        class="w-full max-w-lg"
+        title="No tokens yet"
+        description="Create a token to publish packages or to let CI read your private registry."
+      >
+        <Button size="sm">New token</Button>
+      </EmptyState>
+    ),
+  },
+  {
+    name: "CopyButton",
+    note: "Copies a value and confirms in place for two seconds (clipboard denial is silent).",
+    render: () => (
+      <div class="flex w-full max-w-lg items-center gap-3">
+        <code class="min-w-0 flex-1 overflow-x-auto rounded-lg border border-line bg-surface px-3 py-2 font-mono text-sm">
+          dart pub token add https://pub.example.com/o/acme/pub
+        </code>
+        <CopyButton value="dart pub token add https://pub.example.com/o/acme/pub" />
+      </div>
+    ),
+  },
+  {
+    name: "QrCode",
+    note: "Dependency-free byte-mode QR (level M, versions 1–9); light well in BOTH themes so it stays scannable.",
+    render: () => (
+      <div class="flex flex-wrap items-start gap-6">
+        <div class="w-fit rounded-xl border border-line bg-qr-surface p-4 text-qr-ink">
+          <QrCode value={OTPAUTH_EXAMPLE} label="Example otpauth provisioning URL" />
+        </div>
+        <div class="w-fit rounded-xl border border-line bg-qr-surface p-4 text-qr-ink">
+          <QrCode
+            value={"x".repeat(400)}
+            label="Payload too long"
+            fallback={
+              <p class="max-w-48 text-sm">Too long to encode — enter the secret manually.</p>
+            }
+          />
+        </div>
+      </div>
+    ),
+  },
 ];
+
+const ALERT_INTENTS = ["info", "success", "warning", "danger"] as const;
+const SPINNER_SIZES = ["sm", "md", "lg"] as const;
+const OTPAUTH_EXAMPLE =
+  "otpauth://totp/Pub:ada%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Pub";
+const TABLE_ROWS = [
+  {
+    name: "CI — release pipeline",
+    hint: "pub_9f86",
+    scopes: ["read", "publish"],
+    expires: "5 Nov 2026",
+  },
+  { name: "Local laptop", hint: "pub_2c26", scopes: ["read"], expires: "Never" },
+] as const;
+
+/** Live ToastRegion so the fixed positioning and live region can be inspected. */
+function ToastRegionDemo(): JSX.Element {
+  const [items, setItems] = createSignal([
+    { id: 1, message: "Session revoked.", intent: "success" as const },
+  ]);
+  return (
+    <>
+      <Button
+        size="sm"
+        intent="outline"
+        class="self-start"
+        onClick={() =>
+          setItems((current) =>
+            current.length === 0 ? [{ id: 1, message: "Session revoked.", intent: "success" }] : [],
+          )
+        }
+      >
+        Toggle toast region
+      </Button>
+      <ToastRegion
+        items={items()}
+        label="Notifications"
+        onDismiss={(id) => setItems((current) => current.filter((item) => item.id !== id))}
+      />
+    </>
+  );
+}
 
 export function UiKitPage(): JSX.Element {
   return (

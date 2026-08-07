@@ -16,6 +16,12 @@ export const common = {
   language: { id: "common.language", en: "Language" },
   /** Accessible label of dismiss buttons (dialog close, toast dismiss). */
   close: { id: "common.close", en: "Close" },
+  /** Label of the CopyButton in its idle state; copies the adjacent value to the clipboard. */
+  copy: { id: "common.copy", en: "Copy" },
+  /** Label the CopyButton shows for two seconds after a successful clipboard write. */
+  copied: { id: "common.copied", en: "Copied" },
+  /** Accessible name of the Spinner while an action of unknown duration is running. */
+  loading: { id: "common.loading", en: "Loading…" },
   /** Heading of the 404 error page. */
   notFound: { id: "common.notFound", en: "Page not found" },
   /** Title of the app's placeholder dashboard route (/app). */

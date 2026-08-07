@@ -5,10 +5,27 @@ import { App } from "../../app/App";
 import BaseLayout from "../../layouts/base-layout.astro";
 
 // Prerendered shell entry points only — once mounted, @solidjs/router owns
-// everything under /app in the browser (decision 14). The embedded-asset
-// service on the server will later serve this shell for unknown /app/* paths.
+// everything under /app in the browser (decision 14).
+//
+// Only the STATIC paths can be enumerated here; parameterised ones
+// (/app/orgs/{slug}, /app/auth/callback/{provider}) and any future route are
+// served by the embedded-asset service on the server, which falls back to this
+// same shell for unknown /app/* paths. The island's own catch-all route then
+// renders the in-app 404 when the path matches nothing.
 export function getStaticPaths() {
-  return [{ params: { rest: undefined } }, { params: { rest: "about" } }];
+  const routes = [
+    undefined,
+    "login",
+    "packages",
+    "search",
+    "orgs",
+    "tokens",
+    "sessions",
+    "notifications",
+    "account",
+    "admin",
+  ];
+  return routes.map((rest) => ({ params: { rest } }));
 }
 ---
 

@@ -14,7 +14,17 @@
     "./separator": "./src/separator.tsx",
     "./dialog": "./src/dialog.tsx",
     "./tooltip": "./src/tooltip.tsx",
-    "./theme-toggle": "./src/theme-toggle.tsx"
+    "./theme-toggle": "./src/theme-toggle.tsx",
+    "./qr-encode": "./src/qr-encode.ts",
+    "./table": "./src/table.tsx",
+    "./tabs": "./src/tabs.tsx",
+    "./menu": "./src/menu.tsx",
+    "./alert": "./src/alert.tsx",
+    "./spinner": "./src/spinner.tsx",
+    "./empty-state": "./src/empty-state.tsx",
+    "./copy-button": "./src/copy-button.tsx",
+    "./toast": "./src/toast.tsx",
+    "./qr-code": "./src/qr-code.tsx"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

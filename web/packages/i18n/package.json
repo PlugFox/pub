@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/runtime.ts",
     "./generated/common": "./src/generated/common.ts",
-    "./generated/landing": "./src/generated/landing.ts"
+    "./generated/landing": "./src/generated/landing.ts",
+    "./generated/app": "./src/generated/app.ts"
   },
   "scripts": {
     "i18n:gen": "bun scripts/i18n-gen.ts",

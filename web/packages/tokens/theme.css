@@ -68,6 +68,16 @@
   --pub-danger-ink: oklch(0.45 0.16 27); /* text on soft/canvas/surface */
 
   /*
+   * QR well — the ONE pair that deliberately does NOT flip with the theme.
+   * A QR reader expects dark modules on a light field; an inverted code is
+   * unscannable on most phone cameras, so the 2FA enrollment well keeps a
+   * light background in both themes. Same values appear in the dark block
+   * below so the contrast gate checks the pair there too.
+   */
+  --pub-qr-surface: oklch(1 0 0);
+  --pub-qr-ink: oklch(0.15 0 0);
+
+  /*
    * Radii — SaaS-soft, one notch rounder than Tailwind defaults. Theme
    * independent, so they live only on `:root`.
    */
@@ -121,6 +131,10 @@
   --pub-on-danger: oklch(0.16 0.03 25);
   --pub-danger-soft: oklch(0.27 0.06 25);
   --pub-danger-ink: oklch(0.78 0.11 25);
+
+  /* Intentionally identical to the light values — see the note above. */
+  --pub-qr-surface: oklch(1 0 0);
+  --pub-qr-ink: oklch(0.15 0 0);
 }
 
 /* Layer 2 — semantic mapping consumed by Tailwind utilities. */
@@ -151,6 +165,9 @@
   --color-danger-soft: var(--pub-danger-soft);
   --color-danger-ink: var(--pub-danger-ink);
 
+  --color-qr-surface: var(--pub-qr-surface);
+  --color-qr-ink: var(--pub-qr-ink);
+
   /* Radii override Tailwind's default scale: `rounded-sm` … `rounded-2xl`. */
   --radius-sm: var(--pub-radius-sm);
   --radius-md: var(--pub-radius-md);
@@ -165,3 +182,13 @@
 
 /* Layer 3 — `dark:` utilities follow the stamped attribute, not the OS. */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+ * Kobalte state variants (decision 14 — "custom Tailwind state variants").
+ * Kobalte communicates primitive state through data attributes; naming them
+ * here keeps component class strings free of arbitrary-value syntax
+ * (`data-[selected]:…`), which web/DESIGN.md §7 bans.
+ */
+@custom-variant selected (&:where([data-selected]));
+@custom-variant expanded (&:where([data-expanded]));
+@custom-variant highlighted (&:where([data-highlighted]));

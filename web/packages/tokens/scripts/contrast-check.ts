@@ -45,6 +45,10 @@ const TEXT_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ["danger-ink", "danger-soft"],
   ["danger-ink", "canvas"],
   ["danger-ink", "surface"],
+
+  // The QR well is theme-independent by design; still asserted in both themes
+  // so a future "let's make dark mode consistent" edit trips the gate.
+  ["qr-ink", "qr-surface"],
 ];
 
 function fail(message: string): never {

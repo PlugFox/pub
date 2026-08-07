@@ -1,0 +1,808 @@
+# Namespace: app — the SolidJS island under /app (shell, auth, account, orgs,
+# tokens, sessions, and the honest placeholders for areas the API has not
+# shipped yet).
+#
+# Shape per key:
+#   <camelCaseKey>:
+#     en:   source-of-truth English text (string, or CLDR plural-form map)
+#     desc: mandatory context for translators and LLMs — what/where/constraints
+#     <locale>: optional translation (ru fr it de es pt ja ko zh-Hans)
+#
+# `bun run i18n:gen` regenerates src/generated/ and apps/site/public/locales/;
+# locales missing a translation fall back to English and get a __todo__ marker.
+
+# --- shell ---
+
+skipToContent:
+  en: Skip to content
+  ru: Перейти к содержимому
+  desc: First focusable link in the app shell; jumps past the header to the main region.
+
+navOverview:
+  en: Overview
+  ru: Обзор
+  desc: Sidebar link to the app's start page (/app).
+
+navPackages:
+  en: Packages
+  ru: Пакеты
+  desc: Sidebar link to the package list.
+
+navSearch:
+  en: Search
+  ru: Поиск
+  desc: Sidebar link to the package search screen.
+
+navOrgs:
+  en: Organizations
+  ru: Организации
+  desc: Sidebar link to the list of organizations the user belongs to.
+
+navTokens:
+  en: Tokens
+  ru: Токены
+  desc: Sidebar link to the CLI/API token list.
+
+navSessions:
+  en: Sessions
+  ru: Сеансы
+  desc: Sidebar link to the list of signed-in devices.
+
+navAccount:
+  en: Account
+  ru: Аккаунт
+  desc: Sidebar link to the account screen (profile and security).
+
+navNotifications:
+  en: Notifications
+  ru: Уведомления
+  desc: Sidebar link to the notification center.
+
+navAdmin:
+  en: Admin
+  ru: Администрирование
+  desc: Sidebar link to the instance administration panel.
+
+navPrimary:
+  en: Main navigation
+  ru: Основная навигация
+  desc: Accessible name of the app's primary navigation landmark.
+
+searchPlaceholder:
+  en: Search packages
+  ru: Искать пакеты
+  desc: Placeholder and accessible label of the search field in the app header.
+
+userMenu:
+  en: Account menu
+  ru: Меню аккаунта
+  desc: Accessible name of the avatar button that opens the user menu in the header.
+
+orgSwitcher:
+  en: Organization
+  ru: Организация
+  desc: Accessible name of the header control that switches the active organization.
+
+orgSwitcherAll:
+  en: All organizations
+  ru: Все организации
+  desc: Option in the organization switcher that clears the filter and shows everything.
+
+signOut:
+  en: Sign out
+  ru: Выйти
+  desc: User-menu item that ends the current session and returns to the sign-in screen.
+
+toasts:
+  en: Notifications
+  ru: Уведомления
+  desc: Accessible name of the region where transient toast messages appear.
+
+# --- generic actions and states ---
+
+retry:
+  en: Try again
+  ru: Повторить
+  desc: Button that re-runs a failed request.
+
+cancel:
+  en: Cancel
+  ru: Отмена
+  desc: Button that closes a dialog without performing its action.
+
+create:
+  en: Create
+  ru: Создать
+  desc: Confirming button of a creation dialog (organization, token).
+
+revoke:
+  en: Revoke
+  ru: Отозвать
+  desc: Destructive button that invalidates a token or a session.
+
+genericError:
+  en: Something went wrong. Try again.
+  ru: Что-то пошло не так. Попробуйте ещё раз.
+  desc: Fallback error message when the server refused a request for an unrecognized reason.
+
+networkError:
+  en: Could not reach the server. Check your connection and try again.
+  ru: Не удалось связаться с сервером. Проверьте соединение и попробуйте ещё раз.
+  desc: Error shown when the request never completed (offline, DNS, aborted) — not a refusal.
+
+rateLimited:
+  en: Too many attempts. Try again in {seconds} s.
+  ru: Слишком много попыток. Повторите через {seconds} с.
+  desc: Error for HTTP 429; `{seconds}` is the cool-down from the Retry-After header.
+
+sessionExpired:
+  en: Your session has expired. Sign in again.
+  ru: Сеанс истёк. Войдите заново.
+  desc: Toast shown when the server refused to refresh the session and the user was signed out.
+
+notFoundTitle:
+  en: This page does not exist
+  ru: Такой страницы нет
+  desc: Heading of the 404 screen inside the app island (an unknown /app/* route).
+
+notFoundBody:
+  en: The link may be outdated, or the page may have moved.
+  ru: Возможно, ссылка устарела или страница переехала.
+  desc: Body text of the app's 404 screen.
+
+backToOverview:
+  en: Back to overview
+  ru: Вернуться к обзору
+  desc: Link on the app's 404 screen that returns to /app.
+
+# --- sign-in ---
+
+loginTitle:
+  en: Sign in
+  ru: Вход
+  desc: Heading of the sign-in screen.
+
+loginSubtitle:
+  en: We will email you a one-time code.
+  ru: Мы отправим одноразовый код на вашу почту.
+  desc: Subtitle under the sign-in heading, explaining the email OTP flow.
+
+loginEmailLabel:
+  en: Email
+  ru: Электронная почта
+  desc: Label of the email field on the first step of sign-in.
+
+loginEmailPlaceholder:
+  en: you@example.com
+  ru: you@example.com
+  desc: Placeholder of the sign-in email field. Keep it a plausible address, not a translation.
+
+loginEmailRequired:
+  en: Enter your email address.
+  ru: Введите адрес электронной почты.
+  desc: Validation message when the sign-in form is submitted with an empty email field.
+
+loginContinue:
+  en: Continue
+  ru: Продолжить
+  desc: Button that submits the email and requests a one-time code.
+
+loginCodeTitle:
+  en: Enter your code
+  ru: Введите код
+  desc: Heading of the second sign-in step, where the emailed code is typed.
+
+loginCodeSubtitle:
+  en: We sent an 8-digit code to {email}. It expires in 10 minutes.
+  ru: Мы отправили 8-значный код на {email}. Он действует 10 минут.
+  desc: Subtitle of the code step. `{email}` is the address the code was sent to.
+
+loginCodeLabel:
+  en: Sign-in code
+  ru: Код входа
+  desc: Label of the 8-digit one-time code field.
+
+loginVerify:
+  en: Sign in
+  ru: Войти
+  desc: Button that submits the one-time code and completes the first factor.
+
+loginResend:
+  en: Send a new code
+  ru: Отправить новый код
+  desc: Button that requests a replacement one-time code.
+
+loginResendIn:
+  en: You can request a new code in {seconds} s
+  ru: Новый код можно запросить через {seconds} с
+  desc: Countdown next to the resend button while the cool-down is running.
+
+loginUseAnotherEmail:
+  en: Use a different email
+  ru: Другой адрес
+  desc: Link on the code step that returns to the email step.
+
+loginInvalidCode:
+  en: That code is not valid. Check it and request a new one if needed.
+  ru: Код неверный. Проверьте его или запросите новый.
+  desc: Uniform error for a rejected OTP, TOTP, or recovery code — deliberately says nothing about why (S-04).
+
+loginOidcDivider:
+  en: or
+  ru: или
+  desc: Word separating the email form from the single-sign-on provider buttons.
+
+loginOidcButton:
+  en: Continue with {provider}
+  ru: Войти через {provider}
+  desc: Label of a single-sign-on button; `{provider}` is the configured provider's display name.
+
+loginMfaTitle:
+  en: Two-factor authentication
+  ru: Двухфакторная аутентификация
+  desc: Heading of the sign-in step that asks for the second factor.
+
+loginMfaSubtitle:
+  en: Enter the 6-digit code from your authenticator app.
+  ru: Введите 6-значный код из приложения-аутентификатора.
+  desc: Subtitle of the second-factor step when a TOTP code is expected.
+
+loginMfaRecoverySubtitle:
+  en: Enter one of the recovery codes you saved when you turned on two-factor authentication.
+  ru: Введите один из кодов восстановления, сохранённых при включении двухфакторной аутентификации.
+  desc: Subtitle of the second-factor step when a recovery code is expected.
+
+loginMfaCodeLabel:
+  en: Authentication code
+  ru: Код аутентификации
+  desc: Label of the 6-digit TOTP field.
+
+loginMfaRecoveryLabel:
+  en: Recovery code
+  ru: Код восстановления
+  desc: Label of the recovery-code field.
+
+loginMfaUseRecovery:
+  en: Use a recovery code instead
+  ru: Использовать код восстановления
+  desc: Link that switches the second-factor step from the TOTP field to the recovery-code field.
+
+loginMfaUseApp:
+  en: Use your authenticator app instead
+  ru: Использовать приложение-аутентификатор
+  desc: Link that switches the second-factor step back from the recovery-code field to the TOTP field.
+
+loginProvidersUnavailable:
+  en: Single sign-on is temporarily unavailable.
+  ru: Единый вход временно недоступен.
+  desc: Notice shown when the provider list could not be loaded; the email form still works.
+
+# --- OIDC callback route ---
+
+callbackTitle:
+  en: Finishing sign-in…
+  ru: Завершаем вход…
+  desc: Heading of the /auth/callback screen while the authorization code is being exchanged.
+
+callbackFailed:
+  en: Sign-in could not be completed.
+  ru: Не удалось завершить вход.
+  desc: Heading shown when the OIDC callback was rejected or arrived without its flow handle.
+
+callbackMissingFlow:
+  en: This sign-in link is no longer valid. Start again from the sign-in page.
+  ru: Ссылка для входа больше не действует. Начните вход заново.
+  desc: Explanation when the flow handle is missing from session storage (expired, or a different browser).
+
+callbackBackToLogin:
+  en: Back to sign-in
+  ru: Вернуться ко входу
+  desc: Link on the failed-callback screen that returns to /app/login.
+
+# --- account ---
+
+accountTitle:
+  en: Account
+  ru: Аккаунт
+  desc: Heading of the account screen.
+
+accountTabProfile:
+  en: Profile
+  ru: Профиль
+  desc: Tab of the account screen showing the user's profile summary.
+
+accountTabSecurity:
+  en: Security
+  ru: Безопасность
+  desc: Tab of the account screen holding two-factor authentication settings.
+
+accountEmail:
+  en: Email
+  ru: Электронная почта
+  desc: Field label in the profile summary.
+
+accountEmailMissing:
+  en: No email on file
+  ru: Почта не указана
+  desc: Shown instead of the address when the account has no email (an anonymized or provider-only account).
+
+accountDisplayName:
+  en: Display name
+  ru: Отображаемое имя
+  desc: Field label in the profile summary.
+
+accountMemberSince:
+  en: Member since
+  ru: Дата регистрации
+  desc: Field label for the account creation date in the profile summary.
+
+accountEmailVerified:
+  en: Verified
+  ru: Подтверждён
+  desc: Badge next to a verified email address.
+
+accountEmailUnverified:
+  en: Unverified
+  ru: Не подтверждён
+  desc: Badge next to an email address that has not been verified.
+
+securityTotpTitle:
+  en: Two-factor authentication
+  ru: Двухфакторная аутентификация
+  desc: Heading of the TOTP section on the account security tab.
+
+securityTotpBody:
+  en: Protect publishing and administrative actions with a code from an authenticator app.
+  ru: Защитите публикацию и административные действия кодом из приложения-аутентификатора.
+  desc: Explanation under the two-factor heading.
+
+securityTotpEnable:
+  en: Set up two-factor authentication
+  ru: Настроить двухфакторную аутентификацию
+  desc: Button that starts TOTP enrollment.
+
+securityTotpDisable:
+  en: Turn off two-factor authentication
+  ru: Отключить двухфакторную аутентификацию
+  desc: Destructive button that removes the TOTP credential; requires a fresh second factor.
+
+securityTotpScan:
+  en: Scan this code with your authenticator app.
+  ru: Отсканируйте этот код приложением-аутентификатором.
+  desc: Instruction above the QR code during TOTP enrollment.
+
+securityTotpManual:
+  en: Cannot scan? Enter this secret manually.
+  ru: Не получается отсканировать? Введите ключ вручную.
+  desc: Instruction above the base32 secret, the fallback for a camera-less setup.
+
+securityTotpConfirmLabel:
+  en: Code from the app
+  ru: Код из приложения
+  desc: Label of the field where the first live TOTP code is typed to complete enrollment.
+
+securityTotpConfirm:
+  en: Confirm and turn on
+  ru: Подтвердить и включить
+  desc: Button that verifies the first TOTP code and stores the credential.
+
+securityTotpEnabled:
+  en: Two-factor authentication is on.
+  ru: Двухфакторная аутентификация включена.
+  desc: Status line on the security tab when a TOTP credential exists.
+
+securityRecoveryTitle:
+  en: Save your recovery codes
+  ru: Сохраните коды восстановления
+  desc: Heading of the panel that shows the recovery codes once, right after enrollment.
+
+securityRecoveryBody:
+  en: Each code works once and lets you sign in without your authenticator. This is the only time they are shown.
+  ru: Каждый код работает один раз и позволяет войти без аутентификатора. Больше они показаны не будут.
+  desc: Warning above the recovery-code list; the codes are never retrievable again (S-05).
+
+securityRecoveryDownload:
+  en: Download codes
+  ru: Скачать коды
+  desc: Button that saves the recovery codes as a text file.
+
+securityRecoveryDone:
+  en: I have saved them
+  ru: Я их сохранил
+  desc: Button that dismisses the recovery-code panel.
+
+securityDisableTitle:
+  en: Turn off two-factor authentication?
+  ru: Отключить двухфакторную аутентификацию?
+  desc: Title of the confirmation dialog for removing the TOTP credential.
+
+securityDisableBody:
+  en: Your account will be protected by the email code alone, and publishing tokens will need a fresh sign-in instead of a code.
+  ru: Аккаунт будет защищён только кодом из письма, а для токенов публикации потребуется повторный вход вместо кода.
+  desc: Body of the confirmation dialog for removing the TOTP credential.
+
+securityTotpDisabled:
+  en: Two-factor authentication is off.
+  ru: Двухфакторная аутентификация отключена.
+  desc: Toast confirming that the TOTP credential was removed.
+
+# --- step-up prompt (S-06) ---
+
+stepUpTitle:
+  en: Confirm it is you
+  ru: Подтвердите, что это вы
+  desc: Title of the dialog that asks for a fresh second factor before a sensitive action.
+
+stepUpBody:
+  en: This action needs a fresh code from your authenticator app.
+  ru: Для этого действия нужен свежий код из приложения-аутентификатора.
+  desc: Body of the step-up dialog explaining why the code is being asked for.
+
+stepUpConfirm:
+  en: Confirm
+  ru: Подтвердить
+  desc: Button that submits the step-up code and re-runs the blocked action.
+
+stepUpNoFactor:
+  en: This account has no authenticator app. Sign in again to continue.
+  ru: К аккаунту не подключено приложение-аутентификатор. Войдите заново, чтобы продолжить.
+  desc: Explanation shown in the step-up dialog for accounts without a second factor — their re-auth path is a fresh sign-in (S-06.a).
+
+# --- sessions (S-10) ---
+
+sessionsTitle:
+  en: Sessions
+  ru: Сеансы
+  desc: Heading of the session list screen.
+
+sessionsSubtitle:
+  en: Browsers and devices signed in to this account.
+  ru: Браузеры и устройства, вошедшие в этот аккаунт.
+  desc: Subtitle of the session list screen.
+
+sessionsTableLabel:
+  en: Active sessions
+  ru: Активные сеансы
+  desc: Accessible name of the sessions table and its scroll region.
+
+sessionsCreated:
+  en: Signed in
+  ru: Вход
+  desc: Column header for the moment a session was created.
+
+sessionsLastSeen:
+  en: Last seen
+  ru: Последняя активность
+  desc: Column header for a session's last recorded activity.
+
+sessionsIp:
+  en: IP address
+  ru: IP-адрес
+  desc: Column header for the address the session signed in from.
+
+sessionsDevice:
+  en: Device
+  ru: Устройство
+  desc: Column header for the coarse user agent recorded at sign-in.
+
+sessionsCurrent:
+  en: This device
+  ru: Это устройство
+  desc: Badge marking the row of the session making the request.
+
+sessionsRevokeAll:
+  en: Sign out everywhere else
+  ru: Выйти на других устройствах
+  desc: Button that revokes every session except the current one; requires a fresh second factor.
+
+sessionsEmpty:
+  en: No other sessions
+  ru: Других сеансов нет
+  desc: Empty state of the session list when only the current session exists.
+
+sessionsRevoked:
+  en: Session revoked.
+  ru: Сеанс отозван.
+  desc: Toast confirming that one session was revoked.
+
+sessionsRevokedAll:
+  en:
+    one: "{count} session revoked."
+    other: "{count} sessions revoked."
+  ru:
+    one: "Отозван {count} сеанс."
+    few: "Отозвано {count} сеанса."
+    many: "Отозвано {count} сеансов."
+    other: "Отозвано {count} сеанса."
+  desc: Toast after revoking every other session; `{count}` is how many were revoked.
+
+unknownValue:
+  en: Unknown
+  ru: Неизвестно
+  desc: Placeholder in a table cell when the server has no value for the field (IP, user agent).
+
+# --- tokens (S-13) ---
+
+tokensTitle:
+  en: Tokens
+  ru: Токены
+  desc: Heading of the CLI/API token screen.
+
+tokensSubtitle:
+  en: Credentials for the dart pub client and CI. They are separate from your browser session.
+  ru: Учётные данные для клиента dart pub и CI. Они не связаны с сеансом в браузере.
+  desc: Subtitle of the token screen, stating the two-credential-plane rule.
+
+tokensTableLabel:
+  en: API tokens
+  ru: API-токены
+  desc: Accessible name of the token table and its scroll region.
+
+tokensNew:
+  en: New token
+  ru: Новый токен
+  desc: Button that opens the token creation dialog.
+
+tokensHint:
+  en: Token
+  ru: Токен
+  desc: Column header for the token's label and first-eight-character display hint.
+
+tokensScopes:
+  en: Scopes
+  ru: Права
+  desc: Column header listing a token's granted scopes.
+
+tokensOrg:
+  en: Organization
+  ru: Организация
+  desc: Column header for the organization a token is bound to.
+
+tokensExpires:
+  en: Expires
+  ru: Истекает
+  desc: Column header for a token's expiry date.
+
+tokensLastUsed:
+  en: Last used
+  ru: Последнее использование
+  desc: Column header for a token's last recorded use.
+
+tokensNever:
+  en: Never
+  ru: Никогда
+  desc: Cell value for a token that never expires or has never been used.
+
+tokensEmpty:
+  en: No tokens yet
+  ru: Токенов пока нет
+  desc: Title of the token list's empty state.
+
+tokensEmptyBody:
+  en: Create a token to publish packages or to let CI read your private registry.
+  ru: Создайте токен, чтобы публиковать пакеты или дать CI доступ к приватному реестру.
+  desc: Body of the token list's empty state.
+
+tokensCreateTitle:
+  en: New token
+  ru: Новый токен
+  desc: Title of the token creation dialog.
+
+tokensLabelField:
+  en: Label
+  ru: Название
+  desc: Label of the free-text name field in the token creation dialog.
+
+tokensLabelPlaceholder:
+  en: CI — release pipeline
+  ru: CI — конвейер релизов
+  desc: Placeholder of the token label field; an example of a useful name.
+
+tokensScopesField:
+  en: Scopes
+  ru: Права
+  desc: Group label of the scope checkboxes in the token creation dialog.
+
+tokensScopeRead:
+  en: read — resolve and download packages
+  ru: read — получать и скачивать пакеты
+  desc: Checkbox label for the read scope. The scope name itself stays in English (it is a wire value).
+
+tokensScopePublish:
+  en: publish — upload new versions
+  ru: publish — загружать новые версии
+  desc: Checkbox label for the publish scope. The scope name itself stays in English (it is a wire value).
+
+tokensScopeRetract:
+  en: retract — retract and restore versions
+  ru: retract — отзывать и восстанавливать версии
+  desc: Checkbox label for the retract scope. The scope name itself stays in English (it is a wire value).
+
+tokensScopeAdmin:
+  en: admin — manage organization settings
+  ru: admin — управлять настройками организации
+  desc: Checkbox label for the admin scope. The scope name itself stays in English (it is a wire value).
+
+tokensExpiryField:
+  en: Expires in (days)
+  ru: Срок действия (дней)
+  desc: Label of the numeric lifetime field in the token creation dialog; the default is 90.
+
+tokensStepUpNotice:
+  en: Publishing and administrative scopes ask for a second-factor code before the token is issued.
+  ru: Для прав публикации и администрирования перед выдачей токена потребуется код второго фактора.
+  desc: Notice in the token dialog when a step-up-gated scope is selected (S-06).
+
+tokensOrgRequired:
+  en: Choose an organization for this token.
+  ru: Выберите организацию для токена.
+  desc: Validation message when the token dialog is submitted without an organization.
+
+tokensScopesRequired:
+  en: Choose at least one scope.
+  ru: Выберите хотя бы одно право.
+  desc: Validation message when the token dialog is submitted with no scope selected.
+
+tokensSecretTitle:
+  en: Copy your token now
+  ru: Скопируйте токен сейчас
+  desc: Heading of the panel that shows a freshly created token secret.
+
+tokensSecretBody:
+  en: This is the only time the secret is shown. Store it somewhere safe.
+  ru: Секрет показывается только один раз. Сохраните его в надёжном месте.
+  desc: Warning above a freshly created token secret (show-once, S-13).
+
+tokensSecretCli:
+  en: "Register it with the pub client:"
+  ru: "Добавьте его в клиент pub:"
+  desc: Caption above the ready-to-paste `dart pub token add` command.
+
+tokensRevokeTitle:
+  en: Revoke this token?
+  ru: Отозвать токен?
+  desc: Title of the token revocation confirmation dialog.
+
+tokensRevokeBody:
+  en: Anything using {name} stops working within a minute. This cannot be undone.
+  ru: Всё, что использует {name}, перестанет работать в течение минуты. Отменить это нельзя.
+  desc: Body of the token revocation dialog; `{name}` is the token's label.
+
+tokensRevoked:
+  en: Token revoked.
+  ru: Токен отозван.
+  desc: Toast confirming that a token was revoked.
+
+tokensCreated:
+  en: Token created.
+  ru: Токен создан.
+  desc: Toast confirming that a token was created.
+
+# --- organizations ---
+
+orgsTitle:
+  en: Organizations
+  ru: Организации
+  desc: Heading of the organization list screen.
+
+orgsSubtitle:
+  en: Each organization owns its packages, members, and registry URL.
+  ru: У каждой организации свои пакеты, участники и адрес реестра.
+  desc: Subtitle of the organization list screen.
+
+orgsNew:
+  en: New organization
+  ru: Новая организация
+  desc: Button that opens the organization creation dialog.
+
+orgsRole:
+  en: Your role
+  ru: Ваша роль
+  desc: Label of the badge showing the caller's role in an organization.
+
+orgsRegistryUrl:
+  en: Registry URL
+  ru: Адрес реестра
+  desc: Label of the per-organization virtual registry base shown on an organization card.
+
+orgsEmpty:
+  en: You are not in any organization yet
+  ru: Вы пока не состоите ни в одной организации
+  desc: Title of the organization list's empty state.
+
+orgsEmptyBody:
+  en: Create one to publish private packages and invite your team.
+  ru: Создайте организацию, чтобы публиковать приватные пакеты и пригласить команду.
+  desc: Body of the organization list's empty state.
+
+orgsCreateTitle:
+  en: New organization
+  ru: Новая организация
+  desc: Title of the organization creation dialog.
+
+orgsNameField:
+  en: Name
+  ru: Название
+  desc: Label of the display-name field in the organization creation dialog.
+
+orgsSlugField:
+  en: URL slug
+  ru: Идентификатор в URL
+  desc: Label of the slug field in the organization creation dialog.
+
+orgsSlugHint:
+  en: Becomes the registry address and can never be changed.
+  ru: Становится адресом реестра и не может быть изменён.
+  desc: Help text under the slug field; the slug is immutable (decision 19).
+
+orgsNameRequired:
+  en: Enter a name.
+  ru: Введите название.
+  desc: Validation message when the organization dialog is submitted with an empty name.
+
+orgsSlugRequired:
+  en: Enter a slug of lowercase letters, digits, and hyphens.
+  ru: Введите идентификатор из строчных букв, цифр и дефисов.
+  desc: Validation message when the organization slug is empty or malformed.
+
+orgsCreated:
+  en: Organization created.
+  ru: Организация создана.
+  desc: Toast confirming that an organization was created.
+
+orgDetailTitle:
+  en: Organization
+  ru: Организация
+  desc: Heading of the single-organization screen.
+
+orgDetailTodo:
+  en: Members, invitations, packages, settings, and the audit log for this organization arrive with the management API.
+  ru: Участники, приглашения, пакеты, настройки и журнал аудита появятся вместе с API управления.
+  desc: Placeholder text on the organization detail screen while the management endpoints are being built.
+
+# --- placeholders for areas the API has not shipped ---
+
+comingSoon:
+  en: Coming soon
+  ru: Скоро
+  desc: Badge marking a screen whose backend endpoints do not exist yet.
+
+placeholderPackages:
+  en: The package index, version history, and README rendering land with the registry read API.
+  ru: Каталог пакетов, история версий и отображение README появятся вместе с API чтения реестра.
+  desc: Body of the placeholder card on the packages screen.
+
+placeholderSearch:
+  en: Full-text search with filter tags lands with the search API.
+  ru: Полнотекстовый поиск с фильтрами появится вместе с API поиска.
+  desc: Body of the placeholder card on the search screen.
+
+placeholderSearchQuery:
+  en: You searched for “{query}”. Nothing is wired up yet — this screen is a placeholder.
+  ru: Вы искали «{query}». Пока ничего не подключено — это заглушка.
+  desc: Shown on the search placeholder when the user actually typed a query; `{query}` is their input.
+
+placeholderNotifications:
+  en: The notification center lands with the event stream.
+  ru: Центр уведомлений появится вместе с потоком событий.
+  desc: Body of the placeholder card on the notifications screen.
+
+placeholderAdmin:
+  en: Instance settings, user and organization management, moderation, and the audit viewer land with the admin API.
+  ru: Настройки инстанса, управление пользователями и организациями, модерация и просмотр аудита появятся вместе с API администрирования.
+  desc: Body of the placeholder card on the admin screen.
+
+overviewTitle:
+  en: Overview
+  ru: Обзор
+  desc: Heading of the app's start screen.
+
+overviewSignedInAs:
+  en: Signed in as {name}
+  ru: Вы вошли как {name}
+  desc: Line on the overview screen naming the current user; `{name}` is their display name.
+
+overviewTodo:
+  en: Instance statistics, top packages, and recent activity land with the read API.
+  ru: Статистика инстанса, популярные пакеты и последние события появятся вместе с API чтения.
+  desc: Body of the placeholder card on the overview screen.
