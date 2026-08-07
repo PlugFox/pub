@@ -10,7 +10,7 @@
 //! single-use.
 
 use chrono::{DateTime, Duration, Utc};
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq as _;

@@ -68,7 +68,7 @@ pub fn step_at(now: DateTime<Utc>) -> i64 {
 /// The 6-digit code for `secret` at time-step `step` (RFC 4226 dynamic truncation over
 /// HMAC-SHA-1 of the big-endian step counter).
 pub fn code_at(secret: &[u8], step: i64) -> String {
-    let mut mac = <Hmac<Sha1> as hmac::Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha1> as hmac::KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(&step.to_be_bytes());
     let digest = mac.finalize().into_bytes();
     let offset = usize::from(digest[19] & 0x0F);

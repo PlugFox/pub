@@ -73,31 +73,32 @@ moka = { version = "0.12.15", features = ["future"] }
 deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1"] }
 
 # --- crypto & auth ---
-# default-features = false: only seed-based signing/verification is used — drops the bundled
-# RNG integration ("rand_core") and batch verification; "std" keeps std error types,
-# "fast" keeps the precomputed tables, "zeroize" wipes key material on drop.
-ed25519-dalek = { version = "2.1.1", default-features = false, features = ["std", "fast", "zeroize"] }
-hmac = "0.12.1"
-sha1 = "0.10.6"
-sha2 = "0.10.9"
+# Default features only: "fast" keeps the precomputed tables, "zeroize" wipes key material
+# on drop — exactly the set needed for seed-based signing/verification (the bundled RNG
+# integration "rand_core" and batch verification stay off).
+ed25519-dalek = { version = "3.0.0" }
+hmac = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
 subtle = "2.6.1"
-crc32fast = "1.4.2"
-base64 = "0.22.1"
-getrandom = "0.3.3"
+crc32fast = "1.5.0"
+base64 = "0.23.1"
+getrandom = "0.4.3"
 # TOTP-seed sealing with the env KEK (S-05); default features (aes, alloc, getrandom) are all used.
-aes-gcm = "0.10.3"
+aes-gcm = "0.11.0"
 # Recovery-code hashes (S-05: argon2id).
 argon2 = "0.5.3"
 # RS256 id_token verification (S-01). The "sha2" feature re-exports sha2 with OID support for
 # the PKCS#1 v1.5 digest-info encoding; only public-key verification is used at runtime
 # (the RUSTSEC-2023-0071 Marvin timing channel concerns private-key operations).
-rsa = { version = "0.9.6", features = ["sha2"] }
+rsa = { version = "0.9.10", features = ["sha2"] }
 # ES256 id_token verification (S-01). default-features = false: no pem/pkcs8 parsing — keys
 # arrive as raw JWK coordinates.
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
 # OIDC discovery / JWKS / token exchange (S-01). default-features = false: rustls instead of
-# native-tls (no OpenSSL linkage), json bodies only.
-reqwest = { version = "0.12.8", default-features = false, features = ["json", "rustls-tls"] }
+# native-tls (no OpenSSL linkage), json bodies only; "form" for the OIDC token exchange POST
+# (a separate opt-in feature since 0.13).
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "form"] }
 
 # --- registry ingest & rendering ---
 # default-features = false: the pure-Rust miniz_oxide backend only — no zlib C linkage
@@ -118,7 +119,7 @@ ammonia = "4.1.4"
 # --- mail ---
 # default-features = false: rustls instead of native-tls (no OpenSSL linkage) and the async
 # tokio transport only — the blocking transport is never used.
-lettre = { version = "0.11.11", default-features = false, features = [
+lettre = { version = "0.11.23", default-features = false, features = [
     "builder",
     "hostname",
     "smtp-transport",
@@ -126,7 +127,7 @@ lettre = { version = "0.11.11", default-features = false, features = [
     "tokio1",
     "tokio1-rustls-tls",
 ] }
-askama = "0.14.0"
+askama = "0.16.0"
 
 # --- config & cli ---
 # default-features = false: only TOML config files are supported (decision 09); drops yaml/json5/ron parsers.
@@ -136,7 +137,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 # --- serde & core types ---
 # Lock-free snapshot swap behind the runtime-settings cache (decision 09). A pure-Rust leaf
 # data structure — no infrastructure, which is why it is allowed inside `core`.
-arc-swap = "1.7.1"
+arc-swap = "1.9.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # default-features = false: drops wasmbind/js-sys and the deprecated oldtime API; only the
@@ -158,7 +159,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 anyhow = "1.0.104"
 tempfile = "3.27.0"
 # Test-only: RSA keygen for the mock OIDC issuer needs a rand_core 0.6 RNG (rsa 0.9 API).
-rand = "0.8.5"
+rand = "0.8.7"
 
 # Debug builds of the big-integer and password-hash kernels are unusably slow (RSA keygen and
 # argon2id dominate test wall time); optimizing just these leaf crates keeps `cargo test` fast

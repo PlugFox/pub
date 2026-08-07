@@ -523,8 +523,11 @@ fn verify_signature(alg: &str, jwk: &Jwk, signing_input: &[u8], signature: &[u8]
             let e = decode_component(jwk.e.as_deref(), "e")?;
             let key = rsa::RsaPublicKey::new(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e))
                 .map_err(|_| reject("invalid RSA public key in JWKS"))?;
-            let digest = Sha256::digest(signing_input);
-            key.verify(rsa::pkcs1v15::Pkcs1v15Sign::new::<Sha256>(), &digest, signature)
+            // rsa 0.9 still speaks the digest-0.10 generation, so the hash type for the
+            // PKCS#1 v1.5 digest-info OID comes from its own `rsa::sha2` re-export.
+            use rsa::sha2::Digest as _;
+            let digest = rsa::sha2::Sha256::digest(signing_input);
+            key.verify(rsa::pkcs1v15::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), &digest, signature)
                 .map_err(|_| reject("id_token signature mismatch"))
         }
         "ES256" => {
@@ -537,12 +540,13 @@ fn verify_signature(alg: &str, jwk: &Jwk, signing_input: &[u8], signature: &[u8]
             let (Ok(x), Ok(y)) = (<[u8; 32]>::try_from(x.as_slice()), <[u8; 32]>::try_from(y.as_slice())) else {
                 return Err(reject("invalid P-256 coordinates in JWKS"));
             };
-            let point = p256::EncodedPoint::from_affine_coordinates(
-                &p256::FieldBytes::from(x),
-                &p256::FieldBytes::from(y),
-                false,
-            );
-            let key = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+            // SEC1 uncompressed point: 0x04 || X || Y (raw JWK coordinates). Parsing via
+            // `from_sec1_bytes` validates that the point lies on the curve.
+            let mut sec1 = [0u8; 65];
+            sec1[0] = 0x04;
+            sec1[1..33].copy_from_slice(&x);
+            sec1[33..65].copy_from_slice(&y);
+            let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
                 .map_err(|_| reject("invalid P-256 public key in JWKS"))?;
             let sig = p256::ecdsa::Signature::from_slice(signature).map_err(|_| reject("malformed ES256 signature"))?;
             key.verify(signing_input, &sig).map_err(|_| reject("id_token signature mismatch"))

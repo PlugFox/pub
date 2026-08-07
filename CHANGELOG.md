@@ -2,6 +2,17 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
+
+## 2026-08-07 — dependency sweep: RustCrypto 2026 generation, reqwest 0.13
+
+### Changed
+
+- (server) **Outbound TLS trust now comes from the OS trust store** — reqwest 0.13 replaces the compiled-in Mozilla `webpki-roots` bundle with `rustls-platform-verifier` for the OIDC and upstream pub.dev clients, so custom or corporate CAs installed in the deployment's trust store are honored (the runtime image already ships `ca-certificates`). The rustls crypto provider moves from ring to aws-lc-rs; it builds through its cc path without cmake, so the alpine Docker builder is unaffected.
+- (server) RustCrypto digest-0.11 generation: sha1/sha2 0.11, hmac 0.13, aes-gcm 0.11, p256 0.14, ed25519-dalek 3.0. Same algorithms, same wire and storage formats — only trait plumbing changed. rsa stays 0.9 (0.10 is still pre-release) and keeps its own sha2 0.10 re-export for the PKCS#1 v1.5 digest-info OID.
+- (server) base64 0.23, getrandom 0.4, askama 0.16 (mail templates unchanged), crc32fast 1.5, and latest compatible releases across the tree. rand stays 0.8 — test-only, pinned by rsa 0.9's rand_core 0.6 API.
+- (infra) Toolchains: Rust 1.95.0 → 1.97.1, Bun 1.3.9 → 1.3.14. Web dependencies were already at their latest stable releases; `@pub/api` keeps typescript 5.9.3 (the newest 5.x) because openapi-typescript needs the TS compiler's JS API, which the Go-based TS 7 does not expose — the root toolchain stays on TS 7.
+
 ## 2026-08-07 — design foundation: the Patina palette and a theme registry
 
 The visual identity settles: the owner chose the **"Patina"** direction (warm graphite neutrals at hue 60–85, desaturated teal accent at hue 195) from three validated candidates, and the theme model it lands in is generalized from a light/dark binary to a **registry** — recorded as [decision 24](docs/decisions.md#24--theme-registry-patina-palette-proposed--pending-user-review) (proposed, wording pending review).

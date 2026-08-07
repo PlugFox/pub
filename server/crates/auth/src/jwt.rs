@@ -272,7 +272,7 @@ mod tests {
         // The classic JWT break: take the *public* Ed25519 key, use its raw bytes as an
         // HMAC-SHA-256 secret, and claim `alg: HS256`. A verifier that picked the algorithm
         // from the token instead of pinning it would accept this as authentic.
-        use hmac::{Hmac, Mac as _};
+        use hmac::{Hmac, KeyInit as _, Mac as _};
         use sha2::Sha256;
 
         let ring = keyring();

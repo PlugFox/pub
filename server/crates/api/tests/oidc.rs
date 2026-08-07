@@ -186,7 +186,7 @@ async fn s01_nonce_mismatch_rejected() {
 
 #[tokio::test]
 async fn s01_forged_alg_none_and_hs256_id_tokens_rejected() {
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
 
     let issuer = issuer().await;
     let app = app_with(&issuer, TestOptions::default()).await;

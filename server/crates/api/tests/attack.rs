@@ -180,7 +180,7 @@ async fn s03_code_never_leaks_into_storage_or_responses() {
 async fn s07_forged_access_tokens_are_all_rejected_at_the_boundary() {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-    use hmac::{Hmac, Mac as _};
+    use hmac::{Hmac, KeyInit as _, Mac as _};
     use sha2::Sha256;
 
     let app = TestApp::new().await;

@@ -164,8 +164,11 @@ pub fn sign_rs256(kid: &str, claims: &serde_json::Value) -> String {
         B64URL.encode(serde_json::to_vec(&header).unwrap()),
         B64URL.encode(serde_json::to_vec(claims).unwrap())
     );
-    let digest = Sha256::digest(signing_input.as_bytes());
-    let signature = test_rsa_key().sign(Pkcs1v15Sign::new::<Sha256>(), &digest).expect("rsa sign");
+    // rsa 0.9 still speaks the digest-0.10 generation — the hash type parameter must come
+    // from its own `rsa::sha2` re-export.
+    use rsa::sha2::Digest as _;
+    let digest = rsa::sha2::Sha256::digest(signing_input.as_bytes());
+    let signature = test_rsa_key().sign(Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), &digest).expect("rsa sign");
     format!("{signing_input}.{}", B64URL.encode(signature))
 }
 
