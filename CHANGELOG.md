@@ -2,6 +2,19 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-07 — component tests in a real browser: vitest browser mode
+
+Closes the "specified in the rules but not installed" half of roadmap debt D36: [docs/rules/web.md](docs/rules/web.md) has promised "component tests via vitest browser mode" since the frontend conventions were written — the toolchain now exists, and its first suites already paid for themselves by catching a real Kobalte-default bug.
+
+### Added
+
+- (web) **vitest browser mode** for `packages/ui` — [vitest.config.ts](web/packages/ui/vitest.config.ts): vitest 4 + `@vitest/browser-playwright` driving headless Chromium (the same browser binaries `@playwright/test` already caches; the `playwright` peer resolves from it, no new browser installs). Solid JSX compiled by `vite-plugin-solid`. Run via `bun run test:browser` (root forwards to `@pub/ui`). Naming contract: browser tests are `test/browser/*.vitest.{ts,tsx}` — the `.vitest.` suffix keeps them out of `bun test`'s `*.test.*`/`*.spec.*` globs, so the two runners never pick up each other's files (`bun test` still runs exactly the 350 happy-dom/pure suites).
+- (web) **8 first browser tests** pinning behavior happy-dom cannot honestly cover: [feedback.vitest.tsx](web/packages/ui/test/browser/feedback.vitest.tsx) — the ripple wave sized from the button's real layout with the grow keyframes actually running, release starting the real fade animation and the wave leaving the DOM on its `animationend`, a trusted click driving the full spawn → fade → removal lifecycle, disabled buttons spawning nothing, and the hover sheen behind `@media (hover: hover)` feeding the gradient center; [theme-picker.vitest.tsx](web/packages/ui/test/browser/theme-picker.vitest.tsx) — a real Kobalte menu opening with `menuitemradio` semantics, selecting "Dark" stamping `data-theme="dark"` on `<html>` and persisting to real localStorage, and a persisted mode restored on mount.
+
+### Fixed
+
+- (web) **`MenuRadioItem` now actually closes the menu on select** — caught by the first browser-test run: Kobalte defaults `closeOnSelect: false` for radio items (unlike plain items), so the theme menu silently stayed open after picking a theme, contradicting [menu.tsx](web/packages/ui/src/menu.tsx)'s own documented contract ("selecting an item closes the menu — right for a picker"). The wrapper now defaults to closing; callers can opt out with `closeOnSelect={false}`.
+
 ## 2026-08-07 — interaction feedback: liquid-glass sheen + press ripple
 
 The UI kit gains its interaction-feedback layer — the owner's pick after a four-style prototype, recorded as [decision 25](docs/decisions.md#25--interaction-feedback-liquid-glass-sheen--ripple): a liquid-glass specular sheen follows the pointer on hover on **every** control, and a Material-style ripple answers the press on genuinely interactive elements.

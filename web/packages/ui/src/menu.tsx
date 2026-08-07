@@ -69,7 +69,9 @@ export function MenuItem(props: MenuItemProps): JSX.Element {
  * Single-choice group inside a menu (theme picker, sort order). Kobalte wires
  * `role="menuitemradio"` + `aria-checked`; the checked item shows a check
  * glyph in a fixed-width slot so labels stay aligned either way. Selecting an
- * item closes the menu (Kobalte default), which is right for a picker.
+ * item closes the menu — the WRAPPER's default: Kobalte keeps radio menus
+ * open on select (`closeOnSelect: false`), which is wrong for a picker.
+ * Callers can pass `closeOnSelect={false}` to keep the menu open.
  */
 export const MenuRadioGroup = MenuPrimitive.RadioGroup;
 
@@ -77,12 +79,14 @@ export type MenuRadioItemProps = JSX.HTMLAttributes<HTMLDivElement> & {
   readonly value: string;
   readonly onSelect?: () => void;
   readonly disabled?: boolean;
+  readonly closeOnSelect?: boolean;
 };
 
 export function MenuRadioItem(props: MenuRadioItemProps): JSX.Element {
   const [local, rest] = splitProps(props, ["class", "children", "ref"]);
   return (
     <MenuPrimitive.RadioItem
+      closeOnSelect
       {...rest}
       ref={(el: HTMLDivElement) => {
         feedback(el);

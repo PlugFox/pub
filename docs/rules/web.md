@@ -39,4 +39,5 @@ Bun workspaces; TypeScript 7 strict; Biome (2-space, 100 cols, double quotes) fo
 
 ## Tests
 
-- `bun test` for pure logic (i18n, interceptors, utils) — corner cases first-class; component tests via vitest browser mode where behavior warrants it.
+- `bun test` for pure logic (i18n, interceptors, utils) — corner cases first-class; component tests via vitest browser mode (headless Chromium, playwright provider) where behavior warrants it: `bun run test:browser` from `web/`.
+- Browser tests live in `packages/ui/test/browser/*.vitest.{ts,tsx}` — the `.vitest.` suffix keeps them out of `bun test`'s `*.test.*`/`*.spec.*` globs, and vitest's `include` only matches that suffix. Never name a file so both runners pick it up.

@@ -9,6 +9,7 @@
     "check": "tsc --noEmit -p packages/i18n && tsc --noEmit -p packages/ui && tsc --noEmit -p packages/api && tsc --noEmit -p packages/tokens && tsc --noEmit -p apps/site && biome check . && bun packages/tokens/scripts/contrast-check.ts",
     "build": "bun run --filter @pub/site build",
     "test": "bun test",
+    "test:browser": "bun run --filter @pub/ui test:browser",
     "i18n:gen": "bun packages/i18n/scripts/i18n-gen.ts",
     "gen:api": "bun packages/api/scripts/gen-api.ts",
     "fix": "biome check --write ."

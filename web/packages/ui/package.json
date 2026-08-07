@@ -31,10 +31,14 @@
     "./qr-code": "./src/qr-code.tsx"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:browser": "vitest run"
   },
   "devDependencies": {
-    "happy-dom": "^20.0.11"
+    "@vitest/browser-playwright": "^4.1.10",
+    "happy-dom": "^20.0.11",
+    "vite-plugin-solid": "^2.11.14",
+    "vitest": "^4.1.10"
   },
   "dependencies": {
     "@kobalte/core": "^0.13.12",
