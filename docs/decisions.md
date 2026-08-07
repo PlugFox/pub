@@ -242,9 +242,9 @@ Branding for the landing dashboard (`GET /api/v1/home`) ships as boot config `[b
 
 **Decision.** The product's default name is **Pub**; binary `pubd`. Instances can rebrand at runtime via admin settings: instance name, logo, accent colors — all cosmetic, stored in the `settings` table. The token prefix defaults to **`pub_`** and is instance-configurable; the published secret-scanning regex targets the default prefix, so custom prefixes trade away scanner coverage (documented).
 
-## 18 — Ops: release model, image registry, reference orchestrator (tbd)
+## 18 — Ops: release model, image registry, reference orchestrator
 
-Recorded so foxic's CI shape is not imported blindly. Leanings: releases must **not** commit version bumps to master from CI (race-prone; foxic's known weakness) — the version derives from the git tag and is injected as a build arg; a release-please-style PR flow is to be evaluated. Image registry: leaning **GHCR** over Docker Hub (auth via `GITHUB_TOKEN`, no pull rate limits for self-hosters). Reference orchestrator for the replicated tier: compose remains the documented baseline, Helm chart planned (see product.md); Docker Swarm is not a target.
+**Decided 2026-08-07** (was tbd; leanings confirmed unchanged). The version derives from the git tag `vX.Y.Z` (SemVer) and is injected as a build arg — releases never commit version bumps to master from CI (race-prone; foxic's known weakness). No release-PR bot for now: tags are cut manually, the changelog is maintained by hand per its existing format. Image registry: **GHCR**, `ghcr.io/plugfox/pub` (auth via `GITHUB_TOKEN`, no pull rate limits for self-hosters). Multi-arch `linux/amd64` + `linux/arm64` built on native runners per arch and merged with `imagetools create` — no QEMU-emulated cargo builds. The release workflow on tag: build both arches, boot the image and assert `/healthz` reports the expected version, generate an SBOM, push, publish a GitHub release carrying the changelog section. PR CI builds the Dockerfile without pushing so the image cannot rot on master. Reference orchestrator for the replicated tier: compose remains the documented baseline, Helm chart planned (see product.md); Docker Swarm is not a target.
 
 ## 19 — RBAC: cumulative role levels with a single authorize() chokepoint
 
