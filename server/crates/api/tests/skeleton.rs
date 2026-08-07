@@ -129,13 +129,19 @@ async fn security_headers_are_present_on_every_response() {
     for path in ["/", "/healthz", "/api/v1/ping", "/api/v1/does-not-exist"] {
         let (_status, headers, _body) = get(path).await;
         assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "missing nosniff on {path}");
-        assert_eq!(
-            headers[header::CONTENT_SECURITY_POLICY],
-            "frame-ancestors 'none'",
-            "missing frame-ancestors on {path}"
-        );
         assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "missing x-frame-options on {path}");
+        assert_eq!(headers[header::REFERRER_POLICY], "no-referrer", "missing referrer-policy on {path}");
+        assert!(headers.contains_key("permissions-policy"), "missing permissions-policy on {path}");
         assert!(headers.contains_key("x-request-id"), "missing x-request-id on {path}");
+        // Two CSP tiers (S-11): HTML documents get the strict self+hashes policy from the
+        // asset handler; API responses are data and get the locked-down API policy.
+        let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        if path == "/" {
+            assert!(csp.starts_with("default-src 'self'; "), "wrong document CSP on {path}: {csp}");
+        } else {
+            assert_eq!(csp, "default-src 'none'; frame-ancestors 'none'", "wrong API CSP on {path}");
+        }
+        assert!(csp.contains("frame-ancestors 'none'"), "missing frame-ancestors on {path}: {csp}");
     }
 }
 

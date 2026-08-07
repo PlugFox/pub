@@ -17,3 +17,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The configuration-reference generator (tests/reference.rs) serializes `Settings::default()`
+# to TOML — the same shape the defaults layer of `load_from` is built from — to cross-check
+# the documented keys and default values against the code.
+toml = { workspace = true }

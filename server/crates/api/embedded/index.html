@@ -4,6 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Pub</title>
+    <!-- Inline stubs mirroring the real build's anti-FOUC script and critical style: the
+         S-11 document CSP hashes inline sources at startup, and the integration suite
+         exercises that scanner against these blocks. -->
+    <script>
+      document.documentElement.dataset.theme = localStorage.getItem("pub-theme") || "light";
+    </script>
+    <style>
+      body { font-family: system-ui, sans-serif; }
+    </style>
   </head>
   <body>
     <h1>Pub</h1>

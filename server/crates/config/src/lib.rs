@@ -108,6 +108,8 @@ pub struct CliArgs {
 pub struct Settings {
     /// HTTP server settings.
     pub server: ServerConfig,
+    /// HTTP hygiene: request deadlines, load shedding, and the global body cap (D8/D13).
+    pub http: HttpConfig,
     /// Database backend selection and connection settings.
     pub database: DatabaseConfig,
     /// Blob storage backend selection and settings.
@@ -191,6 +193,49 @@ pub struct BrandingConfig {
 impl Default for BrandingConfig {
     fn default() -> Self {
         Self { name: "Pub".to_owned(), tagline: String::new(), logo_url: String::new(), primary_color: String::new() }
+    }
+}
+
+/// HTTP hygiene limits (roadmap D8/D13; S-28): every request gets a deadline, the instance
+/// gets a concurrency ceiling with load shedding, and bodies get a global cap.
+///
+/// The pub protocol's own carve-outs are derived, not configured: the publish upload rides
+/// `upload_timeout_secs`, its body limit stays `registry.max_archive_bytes` + envelope, and
+/// the SSE stream is exempt from the deadline (its bound is the access-token TTL re-checked
+/// on every heartbeat — S-32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    /// Deadline in seconds for an ordinary request's response head.
+    ///
+    /// Bounds handler work (DB, blob, KV, upstream calls), not response-body streaming: an
+    /// archive download that has started is never killed mid-stream.
+    pub request_timeout_secs: u64,
+    /// Deadline in seconds for the publish upload (`…/api/packages/versions/newUpload`).
+    ///
+    /// The multipart read happens inside the handler, so this bounds how long a client may
+    /// dribble a 100 MB archive; it must accommodate a slow CI link, hence its own knob.
+    pub upload_timeout_secs: u64,
+    /// Requests processed concurrently before the server sheds load with `503 + Retry-After`.
+    ///
+    /// Counts in-flight response *heads*: a long-lived SSE stream or a streaming download
+    /// releases its slot once the head is written, so slow readers cannot pin the budget.
+    pub concurrency_limit: usize,
+    /// Global request-body cap in bytes (app API and everything else without its own limit).
+    ///
+    /// The publish upload subrouter overrides this with the archive cap; nothing else on the
+    /// surface legitimately carries megabytes of request body.
+    pub max_body_bytes: usize,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: 30,
+            upload_timeout_secs: 300,
+            concurrency_limit: 1024,
+            max_body_bytes: 2 * 1024 * 1024,
+        }
     }
 }
 
@@ -1160,6 +1205,17 @@ impl Settings {
         let _ = writeln!(out, "  server.public_url    = {}", self.server.public_url);
         let _ = writeln!(out, "  server.mode          = {}", self.server.mode.as_str());
         let _ = writeln!(out, "  server.trust_proxy   = {}", self.server.trust_proxy_headers);
+        let _ = writeln!(
+            out,
+            "  http.timeouts        = request {}s, upload {}s",
+            self.http.request_timeout_secs, self.http.upload_timeout_secs
+        );
+        let _ = writeln!(
+            out,
+            "  http.limits          = {} concurrent, body {} MB",
+            self.http.concurrency_limit,
+            self.http.max_body_bytes / (1024 * 1024)
+        );
         let _ = writeln!(out, "  database.kind        = {}", self.database.kind.as_str());
         match self.database.kind {
             DatabaseKind::Sqlite => {

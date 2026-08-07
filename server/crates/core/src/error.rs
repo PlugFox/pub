@@ -23,6 +23,13 @@ pub enum Error {
     /// invitation, membership that already exists.
     #[error("conflict: {message}")]
     Conflict { message: String },
+    /// Another actor holds a serialization lock on the resource right now (per-name publish
+    /// lock). Distinct from [`Error::Conflict`] because it is **transient**: retrying the same
+    /// operation later can succeed, so callers may keep retryable state (a staged upload)
+    /// alive instead of burning it — and they must be able to tell the two apart without
+    /// matching on message strings.
+    #[error("busy: {message}")]
+    Busy { message: String },
     /// The actor lacks the required role or scope on a resource it can see (decision 19).
     /// The API layer decides whether this surfaces as 403 or 404 (decision 05 ladder).
     #[error("forbidden: {message}")]
@@ -80,6 +87,7 @@ impl Error {
             Self::Invalid { .. } => "invalid_argument",
             Self::NotFound { .. } => "not_found",
             Self::Conflict { .. } => "conflict",
+            Self::Busy { .. } => "busy",
             Self::Forbidden { .. } => "forbidden",
             Self::Unauthorized { .. } => "unauthorized",
             Self::InvalidCode => "invalid_code",
@@ -107,6 +115,7 @@ mod tests {
             Error::Invalid { message: "m".into() },
             Error::NotFound { what: "w".into() },
             Error::Conflict { message: "m".into() },
+            Error::Busy { message: "m".into() },
             Error::Forbidden { message: "m".into() },
             Error::Unauthorized { message: "m".into() },
             Error::InvalidCode,
@@ -133,6 +142,7 @@ mod tests {
                 "invalid_argument",
                 "not_found",
                 "conflict",
+                "busy",
                 "forbidden",
                 "unauthorized",
                 "invalid_code",

@@ -56,7 +56,10 @@ tower = "0.5.3"
 # "compression-gzip": the pub version listing carries a full pubspec per version and the client
 # refuses to disk-cache responses past ~1 MB (docs/protocol.md sharp edge 7), so the JSON routes
 # are gzipped; archive routes deliberately are not.
-tower-http = { version = "0.7.0", features = ["trace", "request-id", "set-header", "compression-gzip"] }
+# "cors": S-12 — CORS locked to the instance origin by explicit config instead of by omission;
+# timeouts and load shedding are hand-rolled `from_fn` middlewares (path-aware, family-shaped
+# error bodies), so the "timeout"/"limit" features stay off.
+tower-http = { version = "0.7.0", features = ["trace", "request-id", "set-header", "compression-gzip", "cors"] }
 http = "1.5.0"
 http-body-util = "0.1.4"
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
@@ -158,6 +161,10 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 # --- bin / test utilities ---
 anyhow = "1.0.104"
 tempfile = "3.27.0"
+# Test-only: the generated configuration reference serializes `Settings::default()` to TOML to
+# cross-check the parsed struct fields against the real defaults (crates/config/tests/reference.rs).
+# Version matches the copy the `config` crate already pulls in, so no second toml in the tree.
+toml = "1.1.4"
 # Test-only: RSA keygen for the mock OIDC issuer needs a rand_core 0.6 RNG (rsa 0.9 API).
 rand = "0.8.7"
 

@@ -22,7 +22,6 @@ pub-core = { workspace = true }
 # "stream": the upstream archive body is consumed as a stream so the size cap is enforced
 # while bytes arrive rather than after they have all been buffered.
 reqwest = { workspace = true, features = ["stream"] }
-serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }

@@ -431,12 +431,17 @@ pub async fn publish_finalize(
             }))
         }
         Err(err) => {
+            // The held per-name publish lock is the one *client-error* a retry can heal: the
+            // holder may be this very client's timed-out first attempt, and the client retries
+            // this exact URL — burning the staged bytes here would turn every timeout-and-retry
+            // into "publish again from scratch". Checked structurally, never on message text.
+            let held_lock = matches!(err, pub_core::Error::Busy { .. });
             let err = ProtocolError::from_domain(err);
             // A permanent rejection burns the upload — retrying the same bytes cannot help,
             // and leaving them around is a free 100 MB per doomed publish. A transient one
-            // (database down, blob store unreachable) leaves the session finalizable, because
-            // the client *will* retry this exact URL up to seven times.
-            if err.status().is_client_error() {
+            // (database down, blob store unreachable, the lock above) leaves the session
+            // finalizable, because the client *will* retry this exact URL up to seven times.
+            if err.status().is_client_error() && !held_lock {
                 discard_upload(&state, session).await;
             }
             Err(err)
@@ -690,7 +695,7 @@ async fn serve_archive(
     let key = RegistryService::blob_key(FORMAT, &sha256);
     match state.blob.download(&key).await {
         Ok(DownloadPlan::Redirect(url)) => redirect_to(&url),
-        Ok(DownloadPlan::Stream(stream)) => Ok(stream_archive(name, version, size, stream)),
+        Ok(DownloadPlan::Stream(stream)) => Ok(stream_archive(name, version, &sha256, size, stream)),
         // Metadata without bytes is a broken store, not a missing package — but answering
         // anything but 404 here would leak that the version exists while the bytes do not.
         Err(pub_core::Error::NotFound { .. }) => {
@@ -736,10 +741,20 @@ fn redirect_to(url: &url::Url) -> Result<Response, ProtocolError> {
 /// `size` is optional because it is metadata, not the payload: a proxied row whose size we
 /// never measured would otherwise advertise `Content-Length: 0` for a body that is not empty,
 /// which is worse than advertising nothing at all.
-fn stream_archive(name: &str, version: &SemVer, size: Option<i64>, stream: ByteStream) -> Response {
+///
+/// The cache headers are what content addressing buys (S-18): the bytes behind a
+/// name+version can never change — a republish is refused, a hard delete removes the version
+/// — so the archive is `immutable` with its own sha256 as a strong `ETag`. `private`,
+/// because a registry may be private and a shared cache must not serve one org's archive to
+/// another's request.
+fn stream_archive(name: &str, version: &SemVer, sha256: &str, size: Option<i64>, stream: ByteStream) -> Response {
     let mut response = Response::new(Body::from_stream(stream));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable"));
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{sha256}\"")) {
+        headers.insert(header::ETAG, value);
+    }
     if let Some(value) = size.filter(|size| *size > 0).and_then(|size| HeaderValue::from_str(&size.to_string()).ok()) {
         headers.insert(header::CONTENT_LENGTH, value);
     }

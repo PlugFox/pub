@@ -1,9 +1,10 @@
 //! Request guards: the S-12 mutation guard (custom header + JSON-only bodies) and the
 //! KV-backed auth rate-limit layer (S-24).
 //!
-//! Middleware order (docs/rules/api.md): request-id → tracing → security headers → rate
-//! limit → auth extractors. Both guards scope themselves to app-API paths — the pub protocol
-//! surface (`/o/…`, `/pub/…`) has its own contract and must never inherit these checks.
+//! Middleware order (docs/rules/api.md): request-id → tracing → security headers → CORS →
+//! load-shed → timeout → body cap → rate limit → auth extractors. Both guards scope
+//! themselves to app-API paths — the pub protocol surface (`/o/…`, `/pub/…`) has its own
+//! contract and must never inherit these checks.
 
 use axum::Json;
 use axum::extract::{Request, State};

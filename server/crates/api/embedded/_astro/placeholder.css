@@ -1,0 +1,5 @@
+/* Placeholder for the hashed-asset tier: everything under _astro/ carries a content hash in
+   its filename in the real build, so it is served immutable for a year. */
+body {
+  margin: 0;
+}

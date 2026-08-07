@@ -319,10 +319,13 @@ impl RegistryService {
         let name = prepared.pubspec.name.clone();
         let version = prepared.pubspec.version.clone();
 
-        // 3. Per-name lock: concurrent publishes of one package serialize here.
+        // 3. Per-name lock: concurrent publishes of one package serialize here. `Busy`, not
+        // `Conflict`: the holder may be this very client's timed-out first attempt, so the
+        // failure is transient and the API layer must be able to keep the staged upload
+        // finalizable instead of burning it (a duplicate version, by contrast, is permanent).
         let lock_key = format!("publish:{}:{name}", request.format);
         if !self.lock.try_acquire(&lock_key, self.policy.publish_lock_ttl).await? {
-            return Err(Error::Conflict { message: format!("another publish of {name} is already in progress") });
+            return Err(Error::Busy { message: format!("another publish of {name} is already in progress") });
         }
         let result = self.publish_locked(&request, prepared, now).await;
         if let Err(err) = self.lock.release(&lock_key).await {

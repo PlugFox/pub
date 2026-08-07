@@ -423,7 +423,10 @@ async fn a_held_publish_lock_makes_a_concurrent_publish_conflict_not_race() {
     assert!(h.lock.try_acquire("publish:pub:acme_core", std::time::Duration::from_secs(60)).await.expect("acquire"));
 
     let err = h.service.publish(h.request(package("acme_core", "1.0.0", &[])), t0()).await.expect_err("locked");
-    assert_eq!(err.code(), "conflict");
+    // `busy`, not `conflict`: the lock failure is transient, and it must stay structurally
+    // distinguishable from the permanent duplicate-version conflict so the API layer can keep
+    // a staged upload alive across it.
+    assert_eq!(err.code(), "busy");
     assert!(h.blob.keys().is_empty());
 
     // Once released, the same publish succeeds — and the lock is given back afterwards.

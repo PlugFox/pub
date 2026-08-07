@@ -32,7 +32,10 @@ impl ApiError {
         match &self.0 {
             Error::Invalid { .. } => StatusCode::BAD_REQUEST,
             Error::NotFound { .. } => StatusCode::NOT_FOUND,
-            Error::Conflict { .. } | Error::LastOwner { .. } => StatusCode::CONFLICT,
+            // `Busy` (a held serialization lock) is transient where `Conflict` is permanent,
+            // but both are honest 409s on the app API — the distinction matters to callers
+            // that hold retryable state (the pub finalize path), not to the status.
+            Error::Conflict { .. } | Error::Busy { .. } | Error::LastOwner { .. } => StatusCode::CONFLICT,
             // Distinct `step_up_required` code on the same 403 so the UI can prompt for a
             // fresh second factor instead of a dead-end denial (S-06).
             Error::Forbidden { .. } | Error::StepUpRequired => StatusCode::FORBIDDEN,
@@ -89,6 +92,7 @@ mod tests {
         assert_eq!(status_of(Error::Invalid { message: "m".into() }), StatusCode::BAD_REQUEST);
         assert_eq!(status_of(Error::NotFound { what: "w".into() }), StatusCode::NOT_FOUND);
         assert_eq!(status_of(Error::Conflict { message: "m".into() }), StatusCode::CONFLICT);
+        assert_eq!(status_of(Error::Busy { message: "m".into() }), StatusCode::CONFLICT);
         assert_eq!(status_of(Error::Forbidden { message: "m".into() }), StatusCode::FORBIDDEN);
         assert_eq!(status_of(Error::StepUpRequired), StatusCode::FORBIDDEN);
         assert_eq!(status_of(Error::Unauthorized { message: "m".into() }), StatusCode::UNAUTHORIZED);

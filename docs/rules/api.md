@@ -17,6 +17,6 @@ Two API families with different contracts — never mix them:
 ## Both
 
 - Every route registered through utoipa (`OpenApiRouter` + `routes!`) with `#[utoipa::path]` and DTO `ToSchema` — routes and OpenAPI can never drift; the `bearer_auth` SecurityScheme is registered in components. OpenAPI JSON at `/api/openapi.json`; never hand-edited.
-- Middleware order: request-id → tracing → security headers → rate limit → auth. Auth context arrives via typed extractors (`FromRequestParts`), not raw extensions.
+- Middleware order: request-id → tracing → security headers → CORS → load-shed → timeout → 413 reshape → body cap → rate limit → auth. Auth context arrives via typed extractors (`FromRequestParts`), not raw extensions. Middleware-made errors — 408 timeouts, 503 sheds, and 413 body-cap rejections alike — speak the family of the path they answer for — the spec shape on pub routes, the envelope on `/api`.
 - Never log tokens, OTP codes, or `Authorization` headers. Rate-limited responses use 429 + `Retry-After`.
 - DTOs are separate from domain types (`From` conversions); breaking API changes require a decision-log entry.

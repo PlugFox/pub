@@ -38,6 +38,76 @@ fn defaults_load_without_any_sources() {
     assert_eq!(settings.cluster.replicas, 1);
 }
 
+#[test]
+fn http_hygiene_defaults_match_the_roadmap_decision() {
+    // D8/D13: deadlines, load shedding, and the body cap ship on by default — an operator
+    // who configures nothing still gets a bounded server.
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.http.request_timeout_secs, 30);
+    assert_eq!(settings.http.upload_timeout_secs, 300);
+    assert_eq!(settings.http.concurrency_limit, 1024);
+    assert_eq!(settings.http.max_body_bytes, 2 * 1024 * 1024);
+}
+
+#[test]
+fn http_hygiene_zero_and_inverted_values_are_rejected() {
+    for (key, value) in [
+        ("PUB_HTTP__REQUEST_TIMEOUT_SECS", "0"),
+        ("PUB_HTTP__UPLOAD_TIMEOUT_SECS", "0"),
+        ("PUB_HTTP__MAX_BODY_BYTES", "0"),
+        // Below the 16-slot floor the shed is the outage it exists to prevent.
+        ("PUB_HTTP__CONCURRENCY_LIMIT", "15"),
+    ] {
+        assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");
+    }
+    // An upload deadline below the ordinary one could never matter: the ordinary deadline
+    // would already have fired.
+    let err = load_from(
+        &CliArgs::default(),
+        env(&[("PUB_HTTP__REQUEST_TIMEOUT_SECS", "60"), ("PUB_HTTP__UPLOAD_TIMEOUT_SECS", "30")]),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("upload_timeout_secs"), "wrong message: {err}");
+    // The floor itself is fine.
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_HTTP__CONCURRENCY_LIMIT", "16")])).unwrap();
+    assert_eq!(settings.http.concurrency_limit, 16);
+}
+
+#[test]
+fn http_concurrency_limit_has_a_ceiling_below_the_semaphore_panic() {
+    // tokio's Semaphore panics above usize::MAX >> 3 — a huge configured value must be a
+    // startup refusal, never a boot that aborts at router construction.
+    let err = load_from(&CliArgs::default(), env(&[("PUB_HTTP__CONCURRENCY_LIMIT", "1000001")])).unwrap_err();
+    assert!(err.to_string().contains("concurrency_limit"), "wrong message: {err}");
+    // The ceiling itself is fine.
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_HTTP__CONCURRENCY_LIMIT", "1000000")])).unwrap();
+    assert_eq!(settings.http.concurrency_limit, 1_000_000);
+}
+
+#[test]
+fn s12_public_url_must_be_a_real_http_origin() {
+    // Every rejected shape would corrupt the CORS allowlist or the advertised bases: an
+    // unparseable URL, a non-http(s) scheme (opaque origin → the literal "null" origin, which
+    // sandboxed attacker pages can claim), a hostless URL, and a query/fragment typo.
+    for bad in [
+        "not a url",
+        "htp://pub.corp.test",
+        "ftp://pub.corp.test",
+        "unix:/run/pub.sock",
+        "data:text/html,hi",
+        "https://pub.corp.test/?utm=1",
+        "https://pub.corp.test/#frag",
+    ] {
+        let err = load_from(&CliArgs::default(), env(&[("PUB_SERVER__PUBLIC_URL", bad)])).unwrap_err();
+        assert!(err.to_string().contains("public_url"), "accepted {bad:?} / wrong message: {err}");
+    }
+    // Plain http, explicit ports, and subpath mounts (docs/protocol.md sharp edge 8) are legal.
+    for good in ["http://localhost:8080", "https://pub.corp.test", "https://corp.test/registry"] {
+        let settings = load_from(&CliArgs::default(), env(&[("PUB_SERVER__PUBLIC_URL", good)])).unwrap();
+        assert_eq!(settings.server.public_url, good);
+    }
+}
+
 // --- precedence ---
 
 #[test]
@@ -303,6 +373,8 @@ fn summary_lists_defaults() {
     let summary = load_from(&CliArgs::default(), no_env()).unwrap().summary();
     assert!(summary.contains("server.listen        = 0.0.0.0:8080"));
     assert!(summary.contains("server.mode          = dev"));
+    assert!(summary.contains("http.timeouts        = request 30s, upload 300s"));
+    assert!(summary.contains("http.limits          = 1024 concurrent, body 2 MB"));
     assert!(summary.contains("database.kind        = sqlite"));
     assert!(summary.contains("blob.kind            = fs"));
     assert!(summary.contains("kv.kind              = memory"));

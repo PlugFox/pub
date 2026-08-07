@@ -11,6 +11,7 @@ impl Settings {
         self.server.listen.parse::<std::net::SocketAddr>().map_err(|err| {
             invalid(format!("server.listen '{}' is not a valid socket address: {err}", self.server.listen))
         })?;
+        self.validate_public_url()?;
 
         if self.database.kind == DatabaseKind::Postgres && self.database.url.is_none() {
             return Err(invalid("database.kind = postgres requires database.url"));
@@ -44,6 +45,7 @@ impl Settings {
             )));
         }
 
+        self.validate_http()?;
         self.validate_auth()?;
         self.validate_smtp()?;
         self.validate_registry()?;
@@ -83,6 +85,75 @@ impl Settings {
                  connections are recycled at end-of-life, so a longer idle timeout could never fire",
                 pool.max_lifetime_secs, pool.idle_timeout_secs
             )));
+        }
+        Ok(())
+    }
+
+    /// Public-URL invariants (S-12).
+    ///
+    /// The CORS allowlist and the S-12 mutation guard both compare against this URL's
+    /// *origin*, and `url::Url::origin()` of a non-special scheme is **opaque** — it
+    /// serializes to the literal `"null"`, which is exactly the `Origin` a browser sends from
+    /// sandboxed iframes and `file:` pages. A mistyped scheme would therefore allow-list every
+    /// sandboxed attacker page; refuse it at boot instead.
+    fn validate_public_url(&self) -> Result<(), ConfigError> {
+        let raw = &self.server.public_url;
+        let url =
+            url::Url::parse(raw).map_err(|err| invalid(format!("server.public_url is not a valid URL: {err}")))?;
+        match url.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(invalid(format!(
+                    "server.public_url scheme '{other}' must be http or https (S-12: any other scheme has an \
+                     opaque origin, which serializes to the \"null\" origin sandboxed pages can claim)"
+                )));
+            }
+        }
+        if url.cannot_be_a_base() || url.host_str().is_none() {
+            return Err(invalid("server.public_url must have a host"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            // A query or fragment cannot survive into the advertised bases (`PUB_HOSTED_URL`,
+            // upload/finalize URLs) and would only ever be a typo.
+            return Err(invalid("server.public_url must not carry a query or fragment"));
+        }
+        Ok(())
+    }
+
+    /// HTTP hygiene invariants (D8/D13).
+    fn validate_http(&self) -> Result<(), ConfigError> {
+        let http = &self.http;
+        if http.request_timeout_secs == 0 || http.upload_timeout_secs == 0 {
+            // Zero would cancel every request at its first await point — an outage dressed as
+            // a timeout setting. "No deadline" is not something these knobs express.
+            return Err(invalid("http.request_timeout_secs and http.upload_timeout_secs must be greater than 0"));
+        }
+        if http.upload_timeout_secs < http.request_timeout_secs {
+            return Err(invalid(format!(
+                "http.upload_timeout_secs ({}) must be at least http.request_timeout_secs ({}): \
+                 the upload deadline is the ordinary deadline with room for a 100 MB multipart body",
+                http.upload_timeout_secs, http.request_timeout_secs
+            )));
+        }
+        if http.concurrency_limit < 16 {
+            // A handful of slots turns the load shed into the outage it exists to prevent:
+            // static assets, auth, and the pub protocol all ride the same semaphore.
+            return Err(invalid(format!("http.concurrency_limit = {} must be at least 16", http.concurrency_limit)));
+        }
+        // tokio's `Semaphore::new` panics above `MAX_PERMITS` (`usize::MAX >> 3`), so a huge
+        // value would pass validation and then abort the process at router construction. One
+        // million in-flight response heads is already far past what a single instance can
+        // serve, so the ceiling costs nobody a real configuration.
+        const MAX_CONCURRENCY: usize = 1_000_000;
+        if http.concurrency_limit > MAX_CONCURRENCY {
+            return Err(invalid(format!(
+                "http.concurrency_limit = {} must be at most {MAX_CONCURRENCY}",
+                http.concurrency_limit
+            )));
+        }
+        if http.max_body_bytes == 0 {
+            // Zero would reject every request with a body while looking like a configured cap.
+            return Err(invalid("http.max_body_bytes must be greater than 0"));
         }
         Ok(())
     }

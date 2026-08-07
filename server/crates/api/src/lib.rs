@@ -6,16 +6,26 @@
 //! CLI-token management (S-08/S-09/S-13), minimal orgs, and the Hosted Pub Repository Spec v2
 //! surface on both virtual bases (`/o/{org}/pub`, `/pub` — see [`protocol`]).
 //!
-//! Middleware order (docs/rules/api.md): request-id → tracing → security headers → rate
-//! limit → auth (typed extractors in handlers). The two app-API guards deliberately scope
-//! themselves to `/api/…`: the pub protocol has its own contract (no custom header, no JSON
-//! bodies, no browser origin) and must never inherit them.
+//! Middleware order (docs/rules/api.md): request-id → tracing → security headers → CORS →
+//! load-shed → timeout → 413 reshape → body cap → rate limit → auth (typed extractors in
+//! handlers). The
+//! shed and the deadline sit *inside* the header/CORS layers so their 503/408 responses carry
+//! the same headers as everything else, and *outside* the guards so guard I/O rides the
+//! deadline too. The two app-API guards deliberately scope themselves to `/api/…`: the pub
+//! protocol has its own contract (no custom header, no JSON bodies, no browser origin) and
+//! must never inherit them.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::http::{HeaderValue, header};
+use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderName, HeaderValue, Method, header};
 use axum::routing::get;
+use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -30,6 +40,7 @@ pub mod envelope;
 pub mod error;
 pub mod extract;
 pub mod guard;
+pub mod hygiene;
 pub mod protocol;
 pub mod routes;
 mod state;
@@ -137,6 +148,16 @@ pub fn router(state: AppState) -> Router {
         .merge(protocol::router(&state))
         .split_for_parts();
 
+    let http = state.settings.http;
+    // One process-wide budget of in-flight requests (D8). Created here, not per layer clone:
+    // the semaphore *is* the instance's capacity, so every route shares it.
+    let capacity = Arc::new(Semaphore::new(http.concurrency_limit));
+
+    // S-11: compute the document CSP now. The scanner panics on a malformed embedded build
+    // (an unclosed inline block would truncate the scan and ship a wrong policy), and that
+    // refusal belongs at startup, not on the first HTML request of a running instance.
+    assets::init_document_csp();
+
     Router::new()
         .merge(api_router)
         // OpenAPI is generated from route annotations, never hand-edited (docs/rules/api.md).
@@ -148,18 +169,50 @@ pub fn router(state: AppState) -> Router {
                 .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
                 .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(TraceLayer::new_for_http())
+                // S-28 baseline headers on every response. `if_not_present`, so a handler that
+                // knows better wins: assets.rs sets the hashed document CSP on HTML (S-11).
                 .layer(SetResponseHeaderLayer::if_not_present(
                     header::X_CONTENT_TYPE_OPTIONS,
                     HeaderValue::from_static("nosniff"),
                 ))
+                // The API-family CSP (S-11): API and pub responses are data, not documents —
+                // nothing may load, embed, or frame them.
                 .layer(SetResponseHeaderLayer::if_not_present(
                     header::CONTENT_SECURITY_POLICY,
-                    HeaderValue::from_static("frame-ancestors 'none'"),
+                    HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
                 ))
                 .layer(SetResponseHeaderLayer::if_not_present(
                     header::X_FRAME_OPTIONS,
                     HeaderValue::from_static("DENY"),
                 ))
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    header::REFERRER_POLICY,
+                    HeaderValue::from_static("no-referrer"),
+                ))
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    HeaderName::from_static("permissions-policy"),
+                    HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=(), usb=()"),
+                ))
+                // HSTS (https deployments only) and the no-store cache tier for API/pub JSON.
+                .layer(axum::middleware::from_fn_with_state(state.clone(), hygiene::response_headers))
+                // S-12: CORS locked to the instance origin by explicit config. Sits inside the
+                // header layers (preflights get them) and outside the shed (a preflight is
+                // answered even under load — it carries no work).
+                .layer(cors_layer(&state.settings.server.public_url))
+                // D8 load shedding, then the D13 request deadline — shed first so a saturated
+                // instance answers 503 without spending a timeout slot, deadline outside the
+                // guards so their KV I/O is bounded too.
+                .layer(axum::middleware::from_fn(move |request, next| {
+                    hygiene::concurrency_shed(Arc::clone(&capacity), request, next)
+                }))
+                .layer(axum::middleware::from_fn_with_state(state.clone(), hygiene::request_timeout))
+                // Body-cap rejections answer in the family's shape, like the 408/503 bodies
+                // do. Inside CORS (so the reshaped 413 keeps its CORS headers), outside the
+                // body cap and the handlers whose body reads produce the bare 413.
+                .layer(axum::middleware::from_fn(hygiene::reshape_body_limit))
+                // Global request-body cap (D8). The publish upload subrouter overrides it with
+                // the archive cap + multipart envelope — an inner `DefaultBodyLimit` wins.
+                .layer(DefaultBodyLimit::max(http.max_body_bytes))
                 // Auth rate limits (S-24) run after the header layers, before handlers; the
                 // guard scopes itself to auth paths internally.
                 .layer(axum::middleware::from_fn_with_state(state.clone(), guard::auth_rate_limit))
@@ -168,4 +221,31 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::middleware::from_fn_with_state(state.clone(), guard::mutation_guard)),
         )
         .with_state(state)
+}
+
+/// Explicit CORS (S-12): exactly the instance origin, the app API's methods and headers, no
+/// credentials — the API is cookieless (decision 03), so there is nothing for a browser to
+/// attach and nothing to allow.
+///
+/// This layer replaces "locked by omission" with "locked by config"; the *server-side* origin
+/// comparison in [`guard::mutation_guard`] stays untouched as the non-delegating layer
+/// (S-12.a) — CORS enforcement lives in the browser, the guard's does not.
+fn cors_layer(public_url: &str) -> CorsLayer {
+    // An unparseable public URL yields an empty allowlist: CORS stays fully locked rather
+    // than silently open. (`server.public_url` is validated at boot — S-12.)
+    let origin = url::Url::parse(public_url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        // A non-special scheme has an *opaque* origin, which `ascii_serialization` renders as
+        // the literal "null" — and browsers genuinely send `Origin: null` from sandboxed
+        // iframes and file: pages, so allow-listing it would open the API to every sandboxed
+        // attacker page. Config validation refuses such URLs at boot; if one slips through
+        // anyway (defence in depth), emit no allow-origin at all: locked, not null (S-12).
+        .filter(|origin| origin != "null")
+        .and_then(|origin| HeaderValue::from_str(&origin).ok());
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origin))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, HeaderName::from_static(guard::CUSTOM_HEADER)])
+        .max_age(Duration::from_secs(3600))
 }

@@ -109,6 +109,17 @@ pub struct TestOptions {
     pub max_sse_connections: u32,
     /// How many events the replay ring keeps.
     pub replay_buffer: usize,
+    /// D13 request deadline in seconds. The hygiene suite drives it down to prove the SSE
+    /// exemption inside a test's patience.
+    pub request_timeout_secs: u64,
+    /// D13 publish-upload deadline in seconds.
+    pub upload_timeout_secs: u64,
+    /// D8 concurrency ceiling. `Settings` is built directly here (no `validate()`), so the
+    /// hygiene suite may drop below the config floor of 16 — `0` deterministically saturates
+    /// the shed without racing parked requests.
+    pub concurrency_limit: usize,
+    /// D8 global body cap in bytes.
+    pub max_body_bytes: usize,
 }
 
 impl Default for TestOptions {
@@ -136,6 +147,10 @@ impl Default for TestOptions {
             sse_heartbeat_secs: 20,
             max_sse_connections: 5,
             replay_buffer: 256,
+            request_timeout_secs: 30,
+            upload_timeout_secs: 300,
+            concurrency_limit: 1024,
+            max_body_bytes: 2 * 1024 * 1024,
         }
     }
 }
@@ -198,6 +213,9 @@ pub struct TestApp {
     pub state: AppState,
     /// The scripted upstream, when the scenario enabled the proxy.
     pub upstream: Option<Arc<MockUpstream>>,
+    /// The registry's per-name publish lock — tests hold it to simulate a concurrent publish
+    /// (e.g. this client's own timed-out first finalize attempt).
+    pub lock: Arc<InMemoryJobLock>,
     /// The runtime-settings cache this app serves from (decision 09).
     pub runtime: Arc<SettingsCache>,
     /// The domain event bus every service in this app emits into (decision 22).
@@ -227,6 +245,10 @@ impl TestApp {
         settings.kv.kind = KvKind::Memory;
         settings.server.trust_proxy_headers = options.trust_proxy_headers;
         settings.server.public_url = options.public_url.clone();
+        settings.http.request_timeout_secs = options.request_timeout_secs;
+        settings.http.upload_timeout_secs = options.upload_timeout_secs;
+        settings.http.concurrency_limit = options.concurrency_limit;
+        settings.http.max_body_bytes = options.max_body_bytes;
         settings.registry.require_auth_for_read = options.require_auth_for_read;
         settings.registry.rate_limit.publish_per_hour_org = options.publish_per_hour_org;
 
@@ -284,10 +306,11 @@ impl TestApp {
         let events = build_bus(&settings, &repos, Arc::clone(&kv_handle), Arc::clone(&mailer));
         let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
 
+        let lock = Arc::new(InMemoryJobLock::new());
         let registry = Arc::new(RegistryService::new(
             repos.clone(),
             Arc::clone(&blob),
-            Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
+            Arc::clone(&lock) as Arc<dyn JobLock>,
             Arc::clone(&sink),
             RegistryPolicy::default(),
         ));
@@ -343,6 +366,7 @@ impl TestApp {
             mailer,
             state,
             upstream: mock_upstream,
+            lock,
             runtime,
             events,
             clock,
@@ -362,10 +386,12 @@ impl TestApp {
     pub fn restart(&self) -> Self {
         let settings = (*self.state.settings).clone();
         let runtime = Arc::clone(&self.state.runtime);
+        // A restart throws in-process locks away — exactly what a real process restart does.
+        let lock = Arc::new(InMemoryJobLock::new());
         let registry = Arc::new(RegistryService::new(
             self.state.repos.clone(),
             Arc::clone(&self.state.blob),
-            Arc::new(InMemoryJobLock::new()) as Arc<dyn JobLock>,
+            Arc::clone(&lock) as Arc<dyn JobLock>,
             Arc::clone(&self.state.events) as Arc<dyn EventSink>,
             RegistryPolicy::default(),
         ));
@@ -391,6 +417,7 @@ impl TestApp {
             mailer: Arc::clone(&self.mailer),
             state,
             upstream: self.upstream.clone(),
+            lock,
             runtime,
             events: Arc::clone(&self.state.events),
             clock: Arc::clone(&self.clock),

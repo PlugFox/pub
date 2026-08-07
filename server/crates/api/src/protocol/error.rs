@@ -118,6 +118,10 @@ impl ProtocolError {
             Error::Forbidden { message } => Self::forbidden(message),
             Error::Invalid { message } => Self::invalid(message),
             Error::Conflict { message } => Self::plain(StatusCode::BAD_REQUEST, "conflict", message),
+            // A held publish lock stays inside the finalize contract's 200-or-400 ladder, but
+            // keeps its own code: unlike `conflict` it is transient (the finalize handler
+            // reads the status/code pair to decide whether the staged upload survives).
+            Error::Busy { message } => Self::plain(StatusCode::BAD_REQUEST, "busy", message),
             Error::Expired { what } => Self::plain(StatusCode::BAD_REQUEST, "expired", format!("{what} has expired")),
             Error::StepUpRequired => Self::forbidden(err.to_string()),
             Error::RateLimited { retry_after_secs } => Self {
@@ -258,6 +262,16 @@ mod tests {
             let status = ProtocolError::from_domain(err).status;
             assert!(status.is_client_error(), "{code} mapped to {status}, which the client would retry");
         }
+    }
+
+    #[test]
+    fn a_held_publish_lock_is_400_busy_never_5xx() {
+        // Transient, but still inside the finalize 200-or-400 contract — a 5xx here would be
+        // hammered up to 7 times while the lock holder is still working (sharp edge 2). The
+        // distinct code is what lets the finalize handler keep the staged upload alive.
+        let err = ProtocolError::from_domain(Error::Busy { message: "another publish is in progress".into() });
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "busy");
     }
 
     #[test]

@@ -7,7 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 # Session revocation on every authority change (S-09) and KEK sealing of the runtime SMTP
