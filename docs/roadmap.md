@@ -1,6 +1,6 @@
 # Roadmap
 
-State of the project and the plan forward. Written 2026-08-07 against commit `3cbe504` on branch `foundation`, grounded in a full read-only audit of the code (not of the design docs — where the two disagree, the code is what this document reports).
+State of the project and the plan forward. Written 2026-08-07 against commit `3cbe504` on branch `foundation`, grounded in a full read-only audit of the code (not of the design docs — where the two disagree, the code is what this document reports). **Updated later the same day against `9cc1bef`** after the first execution wave: D4, D5, D6 and D24 closed (marked in place below), decisions 18/24/25 accepted and 02 amended, dependencies swept to latest stable (Rust 1.97.1, reqwest 0.13), the Patina palette with a three-theme registry and the sheen+ripple interaction layer landed, and the agent tooling (`.claude/` skills, commands, hooks) ported from foxic.
 
 The original [10-step website roadmap](https://wiki.plugfox.dev/s/website-roadmap) is complete through step 7; this document replaces its remaining steps with a plan shaped by what actually got built.
 
@@ -12,11 +12,11 @@ The original [10-step website roadmap](https://wiki.plugfox.dev/s/website-roadma
 
 | | |
 |---|---|
-| Backend | 16 crates, ~55 500 LOC Rust, 1 176 LOC SQL across 9 migrations per dialect |
-| Frontend | Bun workspace, 4 packages + 1 Astro app, 18 app screens |
-| Tests | **817** server (incl. 26 backend-agnostic contract functions run on both dialects) + **319** web |
-| API surface | 61 app-API routes, 7 pub-protocol routes mounted on 2 virtual bases, `/healthz` |
-| Verified live | `dart pub` 3.12.2 publish/resolve/retract against the binary; an 11-package graph proxied from the real pub.dev |
+| Backend | 16 crates, ~56 400 LOC Rust, 1 176 LOC SQL across 9 migrations per dialect |
+| Frontend | Bun workspace, 4 packages + 1 Astro app, 18 app screens, 3 registered themes |
+| Tests | **841** server (incl. 26 backend-agnostic contract functions run on both dialects) + **350** web |
+| API surface | 61 app-API routes, 7 pub-protocol routes mounted on 2 virtual bases, `/healthz` (now version-reporting) |
+| Verified live | `dart pub` 3.12.2 publish/resolve/retract against the binary; an 11-package graph proxied from the real pub.dev; production `docker run` acceptance — fail-fast secrets, volume survival, OTP sign-in through a mail sink |
 
 ### The foundation that is genuinely load-bearing
 
@@ -38,12 +38,12 @@ The original [10-step website roadmap](https://wiki.plugfox.dev/s/website-roadma
 
 ### What is configured and ready to build on
 
-- **CI**: path-filtered workflows for both sides; server runs fmt/clippy/test with a Postgres service; web runs typecheck, Biome, a WCAG-AA contrast gate over the token palette, an Astro build, and 319 tests.
-- **Docker**: a 4-stage image that builds today (verified: ~4 min, web → dependency layer → binary → alpine runtime, non-root, healthchecked) and compose profiles `pg`/`s3`/`redis`/`full` with zero-config defaults.
+- **CI**: path-filtered workflows for both sides; server runs fmt/clippy/test with a Postgres service; web runs typecheck, Biome, a WCAG-AA contrast gate over the token palette (now 69 pairs across three themes), an Astro build, and 350 tests. New since the audit: a PR Docker-build job (`docker-ci.yml`) and a tag-triggered multi-arch GHCR release workflow with a version smoke test, SBOM and GitHub release (`release.yml`) — no tag has been cut yet.
+- **Docker**: a 4-stage image that builds today (web → dependency layer → binary → alpine runtime, non-root, healthchecked) now shipping **production mode + a data `VOLUME`**, failing fast with actionable errors naming `pubd generate-secrets`; compose profiles `pg`/`s3`/`redis`/`full` — the profile env names are fixed (they were silently ignored) and `full` is wired end to end with MinIO bucket init and a Mailpit sink.
 - **Types**: the frontend generates its API types from the server's OpenAPI document (`bun run gen:api`); a server-side test asserts the document matches the route inventory exactly.
-- **Design system**: OKLCH tokens for both themes with contrast asserted by a script in CI, self-hosted font subsets with Cyrillic, a component kit with a showcase page.
-- **i18n**: YAML with a mandatory `desc` per key, Bun codegen to typed modules, English bundled as fallback, 10 locales generated, Russian genuinely translated.
-- **Governance for agent work**: `CLAUDE.md`, `AGENTS.md`, `docs/rules/*`, a decision log with 23 entries, and a changelog with per-component tags.
+- **Design system**: the Patina palette (decision 24 — warm graphite neutrals, teal accent) behind a **theme registry** — light, dark and true-black AMOLED, contrast asserted per theme by the CI gate; the sheen+ripple interaction layer (decision 25); self-hosted font subsets with Cyrillic; a component kit with a showcase page. Iris/nocturne kept as validated candidate palettes.
+- **i18n**: YAML with a mandatory `desc` per key, Bun codegen to typed modules, English bundled as fallback, 10 locales generated, Russian genuinely translated; verified lazy — no locale dictionary text reaches the JS chunks.
+- **Governance for agent work**: `CLAUDE.md`, `AGENTS.md`, `docs/rules/*`, a decision log with 25 entries, a changelog with per-component tags, and `.claude/` — 21 repo-adapted skills, slash commands (`/server-check`, `/web-check`, `/db-up`, `/new-migration`), a Stop hook and permission settings.
 
 ---
 
@@ -98,7 +98,7 @@ Ranked by risk to a real deployment. Each item names the file where the audit fo
 - **D33** Accessibility gaps verified by reading: no focus management or announcement on route change; `EmptyState` titles are paragraphs, so the 404 and 403 screens have no heading at all; nine admin fields set `aria-invalid` with no `aria-describedby`; Suspense fallbacks are `aria-hidden` skeletons with no live region; a `Badge` `aria-label` replaces the visible role value with the word "Role".
 - **D34** Bundle: the eager island is 79 KB gzip, of which Kobalte is 22.7 KB (pulled in by the shell's static imports of Menu/ThemeToggle/Toast/Dialog) and the full English message catalogue is 9.6 KB; the static landing page ships 23 KB gzip of JS to render one theme toggle.
 - **D35** Astro has no per-locale routes and no docs pages — every built page is `lang="en"`, contradicting decisions 08 and 14.
-- **D36** No component tests (vitest browser mode is specified in the rules and not installed); no Playwright, no bundle budgets, no Lighthouse; no real-`dart pub` job in CI though `docs/protocol.md` calls it "the final arbiter"; no OpenAPI drift check and no codegen idempotence check.
+- **D36** No component tests in a real browser (vitest browser mode is specified in the rules and not installed; the feedback directives got happy-dom DOM-contract tests 2026-08-07, a partial step); `@playwright/test` is now a dev dependency (2026-08-07) but no suite exists; no bundle budgets, no Lighthouse; no real-`dart pub` job in CI though `docs/protocol.md` calls it "the final arbiter"; no OpenAPI drift check and no codegen idempotence check.
 
 ### Absent security requirements
 
@@ -106,7 +106,7 @@ Of S-01…S-33: 20 implemented and tested, 8 partial with a named gap, **5 absen
 
 ### Deliberate deviations to carry forward, not fix
 
-These are documented, justified and should stay unless their exit condition is met: runtime sqlx queries instead of compile-time macros (exit: the sqlx 0.9 CLI dual-backend workflow settles); the pre-DNS SSRF guard (compensated by sha256 verification); 406 reserved exclusively for API-version mismatch; 404 where the pub spec mandates 401 (anti-enumeration, decision 05); the publish budget failing open while auth buckets fail closed.
+These are documented, justified and should stay unless their exit condition is met: runtime sqlx queries instead of compile-time macros (**resolved 2026-08-07**: a spike proved the 0.9 CLI dual-backend workflow now works *and* that macro idioms conflict with the `COLS` dedup, the sqlx-free core and dialect-native binds — decision 02 amended, runtime queries are the recorded norm; new trigger: a drift escape the contract suite misses, or sqlx gaining computed SQL fragments); the pre-DNS SSRF guard (compensated by sha256 verification); 406 reserved exclusively for API-version mismatch; 404 where the pub spec mandates 401 (anti-enumeration, decision 05); the publish budget failing open while auth buckets fail closed.
 
 ---
 
@@ -118,14 +118,14 @@ Five phases. Phases 1 and 2 are what stand between this codebase and someone els
 
 The goal is a stranger installing this from a published artifact and running it in production without reading source code.
 
-1. **Release engineering (decision 18, finally decided).** Version derived from the git tag and injected as a build arg — no CI commits to the default branch. Multi-arch images published to GHCR on tag. A release workflow that builds the Docker image, runs it, asserts `/healthz` reports the expected version, generates an SBOM, and attaches the changelog section. Add a Docker build job to PR CI so the image can never rot.
-2. **A deployable default.** `VOLUME` for data; the image and compose set `PUB_SERVER__MODE=production` and fail fast with actionable errors; a `pubd generate-secrets` subcommand emitting a ready `.env`/TOML fragment (keyring, pepper, KEK); compose `full` wired end to end including MinIO bucket creation and a mail sink for development.
+1. ~~**Release engineering (decision 18, finally decided).**~~ **Done 2026-08-07** (`08ac240`): tag-derived version through the `PUB_VERSION` build arg to `/healthz` and `--version`, PR docker-build CI, multi-arch GHCR release workflow with version smoke, SBOM and GitHub release. Two operational notes for the first tag: the GHCR package is born private (one manual flip to public), and free arm64 runners require a public repository.
+2. ~~**A deployable default.**~~ **Done 2026-08-07** (`31a7aaf`): `VOLUME` + production mode in the image, fail-fast errors naming every missing secret, `pubd generate-secrets` (env/TOML, 0600, no silent overwrite), compose `full` wired end to end (MinIO bucket init, Mailpit sink) and the profile env-name drift fixed. Acceptance proven live, including container-replacement survival and OTP sign-in.
 3. **Operator documentation** in `docs/ops/`: install (docker run, compose, binary), a **generated** configuration reference (derive it from the config structs so it cannot drift), reverse-proxy examples for nginx/Caddy/Traefik including the mandatory `trust_proxy_headers` guidance, backup/restore for both database and blob backends, upgrade procedure, and the key-rotation runbook that three security requirements already reference.
-4. **SQLite fit for the default deployment**: WAL, `busy_timeout`, synchronous mode, configurable pool with acquire/idle/lifetime timeouts (both dialects).
+4. ~~**SQLite fit for the default deployment.**~~ **Done 2026-08-07** (`f786042`): WAL, `synchronous=NORMAL`, 5s `busy_timeout`, foreign keys explicit, `[database.pool]` with validated per-dialect defaults and acquire/idle/lifetime timeouts; concurrency pinned by tests, `:memory:` exempted from pool reaping (a latent data-loss hazard found in passing).
 5. **HTTP hygiene**: request timeout, concurrency limit, global body cap, and the security headers S-11/S-28 require — HSTS, strict CSP with hashes for Astro's framework inline bootstraps, `Referrer-Policy`, `Permissions-Policy`, `Cache-Control` tiers (immutable for hashed assets, `no-store` for sensitive responses) and ETags. An explicit `CorsLayer` rather than locked-by-omission.
 6. **Supply chain in CI**: `cargo audit` with justified ignores, gitleaks with our own token pattern published (S-15), image scanning, dependency update automation, `--locked` and `--frozen-lockfile`.
 
-**Exit:** a tagged release exists; `docker run ghcr.io/…/pub` with a documented env file yields a production-mode instance that survives a container replacement, delivers mail, and passes an external header check; a reader can find every config key in the docs.
+**Exit:** a tagged release exists; `docker run ghcr.io/…/pub` with a documented env file yields a production-mode instance that survives a container replacement, delivers mail, and passes an external header check; a reader can find every config key in the docs. **Status: the middle clause is now demonstrated (production boot, volume survival, mail sign-in); still open — the tag itself, the header check (item 5) and the config docs (item 3).**
 
 ### Phase 2 — Make the claims true *(closes D2, D3, D9–D12, D14, D19–D23, D26, D31, D18, D20)*
 
