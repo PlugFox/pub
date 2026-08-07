@@ -4,6 +4,8 @@
 //! explicit ids. That is the trait's contract 1 in SQL: there is no query here that could
 //! return or touch another account's row even if a caller passed a foreign id.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::notification::{NewNotification, Notification, NotificationCategory, NotificationPreference};
@@ -74,6 +76,12 @@ impl TryFrom<NotificationRow> for Notification {
 }
 
 #[derive(sqlx::FromRow)]
+struct UnreadCountRow {
+    user_id: Uuid,
+    count: i64,
+}
+
+#[derive(sqlx::FromRow)]
 struct UserPrefRow {
     user_id: Uuid,
     category: String,
@@ -128,6 +136,66 @@ impl NotificationRepo for PgNotificationRepo {
         row.try_into()
     }
 
+    async fn create_many(&self, new: &[NewNotification], now: DateTime<Utc>) -> Result<Vec<Notification>> {
+        if new.is_empty() {
+            return Ok(Vec::new());
+        }
+        if new.len() > MAX_RECIPIENT_BATCH {
+            return Err(Error::Invalid { message: format!("at most {MAX_RECIPIENT_BATCH} notifications per batch") });
+        }
+        // Minted here rather than by the database, in input order: UUID v7 is monotonic within
+        // a millisecond, and a user's feed is ordered by this id.
+        let ids: Vec<NotificationId> = new.iter().map(|_| NotificationId::new()).collect();
+        let id_uuids: Vec<Uuid> = ids.iter().map(|id| *id.as_uuid()).collect();
+        let users: Vec<Uuid> = new.iter().map(|item| *item.user_id.as_uuid()).collect();
+        let categories: Vec<String> = new.iter().map(|item| item.category.as_str().to_owned()).collect();
+        let events: Vec<String> = new.iter().map(|item| item.event.clone()).collect();
+        let titles: Vec<String> = new.iter().map(|item| item.title.clone()).collect();
+        let orgs: Vec<Option<Uuid>> = new.iter().map(|item| item.org_id.map(|org| *org.as_uuid())).collect();
+        let payloads: Vec<String> = new
+            .iter()
+            .map(|item| {
+                serde_json::to_string(&item.payload)
+                    .map_err(|err| Error::Internal { message: format!("failed to encode notification payload: {err}") })
+            })
+            .collect::<Result<_>>()?;
+
+        // One statement over parallel arrays rather than a multi-row VALUES list: the bind
+        // count stays at eight regardless of the recipient count, so the batch size is bounded
+        // by policy (`MAX_RECIPIENT_BATCH`) and never by the protocol's parameter limit.
+        let rows: Vec<NotificationRow> = sqlx::query_as(q!(
+            "INSERT INTO notifications (id, user_id, category, event, title, org_id, payload, created_at) \
+             SELECT id, user_id, category, event, title, org_id, payload::jsonb, $8 \
+             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::uuid[], $7::text[]) \
+             AS batch (id, user_id, category, event, title, org_id, payload) RETURNING {COLS}"
+        ))
+        .bind(&id_uuids)
+        .bind(&users)
+        .bind(&categories)
+        .bind(&events)
+        .bind(&titles)
+        .bind(&orgs)
+        .bind(&payloads)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| write_err(err, "notification already exists", "the recipient or org"))?;
+
+        // `RETURNING` promises no order; the minted id sequence is the input order.
+        let mut stored: HashMap<NotificationId, Notification> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let notification: Notification = row.try_into()?;
+            stored.insert(notification.id, notification);
+        }
+        ids.into_iter()
+            .map(|id| {
+                stored.remove(&id).ok_or_else(|| Error::Database {
+                    message: format!("notification {id} is missing from its own insert"),
+                })
+            })
+            .collect()
+    }
+
     async fn list(
         &self,
         user: UserId,
@@ -167,6 +235,25 @@ impl NotificationRepo for PgNotificationRepo {
                 .await
                 .map_err(db_err)?;
         Ok(count)
+    }
+
+    async fn unread_counts(&self, users: &[UserId]) -> Result<Vec<(UserId, i64)>> {
+        if users.is_empty() {
+            return Ok(Vec::new());
+        }
+        if users.len() > MAX_RECIPIENT_BATCH {
+            return Err(Error::Invalid { message: format!("at most {MAX_RECIPIENT_BATCH} recipients per lookup") });
+        }
+        let uuids: Vec<Uuid> = users.iter().map(|user| *user.as_uuid()).collect();
+        let rows: Vec<UnreadCountRow> = sqlx::query_as(
+            "SELECT user_id, COUNT(*) AS count FROM notifications \
+             WHERE read_at IS NULL AND user_id = ANY($1) GROUP BY user_id",
+        )
+        .bind(&uuids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|row| (pub_core::UserId::from_uuid(row.user_id), row.count)).collect())
     }
 
     async fn mark_read(&self, user: UserId, ids: &[NotificationId], now: DateTime<Utc>) -> Result<u64> {

@@ -37,6 +37,7 @@ use crate::package::{
     UpstreamCacheStats, UpstreamPackage, UpstreamSnapshot, UpstreamVersion, Version, Visibility,
 };
 use crate::page::Page;
+use crate::queue::{JobKind, NewQueuedJob, QueueOutcome, QueueState, QueuedJob, QueuedJobId};
 use crate::search::{InstanceCounters, SearchDocument, SearchFacets, SearchHit, SearchQuery, SearchView};
 use crate::semver::SemVer;
 use crate::session::{NewSession, Session, SessionLimits};
@@ -437,6 +438,93 @@ pub trait JobRepo: Send + Sync {
     /// Records how the run ended (see [`JobOutcome`]). A failure keeps the cursor, so the next
     /// run continues rather than starting over.
     async fn finish_run(&self, name: &str, outcome: JobOutcome, now: DateTime<Utc>) -> Result<JobState>;
+}
+
+/// The durable work queue (decision 26; see [`crate::queue`]).
+///
+/// Distinct from [`JobRepo`] on purpose: that one answers "where did this sweep get to" with
+/// one row per job name, this one holds **work items** — one row per thing to do, each with
+/// its own attempts, backoff and dead-letter state. It is in the database rather than behind
+/// [`Kv`] because that seam deliberately has no key enumeration, so nothing could ever find
+/// the items again to drain them (the same reason the download-stats buffer is not a KV
+/// counter — see `registry/src/stats.rs`).
+///
+/// Three properties every implementation must carry, because the worker relies on them rather
+/// than re-checking:
+///
+/// 1. **A claim is exclusive for the length of its lease.** Two concurrent claims never return
+///    the same item, whatever the backend's concurrency model (`FOR UPDATE SKIP LOCKED` on
+///    Postgres, the single writer on SQLite). Without this, one publish notifies everybody
+///    twice and one sign-in sends two codes.
+/// 2. **[`QueueState::Suppressed`] is a dead end.** No method here may move a row out of it —
+///    not [`JobQueueRepo::claim`], not [`JobQueueRepo::complete`], not
+///    [`JobQueueRepo::reap_expired_leases`]. That is S-04.a and S-31 expressed in the storage
+///    layer: a policy-rejected address files a row so the two branches cost the same, and that
+///    row must never become a deliverable message.
+/// 3. **Attempts are spent at claim time**, so an item that kills its handler mid-run still
+///    converges on the dead letter instead of retrying forever.
+///
+/// Retry policy — how many attempts, how long the backoff — lives in the worker, never here:
+/// a repository that deadlettered on its own count would be policy in the schema.
+#[async_trait]
+pub trait JobQueueRepo: Send + Sync {
+    /// Cheap connectivity probe used by `/healthz`.
+    async fn ping(&self) -> Result<()>;
+
+    /// Files one work item and returns the stored row.
+    ///
+    /// `Ok(None)` when the item carries a `dedupe_key` that is already present — a retried
+    /// enqueue is a no-op, not a second copy. A [`NewQueuedJob`] whose state is not
+    /// [`QueueState::is_admissible`] is [`crate::Error::Invalid`]: `done` and `dead` are
+    /// outcomes a worker records, and `running` is a lease nobody holds.
+    async fn enqueue(&self, new: &NewQueuedJob, now: DateTime<Utc>) -> Result<Option<QueuedJob>>;
+
+    /// One item by id; `None` when unknown or already purged.
+    ///
+    /// The drain worker never needs this — it works from what [`JobQueueRepo::claim`] handed
+    /// back — but the admin dead-letter view does, and so does every test that asserts a state
+    /// transition: a queue whose rows can only be observed by claiming them cannot be checked
+    /// without mutating what is being checked.
+    async fn get(&self, id: QueuedJobId) -> Result<Option<QueuedJob>>;
+
+    /// Leases up to `limit` runnable items of these `kinds`, oldest id first, marking each
+    /// `running` until `now + lease` and incrementing its attempt count.
+    ///
+    /// Runnable means `pending` **and** `run_after <= now`. Empty `kinds` or `limit == 0`
+    /// returns an empty batch and performs no query. The returned rows carry their post-claim
+    /// state, so the caller reads `attempts` to decide whether this run is the last one.
+    async fn claim(&self, kinds: &[JobKind], limit: u32, lease: Duration, now: DateTime<Utc>)
+    -> Result<Vec<QueuedJob>>;
+
+    /// Records how one claimed item ended (see [`QueueOutcome`]). `backoff` is consumed only
+    /// by [`QueueOutcome::Retry`], which re-arms `run_after = now + backoff`.
+    ///
+    /// Applies **only to a row that is still `running`**. A worker whose lease already expired
+    /// and was reaped therefore reports into the void rather than clobbering the state of
+    /// whoever holds the item now — and, decisively, a `Retry` can never resurrect a
+    /// suppressed or dead-lettered row into something claimable.
+    async fn complete(
+        &self,
+        id: QueuedJobId,
+        outcome: QueueOutcome,
+        backoff: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Returns every item whose lease expired — a worker died mid-run — to `pending`, and
+    /// reports how many. The attempt those items already spent is **not** given back.
+    async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64>;
+
+    /// Deletes `done` items last written before `before`, and reports how many.
+    ///
+    /// Only `done`: `dead` rows are the operator's record of mail that never arrived, and a
+    /// queue table with no retention is how this becomes the next entry on the list of tables
+    /// that grow forever.
+    async fn purge(&self, before: DateTime<Utc>) -> Result<u64>;
+
+    /// Per-`(kind, state)` item counts for `/metrics` and the admin job table, ordered by kind
+    /// then state. Combinations with no rows are absent rather than reported as zero.
+    async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>>;
 }
 
 /// User account persistence.
@@ -849,6 +937,27 @@ pub trait NotificationRepo: Send + Sync {
     /// Files one notification and returns the stored row.
     async fn create(&self, new: NewNotification, now: DateTime<Utc>) -> Result<Notification>;
 
+    /// Files a batch of notifications and returns the stored rows **in input order**.
+    ///
+    /// The batch form exists because fan-out writes one row per recipient: an org event with
+    /// two hundred members would otherwise be two hundred statements on one worker tick. Bounded
+    /// like [`NotificationRepo::stored_preferences`] — an oversized batch is
+    /// [`crate::Error::Invalid`], an empty one is an empty result and performs no query.
+    ///
+    /// Ids are minted in input order, which is what makes the returned order meaningful: a
+    /// user's feed is ordered by notification id, so recipients handed over in audience order
+    /// read their rows back in that order too.
+    async fn create_many(&self, new: &[NewNotification], now: DateTime<Utc>) -> Result<Vec<Notification>>;
+
+    /// Unread counts for a batch of users, as `(user, count)` pairs in **unspecified** order.
+    ///
+    /// The batch counterpart of [`NotificationRepo::unread_count`], for the same reason the
+    /// batched preference lookup exists: the fan-out needs one badge number per recipient to
+    /// put on its `UserNotified` events. Users with nothing unread are **absent** rather than
+    /// reported as zero — the same shape a `GROUP BY` produces — so callers default a missing
+    /// entry to zero. Bounded and empty-safe like the other batch reads.
+    async fn unread_counts(&self, users: &[UserId]) -> Result<Vec<(UserId, i64)>>;
+
     /// The user's feed, newest first, keyset-paginated over the UUID v7 id (time-ordered, so
     /// the id alone is the cursor). `unread_only` narrows to unread rows.
     ///
@@ -1144,6 +1253,8 @@ pub struct Repositories {
     pub settings: Arc<dyn SettingsRepo>,
     /// Durable background-job state (decision 03, decision 07 mirror).
     pub jobs: Arc<dyn JobRepo>,
+    /// The durable work queue behind asynchronous fan-out and outbound mail (decision 26).
+    pub queue: Arc<dyn JobQueueRepo>,
     /// Package search index and the read model over it (decision 11).
     pub search: Arc<dyn PackageSearch>,
     /// Daily download rollups.

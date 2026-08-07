@@ -18,6 +18,7 @@ pub mod notification;
 pub mod org;
 pub mod package;
 pub mod page;
+pub mod queue;
 pub mod role;
 pub mod search;
 pub mod semver;
@@ -34,6 +35,7 @@ pub use event::DomainEvent;
 pub use format::Format;
 pub use id::{CredentialId, InvitationId, NotificationId, OrgId, PackageId, SessionId, TokenId, UserId, VersionId};
 pub use page::Page;
+pub use queue::QueuedJobId;
 pub use role::RoleLevel;
 pub use semver::SemVer;
 

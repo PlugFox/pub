@@ -4,6 +4,8 @@
 //! explicit ids. That is the trait's contract 1 in SQL: there is no query here that could
 //! return or touch another account's row even if a caller passed a foreign id.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::notification::{NewNotification, Notification, NotificationCategory, NotificationPreference};
@@ -23,6 +25,14 @@ const MAX_MARK_BATCH: usize = 200;
 
 /// Largest recipient batch one fan-out may ask about in a single preference lookup.
 const MAX_RECIPIENT_BATCH: usize = 500;
+
+/// Rows per `INSERT` statement inside a [`NotificationRepo::create_many`] transaction.
+///
+/// Eight columns per row, and older SQLite builds cap a statement at 999 bound parameters, so
+/// the whole 500-recipient batch cannot be one statement. Chunks also keep each statement's
+/// hold on the single write lock short, which matters because this runs while publish traffic
+/// is competing for it.
+const MAX_INSERT_CHUNK: usize = 100;
 
 /// All notification columns, in [`NotificationRow`] order.
 const COLS: &str = "id, user_id, category, event, title, org_id, payload, created_at, read_at";
@@ -70,6 +80,12 @@ impl TryFrom<NotificationRow> for Notification {
             read_at: parse_ts_opt(row.read_at.as_deref())?,
         })
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct UnreadCountRow {
+    user_id: String,
+    count: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -127,6 +143,64 @@ impl NotificationRepo for SqliteNotificationRepo {
         row.try_into()
     }
 
+    async fn create_many(&self, new: &[NewNotification], now: DateTime<Utc>) -> Result<Vec<Notification>> {
+        if new.is_empty() {
+            return Ok(Vec::new());
+        }
+        if new.len() > MAX_RECIPIENT_BATCH {
+            return Err(Error::Invalid { message: format!("at most {MAX_RECIPIENT_BATCH} notifications per batch") });
+        }
+        // Minted here rather than by the database, in input order: UUID v7 is monotonic within
+        // a millisecond, and a user's feed is ordered by this id.
+        let ids: Vec<NotificationId> = new.iter().map(|_| NotificationId::new()).collect();
+        let payloads: Vec<String> = new
+            .iter()
+            .map(|item| {
+                serde_json::to_string(&item.payload)
+                    .map_err(|err| Error::Internal { message: format!("failed to encode notification payload: {err}") })
+            })
+            .collect::<Result<_>>()?;
+        let stamp = super::ts(now);
+
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let mut stored: HashMap<NotificationId, Notification> = HashMap::with_capacity(new.len());
+        for chunk in (0..new.len()).collect::<Vec<_>>().chunks(MAX_INSERT_CHUNK) {
+            let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT INTO notifications (id, user_id, category, event, title, org_id, payload, created_at) ",
+            );
+            query.push_values(chunk.iter().copied(), |mut row, index| {
+                row.push_bind(ids[index].to_string())
+                    .push_bind(new[index].user_id.to_string())
+                    .push_bind(new[index].category.as_str())
+                    .push_bind(new[index].event.as_str())
+                    .push_bind(new[index].title.as_str())
+                    .push_bind(new[index].org_id.map(|org| org.to_string()))
+                    .push_bind(payloads[index].as_str())
+                    .push_bind(stamp.as_str());
+            });
+            query.push(" RETURNING ").push(COLS);
+            let rows: Vec<NotificationRow> = query
+                .build_query_as()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|err| write_err(err, "notification already exists", "the recipient or org"))?;
+            for row in rows {
+                let notification: Notification = row.try_into()?;
+                stored.insert(notification.id, notification);
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+
+        // `RETURNING` promises no order; the minted id sequence is the input order.
+        ids.into_iter()
+            .map(|id| {
+                stored.remove(&id).ok_or_else(|| Error::Database {
+                    message: format!("notification {id} is missing from its own insert"),
+                })
+            })
+            .collect()
+    }
+
     async fn list(
         &self,
         user: UserId,
@@ -165,6 +239,26 @@ impl NotificationRepo for SqliteNotificationRepo {
             .await
             .map_err(db_err)?;
         Ok(count)
+    }
+
+    async fn unread_counts(&self, users: &[UserId]) -> Result<Vec<(UserId, i64)>> {
+        if users.is_empty() {
+            return Ok(Vec::new());
+        }
+        if users.len() > MAX_RECIPIENT_BATCH {
+            return Err(Error::Invalid { message: format!("at most {MAX_RECIPIENT_BATCH} recipients per lookup") });
+        }
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT user_id, COUNT(*) AS count FROM notifications WHERE read_at IS NULL \
+                               AND user_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for user in users {
+            separated.push_bind(user.to_string());
+        }
+        query.push(") GROUP BY user_id");
+        let rows: Vec<UnreadCountRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.into_iter().map(|row| Ok((parse_col::<UserId>(&row.user_id)?, row.count))).collect()
     }
 
     async fn mark_read(&self, user: UserId, ids: &[NotificationId], now: DateTime<Utc>) -> Result<u64> {

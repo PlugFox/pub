@@ -247,3 +247,10 @@ async fn notifications_contract_decision20() {
     pub_db_tests::contract::notifications(&db.repos()).await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn job_queue_contract_s04_s31() {
+    let Some(db) = TestDb::create("job_queue_contract_s04_s31").await else { return };
+    pub_db_tests::contract::job_queue(&db.repos()).await;
+    db.cleanup().await;
+}

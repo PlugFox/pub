@@ -143,3 +143,8 @@ async fn package_transfer_and_stats_contract() {
 async fn notifications_contract_decision20() {
     pub_db_tests::contract::notifications(&fresh_repos().await).await;
 }
+
+#[tokio::test]
+async fn job_queue_contract_s04_s31() {
+    pub_db_tests::contract::job_queue(&fresh_repos().await).await;
+}

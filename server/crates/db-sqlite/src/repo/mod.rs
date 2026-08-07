@@ -28,6 +28,7 @@ mod jobs;
 mod notifications;
 mod orgs;
 mod packages;
+mod queue;
 mod search;
 mod sessions;
 mod settings;
@@ -41,6 +42,7 @@ pub use jobs::SqliteJobRepo;
 pub use notifications::SqliteNotificationRepo;
 pub use orgs::SqliteOrgRepo;
 pub use packages::SqlitePackageRepo;
+pub use queue::SqliteJobQueueRepo;
 pub use search::{SqlitePackageSearch, SqliteStatsRepo};
 pub use sessions::SqliteSessionRepo;
 pub use settings::SqliteSettingsRepo;
@@ -71,6 +73,7 @@ pub fn repositories(pool: SqlitePool) -> Repositories {
         audit: Arc::new(SqliteAuditRepo::new(pool.clone())),
         settings: Arc::new(SqliteSettingsRepo::new(pool.clone())),
         jobs: Arc::new(SqliteJobRepo::new(pool.clone())),
+        queue: Arc::new(SqliteJobQueueRepo::new(pool.clone())),
         search: Arc::new(SqlitePackageSearch::new(pool.clone())),
         stats: Arc::new(SqliteStatsRepo::new(pool.clone())),
         notifications: Arc::new(SqliteNotificationRepo::new(pool)),

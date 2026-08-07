@@ -3,6 +3,8 @@
 //! caller wraps each function in its own test.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::task::Poll;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone as _, Utc};
@@ -15,13 +17,20 @@ use pub_core::package::{
     BaseScope, NewPackage, NewUpstreamVersion, NewVersion, PackageOptions, Publisher, Resolution, UpstreamSnapshot,
     Visibility,
 };
+use pub_core::queue::{JobKind, MailJob, NewQueuedJob, QueueOutcome, QueueState};
 use pub_core::search::{SearchDocument, SearchHit, SearchSort, SearchView, parse_query};
 use pub_core::session::{NewSession, SessionLimits};
 use pub_core::stats::{DownloadDelta, DownloadTotals};
 use pub_core::token::{NewToken, TokenScope};
 use pub_core::traits::Repositories;
 use pub_core::user::{NewUser, UserFilter, UserStatus};
-use pub_core::{Format, OrgId, PackageId, RoleLevel, SemVer, UserId};
+use pub_core::{Format, OrgId, PackageId, QueuedJobId, RoleLevel, SemVer, UserId};
+
+/// The recipient cap both dialects enforce on a batched notification write or read.
+///
+/// Restated here rather than imported: the contract is "past the cap it is a caller error",
+/// and a suite that read the backends' own constant could not notice one of them drifting.
+const MAX_NOTIFICATION_BATCH: usize = 500;
 
 /// Deterministic base instant for every scenario (no wall clock in tests).
 fn t0() -> DateTime<Utc> {
@@ -34,6 +43,14 @@ fn days(n: i64) -> chrono::Duration {
 
 fn hours(n: i64) -> chrono::Duration {
     chrono::Duration::hours(n)
+}
+
+fn minutes(n: i64) -> chrono::Duration {
+    chrono::Duration::minutes(n)
+}
+
+fn seconds(n: i64) -> chrono::Duration {
+    chrono::Duration::seconds(n)
 }
 
 /// Creates an active user with a verified email.
@@ -2878,4 +2895,334 @@ pub async fn notifications(repos: &Repositories) {
         repos.notifications.stored_preferences(&[bob.id], NotificationCategory::Org).await.expect("miss").len(),
         0
     );
+
+    // The batched write the asynchronous fan-out uses (decision 26): one statement per chunk,
+    // ids minted in input order.
+    let batched = |user: UserId, title: &str| NewNotification {
+        user_id: user,
+        category: NotificationCategory::Org,
+        event: "org.membership".to_owned(),
+        title: title.to_owned(),
+        org_id: Some(org.id),
+        payload: serde_json::json!({ "type": "org_membership_changed", "title": title }),
+    };
+    let filed = repos
+        .notifications
+        .create_many(
+            &[batched(alice.id, "alice first"), batched(bob.id, "bob"), batched(alice.id, "alice second")],
+            t0() + hours(9),
+        )
+        .await
+        .expect("create_many");
+    assert_eq!(
+        filed.iter().map(|row| (row.user_id, row.title.as_str())).collect::<Vec<_>>(),
+        vec![(alice.id, "alice first"), (bob.id, "bob"), (alice.id, "alice second")],
+        "the rows come back in input order"
+    );
+    assert!(filed.windows(2).all(|pair| pair[0].id < pair[1].id), "ids are minted in input order");
+    assert!(filed.iter().all(|row| row.created_at == t0() + hours(9) && row.is_unread()));
+    assert_eq!(filed[0].payload["title"], "alice first", "the payload round-trips verbatim");
+    // Which is what makes the recipient's feed read back in the order the audience resolved.
+    let feed = repos.notifications.list(alice.id, true, None, 50).await.expect("feed");
+    assert_eq!(
+        feed.items.iter().map(|row| row.title.as_str()).collect::<Vec<_>>(),
+        vec!["alice second", "alice first"],
+        "newest first inside one batch"
+    );
+    assert!(repos.notifications.create_many(&[], t0()).await.expect("empty batch").is_empty());
+    let oversized: Vec<NewNotification> = (0..=MAX_NOTIFICATION_BATCH).map(|_| batched(alice.id, "flood")).collect();
+    assert_eq!(
+        repos.notifications.create_many(&oversized, t0()).await.expect_err("oversized batch").code(),
+        "invalid_argument",
+        "a batch past the cap is a caller error, never a statement of unbounded size"
+    );
+
+    // The batched badge lookup: grouped, and silent about users with nothing unread.
+    let stranger = UserId::new();
+    let counts = repos.notifications.unread_counts(&[alice.id, bob.id, stranger]).await.expect("unread counts");
+    let counts: BTreeMap<UserId, i64> = counts.into_iter().collect();
+    assert_eq!(counts.get(&alice.id), Some(&2), "the two rows the batch filed");
+    assert_eq!(counts.get(&bob.id), Some(&2), "one older row plus one from the batch");
+    assert_eq!(counts.get(&stranger), None, "a user with nothing unread is absent, not zero");
+    for (user, count) in &counts {
+        assert_eq!(
+            *count,
+            repos.notifications.unread_count(*user).await.expect("single"),
+            "the batch agrees with the single read"
+        );
+    }
+    assert!(repos.notifications.unread_counts(&[]).await.expect("empty").is_empty());
+    let flood: Vec<UserId> = (0..=MAX_NOTIFICATION_BATCH).map(|_| alice.id).collect();
+    assert_eq!(repos.notifications.unread_counts(&flood).await.expect_err("oversized").code(), "invalid_argument");
+}
+
+/// `JobQueueRepo`: the durable work queue behind asynchronous fan-out and outbound mail
+/// (decision 26).
+///
+/// Two assertions carry the weight, because they are the properties the drain worker relies on
+/// without re-checking. **A claim is exclusive**: two drains racing over one backlog receive
+/// disjoint sets, or one publish notifies everybody twice and one sign-in sends two codes.
+/// **A suppressed row is a dead end**: nothing here — not `claim`, not `complete`, not the
+/// lease reaper — can turn the row a policy-rejected address files into a deliverable message
+/// (S-04.a, S-31). The rest of the walk is the retry ladder: backoff, lease expiry, the dead
+/// letter, and the retention that keeps this table from becoming the next one that grows
+/// forever.
+pub async fn job_queue(repos: &Repositories) {
+    repos.queue.ping().await.expect("ping");
+    let lease = Duration::from_secs(60);
+    let backoff = Duration::from_secs(30);
+
+    // An empty queue answers every question without a special case.
+    assert!(repos.queue.depth().await.expect("depth").is_empty());
+    assert!(repos.queue.claim(&JobKind::ALL, 10, lease, t0()).await.expect("claim").is_empty());
+    assert_eq!(repos.queue.reap_expired_leases(t0()).await.expect("reap"), 0);
+    assert_eq!(repos.queue.purge(t0()).await.expect("purge"), 0);
+    assert_eq!(repos.queue.get(QueuedJobId::new()).await.expect("get unknown"), None);
+
+    // Enqueue: the stored row is the item plus the defaults the caller did not state.
+    let mail = repos
+        .queue
+        .enqueue(&NewQueuedJob::pending(MailJob::KIND, mail_payload("alice@corp.com")), t0())
+        .await
+        .expect("enqueue")
+        .expect("a fresh item is stored");
+    assert_eq!(mail.kind, JobKind::MailSend);
+    assert_eq!(mail.state, QueueState::Pending);
+    assert_eq!(mail.attempts, 0);
+    assert_eq!(mail.run_after, t0(), "no delay means runnable now");
+    assert_eq!(mail.locked_until, None);
+    assert_eq!(mail.dedupe_key, None);
+    assert_eq!(mail.last_error, None);
+    assert_eq!(mail.created_at, t0());
+    assert_eq!(mail.updated_at, t0());
+    assert_eq!(mail.payload["to"], "alice@corp.com", "the payload round-trips verbatim");
+    assert_eq!(repos.queue.get(mail.id).await.expect("get"), Some(mail.clone()));
+
+    // A dedupe key makes a retried enqueue a no-op rather than a second copy of the work.
+    let fanout = NewQueuedJob::pending(JobKind::NotificationFanout, serde_json::json!({ "envelope": "opaque" }))
+        .with_dedupe_key("fanout:01K0000000000000000000000A");
+    let queued = repos.queue.enqueue(&fanout, t0()).await.expect("enqueue").expect("the first wins");
+    assert_eq!(queued.dedupe_key.as_deref(), Some("fanout:01K0000000000000000000000A"));
+    assert!(
+        repos.queue.enqueue(&fanout, t0() + minutes(1)).await.expect("re-enqueue").is_none(),
+        "a second enqueue under one key is a no-op"
+    );
+    assert_eq!(queue_depth(repos, JobKind::NotificationFanout, QueueState::Pending).await, 1);
+
+    // Only the two states the request path decides between may be filed.
+    let mut illegal = NewQueuedJob::pending(MailJob::KIND, mail_payload("nobody@corp.com"));
+    illegal.state = QueueState::Done;
+    assert_eq!(
+        repos.queue.enqueue(&illegal, t0()).await.expect_err("done is not an enqueueable state").code(),
+        "invalid_argument"
+    );
+
+    // A claim leases exactly once, and only the kinds it asked for.
+    let claimed = repos.queue.claim(&[JobKind::MailSend], 10, lease, t0()).await.expect("claim");
+    assert_eq!(claimed.iter().map(|job| job.id).collect::<Vec<_>>(), vec![mail.id], "the fan-out row is another kind");
+    assert_eq!(claimed[0].state, QueueState::Running);
+    assert_eq!(claimed[0].attempts, 1, "the attempt is spent when the lease is taken");
+    assert_eq!(claimed[0].locked_until, Some(t0() + seconds(60)));
+    assert!(
+        repos.queue.claim(&[JobKind::MailSend], 10, lease, t0()).await.expect("second claim").is_empty(),
+        "a leased item is nobody else's until its lease runs out"
+    );
+
+    // Degenerate requests are an empty batch, not an empty query.
+    assert!(repos.queue.claim(&[], 10, lease, t0()).await.expect("no kinds").is_empty());
+    assert!(repos.queue.claim(&JobKind::ALL, 0, lease, t0()).await.expect("no room").is_empty());
+
+    // A retry re-arms run_after, records why, and does not refund the attempt.
+    repos
+        .queue
+        .complete(mail.id, QueueOutcome::Retry("smtp unreachable".to_owned()), backoff, t0() + seconds(5))
+        .await
+        .expect("retry");
+    let stored = repos.queue.get(mail.id).await.expect("get").expect("row");
+    assert_eq!(stored.state, QueueState::Pending);
+    assert_eq!(stored.run_after, t0() + seconds(35), "now + backoff, measured from the completion");
+    assert_eq!(stored.last_error.as_deref(), Some("smtp unreachable"));
+    assert_eq!(stored.locked_until, None);
+    assert_eq!(stored.attempts, 1);
+    assert!(
+        repos.queue.claim(&[JobKind::MailSend], 10, lease, t0() + seconds(34)).await.expect("early").is_empty(),
+        "backoff is a floor, not a hint"
+    );
+    let claimed = repos.queue.claim(&[JobKind::MailSend], 10, lease, t0() + seconds(35)).await.expect("claim");
+    assert_eq!(claimed[0].attempts, 2);
+    assert_eq!(claimed[0].locked_until, Some(t0() + seconds(95)));
+
+    // A worker that died mid-run: the lease expires, the item comes back, the attempt stays spent.
+    assert_eq!(
+        repos.queue.reap_expired_leases(t0() + seconds(94)).await.expect("reap early"),
+        0,
+        "a live lease is not an expired one"
+    );
+    assert_eq!(repos.queue.reap_expired_leases(t0() + seconds(95)).await.expect("reap"), 1);
+    let stored = repos.queue.get(mail.id).await.expect("get").expect("row");
+    assert_eq!(stored.state, QueueState::Pending);
+    assert_eq!(stored.locked_until, None);
+    assert_eq!(stored.attempts, 2, "refunding it is how an item that kills its worker retries forever");
+
+    // The worker gives up — the attempt budget is its policy, never the repository's. From here
+    // the dead letter is final, and it is the operator's record of mail that never arrived.
+    let claimed = repos.queue.claim(&[JobKind::MailSend], 10, lease, t0() + minutes(2)).await.expect("claim");
+    assert_eq!(claimed[0].attempts, 3);
+    repos
+        .queue
+        .complete(mail.id, QueueOutcome::Dead("mailbox does not exist".to_owned()), backoff, t0() + minutes(3))
+        .await
+        .expect("dead letter");
+    let dead = repos.queue.get(mail.id).await.expect("get").expect("row");
+    assert_eq!(dead.state, QueueState::Dead);
+    assert_eq!(dead.last_error.as_deref(), Some("mailbox does not exist"));
+    assert_eq!(dead.locked_until, None);
+
+    // S-04.a / S-31: a policy-rejected address files a row so both branches of the request cost
+    // the same. It must never become a deliverable message.
+    let suppressed = repos
+        .queue
+        .enqueue(&NewQueuedJob::suppressed(MailJob::KIND, mail_payload("blocked@evil.test")), t0() + minutes(5))
+        .await
+        .expect("enqueue")
+        .expect("stored");
+    assert_eq!(suppressed.state, QueueState::Suppressed);
+    let claimed = repos.queue.claim(&JobKind::ALL, 10, lease, t0() + days(1)).await.expect("claim");
+    assert_eq!(
+        claimed.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![queued.id],
+        "neither the dead letter nor the suppressed row is claimable, whatever the clock says"
+    );
+    repos
+        .queue
+        .complete(suppressed.id, QueueOutcome::Retry("deliver me".to_owned()), backoff, t0() + days(1))
+        .await
+        .expect("complete");
+    assert_eq!(
+        repos.queue.get(suppressed.id).await.expect("get"),
+        Some(suppressed.clone()),
+        "a completion for a row nobody leased leaves it exactly as it was"
+    );
+    repos
+        .queue
+        .complete(mail.id, QueueOutcome::Retry("too late".to_owned()), backoff, t0() + days(1))
+        .await
+        .expect("complete");
+    assert_eq!(
+        repos.queue.get(mail.id).await.expect("get").expect("row").state,
+        QueueState::Dead,
+        "and a dead letter cannot be resurrected by a worker whose lease was already reaped"
+    );
+    repos.queue.complete(QueuedJobId::new(), QueueOutcome::Done, backoff, t0()).await.expect("unknown id");
+
+    // A success clears the failure the admin surface was showing.
+    repos
+        .queue
+        .complete(queued.id, QueueOutcome::Retry("boom".to_owned()), backoff, t0() + days(1))
+        .await
+        .expect("retry");
+    let claimed = repos.queue.claim(&[JobKind::NotificationFanout], 10, lease, t0() + days(2)).await.expect("claim");
+    assert_eq!(claimed[0].last_error.as_deref(), Some("boom"), "the failure survives while the item is retried");
+    repos.queue.complete(queued.id, QueueOutcome::Done, backoff, t0() + days(2)).await.expect("done");
+    let done = repos.queue.get(queued.id).await.expect("get").expect("row");
+    assert_eq!(done.state, QueueState::Done);
+    assert_eq!(done.last_error, None);
+    assert_eq!(done.updated_at, t0() + days(2));
+
+    // Retention takes the done rows and nothing else.
+    assert_eq!(
+        repos.queue.purge(t0() + days(2)).await.expect("purge"),
+        0,
+        "the bound is strict: a row written at it is not older than it"
+    );
+    assert_eq!(repos.queue.purge(t0() + days(3)).await.expect("purge"), 1);
+    assert_eq!(repos.queue.get(queued.id).await.expect("get"), None);
+    assert_eq!(repos.queue.purge(t0() + days(365)).await.expect("purge"), 0, "only done rows are retention's to take");
+    assert_eq!(repos.queue.get(dead.id).await.expect("get").expect("row").state, QueueState::Dead);
+    assert_eq!(repos.queue.get(suppressed.id).await.expect("get").expect("row").state, QueueState::Suppressed);
+
+    // Depth is what the admin job table and the metrics gauge read.
+    assert_eq!(
+        repos.queue.depth().await.expect("depth"),
+        vec![(JobKind::MailSend, QueueState::Dead, 1), (JobKind::MailSend, QueueState::Suppressed, 1)]
+    );
+
+    // Two drains racing over one backlog. On Postgres this is the `FOR UPDATE SKIP LOCKED`
+    // path; on SQLite it is the single writer. Either way the sets must be disjoint.
+    let racing = t0() + days(400);
+    let mut filed = Vec::new();
+    for index in 0..6 {
+        let job = NewQueuedJob::pending(MailJob::KIND, mail_payload(&format!("racer{index}@corp.com")));
+        filed.push(repos.queue.enqueue(&job, racing).await.expect("enqueue").expect("stored").id);
+    }
+    let (left, right) = interleave(
+        repos.queue.claim(&[JobKind::MailSend], 3, lease, racing),
+        repos.queue.claim(&[JobKind::MailSend], 3, lease, racing),
+    )
+    .await;
+    let mut taken: Vec<QueuedJobId> =
+        left.expect("left claim").into_iter().chain(right.expect("right claim")).map(|job| job.id).collect();
+    assert_eq!(taken.len(), 6, "between them the two drains leased the whole backlog");
+    taken.sort_unstable();
+    taken.dedup();
+    filed.sort_unstable();
+    assert_eq!(taken, filed, "and no item was leased twice");
+}
+
+/// The `mail.send` payload, as the OTP path would file it (sealed — see S-26.b).
+fn mail_payload(to: &str) -> serde_json::Value {
+    serde_json::to_value(MailJob {
+        to: to.to_owned(),
+        subject: "Your sign-in code".to_owned(),
+        text: "c2VhbGVk".to_owned(),
+        html: None,
+        sealed: true,
+    })
+    .expect("encode mail job")
+}
+
+/// How many items sit in one `(kind, state)` cell; absent cells read as zero.
+async fn queue_depth(repos: &Repositories, kind: JobKind, state: QueueState) -> i64 {
+    repos
+        .queue
+        .depth()
+        .await
+        .expect("depth")
+        .into_iter()
+        .find(|(row_kind, row_state, _)| *row_kind == kind && *row_state == state)
+        .map_or(0, |(_, _, count)| count)
+}
+
+/// Polls two repository calls against each other on one task.
+///
+/// This crate has no async runtime among its dependencies — it is a library the backends' test
+/// binaries drive — so there is no `join!` to reach for. It is worth the hand-rolled poll
+/// because a claim exercised only sequentially proves nothing about exclusivity, which is the
+/// one queue property the drain worker relies on without re-checking.
+async fn interleave<T>(left: impl Future<Output = T>, right: impl Future<Output = T>) -> (T, T) {
+    let mut left = Box::pin(left);
+    let mut right = Box::pin(right);
+    let mut left_done: Option<T> = None;
+    let mut right_done: Option<T> = None;
+    std::future::poll_fn(move |cx| {
+        if left_done.is_none()
+            && let Poll::Ready(value) = left.as_mut().poll(cx)
+        {
+            left_done = Some(value);
+        }
+        if right_done.is_none()
+            && let Poll::Ready(value) = right.as_mut().poll(cx)
+        {
+            right_done = Some(value);
+        }
+        match (left_done.take(), right_done.take()) {
+            (Some(left), Some(right)) => Poll::Ready((left, right)),
+            (left, right) => {
+                left_done = left;
+                right_done = right;
+                Poll::Pending
+            }
+        }
+    })
+    .await
 }
