@@ -1,6 +1,8 @@
 # Docker CI — build-only check of the production image (decision 18: PR CI builds the
 # Dockerfile without pushing, so the image cannot rot on master between releases).
 # The release pipeline lives in release.yml; this job never pushes and never tags.
+# The weekly cron is the trivy leg's freshness guarantee: newly published CVEs are
+# scanned against the current master image without waiting for the next code push.
 name: docker-ci
 
 on:
@@ -20,11 +22,18 @@ on:
       - "docker/**"
       - ".dockerignore"
       - ".github/workflows/docker-ci.yml"
+  schedule:
+    # Weekly (Mon 05:30 UTC), same slot as security-ci: trivy re-scans the master
+    # image against the latest vulnerability DB. Path filters do not apply to
+    # schedule triggers, so both jobs simply run: build first (warming the GHA
+    # cache even when it is cold), then the scan leg rebuilds from that cache.
+    - cron: "30 5 * * 1"
   workflow_dispatch:
 
-# One run per ref; superseded runs are cancelled.
+# One run per ref per trigger; superseded runs are cancelled. The event name is part
+# of the group so a push run can never cancel the scheduled leg (or vice versa).
 concurrency:
-  group: docker-ci-${{ github.ref }}
+  group: docker-ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 # Minimal token surface: checkout only (the GHA cache uses its own scoped token).
@@ -37,17 +46,48 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       # Build-only, no PUB_VERSION: same as a local `docker build`, the binary reports the
       # crate version + `+dev`. The GHA cache backend keeps the dependency-compile layer
       # warm across runs (the manifests-stage layer trick makes it effective — see
       # .claude/skills/docker-multi-stage).
       - name: Build the image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Image vulnerability scan (S-30). `needs: build` is ordering only — jobs never
+  # share a local image, so this leg rebuilds with `load: true`, which is seconds
+  # once the build job has warmed the GHA cache, and hands the loaded tag to trivy.
+  # Scope is OS/library vulns only (`scanners: vuln`): secret scanning is gitleaks'
+  # job in security-ci.yml, and Dockerfile config linting (hadolint) is out of scope.
+  scan:
+    name: trivy image scan
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Rebuild the image from the shared cache
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: pub-scan:ci
+          cache-from: type=gha
+      - name: Scan for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: pub-scan:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"

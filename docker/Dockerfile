@@ -16,9 +16,9 @@ FROM oven/bun:1-alpine AS web-build
 WORKDIR /app/web
 # Whole Bun workspace (node_modules / dist are excluded by the root .dockerignore).
 COPY web/ ./
-# Plain install while the scaffold's lockfile churns; move to --frozen-lockfile later
-# (keep in sync with .github/workflows/web-ci.yml).
-RUN bun install
+# --frozen-lockfile: the image embeds exactly the committed bun.lock (S-30; keep in
+# sync with .github/workflows/web-ci.yml).
+RUN bun install --frozen-lockfile
 RUN bun run build
 # Production output: /app/web/apps/site/dist
 
@@ -54,7 +54,7 @@ RUN for manifest in $(find crates -name Cargo.toml); do \
       echo 'fn main() {}' > "$dir/src/main.rs"; \
       : > "$dir/src/lib.rs"; \
     done \
- && cargo build --release
+ && cargo build --release --locked
 
 # 3b. Real sources. First drop the stub src/ dirs so no dummy file survives next to the
 # real tree (a leftover stub main.rs would add a spurious bin target to lib-only crates).
@@ -77,7 +77,7 @@ COPY --from=web-build /app/web/apps/site/dist/ crates/api/embedded/
 # to the crate version marked `+dev`.
 ARG PUB_VERSION=""
 ENV PUB_VERSION=${PUB_VERSION}
-RUN cargo build --release --bin pubd
+RUN cargo build --release --locked --bin pubd
 
 # ---------------------------------------------------------------------------
 # Stage 4 — runtime.

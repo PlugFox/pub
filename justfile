@@ -43,10 +43,11 @@ fmt:
     cd web && bun run fix
     taplo format server/Cargo.toml server/crates/*/Cargo.toml
 
-# Regenerate committed codegen artifacts (i18n modules + API types)
+# Regenerate committed codegen artifacts (i18n modules + API types + config reference)
 gen:
     cd web && bun run i18n:gen
     cd web && bun run gen:api
+    cd server && UPDATE_CONFIG_REFERENCE=1 cargo test -p pub-config --test reference
 
 # --- infra -----------------------------------------------------------------
 
@@ -77,15 +78,19 @@ image-dive: docker-build
 
 # --- hygiene ---------------------------------------------------------------
 
-# Dependency and supply-chain checks
+# Dependency and supply-chain checks: cargo audit/deny/machete for the server,
+# bun audit for the web lockfile (mirrors security-ci.yml)
 audit:
     cd server && cargo audit
-    cd server && cargo deny check
+    cd server && cargo deny --locked check
     cd server && cargo machete
+    cd web && bun audit
 
-# Secret scan over the working tree
+# Secret scan: the working tree (catches staged/untracked files) AND the full
+# commit history — mirrors security-ci.yml's history leg
 secrets-scan:
-    gitleaks detect --source . --no-banner
+    gitleaks dir . --no-banner --redact
+    gitleaks git --no-banner --redact
 
 # Lint GitHub workflow files
 lint-ci:

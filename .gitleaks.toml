@@ -1,0 +1,33 @@
+# Gitleaks configuration — S-15: the registry ships the secret-scanning rule for its
+# own token format so instances (and this repo) can catch leaked credentials.
+# Token format per decision 13 / S-13: `pub_` + 30 base62 chars + 6 base62 CRC32
+# checksum = `pub_` followed by exactly 36 base62 characters. The rule targets the
+# default `pub_` prefix; custom instance prefixes trade away scanner coverage
+# (decision 17, documented there).
+#
+# Used by the lefthook pre-commit hook, `just secrets-scan`, and security-ci.yml.
+
+[extend]
+# Keep the full default ruleset (AWS, GitHub, generic API keys, private keys, …);
+# our rule is an addition, not a replacement.
+useDefault = true
+
+[[rules]]
+id = "pub-registry-token"
+description = "Pub registry CLI/API token (pub_ + 30 base62 + 6 base62 CRC32 checksum)"
+# Word boundaries make the length exact: `pub_v2`/`pub_api` are too short, and a
+# longer identifier fails the trailing \b (its 37th character is a word character).
+regex = '''\bpub_[0-9A-Za-z]{36}\b'''
+keywords = ["pub_"]
+
+# Working-tree (`gitleaks dir`) scans walk gitignored build output, where third-party
+# packages legitimately carry test private keys and sample tokens (rustls/ring fixtures
+# compiled into server/target, npm package fixtures). Those are not our leaks — skip
+# them. Both directories are gitignored, so the history scan never sees them and loses
+# nothing from this allowlist.
+[allowlist]
+description = "Third-party build output (not our code, gitignored)"
+paths = [
+    '''(^|/)server/target/''',
+    '''(^|/)node_modules/''',
+]

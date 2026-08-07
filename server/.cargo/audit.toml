@@ -1,0 +1,13 @@
+# cargo-audit configuration — S-30 (docs/security.md): every ignore carries a written
+# justification. Keep this list in sync with the [advisories] ignore list in deny.toml.
+
+[advisories]
+ignore = [
+    # rsa 0.9: Marvin timing side channel (medium, 5.9) on PRIVATE-key operations.
+    # "No fixed upgrade is available" upstream. Not exploitable here: rsa is used
+    # exclusively for RS256 id_token PUBLIC-key verification in the auth crate
+    # (S-01); the server never holds or operates an RSA private key — its own JWTs
+    # are Ed25519 (S-07). Rationale also inline at the dependency declaration in
+    # Cargo.toml. Revisit when rsa 0.10+ ships the constant-time rewrite.
+    "RUSTSEC-2023-0071",
+]

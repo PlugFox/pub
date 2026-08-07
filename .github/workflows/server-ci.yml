@@ -41,9 +41,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # SHA of the `stable` branch; the toolchain input picks the channel.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
         with:
+          toolchain: stable
           components: rustfmt
       # No rust-cache here: fmt compiles nothing.
       - run: cargo fmt --check
@@ -53,14 +55,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: server -> target
-      - run: cargo clippy --all-targets -- -D warnings
+      # --locked: CI must build exactly the committed Cargo.lock (S-30).
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
     name: cargo test
@@ -86,9 +90,12 @@ jobs:
     env:
       PUB_TEST_POSTGRES_URL: postgres://pub:pub@127.0.0.1:5432/pub
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: server -> target
-      - run: cargo test --workspace
+      # --locked: CI must build exactly the committed Cargo.lock (S-30).
+      - run: cargo test --workspace --locked

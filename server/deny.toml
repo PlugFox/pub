@@ -1,0 +1,57 @@
+# cargo-deny configuration — S-30 (docs/security.md): supply-chain checks run in CI
+# (security-ci.yml) and locally via `just audit`. Any ignore below carries a written
+# justification; removing one requires re-running `cargo deny check` green.
+
+[advisories]
+# Current (version 2) schema: vulnerabilities, unsound code, and yanked crates are
+# errors by default; unmaintained warnings cover the whole tree.
+ignore = [
+    # rsa 0.9: Marvin timing side channel on PRIVATE-key operations. No fixed
+    # upgrade exists. Not exploitable here: the auth crate uses rsa exclusively for
+    # RS256 id_token PUBLIC-key verification (S-01) — the server never holds or
+    # operates an RSA private key (own JWTs are Ed25519, S-07). Rationale also
+    # inline at the dependency declaration in Cargo.toml. Revisit when rsa 0.10+
+    # ships the constant-time rewrite.
+    { id = "RUSTSEC-2023-0071", reason = "RSA private-key timing channel; only public-key verification of IdP signatures is used" },
+    # paste 1.0 is unmaintained (archived by its author). Transitive via
+    # utoipa-axum 0.2, a proc-macro exercised at compile time only — no runtime
+    # code ships from it. Drop this when utoipa-axum moves off paste.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro, compile-time only, transitive via utoipa-axum" },
+]
+
+[licenses]
+# Explicit allowlist derived from what the tree actually uses (`cargo deny list`);
+# additions need a reviewed PR, not a wildcard. All permissive; the two beyond the
+# usual MIT/Apache set are commented.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # wasi/wasip2/wit-bindgen (wasm targets of getrandom/reqwest)
+    "BSD-2-Clause",                   # comrak (markdown), zerocopy
+    "BSD-3-Clause",                   # subtle, curve25519/ed25519-dalek, redis, encoding_rs
+    "ISC",                            # rustls stack: ring, rustls, webpki, aws-lc-rs
+    "Zlib",                           # foldhash, tinyvec
+    "0BSD",                           # quoted_printable (lettre); public-domain-equivalent
+    "BSL-1.0",                        # xxhash-rust, ryu; Boost license — permissive, no copyleft
+    "Unicode-3.0",                    # ICU4X data crates behind url/idna
+    "CDLA-Permissive-2.0",            # webpki-roots bundled Mozilla CA data; permissive data license
+    "MPL-2.0",                        # cssparser/dtoa-short (ammonia); file-level copyleft only —
+                                      # we vendor nothing and modify nothing, obligations end there
+    "MIT-0",                          # aws-lc-sys generated bindings
+    "OpenSSL",                        # aws-lc-sys vendored crypto (Apache-style with advertising clause)
+    "Unicode-DFS-2016",               # finl_unicode (stringprep); Unicode data files license
+    "CC0-1.0",                        # dunce (path normalization); public-domain dedication
+    "Unlicense",                      # memchr/aho-corasick family; public-domain-equivalent
+]
+
+[bans]
+# Duplicate versions are a build-size/attack-surface smell, not an error — the lock
+# resolves what it resolves; Dependabot's grouped updates converge them over time.
+multiple-versions = "warn"
+
+[sources]
+# crates.io only: no git dependencies, no alternate registries. A git dependency
+# is an unreviewed release channel and breaks the `--locked` reproducibility story.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

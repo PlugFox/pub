@@ -12,7 +12,9 @@ pre-commit:
       run: typos {staged_files}
     - name: rustfmt
       glob: "server/**/*.rs"
-      run: cargo fmt --check --manifest-path server/Cargo.toml
+      # --all is required: the workspace manifest is virtual (no targets of its
+      # own), and cargo fmt without it fails with "Failed to find targets".
+      run: cargo fmt --all --check --manifest-path server/Cargo.toml
     - name: taplo
       glob: "server/**/Cargo.toml"
       run: taplo lint {staged_files}
