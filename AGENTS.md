@@ -26,13 +26,33 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 
 | File                   | Contents                                                        |
 | ---------------------- | --------------------------------------------------------------- |
-| `docs/decisions.md`    | 23 numbered decisions with rationale — normative                |
+| `docs/decisions.md`    | 25 numbered decisions with rationale — normative                |
 | `docs/product.md`      | Vision, feature triage v1/v1.1/later, screens list              |
 | `docs/architecture.md` | Crate/workspace layout, data model, pipelines, testing strategy |
 | `docs/security.md`     | S-01…S-33 normative security requirements                       |
 | `docs/protocol.md`     | Pub spec v2 sharp edges + endpoint table                        |
 | `docs/rules/*.md`      | Code conventions per area (read before writing)                 |
 | `CHANGELOG.md`         | Keep-a-Changelog, entries tagged `(server)`/`(web)`/`(infra)`   |
+
+## Tooling
+
+`just` is the canonical task runner (`just --list`); `.mise.toml` pins Bun; git hooks come from `lefthook.yml` (`just hooks` once per clone). Use the wired tool, not an ad-hoc equivalent:
+
+| Tool | Wired where | Use for |
+| --- | --- | --- |
+| `just server-check` / `web-check` / `check` | justfile → documented pipelines | validation before "done" |
+| `cargo nextest` (`just server-test`) | justfile | fast test iteration (no doctests) |
+| `bacon` | run manually in `server/` | live clippy/check loop while editing Rust |
+| `gitleaks` | pre-commit hook + `just secrets-scan` | secret scanning (S-15 CI job planned) |
+| `typos` (config `_typos.toml`) | pre-commit hook + `just spell` | spell-check; extend the config, don't ignore findings |
+| `taplo` | pre-commit hook + `just fmt` | Cargo.toml formatting/lint |
+| `actionlint` (+shellcheck) | pre-commit hook + `just lint-ci` | workflow linting after any `.github/` edit |
+| `cargo audit` / `cargo deny` / `cargo machete` | `just audit` | dependency and supply-chain hygiene |
+| `oha` (`just bench [url]`) | justfile | HTTP load smoke; Phase 2 latency exit criteria |
+| `dive` (`just image-dive`) | justfile | image layer/size analysis when touching docker/ |
+| `hyperfine` | manual | benchmark claims instead of asserting them |
+| `sqlx-cli` 0.9 | manual | migration ops against a live DB (rare; migrations apply at startup) |
+| vitest browser mode | `packages/ui` `test:browser` | component tests in real Chromium (naming: `*.vitest.tsx`, never `*.test.*`) |
 
 ## Mandatory rules
 

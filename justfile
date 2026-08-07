@@ -63,6 +63,18 @@ db-down:
 docker-build:
     docker build -f docker/Dockerfile -t pub:dev .
 
+# Install git hooks (pre-commit: gitleaks, typos, rustfmt, taplo, biome, actionlint)
+hooks:
+    lefthook install
+
+# HTTP load smoke against a running instance (Phase 2 exit criteria live here)
+bench url='http://localhost:8080/healthz':
+    oha -z 10s --no-tui {{url}}
+
+# Inspect production image layers for size regressions (interactive)
+image-dive: docker-build
+    dive pub:dev
+
 # --- hygiene ---------------------------------------------------------------
 
 # Dependency and supply-chain checks

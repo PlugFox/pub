@@ -1,0 +1,25 @@
+# Git hooks via lefthook (https://lefthook.dev). One-time setup: `just hooks`.
+# Hooks are fast by design — full pipelines stay in `just check` and CI.
+# Emergency skip: LEFTHOOK=0 git commit … (fix the finding instead).
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: gitleaks
+      run: gitleaks git --pre-commit --staged --no-banner --redact
+    - name: typos
+      glob: "*.{rs,ts,tsx,astro,md,yaml,yml,toml,sql,css,sh}"
+      run: typos {staged_files}
+    - name: rustfmt
+      glob: "server/**/*.rs"
+      run: cargo fmt --check --manifest-path server/Cargo.toml
+    - name: taplo
+      glob: "server/**/Cargo.toml"
+      run: taplo lint {staged_files}
+    - name: biome
+      root: "web/"
+      glob: "*.{ts,tsx,json,css}"
+      run: bunx biome check --no-errors-on-unmatched {staged_files}
+    - name: actionlint
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: actionlint
