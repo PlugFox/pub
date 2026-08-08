@@ -20,6 +20,7 @@ use std::sync::Arc;
 use axum::http::{Method, StatusCode, header};
 use chrono::Duration;
 use common::{TestApp, TestOptions, package_archive};
+use pub_config::SmtpSecurityMode;
 use pub_core::audit::AuditResult;
 use pub_core::package::{PackageOptions, Visibility};
 use pub_core::settings::SettingsCache;
@@ -554,6 +555,52 @@ async fn s26_a_the_boot_password_is_only_used_for_the_boot_endpoint() {
     let built = app.smtp_builds.built();
     assert_eq!(built.len(), 4);
     assert_eq!(built[3].password.as_deref(), Some("boot-secret-value"));
+}
+
+/// **S-26.a.** The operator's *own* unencrypted relay is a supported deployment, and sign-in
+/// mail leaves it authenticated.
+///
+/// The other side of the gate above, and a shape the suite could not express at all until the
+/// harness grew `smtp_security`: every integration boot was `starttls`, so nothing here ever
+/// resolved the one configuration a transport-level "never authenticate in the clear" guard
+/// could fire on — the operator's own `[smtp] security = "none"` with a password, which
+/// `Settings::validate_smtp` accepts and the ops reference documents for local relays. On such
+/// an instance the effective section equals the boot endpoint on all four fields, so that guard
+/// refused every transport, and — since an unbuildable section is now an error rather than a
+/// sink — every queued sign-in code burned its attempts and dead-lettered with `/healthz` still
+/// green.
+///
+/// What this level can assert is the resolution and the delivery: the harness installs a
+/// recording builder, so the transport is never really constructed here. That the *real*
+/// `SmtpMailer::new` accepts these settings is asserted in `pub-mail`, against the production
+/// builder, which is the layer the refusal lived in.
+#[tokio::test]
+async fn s26_a_a_boot_relay_without_transport_security_still_signs_people_in() {
+    let app = TestApp::with_options(TestOptions {
+        smtp_host: Some("relay.internal".to_owned()),
+        smtp_port: 25,
+        smtp_username: Some("pub".to_owned()),
+        smtp_password: Some("boot-secret-value".to_owned()),
+        smtp_security: SmtpSecurityMode::None,
+        ..TestOptions::default()
+    })
+    .await;
+
+    // A full sign-in: the code is queued, drained, and read back out of the outbox. It fails at
+    // `request_otp`'s "exactly one mail must be sent" if the transport cannot be built.
+    let session = app.login("operator@corp.com").await;
+    assert!(session["access_token"].as_str().is_some(), "nobody could sign in: {session:?}");
+
+    let built = app.smtp_builds.built();
+    assert_eq!(built.len(), 1, "the boot relay must produce exactly one transport");
+    assert_eq!(built[0].host, "relay.internal");
+    assert_eq!(built[0].security, "none");
+    assert_eq!(
+        built[0].password.as_deref(),
+        Some("boot-secret-value"),
+        "an operator's plaintext relay that requires AUTH gets the credential the operator configured"
+    );
+    assert!(built[0].credentialed());
 }
 
 /// **D10.** A stored section the resolver cannot build is an error on the send path — never a

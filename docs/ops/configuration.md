@@ -526,11 +526,21 @@ Password for `username` (secret — always masked in the startup summary).
 Unlike every other key here, this one is **not** projected into the runtime defaults: it
 would have to be sealed under the KEK to live there, and a credential with two possible
 homes makes "which one is live" unanswerable. Instead it is used only when the effective
-section still names *this* endpoint — same host, port, and username. An administrator who
-repoints `smtp.host` and leaves the runtime password unset therefore sends nothing
-authenticated, rather than presenting the operator's credential to a server of their own
-choosing ([S-26.a](../security.md#6-secrets--configuration)). Clearing the
-runtime password falls back here subject to the same match.
+section still names *this* endpoint — same host, same port, same username **and the same
+`security` mode**. An administrator who repoints `smtp.host`, or flips `smtp.security` to
+`none`, and leaves the runtime password unset therefore sends nothing authenticated,
+rather than presenting the operator's credential to a server of their own choosing or
+putting it on the wire in the clear ([S-26.a](../security.md#6-secrets--configuration)).
+The admin surface refuses such a section outright, because a stored `username` with no
+password available to it is not a valid section; the message names `smtp.username`.
+Clearing the runtime password falls back here subject to the same four-field match.
+
+Within that match the credential is presented exactly as configured — including on
+`security = "none"`, which is a supported deployment (an internal relay that requires
+SMTP AUTH but no TLS). The endpoint match is the whole protection: it keeps an instance
+administrator from *redirecting* this credential, and what an operator does with their
+own relay on their own network is their choice, not something this binary overrides by
+refusing to send mail at all.
 
 ### `smtp.from`
 

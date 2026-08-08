@@ -19,12 +19,13 @@
 //!   so that an address rejected by policy costs the request exactly the same work as an
 //!   accepted one ([S-04.a](../../../docs/security.md), [S-31](../../../docs/security.md))
 //!   without ever producing a deliverable message.
-//! - **Arrival order is claim order *within one priority*.** One FIFO across kinds lets a
-//!   two-hundred-recipient broadcast file thousands of rows ahead of the next sign-in code and
-//!   starve it past `otp::PENDING_TTL` — unrelated traffic taking sign-in down instance-wide
-//!   (decision 26's 2026-08-07 amendment). [`NewQueuedJob::priority`] is the dimension that
-//!   fixes it: interactive work at [`NewQueuedJob::INTERACTIVE`], work filed on somebody
-//!   else's behalf at [`NewQueuedJob::BULK`], and the claim orders by it before the id.
+//! - **The queue has lanes, and inside a lane the longest-runnable item goes first.** One FIFO
+//!   across kinds lets a two-hundred-recipient broadcast file thousands of rows ahead of the
+//!   next sign-in code and starve it past `otp::PENDING_TTL` — unrelated traffic taking sign-in
+//!   down instance-wide (decision 26's 2026-08-07 amendment). [`NewQueuedJob::priority`] is the
+//!   dimension that fixes it: interactive work at [`NewQueuedJob::INTERACTIVE`], work filed on
+//!   somebody else's behalf at [`NewQueuedJob::BULK`], and the claim drains
+//!   [`NewQueuedJob::LEVELS`] in order, `(run_after, id)` inside each.
 //! - **A queued mail body is a live credential.** A rendered OTP body sitting in a table is
 //!   the thing [S-26.b](../../../docs/security.md) is about: the payload is sealed under the
 //!   boot KEK before the row is written, and every type here that can hold a rendered body
@@ -44,8 +45,8 @@ use crate::event::EventEnvelope;
 /// Identifier of one queued work item.
 ///
 /// UUID v7 like every other entity id, and here the time ordering is load-bearing rather than
-/// incidental: the claim query orders by id, so **arrival order is claim order** and the table
-/// needs no separate sequence column.
+/// incidental: it is the claim's tie-break, so two items that became runnable at the same
+/// instant are claimed in **arrival order** and the table needs no separate sequence column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct QueuedJobId(Uuid);
@@ -207,11 +208,11 @@ impl FromStr for QueueState {
 /// One stored work item.
 #[derive(Clone, PartialEq, Eq)]
 pub struct QueuedJob {
-    /// Item id — the claim order **within one priority** (UUID v7, time-ordered).
+    /// Item id — the claim's tie-break inside one lane (UUID v7, time-ordered).
     pub id: QueuedJobId,
     /// Which handler runs this.
     pub kind: JobKind,
-    /// Claim order ahead of the id: lower runs first (see [`NewQueuedJob::priority`]).
+    /// Which lane this item is claimed in: lower drains first (see [`NewQueuedJob::priority`]).
     pub priority: i32,
     /// The handler's own document ([`MailJob`], [`FanoutJob`]), opaque to the repository.
     pub payload: serde_json::Value,
@@ -266,13 +267,14 @@ pub struct NewQueuedJob {
     /// [`QueueState::Pending`] or [`QueueState::Suppressed`] — see
     /// [`QueueState::is_admissible`].
     pub state: QueueState,
-    /// Claim order **ahead of the id**: a lower value is claimed first, ties broken by arrival.
+    /// Which lane this item is claimed in: a lower value is drained first, and the lanes are
+    /// the closed set [`NewQueuedJob::LEVELS`].
     ///
-    /// Two values are named ([`NewQueuedJob::INTERACTIVE`], [`NewQueuedJob::BULK`]) and the
-    /// column is an integer rather than an enum so a later kind can slot between them without
-    /// a migration. What it buys is stated in decision 26's amendment: a sign-in code filed
-    /// after four thousand broadcast messages is delivered before them, instead of after the
-    /// ten minutes that make it useless.
+    /// What it buys is stated in decision 26's amendment: a sign-in code filed after four
+    /// thousand broadcast messages is delivered before them, instead of after the ten minutes
+    /// that make it useless. Filing a value outside `LEVELS` is
+    /// [`crate::Error::Invalid`] at the enqueue, because the claim seeks lane by lane and such
+    /// a row would sit in the table unclaimed forever.
     pub priority: i32,
     /// Earliest run instant; `None` means "as soon as a worker picks it up".
     pub run_after: Option<DateTime<Utc>>,
@@ -286,9 +288,30 @@ impl NewQueuedJob {
     /// Work somebody is waiting on right now — a sign-in code, an invitation. The default.
     pub const INTERACTIVE: i32 = 0;
 
-    /// Work filed on somebody else's behalf: a broadcast that is one row per recipient and
-    /// whose latency nobody is watching. Never in front of [`NewQueuedJob::INTERACTIVE`].
+    /// Work filed on somebody else's behalf: a broadcast that is one row per recipient, a
+    /// notification fan-out, anything whose latency nobody is watching. Never in front of
+    /// [`NewQueuedJob::INTERACTIVE`].
     pub const BULK: i32 = 100;
+
+    /// Every claimable lane, lowest first — a **closed** set, and the claim's whole shape.
+    ///
+    /// The claim drains one lane at a time with `priority = ?` rather than one statement with
+    /// `ORDER BY priority`, because an *equality* is what keeps `run_after` a seek bound on
+    /// `(kind, priority, run_after, id)`: with `priority` unconstrained the engine can only
+    /// scan the whole pending partition of each kind and filter, which measured 1000× slower
+    /// on a backlog that a relay outage had backed off into the future. Draining the lanes in
+    /// order is a stronger guarantee than ordering inside one batch — interactive work is
+    /// exhausted before bulk is looked at — and it is why the value is closed rather than an
+    /// arbitrary integer: a row filed outside this set would never be claimed by anyone.
+    ///
+    /// The column stays an `INTEGER`, so slotting a lane between these two is a constant here
+    /// and no migration.
+    pub const LEVELS: [i32; 2] = [Self::INTERACTIVE, Self::BULK];
+
+    /// Whether `priority` is a lane the claim actually drains ([`NewQueuedJob::LEVELS`]).
+    pub fn is_claimable_priority(priority: i32) -> bool {
+        Self::LEVELS.contains(&priority)
+    }
 
     /// An item to run as soon as a worker gets to it, at interactive priority.
     pub fn pending(kind: JobKind, payload: serde_json::Value) -> Self {
@@ -321,12 +344,6 @@ impl NewQueuedJob {
     /// Delays the item until `at`.
     pub fn with_run_after(mut self, at: DateTime<Utc>) -> Self {
         self.run_after = Some(at);
-        self
-    }
-
-    /// Sets the claim priority explicitly.
-    pub const fn with_priority(mut self, priority: i32) -> Self {
-        self.priority = priority;
         self
     }
 }
@@ -565,10 +582,31 @@ mod tests {
         let payload = serde_json::json!({});
         assert_eq!(NewQueuedJob::pending(MailJob::KIND, payload.clone()).priority, NewQueuedJob::INTERACTIVE);
         assert_eq!(NewQueuedJob::suppressed(MailJob::KIND, payload.clone()).priority, NewQueuedJob::INTERACTIVE);
-        let bulk = NewQueuedJob::bulk(MailJob::KIND, payload.clone());
+        let bulk = NewQueuedJob::bulk(MailJob::KIND, payload);
         assert_eq!(bulk.priority, NewQueuedJob::BULK);
         assert_eq!(bulk.state, QueueState::Pending, "bulk is still ordinary runnable work");
-        assert_eq!(NewQueuedJob::pending(MailJob::KIND, payload).with_priority(7).priority, 7);
+    }
+
+    #[test]
+    fn the_lane_set_is_closed_sorted_and_covers_every_constructor() {
+        // The claim seeks `priority = ?` one lane at a time, because an equality is what keeps
+        // `run_after` a seek bound on the claim index — the range form scans the whole pending
+        // partition of each kind. That makes the lane set load-bearing: a row filed at a value
+        // outside it is never claimed by anybody, so no constructor here may produce one and
+        // the repositories refuse one at the enqueue.
+        let mut sorted = NewQueuedJob::LEVELS;
+        sorted.sort_unstable();
+        assert_eq!(sorted, NewQueuedJob::LEVELS, "the claim drains the lanes in array order");
+        let payload = serde_json::json!({});
+        for job in [
+            NewQueuedJob::pending(MailJob::KIND, payload.clone()),
+            NewQueuedJob::bulk(MailJob::KIND, payload.clone()),
+            NewQueuedJob::suppressed(MailJob::KIND, payload),
+        ] {
+            assert!(NewQueuedJob::is_claimable_priority(job.priority), "{:?} files an unclaimable lane", job.kind);
+        }
+        assert!(!NewQueuedJob::is_claimable_priority(7), "a value between the lanes is not a lane");
+        assert!(!NewQueuedJob::is_claimable_priority(-1));
     }
 
     #[test]

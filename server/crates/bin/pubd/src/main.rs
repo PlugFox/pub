@@ -361,7 +361,7 @@ fn spawn_jobs(
     let center = build_notification_center(settings, repos.clone(), runtime);
     let queue_worker = Arc::new(
         pub_jobs::QueueWorker::new(repos.clone(), events, queue_policy)
-            .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue))))
+            .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue), queue_policy.send_timeout)))
             .with_handler(Arc::new(MailHandler::new(mailer, kek, queue_policy.send_timeout))),
     );
     triggers = triggers.with_queue(Arc::clone(&queue_worker));

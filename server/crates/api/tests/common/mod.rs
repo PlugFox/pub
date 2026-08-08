@@ -22,7 +22,7 @@ use pub_auth::jwt::Keyring;
 use pub_auth::oidc::{OidcClient, ProviderConfig};
 use pub_auth::random::OsRandom;
 use pub_blob::ObjectStoreBlob;
-use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings};
+use pub_config::{BlobKind, DatabaseConfig, DatabaseKind, KvKind, Settings, SmtpSecurityMode};
 use pub_core::event::EventSink;
 use pub_core::session::SessionLimits;
 use pub_core::settings::SettingsCache;
@@ -131,6 +131,10 @@ pub struct TestOptions {
     /// Boot `[smtp].password`. Never projected into the runtime document; the resolver presents
     /// it only while the effective section still names the boot endpoint.
     pub smtp_password: Option<String>,
+    /// Boot `[smtp].security` — part of that endpoint (S-26.a), and the option whose absence hid
+    /// a total mail outage: every integration boot was `starttls`, so no test could reach the
+    /// operator's own `none` relay, which a transport guard refused to build at all.
+    pub smtp_security: SmtpSecurityMode,
 }
 
 impl Default for TestOptions {
@@ -166,6 +170,7 @@ impl Default for TestOptions {
             smtp_port: 587,
             smtp_username: None,
             smtp_password: None,
+            smtp_security: SmtpSecurityMode::Starttls,
         }
     }
 }
@@ -409,6 +414,7 @@ impl TestApp {
         settings.smtp.port = options.smtp_port;
         settings.smtp.username = options.smtp_username.clone();
         settings.smtp.password = options.smtp_password.clone().map(pub_config::Secret::new);
+        settings.smtp.security = options.smtp_security;
 
         let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
         db.run_migrations().await.expect("migrate");
@@ -1028,7 +1034,7 @@ fn build_queue_worker(
     let policy = QueuePolicy::default();
     Arc::new(
         QueueWorker::new(repos.clone(), events, policy)
-            .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue))))
+            .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue), policy.send_timeout)))
             .with_handler(Arc::new(MailHandler::new(mailer, TEST_KEK.to_vec(), policy.send_timeout))),
     )
 }

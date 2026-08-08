@@ -3277,6 +3277,57 @@ pub async fn job_queue(repos: &Repositories) {
         QueuePurged { done: 4, suppressed: 0, dead: 0 }
     );
 
+    // A lane the claim does not drain is refused at the enqueue. The claim seeks `priority = ?`
+    // one lane at a time — the only shape in which `run_after` stays a seek bound instead of a
+    // post-filter over the whole pending partition — so a row filed between the lanes would sit
+    // in the table forever, claimed by nobody and visible only as a depth gauge that never
+    // falls. Filing it has to fail loudly instead.
+    let off_lane = NewQueuedJob {
+        priority: NewQueuedJob::BULK - 1,
+        ..NewQueuedJob::pending(MailJob::KIND, mail_payload("nobody@corp.com"))
+    };
+    let refused = repos.queue.enqueue(&off_lane, fair).await.expect_err("a lane nothing drains must be refused");
+    assert_eq!(refused.code(), "invalid_argument");
+    assert!(repos.queue.depth().await.expect("depth").is_empty(), "and nothing was written");
+
+    // Inside a lane the order is *how long an item has been runnable*, not how long ago it was
+    // filed: `run_after` before the id. The two coincide for a row that never failed — its
+    // `run_after` is its enqueue instant — and differ for a retried one, which is the point. An
+    // item that has failed six times and just came off its hour-long backoff must not cut in
+    // front of everything filed while it was waiting; ordering by id would put it first forever.
+    let ladder = t0() + days(320);
+    let retried = repos
+        .queue
+        .enqueue(
+            &NewQueuedJob::pending(MailJob::KIND, mail_payload("retried@corp.com")).with_run_after(ladder + minutes(5)),
+            ladder,
+        )
+        .await
+        .expect("enqueue")
+        .expect("stored");
+    let fresh = repos
+        .queue
+        .enqueue(&NewQueuedJob::pending(MailJob::KIND, mail_payload("fresh@corp.com")), ladder + minutes(1))
+        .await
+        .expect("enqueue")
+        .expect("stored");
+    assert!(retried.id < fresh.id, "the backed-off row is the older one by arrival");
+    // One at a time, because a batch large enough to hold both would prove nothing about the
+    // statement's own `ORDER BY … LIMIT`: what has to be true is that the *first* row the
+    // engine hands back is the one that became runnable first.
+    let mut order = Vec::new();
+    for _ in 0..2 {
+        let claimed = repos.queue.claim(&[JobKind::MailSend], 1, lease, ladder + minutes(6)).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        repos.queue.complete(claimed[0].id, QueueOutcome::Done, backoff, ladder + minutes(6)).await.expect("done");
+        order.push(claimed[0].id);
+    }
+    assert_eq!(order, vec![fresh.id, retried.id], "the row that became runnable first is claimed first");
+    assert_eq!(
+        repos.queue.purge(&retention_at(ladder + days(2))).await.expect("purge"),
+        QueuePurged { done: 2, suppressed: 0, dead: 0 }
+    );
+
     // Two drains racing over one backlog. On Postgres this is the `FOR UPDATE SKIP LOCKED`
     // path; on SQLite it is the single writer. Either way the sets must be disjoint.
     let racing = t0() + days(400);

@@ -479,7 +479,10 @@ pub trait JobQueueRepo: Send + Sync {
     /// `Ok(None)` when the item carries a `dedupe_key` that is already present — a retried
     /// enqueue is a no-op, not a second copy. A [`NewQueuedJob`] whose state is not
     /// [`QueueState::is_admissible`] is [`crate::Error::Invalid`]: `done` and `dead` are
-    /// outcomes a worker records, and `running` is a lease nobody holds.
+    /// outcomes a worker records, and `running` is a lease nobody holds. So is one whose
+    /// priority is not a lane [`NewQueuedJob::LEVELS`] names — the claim seeks lane by lane, so
+    /// such a row would never be claimed at all, and a row nothing can ever run is worse than
+    /// a rejected enqueue.
     async fn enqueue(&self, new: &NewQueuedJob, now: DateTime<Utc>) -> Result<Option<QueuedJob>>;
 
     /// One item by id; `None` when unknown or already purged.
@@ -490,13 +493,18 @@ pub trait JobQueueRepo: Send + Sync {
     /// without mutating what is being checked.
     async fn get(&self, id: QueuedJobId) -> Result<Option<QueuedJob>>;
 
-    /// Leases up to `limit` runnable items of these `kinds` — **lowest priority value first,
-    /// oldest id within a priority** — marking each `running` until `now + lease` and
-    /// incrementing its attempt count.
+    /// Leases up to `limit` runnable items of these `kinds`, marking each `running` until
+    /// `now + lease` and incrementing its attempt count.
     ///
-    /// The priority half of that order is what keeps a sign-in code from being claimed behind
-    /// a broadcast filed minutes earlier (decision 26's amendment); the id half is what makes
-    /// arrival order claim order inside one class of work.
+    /// The order is **lane by lane** ([`NewQueuedJob::LEVELS`], lowest first) and, inside a
+    /// lane, **oldest `run_after` then oldest id**. Draining a lane before the next one is
+    /// looked at is what keeps a sign-in code from waiting behind a broadcast filed minutes
+    /// earlier (decision 26's amendment) — a stronger property than ordering inside one batch,
+    /// and the only shape in which `run_after` stays a seek bound on the claim index rather
+    /// than a filter over the whole pending partition. `run_after` ahead of the id orders items
+    /// by how long they have been *runnable*, which for a never-retried row is its arrival
+    /// order and for a retried one is the moment its backoff expired: an item that has failed
+    /// six times no longer cuts in front of everything filed after it.
     ///
     /// Runnable means `pending` **and** `run_after <= now`. Empty `kinds` or `limit == 0`
     /// returns an empty batch and performs no query. The returned rows carry their post-claim

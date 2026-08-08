@@ -109,7 +109,13 @@ impl EventConsumer for NotificationEnqueuer {
         let job = FanoutJob { envelope: envelope.clone() };
         let payload = serde_json::to_value(&job)
             .map_err(|err| Error::Internal { message: format!("failed to encode a fan-out payload: {err}") })?;
-        let queued = NewQueuedJob::pending(FanoutJob::KIND, payload).with_dedupe_key(job.dedupe_key());
+        // Bulk, like the mail it produces. A fan-out row is the textbook case for the lane's
+        // own definition — work filed on somebody else's behalf, whose latency nobody is
+        // watching — and it is far more expensive than any one message it emits: an audience
+        // resolution, a `create_many` of up to 500 rows, and up to 200 sequential enqueues,
+        // against one SMTP conversation. Leaving it interactive put exactly the volume MF5
+        // moved out of the mail lane back in front of the next sign-in code, one level up.
+        let queued = NewQueuedJob::bulk(FanoutJob::KIND, payload).with_dedupe_key(job.dedupe_key());
         // The event's own timestamp, not the wall clock: an event is stamped where it happens,
         // and the queue row it produces belongs to that same moment.
         match self.queue.enqueue(&queued, event_time(&envelope.event)).await {

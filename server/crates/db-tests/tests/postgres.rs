@@ -289,3 +289,81 @@ async fn the_drains_per_tick_indexes_exist() {
     );
     db.cleanup().await;
 }
+
+/// The claim's seek really uses `run_after`, on a backlog big enough for the planner to care.
+///
+/// The index name is not the property — the wave shipped a claim that used
+/// `job_queue_claim_prio_idx` and still read every pending row of each kind, because `priority`
+/// sits between `kind` and `run_after`: with `priority` unconstrained (`ORDER BY priority, id`
+/// across both lanes) nothing can bound `run_after`, so it degrades to a filter. That is
+/// invisible to `EXPLAIN` on an empty table and invisible to an index-name assertion, so this
+/// one loads a backlog that a relay outage backed off into the future — the exact shape the
+/// backoff ladder produces — and measures both statements. Numbers from the run this test was
+/// written against, 20k pending rows: the lane form is an index-only scan reading 18 buffers;
+/// the cross-lane form is a **sequential scan** the planner chose on cost, reading 301 buffers
+/// and discarding 19 977 rows, inside a write statement that runs up to 64 times a tick.
+#[tokio::test]
+async fn the_claim_seeks_on_run_after_instead_of_filtering_the_whole_backlog() {
+    let Some(db) = TestDb::create("the_claim_seeks_on_run_after").await else { return };
+    // A pending backlog whose every row is backed off into the future, across both kinds and
+    // both lanes: nothing here is claimable, which is what the claim has to discover cheaply.
+    sqlx::query(
+        "INSERT INTO job_queue (id, kind, payload, state, attempts, run_after, locked_until, dedupe_key, \
+         last_error, created_at, updated_at, priority) \
+         SELECT gen_random_uuid(), CASE WHEN i % 4 = 0 THEN 'notification.fanout' ELSE 'mail.send' END, \
+         '{}'::jsonb, 'pending', 0, now() + make_interval(secs => (i % 3600) + 1), NULL, NULL, NULL, now(), now(), \
+         CASE WHEN i % 3 = 0 THEN 0 ELSE 100 END FROM generate_series(1, 20000) AS i",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("load the backlog");
+    sqlx::query("ANALYZE job_queue").execute(&db.pool).await.expect("analyze");
+
+    let explain = async |sql: &str| -> String {
+        let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!("EXPLAIN (ANALYZE, BUFFERS) {sql}")))
+            .fetch_all(&db.pool)
+            .await
+            .expect("explain");
+        rows.into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n")
+    };
+    // Total buffers touched, off the top node's own accounting.
+    let buffers = |plan: &str| -> u64 {
+        plan.lines()
+            .find_map(|line| line.trim().strip_prefix("Buffers: shared hit="))
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no buffer accounting in the plan:\n{plan}"))
+    };
+
+    // What the repository emits: one lane at a time, ordered by the rest of the index.
+    let lane = explain(
+        "SELECT id FROM job_queue WHERE state = 'pending' AND priority = 0 AND run_after <= now() \
+         AND kind = ANY(ARRAY['notification.fanout', 'mail.send']) ORDER BY run_after, id LIMIT 8",
+    )
+    .await;
+    assert!(lane.contains("job_queue_claim_prio_idx"), "the claim does not use the claim index:\n{lane}");
+    let cond = lane
+        .lines()
+        .find(|line| line.trim_start().starts_with("Index Cond:"))
+        .unwrap_or_else(|| panic!("the claim is not an index scan at all:\n{lane}"));
+    for column in ["kind", "priority", "run_after"] {
+        assert!(
+            cond.contains(column),
+            "{column} is not part of the index condition, so the seek is not bounded by it: {cond}"
+        );
+    }
+
+    // The shape it replaced, as the control: same index, same data, no equality on the lane.
+    let cross = explain(
+        "SELECT id FROM job_queue WHERE state = 'pending' AND run_after <= now() \
+         AND kind = ANY(ARRAY['notification.fanout', 'mail.send']) ORDER BY priority, id LIMIT 8",
+    )
+    .await;
+    assert!(
+        buffers(&lane) * 5 < buffers(&cross),
+        "the claim reads {} buffers against the unbounded form's {} — the seek is not paying for itself:\n{lane}\n{cross}",
+        buffers(&lane),
+        buffers(&cross)
+    );
+    db.cleanup().await;
+}

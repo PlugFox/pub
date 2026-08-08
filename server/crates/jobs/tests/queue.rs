@@ -13,6 +13,8 @@
 //! | A pass claims against the clock the drain has reached | [`d2_a_later_pass_claims_against_the_clock_the_drain_has_reached`] |
 //! | A batch is dispatched with bounded concurrency | [`d2_a_claimed_batch_is_dispatched_with_bounded_concurrency`] |
 //! | A sign-in code is never starved by bulk mail | [`d2_a_sign_in_code_overtakes_a_backlog_of_notification_mail`] |
+//! | The fan-out row is bulk, not only its mail | [`d2_the_fanout_row_itself_is_bulk_not_only_the_mail_it_produces`] |
+//! | A hung fan-out cannot outrun its own budget | [`d2_a_fanout_that_hangs_is_bounded_by_the_deadline_its_budget_prices_it_at`] |
 //! | A permanent failure does not burn the budget | [`d2_a_malformed_recipient_deadletters_immediately`] |
 //! | One event, one batch, one mail item per recipient | [`d2_the_fanout_files_every_recipient_in_one_batch_and_queues_their_mail`] |
 //! | Re-enqueueing one event is a no-op | [`d2_a_duplicate_enqueue_of_one_event_is_a_no_op`] |
@@ -36,11 +38,17 @@ use pub_core::traits::{Kv, Mailer, MessageStream, Repositories};
 use pub_core::user::NewUser;
 use pub_core::{DomainEvent, Error, Format, OrgId, PackageId, Result, RoleLevel, UserId, VersionId};
 use pub_db_sqlite::SqliteDb;
-use pub_events::{EventBus, EventBusPolicy, NotificationCenter, NotificationPolicy};
+use pub_events::{
+    EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationEnqueuer, NotificationPolicy,
+};
 use pub_jobs::queue::{HandlerReport, JobHandler};
 use pub_jobs::{FanoutHandler, MailHandler, QueuePolicy, QueueWorker};
 
 const KEK: [u8; 32] = [11u8; 32];
+
+/// The per-item deadline a handler built outside [`Harness::worker`] gets — the drain's own
+/// `send_timeout`, which is what both registered kinds are budgeted at.
+const SEND_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// The sign-in code the S-26.b regression looks for, in the row and in the delivered message.
 const CODE: &str = "12345678";
@@ -272,7 +280,11 @@ impl Harness {
 
     fn worker(&self, policy: QueuePolicy) -> QueueWorker {
         QueueWorker::new(self.repos.clone(), Arc::clone(&self.bus), policy)
-            .with_handler(Arc::new(FanoutHandler::new(self.center(), Arc::clone(&self.repos.queue))))
+            .with_handler(Arc::new(FanoutHandler::new(
+                self.center(),
+                Arc::clone(&self.repos.queue),
+                policy.send_timeout,
+            )))
             .with_handler(Arc::new(MailHandler::new(
                 Arc::clone(&self.mailer) as Arc<dyn Mailer>,
                 KEK.to_vec(),
@@ -628,7 +640,7 @@ async fn d2_a_sign_in_code_overtakes_a_backlog_of_notification_mail() {
     // Phase one: the fan-out files the broadcast. Only the fan-out handler is registered, so
     // the mail it files stays in the table instead of being drained in the same tick.
     let filer = QueueWorker::new(harness.repos.clone(), Arc::clone(&harness.bus), QueuePolicy::default())
-        .with_handler(Arc::new(FanoutHandler::new(harness.center(), Arc::clone(&harness.repos.queue))));
+        .with_handler(Arc::new(FanoutHandler::new(harness.center(), Arc::clone(&harness.repos.queue), SEND_TIMEOUT)));
     let envelope = EventEnvelope::new(membership(harness.org, members[0]));
     let payload = serde_json::to_value(FanoutJob { envelope }).unwrap();
     harness
@@ -667,6 +679,142 @@ async fn d2_a_sign_in_code_overtakes_a_backlog_of_notification_mail() {
         sent.iter().take_while(|message| message.0 != "late@corp.com").count()
     );
     assert_eq!(harness.row(code).await.state, QueueState::Done);
+}
+
+#[tokio::test]
+async fn d2_the_fanout_row_itself_is_bulk_not_only_the_mail_it_produces() {
+    // The residue of the fix above: the per-recipient broadcast *mail* was moved into the bulk
+    // lane and the `notification.fanout` row that produces it was left interactive — although a
+    // fan-out is work filed on somebody else's behalf by definition, and is the far more
+    // expensive of the two (an audience resolution, a `create_many` of up to five hundred rows
+    // and up to two hundred sequential enqueues, against one SMTP conversation). A CI pipeline
+    // publishing into a large org therefore still filed thousands of rows in front of the next
+    // sign-in code — the exact failure the priority dimension was added to remove, one level up.
+    // This drives the real bus consumer, because the lane is decided where the row is filed.
+    let harness = Harness::new(MailMode::Deliver).await;
+    let enqueuer = NotificationEnqueuer::new(Arc::clone(&harness.repos.queue));
+    let mut fanouts = Vec::new();
+    for _ in 0..3 {
+        let envelope = EventEnvelope::new(membership(harness.org, UserId::new()));
+        enqueuer.handle(&envelope).await.expect("the consumer files one row per notifiable event");
+        fanouts.push(envelope.id);
+    }
+    assert_eq!(harness.queued(JobKind::NotificationFanout, QueueState::Pending).await, 3);
+
+    // The sign-in code arrives last and is claimed first, ahead of every fan-out.
+    let code = harness.enqueue_mail_at("late@corp.com", t0() + Duration::seconds(1)).await;
+    let claimed = harness
+        .repos
+        .queue
+        .claim(&JobKind::ALL, 10, StdDuration::from_secs(60), t0() + Duration::seconds(2))
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 4);
+    assert_eq!(claimed[0].id, code, "the sign-in code waited behind {} fan-out rows", fanouts.len());
+    for job in &claimed[1..] {
+        assert_eq!(job.kind, JobKind::NotificationFanout);
+        assert_eq!(job.priority, NewQueuedJob::BULK, "a fan-out is bulk work by the lane's own definition");
+    }
+}
+
+#[tokio::test]
+async fn d2_a_fanout_that_hangs_is_bounded_by_the_deadline_its_budget_prices_it_at() {
+    // The drain leases `remaining / send_timeout` rounds of work per pass and re-checks its
+    // budget only *between* passes, so that arithmetic is a bound only if every registered kind
+    // honours the deadline it is priced at. `MailHandler` did; this one had no timeout anywhere,
+    // while being the kind whose cost is unbounded database work rather than one SMTP
+    // conversation. A pass that claimed fan-out items could therefore run past the leases it had
+    // just minted, after which the next drain reaps them back to `pending` and spends a second
+    // attempt on every one of them.
+    struct HangingQueue {
+        inner: Arc<dyn pub_core::traits::JobQueueRepo>,
+    }
+
+    #[async_trait]
+    impl pub_core::traits::JobQueueRepo for HangingQueue {
+        async fn ping(&self) -> Result<()> {
+            self.inner.ping().await
+        }
+
+        async fn enqueue(&self, _new: &NewQueuedJob, _now: DateTime<Utc>) -> Result<Option<QueuedJob>> {
+            // The shape a contended SQLite writer has: the statement never comes back inside
+            // any interval the caller cares about.
+            tokio::time::sleep(StdDuration::from_secs(60)).await;
+            unreachable!("the deadline must fire first")
+        }
+
+        async fn get(&self, id: QueuedJobId) -> Result<Option<QueuedJob>> {
+            self.inner.get(id).await
+        }
+
+        async fn claim(
+            &self,
+            kinds: &[JobKind],
+            limit: u32,
+            lease: StdDuration,
+            now: DateTime<Utc>,
+        ) -> Result<Vec<QueuedJob>> {
+            self.inner.claim(kinds, limit, lease, now).await
+        }
+
+        async fn complete(
+            &self,
+            id: QueuedJobId,
+            outcome: QueueOutcome,
+            backoff: StdDuration,
+            now: DateTime<Utc>,
+        ) -> Result<()> {
+            self.inner.complete(id, outcome, backoff, now).await
+        }
+
+        async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64> {
+            self.inner.reap_expired_leases(now).await
+        }
+
+        async fn purge(&self, retention: &pub_core::queue::QueueRetention) -> Result<pub_core::queue::QueuePurged> {
+            self.inner.purge(retention).await
+        }
+
+        async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>> {
+            self.inner.depth().await
+        }
+    }
+
+    let harness = Harness::new(MailMode::Deliver).await;
+    let members = harness.members(2).await;
+    let hanging = Arc::new(HangingQueue { inner: Arc::clone(&harness.repos.queue) });
+    let handler = FanoutHandler::new(
+        harness.center(),
+        hanging as Arc<dyn pub_core::traits::JobQueueRepo>,
+        StdDuration::from_millis(50),
+    );
+    let envelope = EventEnvelope::new(membership(harness.org, members[0]));
+    let job = QueuedJob {
+        id: QueuedJobId::new(),
+        kind: JobKind::NotificationFanout,
+        priority: NewQueuedJob::BULK,
+        payload: serde_json::to_value(FanoutJob { envelope }).unwrap(),
+        state: QueueState::Running,
+        attempts: 1,
+        run_after: t0(),
+        locked_until: None,
+        dedupe_key: None,
+        last_error: None,
+        created_at: t0(),
+        updated_at: t0(),
+    };
+
+    let started = std::time::Instant::now();
+    let report = handler.run(&job, t0()).await;
+    let elapsed = started.elapsed();
+    assert!(elapsed < StdDuration::from_secs(5), "the handler must give up on its own: took {elapsed:?}");
+    match report.outcome {
+        // Transient: the rows this run did file are idempotent, so the retry converges.
+        QueueOutcome::Retry(message) => {
+            assert!(message.contains("exceeded"), "the retry must name the deadline: {message}")
+        }
+        other => panic!("an unbounded fan-out must not report success: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -757,7 +905,7 @@ async fn d2_a_fanout_retry_never_sends_a_second_copy_of_a_message() {
     let harness = Harness::new(MailMode::Deliver).await;
     let members = harness.members(3).await;
     let center = harness.center();
-    let handler = FanoutHandler::new(center, Arc::clone(&harness.repos.queue));
+    let handler = FanoutHandler::new(center, Arc::clone(&harness.repos.queue), SEND_TIMEOUT);
     let envelope = EventEnvelope::new(membership(harness.org, members[0]));
     let payload = serde_json::to_value(FanoutJob { envelope: envelope.clone() }).unwrap();
     let job = QueuedJob {
@@ -870,8 +1018,11 @@ async fn d44_a_notification_email_that_cannot_be_queued_is_not_lost_in_silence()
     let harness = Harness::new(MailMode::Deliver).await;
     let members = harness.members(2).await;
     let refusing = Arc::new(RefusingQueue { inner: Arc::clone(&harness.repos.queue), refuse: Mutex::new(true) });
-    let handler =
-        FanoutHandler::new(harness.center(), Arc::clone(&refusing) as Arc<dyn pub_core::traits::JobQueueRepo>);
+    let handler = FanoutHandler::new(
+        harness.center(),
+        Arc::clone(&refusing) as Arc<dyn pub_core::traits::JobQueueRepo>,
+        SEND_TIMEOUT,
+    );
     let envelope = EventEnvelope::new(membership(harness.org, members[0]));
     let job = QueuedJob {
         id: QueuedJobId::new(),

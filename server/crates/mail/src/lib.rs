@@ -58,13 +58,6 @@ pub struct SmtpSettings {
     /// from the settings table, or the boot `[smtp]` password when the section still points at
     /// the boot endpoint (S-26). Its plaintext lifetime is one transport build.
     pub password: Option<String>,
-    /// Whether [`SmtpSettings::password`] came from the boot `[smtp]` layer rather than from the
-    /// runtime section an instance administrator can write.
-    ///
-    /// Provenance, not policy: it is what lets [`SmtpMailer::new`] refuse to put the *operator's*
-    /// credential on an unencrypted transport while leaving an administrator free to configure a
-    /// plaintext relay with a password of their own (decision 09 amendment, S-26.a).
-    pub password_from_boot: bool,
     /// `From:` mailbox, e.g. `Pub <noreply@pub.example>`.
     pub from: String,
     /// Transport security mode.
@@ -78,7 +71,6 @@ impl std::fmt::Debug for SmtpSettings {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field("password_from_boot", &self.password_from_boot)
             .field("from", &self.from)
             .field("security", &self.security)
             .finish()
@@ -106,19 +98,17 @@ impl SmtpMailer {
         .map_err(|err| Error::Config { message: format!("smtp transport setup failed: {err}") })?
         .port(settings.port);
         if let (Some(user), Some(password)) = (&settings.username, &settings.password) {
-            // Belt and braces over the endpoint gate (decision 09 amendment, S-26.a). The gate
-            // one layer up already refuses to hand the boot credential to a section whose
-            // security mode differs from boot; this guard holds even if some future caller
-            // resolves a section another way, because the loss it prevents — `AUTH PLAIN` with
-            // the operator's password readable by anyone on the path — is not recoverable.
-            // A password the administrator stored themselves is their own to expose.
-            if settings.password_from_boot && settings.security == SmtpSecurity::None {
-                return Err(Error::Config {
-                    message: "the boot smtp password is never presented over an unencrypted transport: \
-                              set smtp.security to tls or starttls, or store a runtime password"
-                        .to_owned(),
-                });
-            }
+            // Unconditional, including on an unencrypted transport (decision 09's correction to
+            // its own amendment, S-26.a). The endpoint gate one layer up is the *entire*
+            // mechanism protecting the operator's credential: a runtime section whose security
+            // mode differs from boot no longer matches the boot endpoint, so it is handed no
+            // boot password at all. A second guard here could therefore never fire on the
+            // instance administrator it was written for — and it did fire on the operator's own
+            // `security = "none"` relay, which is a legal, validated, documented configuration
+            // (a local relay wanting SMTP AUTH without TLS). Refusing to build it turned that
+            // deployment into a total mail outage: every message dead-lettered and nobody could
+            // sign in. An operator who configures an unencrypted relay with credentials in their
+            // own boot file has made a decision about their own network.
             builder = builder.credentials(Credentials::new(user.clone(), password.clone()));
         }
         Ok(Self { transport: builder.build(), from })
@@ -418,18 +408,18 @@ impl RuntimeMailer {
 
     /// Resolves the stored section into connection settings, unsealing the password.
     fn resolve_section(&self, section: &SmtpSection, host: &str) -> Result<SmtpSettings> {
-        let (password, password_from_boot) = match section.password_sealed.as_deref() {
-            Some(sealed) => (Some(self.unsealer.unseal(sealed)?), false),
-            // Clearing the runtime password falls back to boot — subject to the endpoint match.
-            None if self.boot_credential_applies(section) => (self.boot.password.clone(), true),
-            None => (None, false),
+        let password = match section.password_sealed.as_deref() {
+            Some(sealed) => Some(self.unsealer.unseal(sealed)?),
+            // Clearing the runtime password falls back to boot — subject to the endpoint match,
+            // which is the whole of S-26.a's protection (decision 09's correction).
+            None if self.boot_credential_applies(section) => self.boot.password.clone(),
+            None => None,
         };
         Ok(SmtpSettings {
             host: host.to_owned(),
             port: section.port,
             username: section.username.clone().filter(|user| !user.is_empty()),
             password,
-            password_from_boot,
             from: section.from.clone(),
             security: parse_security(&section.security),
         })
@@ -515,7 +505,6 @@ pub fn validate_section(section: &SmtpSection) -> Result<()> {
         port: section.port,
         username: None,
         password: None,
-        password_from_boot: false,
         from: section.from.clone(),
         security: parse_security(&section.security),
     })
@@ -836,7 +825,6 @@ mod tests {
 
         mailer.send("dev@corp.com", "boot host", "body").await.unwrap();
         assert_eq!(builder.built()[0].password.as_deref(), Some("boot-secret-value"));
-        assert!(builder.built()[0].password_from_boot);
         assert!(mailer.describe().credentialed);
 
         store(&cache, section(Some("smtp.attacker.example"), Some("mailer"), None), 2);
@@ -951,7 +939,6 @@ mod tests {
             port: 2525,
             username: None,
             password: None,
-            password_from_boot: false,
             from: from.to_owned(),
             security,
         }
@@ -979,23 +966,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s26_a_a_boot_credential_is_never_attached_to_an_unencrypted_transport() {
-        // Belt and braces behind the endpoint gate, asserted on the *real* builder rather than
-        // on the recording double the integration harness installs: the double never runs
-        // `SmtpMailer::new`, which is why this path had no coverage at all.
-        let credentialed = |security, from_boot| SmtpSettings {
-            username: Some("mailer".to_owned()),
-            password: Some("OPERATOR-SECRET".to_owned()),
-            password_from_boot: from_boot,
-            ..connection("smtp.example.com", "Pub <noreply@pub.example>", security)
+    async fn s26_a_a_boot_relay_with_no_transport_security_still_builds_and_delivers() {
+        // The regression the "belt and braces" guard shipped, from the boot configuration that
+        // produces it rather than from a hand-built `SmtpSettings`. `security = "none"` with a
+        // password is legal (`Settings::validate_smtp` accepts it), documented ("local relays
+        // and tests only") and unremarkable: an internal relay that wants SMTP AUTH without
+        // TLS. On such an instance `runtime_defaults()` makes the effective section equal the
+        // boot endpoint on all four fields, so the boot credential applies to every send — and
+        // a guard that refused *that* combination made every message fail to build a transport
+        // at all, which since the MF2 fix is an error rather than a sink: every OTP burns its
+        // eight attempts and dead-letters, and nobody can sign in. The endpoint gate above is
+        // what keeps an instance admin away from the credential (see the test before this one);
+        // this one is what keeps the operator's own relay working.
+        let boot = BootSmtp {
+            host: Some("relay.internal".to_owned()),
+            port: 25,
+            username: Some("pub".to_owned()),
+            security: "none".to_owned(),
+            password: Some("boot-secret-value".to_owned()),
         };
-        let err = SmtpMailer::new(&credentialed(SmtpSecurity::None, true)).map(drop).expect_err("must be refused");
-        assert_eq!(err.code(), "config_invalid");
-        assert!(!err.to_string().contains("OPERATOR-SECRET"), "the refusal must not quote the credential: {err}");
-        // An encrypted transport carries it, and so does a plaintext relay whose password the
-        // administrator stored themselves — theirs to expose, unlike the operator's.
-        assert!(SmtpMailer::new(&credentialed(SmtpSecurity::Starttls, true)).is_ok());
-        assert!(SmtpMailer::new(&credentialed(SmtpSecurity::None, false)).is_ok());
+        // Byte-identical to what `runtime_defaults()` projects from that boot section, which is
+        // what an instance whose `settings` table was never written serves.
+        let section = SmtpSection {
+            host: Some("relay.internal".to_owned()),
+            port: 25,
+            username: Some("pub".to_owned()),
+            from: "Pub <noreply@corp.example>".to_owned(),
+            security: "none".to_owned(),
+            password_sealed: None,
+        };
+
+        // The real transport builder — the call the guard used to refuse. The recording double
+        // the integration harness installs never runs `SmtpMailer::new`, so nothing else in the
+        // suite can see this.
+        let real = RuntimeMailer::new(
+            cache_with(section.clone()),
+            Arc::new(SmtpMailerBuilder) as Arc<dyn MailerBuilder>,
+            unsealer(|_: &str| Ok(String::new())),
+            boot.clone(),
+            Arc::new(InMemoryMailer::new()) as Arc<dyn Mailer>,
+        );
+        real.resolve().expect("an unencrypted boot relay must still build a transport");
+        real.resolution().expect("…and the operator's own section must count as in force");
+
+        // …and the credential really is presented, so the relay's AUTH succeeds and the message
+        // leaves. `send_multipart` is the path queued sign-in mail takes.
+        let builder = Arc::new(RecordingBuilder::default());
+        let mailer = runtime(cache_with(section), Arc::clone(&builder), boot);
+        mailer.send_multipart("dev@corp.com", "Your sign-in code", "text", "<p>html</p>").await.expect("delivers");
+        assert_eq!(builder.built()[0].password.as_deref(), Some("boot-secret-value"));
+        assert_eq!(builder.built()[0].security, SmtpSecurity::None);
+        assert_eq!(builder.outbox.sent().len(), 1, "the message has to actually leave");
+        assert!(mailer.describe().credentialed);
     }
 
     #[tokio::test]

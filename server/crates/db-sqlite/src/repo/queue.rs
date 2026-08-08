@@ -45,6 +45,42 @@ impl SqliteJobQueueRepo {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// Leases up to `limit` runnable items of one lane, oldest-runnable first.
+    ///
+    /// The predicate is exactly the claim index's prefix — `kind`, `priority`, `run_after` —
+    /// and the `ORDER BY` is the rest of it, so the statement is a seek that stops at `limit`
+    /// instead of a scan of the lane. The `state` literal is what lets the partial index be
+    /// inferred, the same reason retention spells its states out.
+    async fn claim_lane(
+        &self,
+        kinds: &[JobKind],
+        priority: i32,
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<QueuedJob>> {
+        let mut query: QueryBuilder<Sqlite> =
+            QueryBuilder::new("UPDATE job_queue SET state = 'running', attempts = attempts + 1, locked_until = ");
+        query.push_bind(super::ts(deadline(now, lease)));
+        query.push(", updated_at = ").push_bind(super::ts(now));
+        query.push(" WHERE id IN (SELECT id FROM job_queue WHERE state = 'pending' AND priority = ");
+        query.push_bind(priority);
+        query.push(" AND run_after <= ").push_bind(super::ts(now));
+        query.push(" AND kind IN (");
+        let mut separated = query.separated(", ");
+        for kind in kinds {
+            separated.push_bind(kind.as_str());
+        }
+        query.push(") ORDER BY run_after, id LIMIT ").push_bind(i64::from(limit));
+        query.push(") RETURNING ").push(COLS);
+
+        let rows: Vec<QueueRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let mut claimed: Vec<QueuedJob> = rows.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
+        // `RETURNING` makes no ordering promise; the caller was promised the claim order.
+        claimed.sort_by_key(|job| (job.run_after, job.id));
+        Ok(claimed)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -117,6 +153,13 @@ impl JobQueueRepo for SqliteJobQueueRepo {
         if !new.state.is_admissible() {
             return Err(Error::Invalid { message: format!("cannot enqueue a job in state {}", new.state) });
         }
+        // The claim drains one lane at a time, so a row outside the lane set is a row nothing
+        // will ever claim — invisible work, which is worse than a refused enqueue.
+        if !NewQueuedJob::is_claimable_priority(new.priority) {
+            return Err(Error::Invalid {
+                message: format!("priority {} is not a claim lane {:?}", new.priority, NewQueuedJob::LEVELS),
+            });
+        }
         let payload = serde_json::to_string(&new.payload)
             .map_err(|err| Error::Internal { message: format!("failed to encode queue payload: {err}") })?;
         let stamp = super::ts(now);
@@ -163,28 +206,25 @@ impl JobQueueRepo for SqliteJobQueueRepo {
         if kinds.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = i64::from(limit.min(MAX_CLAIM_BATCH));
-        let mut query: QueryBuilder<Sqlite> =
-            QueryBuilder::new("UPDATE job_queue SET state = 'running', attempts = attempts + 1, locked_until = ");
-        query.push_bind(super::ts(deadline(now, lease)));
-        query.push(", updated_at = ").push_bind(super::ts(now));
-        // Priority first, then oldest id: the id is UUID v7, so the tie-break is arrival order
-        // without a sequence column, and the priority ahead of it is what keeps a sign-in code
-        // from being claimed behind a broadcast filed minutes earlier (decision 26 amendment).
-        query.push(" WHERE id IN (SELECT id FROM job_queue WHERE state = 'pending' AND run_after <= ");
-        query.push_bind(super::ts(now));
-        query.push(" AND kind IN (");
-        let mut separated = query.separated(", ");
-        for kind in kinds {
-            separated.push_bind(kind.as_str());
+        let mut remaining = limit.min(MAX_CLAIM_BATCH);
+        let mut claimed: Vec<QueuedJob> = Vec::new();
+        // One statement per lane, drained in order, instead of one statement ordering by
+        // priority. Two things come out of it. The **equality** on `priority` is what lets
+        // `job_queue_claim_prio_idx (kind, priority, run_after, id)` use `run_after` as a seek
+        // bound: with `priority` unconstrained the engine can only scan every pending entry of
+        // each kind and filter, which measured 6.3 ms against 0.007 ms on a 200k-row backlog a
+        // relay outage had backed off into the future — inside a write statement that holds
+        // SQLite's single writer, up to 64 times per tick. And draining a lane before looking
+        // at the next is strictly stronger than ordering one batch: interactive work is
+        // exhausted before any bulk item is leased.
+        for level in NewQueuedJob::LEVELS {
+            if remaining == 0 {
+                break;
+            }
+            let batch = self.claim_lane(kinds, level, remaining, lease, now).await?;
+            remaining = remaining.saturating_sub(u32::try_from(batch.len()).unwrap_or(u32::MAX));
+            claimed.extend(batch);
         }
-        query.push(") ORDER BY priority, id LIMIT ").push_bind(limit);
-        query.push(") RETURNING ").push(COLS);
-
-        let rows: Vec<QueueRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
-        let mut claimed: Vec<QueuedJob> = rows.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
-        // `RETURNING` makes no ordering promise; the caller was promised the claim order.
-        claimed.sort_by_key(|job| (job.priority, job.id));
         Ok(claimed)
     }
 

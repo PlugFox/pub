@@ -193,13 +193,27 @@ async fn the_drains_per_tick_statements_are_index_lookups() {
         plan("SELECT kind, state, COUNT(*) AS count FROM job_queue GROUP BY kind, state ORDER BY kind, state").await;
     assert!(depth.contains("job_queue_depth_idx"), "the depth aggregate reads the whole table: {depth}");
 
-    // The claim, which now orders by priority before the id.
+    // The claim, once per lane per pass. The index name is *not* the assertion — the wave
+    // shipped a claim that used this very index and still read every pending row of each kind,
+    // because `priority` sits between `kind` and `run_after`: with `priority` unconstrained
+    // (`ORDER BY priority, id` over both lanes at once) the seek stops at the `kind` prefix and
+    // `run_after` becomes a post-filter, measured at 6.3 ms against 0.007 ms on a 200k-row
+    // backlog a relay outage had backed off into the future — per claim, inside a write
+    // statement, up to 64 times a tick. What the equality on `priority` buys is the *columns
+    // the seek can use*, so that is what this asserts.
     let claim = plan(
-        "SELECT id FROM job_queue WHERE state = 'pending' AND run_after <= '2026-08-07T00:00:00Z' \
-         AND kind IN ('mail.send') ORDER BY priority, id LIMIT 50",
+        "SELECT id FROM job_queue WHERE state = 'pending' AND priority = 0 \
+         AND run_after <= '2026-08-07T00:00:00Z' AND kind IN ('notification.fanout', 'mail.send') \
+         ORDER BY run_after, id LIMIT 8",
     )
     .await;
     assert!(claim.contains("job_queue_claim_prio_idx"), "the claim full-scans the backlog: {claim}");
+    for column in ["kind=?", "priority=?", "run_after<"] {
+        assert!(
+            claim.contains(column),
+            "the claim seek does not bound {column}, so it reads the whole pending partition: {claim}"
+        );
+    }
 
     // The lease reaper, once per tick.
     let reap = plan(

@@ -47,6 +47,39 @@ impl PgJobQueueRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Leases up to `limit` runnable items of one lane, oldest-runnable first.
+    ///
+    /// The predicate is exactly the claim index's prefix — `kind`, `priority`, `run_after` —
+    /// and the `ORDER BY` is the rest of it, so the statement is an index scan that stops at
+    /// `limit` instead of one over the whole lane. `SKIP LOCKED` so a concurrent drain takes
+    /// the next rows instead of blocking on these.
+    async fn claim_lane(
+        &self,
+        names: &[String],
+        priority: i32,
+        limit: u32,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<QueuedJob>> {
+        let rows: Vec<QueueRow> = sqlx::query_as(q!(
+            "UPDATE job_queue SET state = 'running', attempts = attempts + 1, locked_until = $1, updated_at = $2 \
+             WHERE id IN (SELECT id FROM job_queue WHERE state = 'pending' AND priority = $3 AND run_after <= $2 \
+             AND kind = ANY($4) ORDER BY run_after, id LIMIT $5 FOR UPDATE SKIP LOCKED) RETURNING {COLS}"
+        ))
+        .bind(deadline(now, lease))
+        .bind(now)
+        .bind(priority)
+        .bind(names)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut claimed: Vec<QueuedJob> = rows.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
+        // `RETURNING` makes no ordering promise; the caller was promised the claim order.
+        claimed.sort_by_key(|job| (job.run_after, job.id));
+        Ok(claimed)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -116,6 +149,13 @@ impl JobQueueRepo for PgJobQueueRepo {
         if !new.state.is_admissible() {
             return Err(Error::Invalid { message: format!("cannot enqueue a job in state {}", new.state) });
         }
+        // The claim drains one lane at a time, so a row outside the lane set is a row nothing
+        // will ever claim — invisible work, which is worse than a refused enqueue.
+        if !NewQueuedJob::is_claimable_priority(new.priority) {
+            return Err(Error::Invalid {
+                message: format!("priority {} is not a claim lane {:?}", new.priority, NewQueuedJob::LEVELS),
+            });
+        }
         let payload = serde_json::to_string(&new.payload)
             .map_err(|err| Error::Internal { message: format!("failed to encode queue payload: {err}") })?;
         // DO NOTHING rather than DO UPDATE: a retried enqueue must not disturb the item that is
@@ -161,25 +201,23 @@ impl JobQueueRepo for PgJobQueueRepo {
             return Ok(Vec::new());
         }
         let names: Vec<String> = kinds.iter().map(|kind| kind.as_str().to_owned()).collect();
-        // Priority first, then oldest id (UUID v7 = arrival order): the priority is what keeps
-        // a sign-in code from being claimed behind a broadcast filed minutes earlier
-        // (decision 26 amendment). `SKIP LOCKED` so a concurrent drain takes the next batch
-        // instead of blocking on this one's rows.
-        let rows: Vec<QueueRow> = sqlx::query_as(q!(
-            "UPDATE job_queue SET state = 'running', attempts = attempts + 1, locked_until = $1, updated_at = $2 \
-             WHERE id IN (SELECT id FROM job_queue WHERE state = 'pending' AND run_after <= $2 AND kind = ANY($3) \
-             ORDER BY priority, id LIMIT $4 FOR UPDATE SKIP LOCKED) RETURNING {COLS}"
-        ))
-        .bind(deadline(now, lease))
-        .bind(now)
-        .bind(&names)
-        .bind(i64::from(limit.min(MAX_CLAIM_BATCH)))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let mut claimed: Vec<QueuedJob> = rows.into_iter().map(TryInto::try_into).collect::<Result<_>>()?;
-        // `RETURNING` makes no ordering promise; the caller was promised the claim order.
-        claimed.sort_by_key(|job| (job.priority, job.id));
+        let mut remaining = limit.min(MAX_CLAIM_BATCH);
+        let mut claimed: Vec<QueuedJob> = Vec::new();
+        // One statement per lane, drained in order, instead of one statement ordering by
+        // priority — the same shape and the same reason as the SQLite sibling. The **equality**
+        // on `priority` is what lets `job_queue_claim_prio_idx (kind, priority, run_after, id)`
+        // use `run_after` as a scan bound; with `priority` unconstrained the index degrades to
+        // its `kind` prefix and every claim reads the whole pending partition of each kind.
+        // Draining a lane before the next one is looked at is also strictly stronger than
+        // ordering inside one batch: interactive work is exhausted before bulk is leased.
+        for level in NewQueuedJob::LEVELS {
+            if remaining == 0 {
+                break;
+            }
+            let batch = self.claim_lane(&names, level, remaining, lease, now).await?;
+            remaining = remaining.saturating_sub(u32::try_from(batch.len()).unwrap_or(u32::MAX));
+            claimed.extend(batch);
+        }
         Ok(claimed)
     }
 
