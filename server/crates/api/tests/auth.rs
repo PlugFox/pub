@@ -616,7 +616,7 @@ async fn s04a_accepted_and_rejected_addresses_do_identical_work() {
 
 /// **S-31.** A suppressed row is a dead end: the drain never claims it, so a blocked address
 /// cannot be talked into a redeemable code by anything the worker does later — and it does not
-/// live forever either (D43). This endpoint is unauthenticated and every row it files carries
+/// live forever either (decision 26). This endpoint is unauthenticated and every row it files carries
 /// the address somebody typed at a login form, so "kept until the operator notices" is the
 /// wrong answer: nothing reads one after the request that filed it, and decision 26 promises
 /// the queue does not become the next unbounded table.

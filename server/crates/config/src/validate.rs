@@ -692,7 +692,7 @@ mod tests {
             ("retention", QueueConfig { retain_done_hours: 0, ..QueueConfig::default() }),
             // Every terminal state's window is bounded and none of them is zero: a suppressed
             // row must not outlive its request forever, and a dead letter must not be deleted
-            // on the tick after it was written (D43).
+            // on the tick after it was written (decision 26, the per-terminal-state retention bullet).
             ("suppressed retention", QueueConfig { retain_suppressed_hours: 0, ..QueueConfig::default() }),
             ("dead retention", QueueConfig { retain_dead_days: 0, ..QueueConfig::default() }),
             // Zero would time out every delivery before it started: SMTP never contacted, every

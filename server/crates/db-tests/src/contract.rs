@@ -3035,7 +3035,7 @@ pub async fn job_queue(repos: &Repositories) {
     repos.queue.ping().await.expect("ping");
     let lease = Duration::from_secs(60);
     let backoff = Duration::from_secs(30);
-    // One cutoff per terminal state (D43); `at` moves all three together for the walk below.
+    // One cutoff per terminal state (decision 26); `at` moves all three together for the walk below.
     let retention_at = |instant: DateTime<Utc>| QueueRetention {
         done_before: instant,
         suppressed_before: instant,
@@ -3201,7 +3201,7 @@ pub async fn job_queue(repos: &Repositories) {
     assert_eq!(done.updated_at, t0() + days(2));
 
     // Retention: every terminal state has its own cutoff, and a state whose cutoff has not
-    // arrived is untouched by a pass that deletes another one (D43 — before this, `done` was
+    // arrived is untouched by a pass that deletes another one (decision 26 — before this, `done` was
     // the only state with a bound and the other two grew forever).
     let at_the_bound = QueueRetention { done_before: t0() + days(2), suppressed_before: t0(), dead_before: t0() };
     assert_eq!(

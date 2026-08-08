@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn every_terminal_state_has_a_retention_window_and_the_dead_letter_keeps_the_longest() {
-        // D43: retention covered `done` and nothing else, so a suppressed row — one per
+        // Decision 26 (retention bullet): retention covered `done` and nothing else, so a suppressed row — one per
         // policy-rejected sign-in attempt, filed by an unauthenticated endpoint, carrying the
         // attempted address in the clear — lived forever, and so did every dead letter.
         let policy = QueuePolicy::default();
