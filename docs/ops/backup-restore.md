@@ -24,6 +24,8 @@ Dump the database **before** snapshotting the blob store. Blobs are written befo
 
 If blob GC is enabled (it ships **disabled and dry-run**), prefer pausing it for the duration of a backup (`jobs.blob_gc.enabled = false`, restart — or simply schedule backups apart from `jobs.blob_gc.interval_secs`). The `min_age_secs` grace (default 24 h) already protects young objects, but a GC deleting a just-orphaned blob between your DB dump and your blob sync is a race no grace period fully closes.
 
+The **staged-upload sweep** (`staging-sweep`) is a different matter and needs no pausing: it ships **on** and only ever removes objects under `uploads/`, which no version row references and no restore needs ([decision 31](../decisions.md#31--blob-lifecycle-staged-uploads-swept-by-default-and-an-archive-gc-that-streams-batches-and-resumes)). A blob snapshot that happens to contain some of them just restores garbage the next pass collects again. What it *does* mean for a restore: an upload that was in flight when the snapshot was taken does not survive it, which is correct — the KV session record does not survive either, so the client's finalize would have failed anyway.
+
 ## SQLite (the default deployment)
 
 The database runs in WAL mode, so it is **three files**: `pub.sqlite3`, `pub.sqlite3-wal`, `pub.sqlite3-shm` (under `/data/data/` in the container). Two safe procedures; copying the main file alone while the server runs is **not** one of them — you get a torn snapshot missing everything still in the WAL.

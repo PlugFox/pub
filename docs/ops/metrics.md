@@ -175,6 +175,46 @@ No labels.
 
 Bytes reclaimed by the garbage collector.
 
+## `blob_gc_shards_total`
+
+*counter*
+
+No labels.
+
+Archive shards swept to the end. A sweep walks the key space one shard at a time from a durable cursor, so this is the rate at which coverage rotates.
+
+## `blob_gc_sweep_converged`
+
+*gauge*
+
+No labels.
+
+1 when the last collector pass reached the end of the key space, 0 when it spent its budget first. Sustained 0 means passes never finish: raise `jobs.blob_gc.budget_secs` or lower the interval.
+
+## `staging_sweep_scanned_total`
+
+*counter*
+
+No labels.
+
+Staged-upload keys examined by the abandoned-upload sweep.
+
+## `staging_sweep_deleted_total`
+
+*counter*
+
+No labels.
+
+Abandoned staged uploads deleted. Steady state is roughly the rate of publishes that are started and never finished.
+
+## `staging_sweep_bytes_total`
+
+*counter*
+
+No labels.
+
+Bytes reclaimed from abandoned staged uploads.
+
 ## `queue_jobs_total`
 
 *counter*

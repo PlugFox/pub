@@ -211,9 +211,26 @@ Outbound mail is asynchronous ([decision 26](../decisions.md#26--durable-job-que
 
 **If nobody can sign in and mail is the reason**, the recovery is in the [security runbook](security-runbook.md#break-glass): `pubd reset-smtp`.
 
+## What deletes bytes
+
+Two jobs delete objects from the blob store, and they ship with **opposite defaults** ([decision 31](../decisions.md#31--blob-lifecycle-staged-uploads-swept-by-default-and-an-archive-gc-that-streams-batches-and-resumes)). The split is the point: one of them removes bytes somebody may have pinned in a `pubspec.lock`, the other removes bytes nobody can reach.
+
+| Job | Default | What it removes | Grace |
+|---|---|---|---|
+| `staging-sweep` | **on**, deletes for real, hourly | Abandoned staged uploads under `uploads/<format>/<session>.tar.gz` — publishes that were started and never finished | `jobs.staging.min_age_secs`, default 2 h |
+| `blob-gc` | **off**, and dry-run when first enabled, every 6 h | Content-addressed archives that no live version and no cached upstream version references | `jobs.blob_gc.min_age_secs`, default 24 h |
+
+**Why the staged sweep can be on.** A staged upload's session record lives in the KV for one hour. After it expires, `newUploadFinish` answers "this upload has expired or was already finalized" — there is no second door, and no database row ever referenced the object. So age alone decides it, and the two-hour default grace is the one-hour TTL plus room for clock skew. Before this job existed the same sweep rode `blob-gc`, which ships disabled, so a default install kept every abandoned upload forever, bounded only by the S-24 publish budget times the archive cap.
+
+**Why the archive collector cannot.** Content addressing means one object can back a local publish *and* a proxied upstream archive that never met each other, so a key is collectable only when both registers agree — and a mistake is the one failure this system cannot repair ([S-18](../security.md#4-supply-chain--registry-integrity)). Turn it on, read a dry-run pass, then clear `jobs.blob_gc.dry_run`.
+
+**Reading a `blob-gc` pass.** It walks the key space one shard at a time from a durable cursor and stops when `jobs.blob_gc.budget_secs` is spent, so `phase` reads either `swept` (or `dry-run`) when the pass reached the end, or `swept, resumes at pub:3f` when it did not. That is normal on a large bucket — coverage rotates across passes — but it should not be *every* pass: `blob_gc_sweep_converged` sitting at 0 means no rotation ever completes, and the fix is a larger budget or a shorter interval. `staging-sweep` has no cursor because everything it collects leaves the namespace, so each pass makes the next one smaller.
+
+**One safety property worth knowing about**, because it explains a non-zero `contested` count in a report: both jobs re-read an object's age immediately before deleting it. `put` on a content-addressed key is an idempotent overwrite, so republishing byte-identical content refreshes an object that a listing already called old and unreferenced; the re-read sees that and skips. A steady trickle of `contested` is a busy registry, not a fault.
+
 ## What deletes rows, and what it needs
 
-One job deletes anything in this instance: `lifecycle-purge` ([decision 30](../decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature), [S-23](../security.md#5-audit--abuse)). It is **on by default** — a default install whose tables only grow is not a default — and it runs every 15 minutes.
+One job deletes rows in this instance: `lifecycle-purge` ([decision 30](../decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature), [S-23](../security.md#5-audit--abuse)). It is **on by default** — a default install whose tables only grow is not a default — and it runs every 15 minutes.
 
 **What it removes**, per `[jobs.lifecycle]`; every window is a number of days and `0` means keep forever:
 

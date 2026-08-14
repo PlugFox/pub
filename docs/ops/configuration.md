@@ -909,13 +909,18 @@ Background-job settings (decision 03: leader-locked interval scheduler).
 
 ## `[jobs.blob_gc]`
 
-Unreferenced-blob garbage collection.
+Unreferenced-archive garbage collection (off by default — it deletes published bytes).
 
-Unreferenced-blob GC settings.
+Unreferenced-archive GC settings ([decision 31](../decisions.md)).
 
 Off and dry-run by default in both cases for the same reason: the job deletes bytes
 permanently, and byte stability is the one property this system cannot repair after the
 fact (S-18). An operator turns it on, reads a dry-run pass, then clears `dry_run`.
+
+Abandoned staged uploads are **not** governed here — they are [`StagingConfig`], they are on
+by default, and the split is deliberate: `enabled = false` in this section must mean no bytes
+are deleted by it, and a staged upload nobody can finalize is not the same risk as an archive
+somebody may have pinned.
 
 ### `jobs.blob_gc.enabled`
 
@@ -939,9 +944,72 @@ Report what would be deleted and delete nothing.
 
 integer · `PUB_JOBS__BLOB_GC__MIN_AGE_SECS` · default: `86400`
 
-Grace period: objects younger than this are never collected. Must exceed the staged
-upload TTL (1 hour) — a staged upload is finalizable, and therefore live, that whole
-time without any database row referencing it.
+Grace period: objects younger than this are never collected. It covers the window in
+which a freshly published archive is legitimately unreferenced — the pipeline writes the
+bytes before the row — with room for a slow publish and for clock skew between hosts.
+
+### `jobs.blob_gc.batch`
+
+integer · `PUB_JOBS__BLOB_GC__BATCH` · default: `256`
+
+Collectable keys resolved per pair of reference queries.
+
+The job's cost model: one round trip per object is what made a sweep unaffordable on any
+instance large enough to need one. Bounded above so a batch cannot outgrow SQLite's
+bind-variable ceiling.
+
+### `jobs.blob_gc.budget_secs`
+
+integer · `PUB_JOBS__BLOB_GC__BUDGET_SECS` · default: `300`
+
+Wall-clock bound on one pass, in seconds. A pass that spends it stops between shards and
+records where to resume; the lock TTL is twice this.
+
+## `[jobs.staging]`
+
+Abandoned-staged-upload sweep (on by default — nothing can reach those bytes).
+
+Abandoned-staged-upload sweep settings ([decision 31](../decisions.md),
+[S-20.a](../security.md#4-supply-chain--registry-integrity)).
+
+**On by default**, which is the one thing about this section worth reading twice. An
+unfinished publish leaves its archive in the staging namespace, and an hour later the session
+record is gone and nothing — no row, no URL, no client — can reach those bytes again. Before
+this section existed they were swept by the unreferenced-archive collector above, which ships
+disabled, so on a default install they were never collected at all and the only bound on the
+pile was the S-24 publish budget times the archive cap.
+
+### `jobs.staging.enabled`
+
+boolean · `PUB_JOBS__STAGING__ENABLED` · default: `true`
+
+Whether the sweep is scheduled. Turning it off means staged uploads accumulate forever.
+
+### `jobs.staging.interval_secs`
+
+integer · `PUB_JOBS__STAGING__INTERVAL_SECS` · default: `3600`
+
+Seconds between passes.
+
+### `jobs.staging.dry_run`
+
+boolean · `PUB_JOBS__STAGING__DRY_RUN` · default: `false`
+
+Report what would be deleted and delete nothing.
+
+### `jobs.staging.min_age_secs`
+
+integer · `PUB_JOBS__STAGING__MIN_AGE_SECS` · default: `7200`
+
+Grace period: staged objects younger than this are never collected. Must exceed the
+one-hour upload TTL — an upload is finalizable, and therefore live, that whole time with
+nothing referencing it.
+
+### `jobs.staging.budget_secs`
+
+integer · `PUB_JOBS__STAGING__BUDGET_SECS` · default: `60`
+
+Wall-clock bound on one pass, in seconds.
 
 ## `[jobs.reindex]`
 
