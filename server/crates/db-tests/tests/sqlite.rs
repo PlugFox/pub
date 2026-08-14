@@ -284,3 +284,48 @@ async fn the_drains_per_tick_statements_are_index_lookups() {
     .await;
     assert!(dedupe.contains("notifications_event_idx"), "the exactly-once conflict check is a scan: {dedupe}");
 }
+
+/// The blob collector's reference check must be an index seek on **both** registers
+/// ([decision 31](../../../../docs/decisions.md)).
+///
+/// This is the query that decides whether bytes may be deleted, asked once per batch of
+/// candidate keys, and each half runs against a table that only grows: `versions` on a busy
+/// registry, `upstream_versions` on a mirror (pub.dev is ~60 000 packages). The batching from
+/// decision 31 removed two round trips *per object*; a sequential scan inside each batch would
+/// have put the cost straight back, one layer down and invisible to every test that only checks
+/// the answer.
+///
+/// Both indexes are partial, and the literal in the statement is what lets SQLite infer them —
+/// exactly the bind-versus-literal distinction the drain's plan test pins above. The repository
+/// writes `tombstone = 0` and `cached = 1` as literals for this reason.
+#[tokio::test]
+async fn the_blob_collectors_reference_check_is_an_index_lookup() {
+    let cfg =
+        DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
+    let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
+    db.run_migrations().await.expect("migrate");
+
+    // `AssertSqlSafe`: composed here from literals in this file, no value from anywhere else.
+    let plan = async |sql: &str| -> String {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("explain");
+        rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | ")
+    };
+
+    let live =
+        plan("SELECT DISTINCT archive_sha256 FROM versions WHERE tombstone = 0 AND archive_sha256 IN (?, ?)").await;
+    assert!(live.contains("versions_sha256_idx"), "the live-reference check scans `versions`: {live}");
+    assert!(!live.contains("SCAN versions"), "{live}");
+
+    let cached =
+        plan("SELECT DISTINCT archive_sha256 FROM upstream_versions WHERE cached = 1 AND archive_sha256 IN (?, ?)")
+            .await;
+    assert!(
+        cached.contains("upstream_versions_sha256_idx"),
+        "the proxy-cache reference check scans `upstream_versions`: {cached}"
+    );
+    assert!(!cached.contains("SCAN upstream_versions"), "{cached}");
+}

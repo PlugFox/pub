@@ -528,3 +528,70 @@ async fn s22_a_the_hardened_app_role_prunes_audit_without_holding_delete() {
         .expect("drop the test role");
     admin.close().await.expect("close admin connection");
 }
+
+/// **Decision 31.** The blob collector's reference check seeks both registers instead of
+/// scanning them.
+///
+/// This is the query that decides whether bytes may be deleted, asked once per batch of
+/// candidate keys, and its second half runs against `upstream_versions` — the largest table in
+/// the schema on a mirror-mode instance, and the one that had no index on `archive_sha256` at
+/// all, because until decision 31 it was asked one hash at a time by a job that shipped
+/// disabled. Batching removed two round trips per object; a sequential scan inside each batch
+/// would have put the whole cost back one layer down, where no test that only checks the
+/// *answer* would ever notice.
+///
+/// Both indexes are partial, so the assertion is on the plan rather than on the index existing:
+/// a predicate that drifted away from `WHERE cached` / `WHERE NOT tombstone` leaves the index in
+/// `pg_indexes` and stops matching the query.
+#[tokio::test]
+async fn the_blob_collectors_reference_check_seeks_both_registers() {
+    let Some(db) = TestDb::create("the_blob_collectors_reference_check").await else { return };
+    // Enough rows, with enough distinct hashes, that the planner has a reason to care.
+    sqlx::query(
+        "INSERT INTO upstream_packages (id, format, name, upstream, discontinued, replaced_by, \
+         advisories_updated, listing, fetched_at) \
+         VALUES (gen_random_uuid(), 'pub', 'http', 'https://pub.dev', FALSE, NULL, NULL, NULL, now())",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("seed the upstream package");
+    sqlx::query(
+        "INSERT INTO upstream_versions (id, upstream_package_id, version, version_sort, pubspec, archive_sha256, \
+         archive_size, retracted, cached, published_at, fetched_at) \
+         SELECT gen_random_uuid(), p.id, '1.0.' || i, '1.0.' || lpad(i::text, 10, '0'), '{}'::jsonb, \
+         encode(sha256(i::text::bytea), 'hex'), 1024, FALSE, i % 2 = 0, now(), now() \
+         FROM upstream_packages p, generate_series(1, 20000) AS i",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("load the proxy cache");
+    sqlx::query("ANALYZE upstream_versions").execute(&db.pool).await.expect("analyze");
+
+    let explain = async |sql: &str| -> String {
+        let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!("EXPLAIN (ANALYZE, BUFFERS) {sql}")))
+            .fetch_all(&db.pool)
+            .await
+            .expect("explain");
+        rows.into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n")
+    };
+
+    // The proxy-cache half, exactly as `cached_sha256s` emits it.
+    let cached = explain(
+        "SELECT DISTINCT archive_sha256 FROM upstream_versions WHERE cached \
+         AND archive_sha256 = ANY(ARRAY[encode(sha256('7'::text::bytea), 'hex'), \
+         encode(sha256('8'::text::bytea), 'hex')])",
+    )
+    .await;
+    assert!(cached.contains("upstream_versions_sha256_idx"), "the proxy-cache check is a scan:\n{cached}");
+    assert!(!cached.contains("Seq Scan on upstream_versions"), "{cached}");
+
+    // The local half, which has had `versions_sha256_idx` since 0004 — asserted here so the pair
+    // is checked together rather than one of them being assumed.
+    let live = explain(
+        "SELECT DISTINCT archive_sha256 FROM versions WHERE NOT tombstone \
+         AND archive_sha256 = ANY(ARRAY[repeat('a', 64), repeat('b', 64)])",
+    )
+    .await;
+    assert!(live.contains("versions_sha256_idx"), "the live-reference check is a scan:\n{live}");
+    db.cleanup().await;
+}

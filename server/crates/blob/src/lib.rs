@@ -10,13 +10,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use pub_config::{BlobConfig, BlobKind};
-use pub_core::traits::{BlobObject, BlobStore, DownloadPlan};
+use pub_core::traits::{BlobObject, BlobStore, DownloadPlan, PrefixListing};
 use pub_core::{Error, Result};
 
 /// [`BlobStore`] backed by any `object_store` implementation.
@@ -113,24 +114,65 @@ impl BlobStore for ObjectStoreBlob {
         }
     }
 
-    /// Recursive listing under `prefix` (the unreferenced-blob GC job's only enumeration path).
+    /// Recursive listing under `prefix`, streamed (the byte collectors' enumeration path).
     ///
-    /// `object_store`'s `list` already walks every level below the prefix, which is what this
-    /// caller needs: archive keys are sharded (`pub/ab/<sha>.tar.gz`), so a delimiter-based
-    /// listing would return 256 directories and no objects.
-    async fn list(&self, prefix: &str) -> Result<Vec<BlobObject>> {
+    /// `object_store`'s `list` already walks every level below the prefix and already hands
+    /// back a stream, so this is a rename of the item type and nothing else: nothing here
+    /// collects, because the caller's whole reason for streaming is that the key space may not
+    /// fit in memory.
+    fn list_stream<'a>(&'a self, prefix: &'a str) -> BoxStream<'a, Result<BlobObject>> {
         let path = ObjectPath::from(prefix);
-        let mut stream = self.store.list(Some(&path));
-        let mut objects = Vec::new();
-        while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(blob_err)?;
-            objects.push(BlobObject {
+        self.store
+            .list(Some(&path))
+            .map(|meta| {
+                let meta = meta.map_err(blob_err)?;
+                Ok(BlobObject {
+                    key: meta.location.as_ref().to_owned(),
+                    size: meta.size,
+                    last_modified: Some(meta.last_modified),
+                })
+            })
+            .boxed()
+    }
+
+    /// One level below `prefix`: the shard directories, and anything sitting outside them.
+    ///
+    /// This is the delimited listing — the one the recursive walk above deliberately is not.
+    /// `object_store` spells a common prefix without its trailing delimiter, so it is added
+    /// back here: the caller concatenates it with a key and must not have to know which
+    /// backend's convention it is holding.
+    async fn list_prefixes(&self, prefix: &str) -> Result<PrefixListing> {
+        let path = ObjectPath::from(prefix);
+        let listing = self.store.list_with_delimiter(Some(&path)).await.map_err(blob_err)?;
+        Ok(PrefixListing {
+            prefixes: listing.common_prefixes.iter().map(|child| format!("{}/", child.as_ref())).collect(),
+            objects: listing
+                .objects
+                .into_iter()
+                .map(|meta| BlobObject {
+                    key: meta.location.as_ref().to_owned(),
+                    size: meta.size,
+                    last_modified: Some(meta.last_modified),
+                })
+                .collect(),
+        })
+    }
+
+    /// Current metadata for one key; `None` when it is gone.
+    ///
+    /// A missing object is an answer, not a failure: the collectors call this on a key they
+    /// are about to delete, and "somebody deleted it first" is the ordinary outcome of a
+    /// retried hard delete or a second sweep.
+    async fn head(&self, key: &str) -> Result<Option<BlobObject>> {
+        match self.store.head(&ObjectPath::from(key)).await {
+            Ok(meta) => Ok(Some(BlobObject {
                 key: meta.location.as_ref().to_owned(),
                 size: meta.size,
                 last_modified: Some(meta.last_modified),
-            });
+            })),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(blob_err(err)),
         }
-        Ok(objects)
     }
 }
 
@@ -220,6 +262,57 @@ mod tests {
         assert!(listed[0].last_modified.is_some(), "GC needs an age to respect its grace period");
         assert_eq!(listed[1].size, 3);
         assert!(blob.list("nothing/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_prefixes_reports_shards_and_what_is_outside_them() {
+        // The archive collector walks shards and *reports* everything else, so both halves of
+        // this answer are load-bearing: a prefix it does not get back is a prefix it never
+        // visits, and an object it does not get back is one nothing would ever mention.
+        let blob = ObjectStoreBlob::memory();
+        blob.put("pub/ab/abcd.tar.gz", Bytes::from_static(b"12345")).await.unwrap();
+        blob.put("pub/cd/cdef.tar.gz", Bytes::from_static(b"123")).await.unwrap();
+        blob.put("pub/zz/foreign.txt", Bytes::from_static(b"mystery")).await.unwrap();
+        blob.put("pub/stray.txt", Bytes::from_static(b"outside every shard")).await.unwrap();
+
+        let mut listing = blob.list_prefixes("pub/").await.unwrap();
+        listing.prefixes.sort();
+        assert_eq!(listing.prefixes, ["pub/ab/", "pub/cd/", "pub/zz/"], "the delimiter is included, always");
+        assert_eq!(listing.objects.len(), 1, "only the key that is inside no shard: {listing:?}");
+        assert_eq!(listing.objects[0].key, "pub/stray.txt");
+        assert!(listing.objects[0].last_modified.is_some());
+
+        let empty = blob.list_prefixes("nothing/").await.unwrap();
+        assert!(empty.prefixes.is_empty() && empty.objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_reports_metadata_and_absence_without_an_error() {
+        // The collectors call `head` on a key they are about to delete: "somebody deleted it
+        // first" is an ordinary outcome, not a failed pass.
+        let blob = ObjectStoreBlob::memory();
+        blob.put("pub/ab/abcd.tar.gz", Bytes::from_static(b"12345")).await.unwrap();
+
+        let found = blob.head("pub/ab/abcd.tar.gz").await.unwrap().expect("present");
+        assert_eq!(found.key, "pub/ab/abcd.tar.gz");
+        assert_eq!(found.size, 5);
+        assert!(found.last_modified.is_some(), "the re-read exists to compare an age");
+        assert!(blob.head("pub/ab/gone.tar.gz").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fs_head_and_prefixes_match_the_memory_backend() {
+        // Same contract on the backend a default install actually runs.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BlobConfig { path: dir.path().join("blobs").to_string_lossy().into_owned(), ..BlobConfig::default() };
+        let blob = ObjectStoreBlob::fs(&cfg).unwrap();
+        blob.put("pub/ab/abcd.tar.gz", Bytes::from_static(b"12345")).await.unwrap();
+
+        let listing = blob.list_prefixes("pub/").await.unwrap();
+        assert_eq!(listing.prefixes, ["pub/ab/"]);
+        assert!(listing.objects.is_empty());
+        assert_eq!(blob.head("pub/ab/abcd.tar.gz").await.unwrap().expect("present").size, 5);
+        assert!(blob.head("pub/ab/gone.tar.gz").await.unwrap().is_none());
     }
 
     #[tokio::test]

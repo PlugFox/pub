@@ -9,6 +9,8 @@
 //!   compared with SQLite's default BINARY collation. Ordering by the version text would put
 //!   `1.0.0-beta.11` before `1.0.0-beta.2`.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::package::{
@@ -510,6 +512,24 @@ impl PackageRepo for SqlitePackageRepo {
                 .map_err(db_err)?;
         let count: i64 = row.get("n");
         Ok(count.max(0) as u64)
+    }
+
+    async fn live_sha256s(&self, hashes: &[String]) -> Result<HashSet<String>> {
+        if hashes.is_empty() {
+            // An `IN ()` is a syntax error on SQLite, and a round trip that can only answer
+            // "nothing" is one the collector should not be making in the first place.
+            return Ok(HashSet::new());
+        }
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT DISTINCT archive_sha256 FROM versions WHERE tombstone = 0 AND archive_sha256 IN (",
+        );
+        let mut list = query.separated(", ");
+        for hash in hashes {
+            list.push_bind(hash.clone());
+        }
+        list.push_unseparated(")");
+        let found: Vec<String> = query.build_query_scalar().fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(found.into_iter().collect())
     }
 
     async fn transfer(&self, id: PackageId, to_org: OrgId, now: DateTime<Utc>) -> Result<Package> {

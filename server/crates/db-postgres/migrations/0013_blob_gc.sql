@@ -1,0 +1,19 @@
+-- 0013_blob_gc (postgres): the second half of the blob collector's reference check, per
+-- decision 31. Forward-only.
+--
+-- A key is collectable only when *both* registers agree nothing points at it: `versions` and
+-- cached `upstream_versions`. The first half has been served since 0004 by
+-- `versions_sha256_idx (archive_sha256) WHERE NOT tombstone`; the second half had no index at
+-- all, because until now it was asked one hash at a time by a job that shipped disabled.
+--
+-- Decision 31 makes that query the collector's inner loop — one per batch of candidate keys —
+-- and a mirror-mode instance's `upstream_versions` is the largest table in the schema (pub.dev
+-- is ~60 000 packages, each with many versions). Without this index every batch is a sequential
+-- scan of it, which is the same "the job cannot be turned on" outcome, moved one layer down.
+--
+-- Partial on `cached`, mirroring `versions_sha256_idx`'s partiality on `tombstone`, and for the
+-- same reason: a snapshot row carries the hash upstream advertised long before this instance
+-- holds any bytes for it, and a row that holds no bytes is not a blob reference. The predicate
+-- in the index is exactly the predicate in the query, so the planner can use it for
+-- `WHERE cached AND archive_sha256 = ANY($1)`.
+CREATE INDEX upstream_versions_sha256_idx ON upstream_versions (archive_sha256) WHERE cached;

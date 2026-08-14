@@ -13,6 +13,7 @@
 //! Time is always a parameter (`now: DateTime<Utc>`): repositories never read the clock, so
 //! expiry, throttling, and validity windows are deterministic under test.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -214,6 +215,17 @@ pub trait PackageRepo: Send + Sync {
     /// docs/protocol.md sharp edge 3).
     async fn count_versions_with_sha256(&self, sha256: &str) -> Result<u64>;
 
+    /// Which of `hashes` a **live** (non-tombstone) version still references.
+    ///
+    /// The batch form of [`PackageRepo::count_versions_with_sha256`], and the reason it exists
+    /// is the collector's cost model: asking per object made a sweep two round trips per key,
+    /// which is what kept the unreferenced-blob GC off on any instance large enough to need it
+    /// ([decision 31](../../../docs/decisions.md)). The collector never needs the *count*, only
+    /// whether the answer is zero, so the batch form returns the referenced subset.
+    ///
+    /// An empty input is an empty answer and must not reach the database.
+    async fn live_sha256s(&self, hashes: &[String]) -> Result<HashSet<String>>;
+
     /// Claims `(format, name)` for `org` (decision 01).
     ///
     /// Idempotent for the holder: re-claiming a name the org already holds returns the
@@ -386,6 +398,16 @@ pub trait UpstreamRepo: Send + Sync {
     /// [`PackageRepo::count_versions_with_sha256`] before it deletes anything. Missing this
     /// half would delete bytes a `pubspec.lock` pins through the proxy (S-18).
     async fn count_cached_with_sha256(&self, sha256: &str) -> Result<u64>;
+
+    /// Which of `hashes` a **cached** upstream version still references.
+    ///
+    /// The batch form of [`UpstreamRepo::count_cached_with_sha256`], paired with
+    /// [`PackageRepo::live_sha256s`]: the collector asks both registers once per batch and
+    /// keeps every key either of them names. Both halves stay mandatory — one blob can be
+    /// shared by a local publish and a proxied archive that never met.
+    ///
+    /// An empty input is an empty answer and must not reach the database.
+    async fn cached_sha256s(&self, hashes: &[String]) -> Result<HashSet<String>>;
 
     /// Records a refused archive (S-19 hash mismatch). Repeated observations of one
     /// `(format, name, version)` collapse onto one row: `occurrences` increments and
@@ -1165,25 +1187,85 @@ pub trait BlobStore: Send + Sync {
     /// edge 3 — served bytes are stable forever).
     async fn delete(&self, key: &str) -> Result<()>;
 
-    /// Every object under `prefix`, with its size and last-modified time.
+    /// Every object under `prefix`, streamed, with its size and last-modified time.
     ///
-    /// Exists for one caller — the unreferenced-blob GC job — and the last-modified time is
-    /// what makes that job safe: the publish pipeline writes bytes *before* the version row
-    /// (an interrupted publish must leave garbage, never a row pointing at nothing), so a
-    /// freshly written blob is legitimately unreferenced for the width of one transaction.
-    /// GC therefore refuses to touch anything younger than its grace period, and a backend
-    /// that cannot report an age cannot be swept.
+    /// Exists for the byte-collecting jobs ([decision 31](../../../docs/decisions.md)) and the
+    /// last-modified time is what makes them safe: the publish pipeline writes bytes *before*
+    /// the version row (an interrupted publish must leave garbage, never a row pointing at
+    /// nothing), so a freshly written blob is legitimately unreferenced for the width of one
+    /// transaction. A collector therefore refuses to touch anything younger than its grace
+    /// period, and a backend that cannot report an age cannot be swept.
     ///
-    /// The default is [`crate::Error::Unimplemented`]: a store that cannot enumerate is not a
-    /// broken store, it just cannot be garbage-collected, and the job reports that as a job
-    /// failure rather than silently deleting on incomplete information.
-    async fn list(&self, prefix: &str) -> Result<Vec<BlobObject>> {
+    /// **A stream rather than a `Vec`**: a key space large enough to be worth collecting is
+    /// large enough that materializing it is the memory profile of the job. The caller reads
+    /// one object at a time and holds only its own bounded batch.
+    ///
+    /// The default is a stream that yields one [`crate::Error::Unimplemented`]: a store that
+    /// cannot enumerate is not a broken store, it just cannot be garbage-collected, and the
+    /// job reports that as a job failure rather than silently deleting on incomplete
+    /// information.
+    fn list_stream<'a>(&'a self, prefix: &'a str) -> BoxStream<'a, Result<BlobObject>> {
         let _ = prefix;
-        Err(crate::Error::Unimplemented { what: "this blob backend cannot enumerate objects".to_owned() })
+        use futures::StreamExt as _;
+
+        futures::stream::once(async {
+            Err(crate::Error::Unimplemented { what: "this blob backend cannot enumerate objects".to_owned() })
+        })
+        .boxed()
+    }
+
+    /// Every object under `prefix`, collected.
+    ///
+    /// The convenience form of [`BlobStore::list_stream`], for callers that know the prefix is
+    /// small (tests, a staging namespace bounded by a publish budget). A collector over an
+    /// unbounded key space uses the stream.
+    async fn list(&self, prefix: &str) -> Result<Vec<BlobObject>> {
+        use futures::StreamExt as _;
+
+        let mut stream = self.list_stream(prefix);
+        let mut objects = Vec::new();
+        while let Some(object) = stream.next().await {
+            objects.push(object?);
+        }
+        Ok(objects)
+    }
+
+    /// One level below `prefix`: the child prefixes, and any object sitting directly at this
+    /// level rather than inside one of them.
+    ///
+    /// This is how the archive collector decides *what to walk*. Content-addressed keys are
+    /// sharded (`pub/ab/<sha>.tar.gz`), and `object_store` guarantees **no ordering** on a
+    /// listing — so a resumable sweep cannot be "continue after the last key I saw", it has to
+    /// be a walk over units the caller can name and order itself. Shards are those units.
+    ///
+    /// Reporting the objects at this level is the second half of the contract: a key that is
+    /// not inside a shard is a key the collector will never walk, and one it must therefore be
+    /// able to *report* rather than silently ignore.
+    ///
+    /// Same default and the same reason as [`BlobStore::list_stream`].
+    async fn list_prefixes(&self, prefix: &str) -> Result<PrefixListing> {
+        let _ = prefix;
+        Err(crate::Error::Unimplemented { what: "this blob backend cannot enumerate prefixes".to_owned() })
+    }
+
+    /// One object's current metadata; `None` when it does not exist.
+    ///
+    /// The collectors call this **immediately before deleting**, and it is not redundant with
+    /// the listing that found the object: `put` on a content-addressed key is an idempotent
+    /// overwrite, so republishing byte-identical content refreshes the object's
+    /// `last_modified` while a collector is holding a listing that says "old and
+    /// unreferenced". Re-reading turns that race into a skip. It does not close the window
+    /// entirely — there is no conditional delete on this seam — it narrows it from the width
+    /// of a sweep to the width of one round trip.
+    ///
+    /// Same default and the same reason as [`BlobStore::list_stream`].
+    async fn head(&self, key: &str) -> Result<Option<BlobObject>> {
+        let _ = key;
+        Err(crate::Error::Unimplemented { what: "this blob backend cannot read object metadata".to_owned() })
     }
 }
 
-/// One stored object, as [`BlobStore::list`] reports it.
+/// One stored object, as [`BlobStore::list_stream`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobObject {
     /// Storage key.
@@ -1192,6 +1274,16 @@ pub struct BlobObject {
     pub size: u64,
     /// Last modification time, when the backend reports one.
     pub last_modified: Option<DateTime<Utc>>,
+}
+
+/// One level of a key space, as [`BlobStore::list_prefixes`] reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrefixListing {
+    /// Child prefixes, each ending in `/` exactly as the backend spells them.
+    pub prefixes: Vec<String>,
+    /// Objects at this level — outside every child prefix, and therefore outside any walk
+    /// driven by them.
+    pub objects: Vec<BlobObject>,
 }
 
 /// Key-value store **and** pub/sub broker (decision 03) — one seam for revocation fast paths,

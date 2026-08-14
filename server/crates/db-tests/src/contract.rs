@@ -1426,6 +1426,21 @@ pub async fn publish_invariants(repos: &Repositories) {
     assert_eq!(repos.packages.count_versions_with_sha256(&shared).await.expect("count"), 2);
     assert_eq!(repos.packages.count_versions_with_sha256(&"0".repeat(64)).await.expect("count"), 0);
 
+    // The batch form the blob collector actually runs on (decision 31): same question, asked
+    // once for a whole batch of candidate keys, answered as the referenced subset.
+    let absent = "0".repeat(64);
+    let batch = vec![shared.clone(), absent.clone()];
+    let referenced = repos.packages.live_sha256s(&batch).await.expect("batch");
+    assert_eq!(referenced.len(), 1, "only the hash a live version points at");
+    assert!(referenced.contains(&shared));
+    assert!(!referenced.contains(&absent));
+    // An empty input must not reach the database — and must certainly not answer "everything".
+    assert!(repos.packages.live_sha256s(&[]).await.expect("empty batch").is_empty());
+    // A repeated hash is one row in the answer, not two: the collector dedups before asking and
+    // this makes the contract explicit either way.
+    let repeated = repos.packages.live_sha256s(&[shared.clone(), shared.clone()]).await.expect("repeat");
+    assert_eq!(repeated.len(), 1);
+
     // Hard delete: the row becomes a tombstone with its payload cleared…
     let tombstone = repos.packages.hard_delete_version(published.version.id).await.expect("hard delete");
     assert!(tombstone.tombstone);
@@ -1841,6 +1856,16 @@ pub async fn upstream_mirror_reads(repos: &Repositories) {
     assert!(repos.upstream.mark_cached(cached_row.id, &sha_a, 2048, t0() + hours(3)).await.expect("mark"));
     assert_eq!(repos.upstream.count_cached_with_sha256(&sha_a).await.expect("count"), 1);
     assert_eq!(repos.upstream.count_cached_with_sha256(&sha_b).await.expect("count"), 0);
+
+    // The batch form (decision 31). `sha_b` is known to the snapshot but holds no bytes, so a
+    // collector that read this answer as "both are referenced" would keep garbage forever, and
+    // one that read it as "neither" would delete `sha_a`'s archive out from under a lockfile.
+    let batch = vec![sha_a.clone(), sha_b.clone()];
+    let cached_set = repos.upstream.cached_sha256s(&batch).await.expect("batch");
+    assert_eq!(cached_set.len(), 1);
+    assert!(cached_set.contains(&sha_a));
+    assert!(!cached_set.contains(&sha_b), "a snapshot row is not a blob reference");
+    assert!(repos.upstream.cached_sha256s(&[]).await.expect("empty batch").is_empty());
 
     // The admin inventory aggregates per package: version counts and the bytes we actually hold.
     let page = repos.upstream.list_cached(Format::Pub, None, 50).await.expect("inventory");

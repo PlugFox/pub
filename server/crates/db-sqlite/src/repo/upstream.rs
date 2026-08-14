@@ -11,6 +11,8 @@
 //!   "upstream changed its mind about bytes we already store" a *detectable* event instead of
 //!   a silent overwrite of the hash we serve under.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::package::{
@@ -403,6 +405,26 @@ impl UpstreamRepo for SqliteUpstreamRepo {
                 .await
                 .map_err(db_err)?;
         Ok(count.max(0) as u64)
+    }
+
+    async fn cached_sha256s(&self, hashes: &[String]) -> Result<HashSet<String>> {
+        if hashes.is_empty() {
+            // `IN ()` does not parse on SQLite, and the answer is known without asking.
+            return Ok(HashSet::new());
+        }
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT DISTINCT archive_sha256 FROM upstream_versions WHERE cached = 1 AND archive_sha256 IN (",
+        );
+        let mut list = query.separated(", ");
+        for hash in hashes {
+            list.push_bind(hash.clone());
+        }
+        list.push_unseparated(")");
+        // `cached = 1` is the whole distinction: a snapshot row carries the hash upstream
+        // advertised long before this instance holds any bytes for it, and only the rows that
+        // hold bytes are blob references. `upstream_versions_sha256_idx` (0013) serves this.
+        let found: Vec<String> = query.build_query_scalar().fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(found.into_iter().collect())
     }
 
     async fn record_quarantine(&self, entry: NewQuarantineEntry, now: DateTime<Utc>) -> Result<QuarantineEntry> {

@@ -10,6 +10,8 @@
 //!   whose column is declared `COLLATE "C"` in migration 0004 — under a locale collation the
 //!   key's punctuation and case rules would be folded away and pre-releases would reorder.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::package::{
@@ -517,6 +519,23 @@ impl PackageRepo for PgPackageRepo {
             .map_err(db_err)?;
         let count: i64 = row.get("n");
         Ok(count.max(0) as u64)
+    }
+
+    async fn live_sha256s(&self, hashes: &[String]) -> Result<HashSet<String>> {
+        if hashes.is_empty() {
+            // One bind of an empty array would work here, unlike SQLite — the contract is the
+            // same on both dialects so that the collector's cost model does not depend on which
+            // database it is talking to.
+            return Ok(HashSet::new());
+        }
+        let found: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT archive_sha256 FROM versions WHERE NOT tombstone AND archive_sha256 = ANY($1)",
+        )
+        .bind(hashes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(found.into_iter().collect())
     }
 
     async fn transfer(&self, id: PackageId, to_org: OrgId, now: DateTime<Utc>) -> Result<Package> {
