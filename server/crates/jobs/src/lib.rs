@@ -9,7 +9,12 @@
 //!   S-17 shadowing alarm for names upstream carries that this instance claims.
 //! - [`gc`] — unreferenced-blob collection. Content addressing means a blob can be shared by
 //!   things that never met, so a key is collectable only when both the local version register
-//!   and the proxy cache agree nothing live points at it.
+//!   and the proxy cache agree nothing live points at it. Off by default, and it streams its
+//!   key space one shard at a time from a durable cursor, because it deletes bytes a
+//!   `pubspec.lock` may pin (decision 31).
+//! - [`staging`] — abandoned staged uploads, the *other* byte collector and the one that is
+//!   **on by default**: an unfinished publish leaves an archive that no row and no session can
+//!   ever reach again, so age alone decides it and no database is consulted (decision 31).
 //!
 //! - [`reindex`] — search-index rebuild. The index is a projection maintained best-effort by
 //!   the publish path, so something has to close the gap; this is also how an existing instance
@@ -48,6 +53,7 @@ pub mod queue;
 pub mod registry;
 pub mod reindex;
 mod scheduler;
+pub mod staging;
 
 pub use downloads::{DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, RollupReport};
 pub use fanout::FanoutHandler;
@@ -60,5 +66,6 @@ pub use queue::{HandlerReport, JobHandler, QUEUE_JOB, QueuePolicy, QueueReport, 
 pub use registry::JobRegistry;
 pub use reindex::{REINDEX_JOB, ReindexPolicy, ReindexReport, Reindexer};
 pub use scheduler::{Scheduler, SchedulerHandle};
+pub use staging::{STAGING_SWEEP_JOB, StagingPolicy, StagingReport, StagingSweeper};
 
 pub use pub_core::traits::JobLock;

@@ -256,15 +256,45 @@ impl Settings {
         if gc.interval_secs == 0 {
             return Err(invalid("jobs.blob_gc.interval_secs must be greater than 0"));
         }
-        // A staged upload is finalizable — and therefore live — for an hour after its bytes are
-        // written, with no database row referencing it. A shorter grace period would let the
-        // collector delete a publish out from under the client that is retrying its finalize.
+        // The publish pipeline writes an archive before the row that references it, so a fresh
+        // blob is legitimately unreferenced for the width of one publish. An hour is the floor
+        // kept from when this collector also swept staged uploads: it is generous against a slow
+        // publish and against clock skew between the application host and the object store.
         if gc.min_age_secs < 3600 {
             return Err(invalid(format!(
-                "jobs.blob_gc.min_age_secs = {} must be at least 3600: a staged upload stays finalizable \
-                 for an hour with nothing referencing it",
+                "jobs.blob_gc.min_age_secs = {} must be at least 3600: an archive is legitimately \
+                 unreferenced while the publish that wrote it is still running",
                 gc.min_age_secs
             )));
+        }
+        if gc.budget_secs == 0 {
+            // A pass with no budget is a leader lock held for a whole sweep of the key space —
+            // the shape this collector was rewritten to leave (decision 31).
+            return Err(invalid("jobs.blob_gc.budget_secs must be greater than 0"));
+        }
+        // Zero would be a collector that can never resolve a candidate; the ceiling keeps one
+        // batch inside SQLite's bind-variable limit (999) with room to spare.
+        if gc.batch == 0 || gc.batch > 500 {
+            return Err(invalid(format!("jobs.blob_gc.batch = {} must be between 1 and 500", gc.batch)));
+        }
+
+        let staging = &self.jobs.staging;
+        if staging.interval_secs == 0 {
+            return Err(invalid("jobs.staging.interval_secs must be greater than 0"));
+        }
+        // The one bound that is a correctness rule rather than a cost knob: a staged upload is
+        // finalizable — and therefore live — for an hour after its bytes are written, with no
+        // database row referencing it. A shorter grace period would let the sweep delete a
+        // publish out from under the client that is retrying its finalize.
+        if staging.min_age_secs < 3600 {
+            return Err(invalid(format!(
+                "jobs.staging.min_age_secs = {} must be at least 3600: a staged upload stays finalizable \
+                 for an hour with nothing referencing it",
+                staging.min_age_secs
+            )));
+        }
+        if staging.budget_secs == 0 {
+            return Err(invalid("jobs.staging.budget_secs must be greater than 0"));
         }
 
         let reindex = &self.jobs.reindex;

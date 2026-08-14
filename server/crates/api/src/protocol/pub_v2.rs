@@ -144,8 +144,10 @@ pub struct SuccessMessage {
 /// different token publish someone else's bytes under its own provenance (S-21).
 ///
 /// `user_id` and `size` are written but not read by finalize (the token binding is the
-/// stricter check): they are the forensic and accounting fields the abandoned-upload sweeper
-/// will need — TODO(jobs crate), together with dropping staged blobs whose record has expired.
+/// stricter check): they are forensic and accounting fields, kept for the per-org storage quota
+/// S-20 still owes. The abandoned-upload sweep does **not** read them — it collects staged bytes
+/// by age alone and never consults this record, deliberately
+/// ([decision 31](../../../../../docs/decisions.md), `pub_jobs::staging`).
 #[derive(Debug, Serialize, Deserialize)]
 struct UploadSession {
     token_id: TokenId,
@@ -1108,6 +1110,10 @@ mod tests {
         assert!(!key.starts_with(&format!("{}/", FORMAT.as_str())), "{key} collides with published archives");
     }
 
+    /// The shape is a contract with a job in another crate: `pub_jobs::staging` only collects
+    /// `uploads/<format>/<32 lowercase hex>.tar.gz` and leaves everything else alone, so an id
+    /// that changed length or alphabet would stop abandoned uploads from ever being swept —
+    /// silently, and on the side of keeping garbage rather than deleting bytes (decision 31).
     #[test]
     fn session_ids_are_128_bit_hex_and_unique() {
         let a = new_session_id();

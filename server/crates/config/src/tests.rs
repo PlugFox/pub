@@ -1005,6 +1005,36 @@ fn the_mirror_and_the_gc_are_both_off_by_default() {
 }
 
 #[test]
+fn the_staged_upload_sweep_is_on_by_default_and_deletes() {
+    // The other half of decision 31, and the opposite default on purpose: an unfinished publish
+    // leaves bytes that no row, no URL and no client can reach once the session record expires,
+    // so a default install that never collects them just accumulates them (D22). The grace
+    // period has to outlive the one-hour upload TTL, and does, with room for clock skew.
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert!(settings.jobs.staging.enabled);
+    assert!(!settings.jobs.staging.dry_run, "a report nobody reads is not a sweep");
+    assert_eq!(settings.jobs.staging.min_age_secs, 2 * 3600);
+    assert!(settings.jobs.staging.min_age_secs > 3600);
+
+    let summary = settings.summary();
+    assert!(summary.contains("jobs.staging         = every 3600s, grace 7200s"), "{summary}");
+    assert!(!summary.contains("jobs.staging         = <disabled"), "{summary}");
+}
+
+#[test]
+fn switching_the_staged_upload_sweep_off_says_what_that_costs() {
+    // It is the one byte collector that is normally on, so the startup log has to make an
+    // operator's own decision visible rather than printing a bare `<disabled>`.
+    let settings = load_from(&CliArgs::default(), env(&[("PUB_JOBS__STAGING__ENABLED", "false")])).unwrap();
+    assert!(!settings.jobs.staging.enabled);
+    assert!(
+        settings.summary().contains("jobs.staging         = <disabled — abandoned uploads are kept forever>"),
+        "{}",
+        settings.summary()
+    );
+}
+
+#[test]
 fn mirror_and_gc_settings_come_from_the_environment_and_are_summarized() {
     let settings = load_from(
         &CliArgs::default(),
@@ -1055,9 +1085,21 @@ fn nonsensical_job_settings_are_startup_errors() {
         ("PUB_UPSTREAM__MIRROR__REFRESH_AFTER_SECS", "0"),
         ("PUB_UPSTREAM__MIRROR__RESWEEP_AFTER_SECS", "0"),
         ("PUB_JOBS__BLOB_GC__INTERVAL_SECS", "0"),
-        // A grace period below the staged-upload TTL would let the collector delete a publish
-        // out from under a client that is still retrying its finalize.
+        // A grace period below an hour would let the collector delete an archive whose publish
+        // is still running — the pipeline writes the bytes before the row that references them.
         ("PUB_JOBS__BLOB_GC__MIN_AGE_SECS", "60"),
+        // A pass with no budget is a leader lock held for a whole sweep of the key space, and a
+        // batch outside these bounds is either a collector that cannot decide anything or one
+        // that outgrows SQLite's bind-variable ceiling (decision 31).
+        ("PUB_JOBS__BLOB_GC__BUDGET_SECS", "0"),
+        ("PUB_JOBS__BLOB_GC__BATCH", "0"),
+        ("PUB_JOBS__BLOB_GC__BATCH", "501"),
+        ("PUB_JOBS__STAGING__INTERVAL_SECS", "0"),
+        // The one that is a correctness rule rather than a cost knob: a staged upload is
+        // finalizable — and therefore live — for an hour with nothing referencing it, so a
+        // shorter grace period deletes a publish out from under the client retrying its finalize.
+        ("PUB_JOBS__STAGING__MIN_AGE_SECS", "3599"),
+        ("PUB_JOBS__STAGING__BUDGET_SECS", "0"),
     ];
     for (key, value) in cases {
         assert!(load_from(&CliArgs::default(), env(&[(key, value)])).is_err(), "accepted {key} = {value}");

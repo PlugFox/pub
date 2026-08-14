@@ -33,7 +33,7 @@ use pub_jobs::{
     BLOB_GC_JOB, BlobGc, DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, FanoutHandler, GcPolicy,
     InMemoryJobLock, JobLockTtls, JobRegistry, LIFECYCLE_JOB, LifecyclePolicy, LifecycleWorker, MIRROR_JOB,
     MailHandler, MirrorMode, MirrorPolicy, MirrorWorker, QUEUE_JOB, QueuePolicy, REINDEX_JOB, ReindexPolicy, Reindexer,
-    Scheduler, SchedulerHandle,
+    STAGING_SWEEP_JOB, Scheduler, SchedulerHandle, StagingPolicy, StagingSweeper,
 };
 use pub_kv::{MemoryKv, RedisKv};
 use pub_mail::{BootSmtp, InMemoryMailer, RuntimeMailer, SmtpMailerBuilder};
@@ -398,8 +398,16 @@ fn spawn_jobs(
     // raising `lease_secs` silently set the lock lifetime of mirror sync, reindex, blob GC and the
     // download rollup as well.
     let lifecycle_cfg = settings.jobs.lifecycle;
+    let gc_budget = Duration::from_secs(settings.jobs.blob_gc.budget_secs);
+    let staging_budget = Duration::from_secs(settings.jobs.staging.budget_secs);
     let ttls = JobLockTtls::default()
         .set(QUEUE_JOB, JobLockTtls::DEFAULT.max(queue_policy.lease))
+        // The byte collectors, on the same rule as the retention pass below: twice the budget,
+        // because a pass is always a little longer than the budget it checks between units of
+        // work, and a lock that expires under a running sweep lets a second one start beside it
+        // (decision 31).
+        .set(BLOB_GC_JOB, JobLockTtls::DEFAULT.max(gc_budget.saturating_mul(2)))
+        .set(STAGING_SWEEP_JOB, JobLockTtls::DEFAULT.max(staging_budget.saturating_mul(2)))
         // Twice the budget, not once. A pass is always strictly longer than its budget — the check
         // happens between batches, so the statement in flight when it expires runs to completion,
         // and `finish_run` plus the checkpoint follow — so a TTL equal to the budget has zero
@@ -539,6 +547,9 @@ fn spawn_jobs(
         registered.push(DOWNLOAD_ROLLUP_JOB);
     }
 
+    // The two byte collectors (decision 31). They are separate jobs because they delete two
+    // different things: this one removes archives a `pubspec.lock` may pin and ships off, the
+    // next one removes staged uploads nothing can reach and ships on.
     let gc_cfg = settings.jobs.blob_gc;
     if gc_cfg.enabled {
         let policy = GcPolicy {
@@ -546,9 +557,11 @@ fn spawn_jobs(
             interval: Duration::from_secs(gc_cfg.interval_secs),
             dry_run: gc_cfg.dry_run,
             min_age: chrono::Duration::seconds(gc_cfg.min_age_secs as i64),
+            batch: gc_cfg.batch,
+            budget: Duration::from_secs(gc_cfg.budget_secs),
         };
         let interval = policy.interval;
-        let gc = Arc::new(BlobGc::new(repos, blob, vec![Format::Pub], policy));
+        let gc = Arc::new(BlobGc::new(repos.clone(), Arc::clone(&blob), vec![Format::Pub], policy));
         triggers = triggers.with_blob_gc(Arc::clone(&gc));
         scheduler.add(BLOB_GC_JOB, interval, move || {
             let gc = Arc::clone(&gc);
@@ -558,6 +571,28 @@ fn spawn_jobs(
             }
         });
         registered.push(BLOB_GC_JOB);
+    }
+
+    let staging_cfg = settings.jobs.staging;
+    if staging_cfg.enabled {
+        let policy = StagingPolicy {
+            enabled: true,
+            interval: Duration::from_secs(staging_cfg.interval_secs),
+            dry_run: staging_cfg.dry_run,
+            min_age: chrono::Duration::seconds(staging_cfg.min_age_secs as i64),
+            budget: Duration::from_secs(staging_cfg.budget_secs),
+        };
+        let interval = policy.interval;
+        let sweeper = Arc::new(StagingSweeper::new(repos, blob, vec![Format::Pub], policy));
+        triggers = triggers.with_staging_sweep(Arc::clone(&sweeper));
+        scheduler.add(STAGING_SWEEP_JOB, interval, move || {
+            let sweeper = Arc::clone(&sweeper);
+            async move {
+                sweeper.run_once(chrono::Utc::now()).await?;
+                Ok(())
+            }
+        });
+        registered.push(STAGING_SWEEP_JOB);
     }
 
     let triggers: Arc<dyn JobTrigger> = Arc::new(triggers);

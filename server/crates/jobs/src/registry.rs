@@ -35,6 +35,7 @@ use crate::lock::JobLockTtls;
 use crate::mirror::{MIRROR_JOB, MirrorWorker};
 use crate::queue::{QUEUE_JOB, QueueWorker};
 use crate::reindex::{REINDEX_JOB, Reindexer};
+use crate::staging::{STAGING_SWEEP_JOB, StagingSweeper};
 
 /// Releases a job lock when dropped, including when the run it guards is **cancelled**.
 ///
@@ -259,7 +260,7 @@ impl JobRegistry {
         self
     }
 
-    /// Registers the unreferenced-blob collector (decision 06 addendum).
+    /// Registers the unreferenced-blob collector (decision 06 addendum, decision 31).
     #[must_use]
     pub fn with_blob_gc(mut self, worker: Arc<BlobGc>) -> Self {
         self.runners.insert(
@@ -274,8 +275,39 @@ impl JobRegistry {
                         "bytes": report.bytes,
                         "referenced": report.referenced,
                         "too_young": report.too_young,
-                        "staged": report.staged,
+                        "contested": report.contested,
                         "unrecognized": report.unrecognized,
+                        "shards": report.shards,
+                        // A manual run that stopped on its budget has to say so: "deleted 0" and
+                        // "did not get there" are the same number and different facts.
+                        "converged": report.converged,
+                        "resumes_at": report.cursor,
+                        "dry_run": report.dry_run,
+                    }))
+                }
+                .boxed()
+            }),
+        );
+        self
+    }
+
+    /// Registers the abandoned-staged-upload sweep (decision 31).
+    #[must_use]
+    pub fn with_staging_sweep(mut self, worker: Arc<StagingSweeper>) -> Self {
+        self.runners.insert(
+            STAGING_SWEEP_JOB.to_owned(),
+            Arc::new(move |now| {
+                let worker = Arc::clone(&worker);
+                async move {
+                    let report = worker.run_once(now).await?;
+                    Ok(serde_json::json!({
+                        "scanned": report.scanned,
+                        "deleted": report.deleted,
+                        "bytes": report.bytes,
+                        "too_young": report.too_young,
+                        "contested": report.contested,
+                        "unrecognized": report.unrecognized,
+                        "converged": report.converged,
                         "dry_run": report.dry_run,
                     }))
                 }

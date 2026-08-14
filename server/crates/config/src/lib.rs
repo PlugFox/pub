@@ -1023,8 +1023,10 @@ impl Default for MirrorConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobsConfig {
-    /// Unreferenced-blob garbage collection.
+    /// Unreferenced-archive garbage collection (off by default — it deletes published bytes).
     pub blob_gc: BlobGcConfig,
+    /// Abandoned-staged-upload sweep (on by default — nothing can reach those bytes).
+    pub staging: StagingConfig,
     /// Search-index rebuild (decision 11).
     pub reindex: ReindexConfig,
     /// Download-statistics rollup.
@@ -1264,11 +1266,16 @@ impl Default for DownloadsConfig {
     }
 }
 
-/// Unreferenced-blob GC settings.
+/// Unreferenced-archive GC settings ([decision 31](../../../docs/decisions.md)).
 ///
 /// Off and dry-run by default in both cases for the same reason: the job deletes bytes
 /// permanently, and byte stability is the one property this system cannot repair after the
 /// fact (S-18). An operator turns it on, reads a dry-run pass, then clears `dry_run`.
+///
+/// Abandoned staged uploads are **not** governed here — they are [`StagingConfig`], they are on
+/// by default, and the split is deliberate: `enabled = false` in this section must mean no bytes
+/// are deleted by it, and a staged upload nobody can finalize is not the same risk as an archive
+/// somebody may have pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BlobGcConfig {
@@ -1278,15 +1285,63 @@ pub struct BlobGcConfig {
     pub interval_secs: u64,
     /// Report what would be deleted and delete nothing.
     pub dry_run: bool,
-    /// Grace period: objects younger than this are never collected. Must exceed the staged
-    /// upload TTL (1 hour) — a staged upload is finalizable, and therefore live, that whole
-    /// time without any database row referencing it.
+    /// Grace period: objects younger than this are never collected. It covers the window in
+    /// which a freshly published archive is legitimately unreferenced — the pipeline writes the
+    /// bytes before the row — with room for a slow publish and for clock skew between hosts.
     pub min_age_secs: u64,
+    /// Collectable keys resolved per pair of reference queries.
+    ///
+    /// The job's cost model: one round trip per object is what made a sweep unaffordable on any
+    /// instance large enough to need one. Bounded above so a batch cannot outgrow SQLite's
+    /// bind-variable ceiling.
+    pub batch: u32,
+    /// Wall-clock bound on one pass, in seconds. A pass that spends it stops between shards and
+    /// records where to resume; the lock TTL is twice this.
+    pub budget_secs: u64,
 }
 
 impl Default for BlobGcConfig {
     fn default() -> Self {
-        Self { enabled: false, interval_secs: 6 * 3600, dry_run: true, min_age_secs: 24 * 3600 }
+        Self {
+            enabled: false,
+            interval_secs: 6 * 3600,
+            dry_run: true,
+            min_age_secs: 24 * 3600,
+            batch: 256,
+            budget_secs: 300,
+        }
+    }
+}
+
+/// Abandoned-staged-upload sweep settings ([decision 31](../../../docs/decisions.md),
+/// [S-20.a](../../../docs/security.md#4-supply-chain--registry-integrity)).
+///
+/// **On by default**, which is the one thing about this section worth reading twice. An
+/// unfinished publish leaves its archive in the staging namespace, and an hour later the session
+/// record is gone and nothing — no row, no URL, no client — can reach those bytes again. Before
+/// this section existed they were swept by the unreferenced-archive collector above, which ships
+/// disabled, so on a default install they were never collected at all and the only bound on the
+/// pile was the S-24 publish budget times the archive cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StagingConfig {
+    /// Whether the sweep is scheduled. Turning it off means staged uploads accumulate forever.
+    pub enabled: bool,
+    /// Seconds between passes.
+    pub interval_secs: u64,
+    /// Report what would be deleted and delete nothing.
+    pub dry_run: bool,
+    /// Grace period: staged objects younger than this are never collected. Must exceed the
+    /// one-hour upload TTL — an upload is finalizable, and therefore live, that whole time with
+    /// nothing referencing it.
+    pub min_age_secs: u64,
+    /// Wall-clock bound on one pass, in seconds.
+    pub budget_secs: u64,
+}
+
+impl Default for StagingConfig {
+    fn default() -> Self {
+        Self { enabled: true, interval_secs: 3600, dry_run: false, min_age_secs: 2 * 3600, budget_secs: 60 }
     }
 }
 
@@ -1656,6 +1711,21 @@ impl Settings {
             );
         } else {
             let _ = writeln!(out, "  jobs.blob_gc         = <disabled>");
+        }
+
+        let staging = &self.jobs.staging;
+        if staging.enabled {
+            let _ = writeln!(
+                out,
+                "  jobs.staging         = every {}s, grace {}s{}",
+                staging.interval_secs,
+                staging.min_age_secs,
+                if staging.dry_run { " (DRY RUN — nothing is deleted)" } else { "" }
+            );
+        } else {
+            // Worth a word: this is the one byte collector that is normally on, so an operator
+            // reading a startup log wants to know it is them who turned it off.
+            let _ = writeln!(out, "  jobs.staging         = <disabled — abandoned uploads are kept forever>");
         }
 
         // Auth: secrets masked (S-25); kids are public metadata and are listed for rotation
