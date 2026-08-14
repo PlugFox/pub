@@ -43,11 +43,12 @@ fmt:
     cd web && bun run fix
     taplo format server/Cargo.toml server/crates/*/Cargo.toml
 
-# Regenerate committed codegen artifacts (i18n modules + API types + config reference)
+# Regenerate committed codegen artifacts (i18n modules + API types + config/metrics references)
 gen:
     cd web && bun run i18n:gen
     cd web && bun run gen:api
     cd server && UPDATE_CONFIG_REFERENCE=1 cargo test -p pub-config --test reference
+    cd server && UPDATE_METRICS_REFERENCE=1 cargo test -p pub-telemetry --test catalogue
 
 # --- infra -----------------------------------------------------------------
 

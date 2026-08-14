@@ -9,11 +9,13 @@ Pub ships as **one binary, `pubd`**, with the web UI embedded ([decision 04](../
 | [reverse-proxy.md](reverse-proxy.md) | nginx / Caddy / Traefik examples: TLS, `public_url` correctness, `trust_proxy_headers`, SSE, upload sizes and timeouts |
 | [backup-restore.md](backup-restore.md) | What to back up and in which order, per database and blob backend; restore and post-restore verification |
 | [upgrade.md](upgrade.md) | Upgrade procedure, automatic forward-only migrations, version verification, why rollback means restore |
-| [security-runbook.md](security-runbook.md) | `require_auth_for_read` guidance (S-04.c), proxy-header trust (S-24.b), the key-rotation runbook (S-27), break-glass, responding to shadowing and quarantine alarms |
+| [security-runbook.md](security-runbook.md) | `require_auth_for_read` guidance (S-04.c), proxy-header trust (S-24.b), the key-rotation runbook (S-27), break-glass — including the mail-plane lockout and `pubd reset-smtp` — and responding to shadowing and quarantine alarms |
+| [monitoring.md](monitoring.md) | Turning the Prometheus exposition on, its separate listener, alert rules, a starting dashboard, and **how a dead mail plane surfaces** |
+| [metrics.md](metrics.md) | Every exported instrument — **generated from the exporter's catalogue**, do not edit by hand |
 | [token-scanning.md](token-scanning.md) | The published CLI-token format, regex, and offline checksum verification for secret scanners (S-15) |
 
 Not covered here because it does not exist yet (honesty over aspiration; each item is tracked):
-Prometheus `/metrics` and the other telemetry exports are inert flags today (roadmap D9);
 running more than one replica is unsafe despite the config validator accepting it with Redis (D1) — see [install.md](install.md#one-replica-for-now);
-the supply-chain registers (quarantine, shadowing) have no admin screens yet and are read through the audit log (D26);
-nothing purges old sessions, audit rows, or notifications (D12).
+the supply-chain registers (quarantine, shadowing) have no admin screens yet and are read through the audit log (D26) — the metrics and alert rules for them are in [monitoring.md](monitoring.md);
+nothing purges old sessions, audit rows, or notifications (D12);
+trace export is not implemented — this build exports metrics and logs, and the `telemetry.otlp` flag that promised otherwise was removed rather than left in place ([decision 23](../decisions.md#23--monitoring-is-optional)).

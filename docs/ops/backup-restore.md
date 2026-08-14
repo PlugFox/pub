@@ -12,7 +12,7 @@ The KV store (in-process or Redis) needs **no** backup: it carries caches, rate-
 
 The generated env/TOML fragment (`pubd generate-secrets`) is part of the backup set, and its pieces fail very differently:
 
-- **`auth.kek`** — irreplaceable. It seals every TOTP seed and the runtime-stored SMTP password ([S-26](../security.md#6-secrets--configuration)). A restore with a *different* KEK silently bricks every enrolled second factor (roadmap D27; [security-runbook.md](security-runbook.md#the-kek-cannot-be-rotated-today)).
+- **`auth.kek`** — irreplaceable. It seals every TOTP seed, the runtime-stored SMTP password, **and the body of every queued message** ([S-26](../security.md#6-secrets--configuration)). A restore with a *different* KEK silently bricks every enrolled second factor (roadmap D27; [security-runbook.md](security-runbook.md#the-kek-cannot-be-rotated-today)) — and queued mail is worse than bricked: a body the KEK cannot open **dead-letters on the first attempt, not after eight**, so every in-flight sign-in code and invitation in the restored queue is discarded with no retry. Those rows live for minutes, so restoring a backup taken minutes ago under a new KEK costs a handful of undelivered codes; it is silent, which is why it is written here.
 - **`auth.jwt.kid` + `signing_key`** — losing them logs every browser session out (users sign in again). Annoying, recoverable.
 - **`auth.otp_pepper`** — losing it invalidates outstanding OTP codes, which live 10 minutes anyway. Trivial.
 
@@ -84,8 +84,10 @@ curl -s https://pub.example.com/healthz     # status: ok, checks all true
 curl -s https://pub.example.com/pub/api/packages/<some_public_package> | head -c 400
 curl -sfo /dev/null "<an archive_url from that listing>" && echo "archive ok"
 
-# 3. Auth round-trips: sign in through the web UI (proves OTP pepper + SMTP),
-#    and `dart pub get` a real project against the instance (proves tokens).
+# 3. Auth round-trips: sign in through the web UI and `dart pub get` a real project
+#    against the instance (proves tokens). The sign-in proves the OTP pepper; it proves
+#    SMTP only once the code actually arrives, because delivery is asynchronous — if it
+#    does not, read mail_transport_unusable and the audit log (ops/monitoring.md).
 ```
 
 If TOTP-enrolled users cannot pass their second factor after a restore, the running KEK is not the one the backup was sealed under — stop and fix the secret material before anything else; the seeds are unrecoverable without it.

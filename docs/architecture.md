@@ -10,7 +10,8 @@ Companion to [decisions.md](decisions.md) (the "why"); this is the "how". Backen
  browser ─JWT/localStorage►  ├─ protocol routes (/o/{org}/pub/api/…) │
  admin UI ──JWT──────────►  ├─ app REST API + SSE (/api/v1/…)        │
                         │   ├─ embedded static assets (Astro build)  │
-                        │   └─ /healthz /metrics /openapi.json       │
+                        │   └─ /healthz /openapi.json               │
+                        │      (metrics: its own listener, dec. 28)  │
                         │  core traits ─┬─ db: sqlite | postgres     │
                         │               ├─ blob: fs | s3 | memory    │
                         │               ├─ kv: memory | redis        │
@@ -29,7 +30,8 @@ server/
 ├── crates/
 │   ├── core/                   # domain types, error enums (decision 16), trait definitions:
 │   │                           #   PackageRepo UpstreamRepo UserRepo OrgRepo TokenRepo
-│   │                           #   SessionRepo AuditRepo SettingsRepo JobRepo
+│   │                           #   SessionRepo AuditRepo SettingsRepo JobRepo JobQueueRepo
+│   │                           #   NotificationRepo
 │   │                           #   BlobStore Kv (store+broker) PackageSearch Mailer JobLock
 │   │                           #   JobTrigger; runtime-settings document + ArcSwap cache
 │   │                           # zero infrastructure dependencies
@@ -52,19 +54,27 @@ server/
 │   │                           #   revocation chokepoint), instance administration
 │   │                           #   (runtime settings, users, orgs, audit, stats, jobs)
 │   ├── mail/                   # lettre + askama templates (text+HTML multipart)
-│   ├── jobs/                   # interval scheduler + JobLock leader election;
+│   ├── jobs/                   # interval scheduler + JobLock leader election, and the
+│   │                           #   durable queue worker (decision 26): queue.rs (claim,
+│   │                           #   backoff, dead letters, retention), fanout.rs, mail.rs;
 │   │                           #   mirror.rs (decision 07 sync worker driving
-│   │                           #   UpstreamService), gc.rs (unreferenced-blob GC);
-│   │                           #   later: session/OTP purge, reindex, webhook delivery
+│   │                           #   UpstreamService), gc.rs (unreferenced-blob GC),
+│   │                           #   reindex.rs, downloads.rs;
+│   │                           #   later: session/OTP purge, webhook delivery (S-33 is one
+│   │                           #   more kind on the same queue)
 │   ├── events/                 # the domain event bus (decision 22): in-process broadcast,
 │   │                           #   KV-broker bridge, replay ring, per-user stream budget
-│   │                           #   (bus.rs) + the notification center consumer (notify.rs)
+│   │                           #   (bus.rs) + notify.rs: the NotificationEnqueuer that turns
+│   │                           #   an event into ONE durable queue row, and the
+│   │                           #   NotificationCenter the queue worker calls to fan it out
 │   ├── api/                    # axum routers (utoipa OpenApiRouter), extractors, DTOs;
 │   │                           #   one protocol module per format (pub now; npm/cargo
 │   │                           #   later — decision 21) + app REST + SSE;
 │   │                           #   tower layers: auth, rate limit, CSP/security headers,
 │   │                           #   request-id, tracing, embedded-assets service
-│   ├── telemetry/              # tracing init, optional OTLP, prometheus metrics
+│   ├── telemetry/              # tracing init (pretty|json), the instrument catalogue that
+│   │                           #   generates docs/ops/metrics.md, and the Prometheus
+│   │                           #   exposition on its own listener (decision 28)
 └── └── bin/pubd/               # clap entrypoint: load config → build Arc<dyn Trait>
                                 #   AppState → migrate → spawn jobs → serve
 ```
@@ -82,7 +92,8 @@ Wiring is plain runtime polymorphism: `AppState` holds `Arc<dyn PackageRepo>`, `
 - `jobs (name, cursor, phase, last_run_at, last_success_at, last_error, runs, processed, failures)` — durable background-job state behind `JobRepo`, keyed by the same name the `JobLock` uses. The cursor is opaque to the repository (interpreting it would put job logic in the schema) and counters are added to rather than written, so a run that dies between checkpoints leaves its partial progress recorded. This is what makes a full mirror sweep resume across restarts and leader changes.
 - `sessions` (refresh-token hash, device metadata, revoked_at) and `tokens` (SHA-256 hash, display hint, scopes, org binding, package patterns, expiry, last_used throttled).
 - `audit_log` — append-only (INSERT-only DB role), ULID ids, dot-namespaced actions, actor/IP/UA/org/target/metadata.
-- `notifications (user_id, category, event, title, org_id, payload, created_at, read_at)` and `notification_prefs (user_id, category, in_app, email)` — the notification center ([decision 20](decisions.md#20--realtime-sse-event-stream--notification-center), migration 0009) behind `NotificationRepo`. Fan-out is at **write time**: one row per recipient, decided against the membership as it stands when the event happens, so a later joiner never inherits older private-package activity and a leaver keeps nothing new. `org_id` deliberately carries **no foreign key**, for the same reason `audit_log.org_id` has none — a record of something that happened has to stay readable after the organization it happened in is erased. Preferences are stored sparsely: an absent row means the category's default (`in_app` on for all three, `email` on for the high-importance `org` and `security`), which is what lets a category added by a later release behave correctly for accounts that predate it.
+- `job_queue (id, kind, priority, payload, state, attempts, run_after, locked_until, dedupe_key, last_error, created_at, updated_at)` — the durable queue ([decision 26](decisions.md#26--durable-job-queue-async-fan-out-and-outbound-mail-off-the-request-path), migration 0010, extended by 0011) behind `JobQueueRepo`. Claimed one priority lane at a time (`FOR UPDATE SKIP LOCKED` on Postgres, a single-writer `UPDATE … RETURNING` on SQLite), with an exponential backoff ladder, dead letters, and per-terminal-state retention. `dedupe_key` is what makes a re-enqueue a no-op.
+- `notifications (user_id, category, event, title, org_id, payload, created_at, read_at, event_id)` and `notification_prefs (user_id, category, in_app, email)` — the notification center ([decision 20](decisions.md#20--realtime-sse-event-stream--notification-center), migration 0009) behind `NotificationRepo`. `event_id` and its partial unique index on `(user_id, event_id)` (migration 0011) are what make fan-out **exactly once** — the batched insert is `ON CONFLICT DO NOTHING`, so a worker that crashes mid-fan-out converges to the same rows on re-run. Fan-out is one row per recipient, decided against the membership as it stands when the event happens, so a later joiner never inherits older private-package activity and a leaver keeps nothing new. `org_id` deliberately carries **no foreign key**, for the same reason `audit_log.org_id` has none — a record of something that happened has to stay readable after the organization it happened in is erased. Preferences are stored sparsely: an absent row means the category's default (`in_app` on for all three, `email` on for the high-importance `org` and `security`), which is what lets a category added by a later release behave correctly for accounts that predate it.
 - `webhooks (org_id | null for instance-wide, url, secret_enc, event_filters, active)` and `webhook_deliveries (webhook_id, event_id, status, attempts, last_error)` — outbound integrations ([decision 22](decisions.md#22--domain-event-bus-webhooks-and-integrations-on-top), S-33), delivered by the jobs crate.
 - `package_search` + `package_tags` — the search index ([decision 11](decisions.md#11--search-behind-a-trait), migration 0007) behind `PackageSearch`. One denormalized document per package **that has a live version** (org slug, visibility/discontinued/unlisted flags, the newest version's description, topics, README text, version count, freshness, denormalized download totals), plus a Postgres `tsvector` generated column with a GIN index and a `pg_trgm` index on the name, or a SQLite FTS5 external-content table with sync triggers. `package_tags (package_id, kind, value)` holds the exact-match dimensions — `topic:`, `dependency:`, `dev_dependency:` — and with them the reverse dependency graph. Both are **derived data**: rebuildable in full by the reindex job, which is what lets the publish path treat an index write as best-effort.
 - `download_stats (package_id, version_id, date, count)` — daily rollups aggregated from fire-and-forget download events (HEAD/GET dedup as in foxic: pub clients HEAD before GET, only GET counts); powers package/org/instance statistics. Counting a download costs **no I/O**: the archive handler increments an in-process buffer (`registry/src/stats.rs`) that the rollup job drains on its interval with an *additive* upsert, so several instances flushing the same day sum correctly. The trade-off is explicit — a crash loses up to one flush interval on that instance, which is acceptable for a statistic and is why nothing decides anything from these numbers.
@@ -137,11 +148,16 @@ A cached listing is served without asking upstream for `upstream.listing_ttl_sec
 ```
  domain service ──emit──► EventBus ──┬──► in-process broadcast ──► SSE writer task per stream
                                      ├──► KV broker topic ────────► peer instances' streams
-                                     ├──► NotificationCenter ─────► notifications rows + email
-                                     └──► (webhooks: the seam, v1.1)
+                                     ├──► NotificationEnqueuer ───► ONE job_queue row
+                                     └──► (webhooks: another job kind, v1.1)
+
+ queue drain (JobLock leader) ──► FanoutHandler ──► NotificationCenter::deliver
+                                                     ├──► notifications rows (one batch)
+                                                     ├──► queued mail rows (one per recipient)
+                                                     └──► publish_followup ──► the stream
 ```
 
-Every instance republishes to the broker topic and subscribes to peers, so any instance can serve any client's stream; the payload carries an `origin` so a publisher ignores its own echo. **Consumers run only on the emitting instance** — a peer feeds an inbound event to its stream and to nothing else, or N replicas would file N notification rows for one event. A consumer's follow-up events (the center returns one `UserNotified` per recipient) are broadcast but never re-consumed, so there is no cycle.
+Every instance republishes to the broker topic and subscribes to peers, so any instance can serve any client's stream; the payload carries an `origin` so a publisher ignores its own echo. **The enqueue runs only on the emitting instance; the drain runs on the `JobLock` leader** ([decision 26](decisions.md#26--durable-job-queue-async-fan-out-and-outbound-mail-off-the-request-path)) — a peer feeds an inbound event to its stream and to nothing else, or N replicas would file N queue rows for one event. Slow work is therefore never on the request path: the emitting request writes exactly one row, and its cost is constant in the recipient count. A consumer's follow-up events (the center returns one `UserNotified` per recipient) are broadcast but never re-consumed, so there is no cycle.
 
 The browser uses fetch-streaming (not `EventSource` — it cannot set `Authorization`). Heartbeats are the revocation re-check (S-32): the config validator refuses a heartbeat at or above the access TTL, and the stream also ends at the token's `exp`. `Last-Event-ID` replays best-effort from a bounded **per-instance** ring through the *same* visibility filter live delivery uses, so a reconnect can never widen what a principal sees; ids are ULIDs minted at the origin, so they still compare in time order across instances. Filtering reads exactly one thing — `DomainEvent::audience()` (`Org` | `Instance` | `User`) — through the `authorize()` chokepoint. The stream is a hint channel: clients reconcile through the REST API, so lost events are never correctness bugs.
 
@@ -151,14 +167,16 @@ The browser uses fetch-streaming (not `EventSource` — it cannot set `Authoriza
 
 Interval scheduler in `jobs/` guarded by `JobLock` leader election (PG advisory lock / Redis lock / trivial single-node): mirror sync, unreferenced-blob GC, expired session/OTP/invitation purge, audit retention, search reindex, token-expiry notification emails. Job state (last-run, cursors) in DB; every job idempotent and safe to rerun.
 
-Two jobs exist today, both **off by default** and each skipped entirely when disabled — a job that is not registered cannot tick, which is a stronger guarantee than one whose body returns early:
+Five jobs ship today. Four are **off by default** except the download rollup, and each disabled one is skipped entirely rather than returning early — a job that is not registered cannot tick, which is the stronger guarantee. The **queue drain is the exception with no `enabled` key at all**: it carries sign-in mail, so an operator who could disable it would not be able to sign in to re-enable it ([decision 26](decisions.md#26--durable-job-queue-async-fan-out-and-outbound-mail-off-the-request-path)).
+
+- **Queue drain** (`queue.rs`, decision 26). Claims a bounded batch per tick, dispatches it with bounded concurrency across the registered handlers (`fanout.rs`, `mail.rs`), re-reads the clock per pass so leases and backoffs are computed from the present, and stops when it has spent a fraction of its own lease. Retention runs on the same tick, per terminal state. **Always on**, and the only place outbound SMTP happens.
 
 - **Mirror sync** (`mirror.rs`, decision 07 second half). `off` | `recent` | `full`. `recent` re-polls the packages this instance already caches, oldest snapshot first; `full` first enumerates upstream's `/api/package-names`, chunked and resumable from a durable cursor, then behaves like `recent` until `resweep_after` starts the next enumeration. Both drive `UpstreamService::refresh` — the read-through pipeline with the read TTL replaced by a caller-supplied freshness floor — so there is no second ingest path. A name claimed locally is observed as an [S-17](security.md#4-supply-chain--registry-integrity) alarm and never mirrored; an open circuit skips the whole tick rather than spending the half-open probe on the first name of a chunk.
 - **Unreferenced-blob GC** (`gc.rs`). Collects content-addressed archives no live version and no cached upstream version references, plus staged uploads past the grace period. Dry-run by default; `min_age` (≥ the 1-hour staged-upload TTL) protects the window in which a blob is legitimately unreferenced, since publish writes bytes before the version row.
 - **Search reindex** (`reindex.rs`, decision 11). Walks every package via `PackageRepo::list_all` and rebuilds its document through the same `pub_registry::index::build_document` the publish path uses, so a repaired index is what incremental maintenance would have produced. Chunked with a durable `(format, name)` cursor — a tick's cost is bounded and a restart resumes — and a completed sweep waits out `resweep_after`. Off by default: this is the *repair* tool (a failed incremental write, a scoring change, migration 0007 arriving on an instance that already has packages), not how documents normally get written.
 - **Download rollup** (`downloads.rs`). Drains the in-process download buffer into `download_stats`, then writes the touched packages' totals back onto their search documents so `sort:downloads` reads one indexed column. **On by default** — unlike every other job here, because it is the only thing that moves buffered counts into the database: disabling it does not mean fewer statistics, it means a buffer that fills and starts dropping.
 
-Domain counters these jobs feed (decision 23, exporter off by default): `upstream_fetch_total{kind,outcome}`, `cache_hit_ratio`, `upstream_sync_lag_seconds`, `quarantine_total`, `shadowing_alarms_total`, `blob_gc_{scanned,deleted,bytes}_total`, `search_reindex_{documents,removed}_total`, `downloads_total`.
+Every instrument these jobs feed is catalogued in **[ops/metrics.md](ops/metrics.md)**, which is generated from the exporter's own list and fails the build when the two disagree — this paragraph used to hand-list them, and drifted to 11 names against 21 emitted before anything noticed ([decision 28](decisions.md#28--the-observability-plane-its-own-listener-bounded-labels-and-timing-that-stays-opt-in)).
 
 ## Frontend workspace
 
@@ -187,7 +205,7 @@ Boot-time only (env/CLI/mounted files, never DB): DB URL, blob credentials, Redi
 
 ## Observability
 
-`tracing` + JSON logs, request-id propagation, Server-Timing on hot paths. Exports are opt-in and off by default ([decision 23](decisions.md#23--monitoring-is-optional)): Prometheus `/metrics` (HTTP RED + domain counters: downloads_total, publishes_total, upstream_sync_lag, cache_hit_ratio; optionally on its own listen address) and OTLP trace export, both isolated in `telemetry/`. `/healthz` is always on and reports configured backends and migration status.
+`tracing` with a configurable format (`telemetry.log_format = pretty | json`) and request-id propagation, always on. Exports are opt-in and off by default ([decision 23](decisions.md#23--monitoring-is-optional)): the Prometheus exposition — HTTP RED metrics plus the domain instruments catalogued in [ops/metrics.md](ops/metrics.md) — is served on **its own listener** (`telemetry.metrics_listen`, default loopback), never as a route on the application port, for the reasons in [decision 28](decisions.md#28--the-observability-plane-its-own-listener-bounded-labels-and-timing-that-stays-opt-in). `Server-Timing` is a separate opt-in and is **never** emitted on the authentication family ([S-04.d](security.md#1-authentication)). Trace export is not implemented; the `telemetry.otlp` flag that claimed otherwise was removed rather than left in place. `/healthz` is always on, reports configured backends, and memoizes its backend probes for one second so an unauthenticated probe loop is not an amplifier.
 
 ## Testing strategy
 

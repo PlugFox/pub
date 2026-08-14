@@ -1,0 +1,183 @@
+# Monitoring
+
+Metrics are **off by default** ([decision 23](../decisions.md#23--monitoring-is-optional)) and nothing about running Pub requires a monitoring stack. This page is for the deployment that wants one: how to turn the exposition on, what to alert on, and — the part that matters most on a self-hosted instance — **how a broken mail plane surfaces**, because since delivery moved off the request path it is the one failure that can lock an operator out of their own registry.
+
+Every instrument is listed in [metrics.md](metrics.md), which is generated from the exporter's own catalogue and fails the build if it drifts.
+
+## Turning it on
+
+```toml
+[telemetry]
+prometheus     = true
+metrics_listen = "127.0.0.1:9090"   # default
+log_format     = "json"             # optional: one JSON object per line, for a shipper
+```
+
+`/metrics` is served on **its own listener** and is never a route on the application port ([decision 28](../decisions.md#28--the-observability-plane-its-own-listener-bounded-labels-and-timing-that-stays-opt-in)). Three reasons, and each one is enough on its own:
+
+- the application listener sheds load under saturation, so a scrape mounted there goes dark exactly when you are trying to find out why the instance is saturated;
+- the exposition would inherit the application's cache and error-shape middleware, none of which is right for it;
+- it would be published on the instance's public origin, which is not a default anybody should inherit.
+
+**The exposition is unauthenticated.** The default binds loopback, which is correct for a Prometheus running on the same host or a sidecar in the same pod. Publishing it (`0.0.0.0:9090`) is a deliberate act — put it on an internal network, or in front of your proxy's allowlist. The config validator refuses a `metrics_listen` that shares a port with `server.listen`.
+
+### Docker and compose
+
+The image keeps its single `EXPOSE`; map the second port yourself when you need it from outside the container:
+
+```yaml
+services:
+  pub:
+    environment:
+      PUB_TELEMETRY__PROMETHEUS: "true"
+      PUB_TELEMETRY__METRICS_LISTEN: "0.0.0.0:9090"   # required in a container: loopback is
+                                                      # the container's own loopback
+    ports:
+      - "127.0.0.1:9090:9090"                         # bind the host side to loopback
+```
+
+### Scrape config
+
+```yaml
+scrape_configs:
+  - job_name: pub
+    static_configs:
+      - targets: ["pub-host:9090"]
+```
+
+## `Server-Timing`
+
+Off by default and **never emitted on `/api/v1/auth/*`, whatever the flag says** ([S-04.d](../security.md#1-authentication)). Enabling it (`telemetry.server_timing = true`) publishes exact server-side durations on the read model and the pub protocol, both of which answer 404 for "not yours" as well as "does not exist" — the header hands a prober the timing differential that the network would otherwise hide. It is a debugging aid for an instance you control, not a production default.
+
+## Alert rules
+
+Ship these; they are the signals that mean something on this product specifically.
+
+```yaml
+groups:
+  - name: pub
+    rules:
+      # --- the mail plane (roadmap D43, decision 29) --------------------------------------
+      # THE important one on an OTP-only instance. Outbound mail is asynchronous, so a broken
+      # relay costs nothing at request time and would otherwise surface ~21 minutes later as a
+      # dead letter — on the admin API, which needs a session, which arrives by mail. This
+      # gauge fires on the FIRST failure and needs no session to read.
+      - alert: PubMailTransportUnusable
+        expr: mail_transport_unusable == 1
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Pub cannot deliver outbound mail"
+          description: >-
+            Sign-in codes, invitations and notifications are not being delivered. A code expires
+            in 10 minutes and the retry ladder takes ~21 to dead-letter, so codes are being lost
+            now. If nobody can sign in to fix it, see the mail-plane break-glass entry in the
+            security runbook.
+
+      - alert: PubDeadLetters
+        expr: increase(queue_jobs_total{outcome="dead"}[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub gave up on {{ $value }} queued job(s) in the last hour"
+          description: "Dead letters are kept for 30 days; there is no requeue endpoint — fix the cause and have the action retried."
+
+      - alert: PubQueueBacklog
+        expr: sum(queue_depth{state="pending"}) > 1000
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub's job queue is growing faster than it drains"
+
+      # --- supply chain (decision 07, S-21) -----------------------------------------------
+      # Any of these is worth a human look. They are not errors; they are the signals the
+      # upstream proxy exists to produce.
+      - alert: PubUpstreamQuarantine
+        expr: increase(quarantine_total[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Upstream archive bytes did not match the advertised digest"
+          description: "Either a broken mirror or an attempted substitution. The archive was quarantined, not served."
+
+      - alert: PubUpstreamDrift
+        expr: increase(upstream_drift_total[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "An upstream version's bytes changed after Pub cached them"
+          description: "The cached copy was kept. A published version's bytes are immutable, so this is always a fact about the upstream."
+
+      - alert: PubShadowingAlarm
+        expr: increase(shadowing_alarms_total[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "A local package name also exists upstream"
+          description: "Dependency-confusion signal. Local always wins; decide whether that is what you want for this name."
+
+      - alert: PubMirrorSyncLag
+        expr: upstream_sync_lag_seconds > 86400
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub's mirror sweep has not completed for over a day"
+
+      # --- abuse limits (S-24) ------------------------------------------------------------
+      - alert: PubRateLimitFallback
+        expr: increase(rate_limit_fallback_total[5m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub's shared rate-limit store is unreachable"
+          description: >-
+            Auth-abuse limits are being enforced per instance instead of across the cluster
+            (S-24.e), so the effective budget is up to N x the limit on N replicas. Sign-in keeps
+            working; fix the KV.
+
+      # --- the basics ---------------------------------------------------------------------
+      - alert: PubHighErrorRate
+        expr: >-
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(http_requests_total[5m])) > 0.05
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Over 5% of Pub's responses are 5xx"
+
+      - alert: PubShedding
+        expr: sum(rate(http_requests_total{status="503"}[5m])) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub is shedding load"
+          description: "The instance is at its `http.concurrency_limit`. Raise it, or add capacity."
+```
+
+## A starting dashboard
+
+There is no dashboard JSON to import — one would be a large generated artifact that rots faster than this page. Six panels cover the instance:
+
+| Panel | Query |
+|---|---|
+| Request rate by status | `sum by (status) (rate(http_requests_total[5m]))` |
+| p95 latency by route | `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))` |
+| Publishes | `sum(rate(publishes_total[1h]))` |
+| Queue depth | `sum by (kind, state) (queue_depth)` |
+| Mail plane | `mail_transport_unusable` (stat, red on 1) |
+| Upstream cache hit ratio | `cache_hit_ratio` |
+
+The `route` label is the router's matched path (`/api/v1/packages/{name}`), or one of `{api}`, `{pub}`, `{asset}` for requests that matched no route — bounded on purpose, so an anonymous caller cannot mint label values.
+
+## When the mail plane is down
+
+Outbound mail is asynchronous ([decision 26](../decisions.md#26--durable-job-queue-async-fan-out-and-outbound-mail-off-the-request-path)), which changed the failure mode of every message the instance sends. A broken relay used to fail the request loudly; now the request succeeds, a row is filed, and the outcome arrives later.
+
+**Where it shows.** In order of how soon you learn:
+
+1. `mail_transport_unusable == 1` — on the first failure, and at startup if the SMTP section will not build at all.
+2. An audit row: `mail.delivery_failed` on the edge, `mail.delivery_recovered` when it comes back. One row per transition, not per attempt.
+3. The instance log — the same transition, at `error`.
+4. `GET /api/v1/admin/stats` → the queue drain's `phase`, e.g. `drain (3 dead)`, also rendered in the **State** column of the admin jobs table.
+5. `queue_jobs_total{kind="mail",outcome="dead"}` — the slowest signal, ~21 minutes after the first attempt.
+
+**What it costs.** With the shipped defaults (`max_attempts = 8`, `backoff_base_secs = 10`) the seven waits sum to about 21 minutes before a message can reach `dead`. A sign-in code expires after **10** minutes, so a code that needs two retries expires before it is delivered even if delivery eventually succeeds. Dead letters are kept for 30 days and there is **no requeue endpoint** — the honest instruction is: fix the relay, then have the user request a new code.
+
+**One restore-specific trap.** Queued mail bodies are sealed under `auth.kek`, and a body the KEK cannot open **dead-letters on the first attempt**, not after eight. Restoring a database under a different KEK therefore discards every in-flight message silently. See [backup-restore.md](backup-restore.md).
+
+**If nobody can sign in and mail is the reason**, the recovery is in the [security runbook](security-runbook.md#break-glass): `pubd reset-smtp`.

@@ -45,7 +45,7 @@ Home (top / popular / recently-updated packages, instance stats), login (configu
 5. Web UI: the full v1 screen set (see Screens) — home with tops, search, package pages, org/token/session management, account, notification center, admin panel.
 6. SSE event stream + notification center; basic download statistics (daily rollups, package counters).
 7. Security baseline: audit log (append-only), rate limits with anti-lockout, anti-enumeration, step-up auth, sign-in domain policy, retract + gated hard delete.
-8. Observability: `/healthz` always on; Prometheus metrics and OTLP export optional, config-gated (decision 23); structured tracing.
+8. Observability: `/healthz` always on; Prometheus metrics optional and config-gated on their own listener ([decision 28](decisions.md#28--the-observability-plane-its-own-listener-bounded-labels-and-timing-that-stays-opt-in)); structured tracing with a selectable log format. Trace export is not implemented and the flag that promised it was removed rather than left in place ([decision 23](decisions.md#23--monitoring-is-optional) amendment) — it returns as its own decision when it is built.
 
 **V1.1 (fast follow):** OSV advisories endpoint + upstream advisory relay, WebAuthn/passkeys, token expiry notification emails, upstream `delay` quarantine mode, download charts (weekly per version), outbound webhooks (HMAC-signed, per-org, delivery log), pub.dev-shaped `/score` and `/metrics` endpoints with stubbed payloads (ecosystem tooling reads them; real pana data comes later).
 

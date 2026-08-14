@@ -26,7 +26,7 @@ curl -s http://localhost:8080/healthz
 Two more things a real deployment needs on day one:
 
 - **`server.public_url`** (`PUB_SERVER__PUBLIC_URL`) — the exact URL clients reach you on. It is load-bearing far beyond cosmetics; set it before anything else and read [reverse-proxy.md](reverse-proxy.md#public_url-is-load-bearing).
-- **SMTP** (`PUB_SMTP__*`) — email OTP is the always-available sign-in factor ([decision 12](../decisions.md#12--auth-factors)), so an instance whose mail goes nowhere is an instance nobody can sign in to. Configure it in **boot config**: the admin-UI SMTP settings are accepted and stored but do not yet rebuild the mailer (roadmap D10).
+- **SMTP** (`PUB_SMTP__*`) — email OTP is the always-available sign-in factor ([decision 12](../decisions.md#12--auth-factors)), so an instance whose mail goes nowhere is an instance nobody can sign in to. Configure it in **boot config** even though the admin UI can change it at runtime: a stored SMTP section *replaces* the boot one wholesale, so the boot section is what an instance falls back to when the stored one is cleared with `pubd reset-smtp` — which is the supported way back in when a bad SMTP edit is what blocks sign-in ([break-glass](security-runbook.md#break-glass)). Mail is delivered asynchronously by the job queue; [monitoring.md](monitoring.md#when-the-mail-plane-is-down) covers how a failure surfaces.
 
 ### Production vs dev mode
 
