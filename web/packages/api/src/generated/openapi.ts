@@ -35,6 +35,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/audit/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Streams the audit log as NDJSON over a keyset walk (S-23).
+         * @description One request gets the whole filtered log: the handler walks pages internally and writes each one
+         *     to the wire before reading the next, so the response is a stream and never a buffer. Three
+         *     properties are the design and are worth stating where the code is:
+         *
+         *     - **Step-up gated** ([S-06.c](../../../../docs/security.md#1-authentication)). S-06's list is
+         *       about escalation and this grants nothing — but one request hands the caller every actor id, IP
+         *       and user agent the instance has recorded, which is the highest-value single read on the
+         *       surface and precisely what a stolen stale admin session is for. The *viewer* stays ungated:
+         *       the line is bulk, not sensitivity.
+         *     - **It ends with `{"done":true,"count":N}`.** Once the response head is sent there is no status
+         *       code left to report a failure, and a silently truncated compliance export is worse than a
+         *       failed one. A client that does not see the terminator has an incomplete file and can tell.
+         *     - **It is resumable.** `cursor` accepts the id of the last event a caller received, so a broken
+         *       connection costs the rows already written and nothing more.
+         *
+         *     The response body has no bound, which is [D38](../../../../docs/roadmap.md) — the deadline covers
+         *     the head and the concurrency permit is released on it. That is unchanged and deliberate here: an
+         *     export is a long response by design.
+         */
+        get: operations["export_audit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/jobs/{job}/run": {
         parameters: {
             query?: never;
@@ -3711,7 +3748,7 @@ export interface operations {
                 until: string | null;
                 /** @description Opaque cursor from the previous page. */
                 cursor: string | null;
-                /** @description Page size, 1..=100 (default 20). */
+                /** @description Page size, 1..=100 (default 20). Ignored by the export, which sizes its own round trips. */
                 limit: number | null;
             };
             cookie?: never;
@@ -3738,6 +3775,70 @@ export interface operations {
             };
             /** @description Not an instance administrator */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    export_audit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Only events in this org (id). */
+                org: string | null;
+                /** @description Only events whose dot-namespaced action starts with this prefix, e.g. `org.member.`. */
+                action: string | null;
+                /** @description Only events by this actor id. Interpreted per `actor_kind`. */
+                actor: string | null;
+                /** @description How to read `actor`: `user` (default) | `token`. */
+                actor_kind: string | null;
+                /** @description Only events at or after this time (RFC3339, inclusive). */
+                from: string | null;
+                /** @description Only events before this time (RFC3339, exclusive). */
+                until: string | null;
+                /** @description Opaque cursor from the previous page. */
+                cursor: string | null;
+                /** @description Page size, 1..=100 (default 20). Ignored by the export, which sizes its own round trips. */
+                limit: number | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The filtered audit log as NDJSON, one event per line, terminated by {"done":true,"count":N} */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Malformed cursor or filter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an instance administrator, or step-up required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Past the per-administrator export budget */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
