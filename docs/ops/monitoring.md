@@ -88,6 +88,35 @@ groups:
         annotations:
           summary: "Pub's job queue is growing faster than it drains"
 
+      # --- retention (roadmap D12/D46, decision 30) ---------------------------------------
+      # The expected cause is a Postgres provisioned per the hardened S-22 template without the
+      # EXECUTE grant on pub_audit_prune. Nothing else changes when this happens: the pass keeps
+      # sweeping every other table and reports success for them, so without this alert an audit
+      # log that grows forever looks exactly like one that does not.
+      - alert: PubRetentionRefused
+        expr: retention_refused_tables > 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub cannot delete from {{ $value }} table(s) it is configured to trim"
+          description: >-
+            S-23 retention was refused by the database. On PostgreSQL the app role deliberately
+            holds no DELETE on audit_log and prunes through a SECURITY DEFINER function; if the
+            EXECUTE grant is missing, run:
+            GRANT EXECUTE ON FUNCTION pub_audit_prune(TIMESTAMPTZ, INT) TO <app_role>;
+            The affected table is named in the instance log and in the lifecycle job's last error.
+
+      - alert: PubRetentionBacklog
+        expr: retention_backlog_tables > 0
+        for: 6h
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub's retention pass has not caught up in 6 hours"
+          description: >-
+            Transient after a window is lowered or a backup is restored — the next pass continues
+            where this one stopped. Persistent means the row rate is above what
+            jobs.lifecycle.batch and jobs.lifecycle.budget_secs can clear in 15 minutes.
+
       # --- supply chain (decision 07, S-21) -----------------------------------------------
       # Any of these is worth a human look. They are not errors; they are the signals the
       # upstream proxy exists to produce.
@@ -181,3 +210,34 @@ Outbound mail is asynchronous ([decision 26](../decisions.md#26--durable-job-que
 **One restore-specific trap.** Queued mail bodies are sealed under `auth.kek`, and a body the KEK cannot open **dead-letters on the first attempt**, not after eight. Restoring a database under a different KEK therefore discards every in-flight message silently. See [backup-restore.md](backup-restore.md).
 
 **If nobody can sign in and mail is the reason**, the recovery is in the [security runbook](security-runbook.md#break-glass): `pubd reset-smtp`.
+
+## What deletes rows, and what it needs
+
+One job deletes anything in this instance: `lifecycle-purge` ([decision 30](../decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature), [S-23](../security.md#5-audit--abuse)). It is **on by default** — a default install whose tables only grow is not a default — and it runs every 15 minutes.
+
+**What it removes**, per `[jobs.lifecycle]`; every window is a number of days and `0` means keep forever:
+
+| Table | Default | Aged from |
+|---|---|---|
+| `audit_log` | 730 d (≈24 months) | `created_at` — one window for every action, [S-23.a](../security.md#5-audit--abuse) |
+| `sessions` | 30 d | `last_seen_at`, so a purged row could no longer authenticate |
+| `invitations` | 30 d | whenever it settled — accepted, revoked, or expired |
+| `notifications` | 180 d | `created_at`; read state is not part of it |
+| `download_stats` | **keep forever** | `date`, when enabled |
+| `job_queue` | its own three windows in `[jobs.queue]` | `updated_at`, per terminal state |
+
+There is **no on/off switch for the job itself** — each window is one, and `0` means keep forever. That is deliberate: a job-level flag would also stop the `job_queue` windows you configured in `[jobs.queue]`, including the one-hour `suppressed` window that holds addresses typed at the login form by unauthenticated callers.
+
+Version tombstones are never deleted, deliberately: a tombstone is what keeps a hard-deleted version number unpublishable ([S-18](../security.md#4-supply-chain--registry-integrity)).
+
+**On PostgreSQL it needs one grant.** The app role deliberately holds **no `DELETE` on `audit_log`** — that is [S-22](../security.md#5-audit--abuse), and decision 30 refused to trade it away for this feature. Retention calls `pub_audit_prune(cutoff, batch)` instead: a `SECURITY DEFINER` function created by migration 0012, owned by the migration role, which refuses any cutoff that is not comfortably in the past. Migration 0012 **revokes `EXECUTE` from `PUBLIC`** — otherwise every role that can reach the database could prune this instance's audit log — so unless your application connects as the database owner, grant it explicitly:
+
+```sql
+GRANT EXECUTE ON FUNCTION pub_audit_prune(TIMESTAMPTZ, INT) TO pub_app;
+```
+
+Without it, audit retention is refused, `retention_refused_tables` goes to 1, the instance logs the grant above by name, and **every other table is still swept** — one missing grant does not stop sessions from being purged. This is the one deployment step retention adds, and it is deliberately a step rather than a default: relying on Postgres' `PUBLIC` execute default would have meant no action for you and the same capability for every other role on a shared cluster.
+
+**Reading a pass.** `GET /api/v1/admin/stats` carries the job's `phase`: `drained` when every table is clear, `backlog: notifications, audit_log` when a released backlog outlived the pass's budget. `POST /api/v1/admin/jobs/lifecycle-purge/run` runs one on demand; its report is a line per table, including the ones set to keep forever, so a table that is missing from it is a bug rather than a table with nothing to delete.
+
+**Why a backlog is normal, briefly.** Every delete is bounded to `jobs.lifecycle.batch` rows per statement and the pass stops at `jobs.lifecycle.budget_secs`. On SQLite that bound is load-bearing: one unbounded `DELETE` holds the single writer for its whole duration, and a hold past the busy timeout turns a concurrent publish or sign-in into an error instead of a wait. So lowering a window, restoring a backup, or correcting the clock forward releases a backlog that drains over several passes rather than in one statement.
