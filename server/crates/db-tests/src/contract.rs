@@ -33,6 +33,11 @@ use pub_core::{Format, OrgId, PackageId, QueuedJobId, RoleLevel, SemVer, UserId}
 /// and a suite that read the backends' own constant could not notice one of them drifting.
 const MAX_NOTIFICATION_BATCH: usize = 500;
 
+/// Batch bound used where a retention scenario is about *what* is deleted rather than about the
+/// bound itself. Large enough that one call drains the fixture, so the assertion under test stays
+/// the predicate; the bound has its own scenarios.
+const PURGE_BATCH: u32 = 1_000;
+
 /// Deterministic base instant for every scenario (no wall clock in tests).
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap()
@@ -3065,7 +3070,7 @@ pub async fn job_queue(repos: &Repositories) {
     assert!(repos.queue.depth().await.expect("depth").is_empty());
     assert!(repos.queue.claim(&JobKind::ALL, 10, lease, t0()).await.expect("claim").is_empty());
     assert_eq!(repos.queue.reap_expired_leases(t0()).await.expect("reap"), 0);
-    assert_eq!(repos.queue.purge(&retention_at(t0())).await.expect("purge"), QueuePurged::default());
+    assert_eq!(repos.queue.purge(&retention_at(t0()), PURGE_BATCH).await.expect("purge"), QueuePurged::default());
     assert_eq!(repos.queue.get(QueuedJobId::new()).await.expect("get unknown"), None);
 
     // Enqueue: the stored row is the item plus the defaults the caller did not state.
@@ -3224,13 +3229,13 @@ pub async fn job_queue(repos: &Repositories) {
     // the only state with a bound and the other two grew forever).
     let at_the_bound = QueueRetention { done_before: t0() + days(2), suppressed_before: t0(), dead_before: t0() };
     assert_eq!(
-        repos.queue.purge(&at_the_bound).await.expect("purge"),
+        repos.queue.purge(&at_the_bound, PURGE_BATCH).await.expect("purge"),
         QueuePurged::default(),
         "the bound is strict: a row written at it is not older than it"
     );
     let done_only = QueueRetention { done_before: t0() + days(3), suppressed_before: t0(), dead_before: t0() };
     assert_eq!(
-        repos.queue.purge(&done_only).await.expect("purge"),
+        repos.queue.purge(&done_only, PURGE_BATCH).await.expect("purge"),
         QueuePurged { done: 1, suppressed: 0, dead: 0 },
         "one state's cutoff is not another's"
     );
@@ -3243,7 +3248,7 @@ pub async fn job_queue(repos: &Repositories) {
     // the clear with nothing left to read it (S-04.a/S-31).
     let suppressed_only = QueueRetention { done_before: t0(), suppressed_before: t0() + days(3), dead_before: t0() };
     assert_eq!(
-        repos.queue.purge(&suppressed_only).await.expect("purge"),
+        repos.queue.purge(&suppressed_only, PURGE_BATCH).await.expect("purge"),
         QueuePurged { done: 0, suppressed: 1, dead: 0 }
     );
     assert_eq!(repos.queue.get(suppressed.id).await.expect("get"), None);
@@ -3255,7 +3260,7 @@ pub async fn job_queue(repos: &Repositories) {
 
     // And the dead letter goes last, at a window measured in weeks rather than hours.
     assert_eq!(
-        repos.queue.purge(&retention_at(t0() + days(365))).await.expect("purge"),
+        repos.queue.purge(&retention_at(t0() + days(365)), PURGE_BATCH).await.expect("purge"),
         QueuePurged { done: 0, suppressed: 0, dead: 1 }
     );
     assert_eq!(repos.queue.get(dead.id).await.expect("get"), None);
@@ -3292,7 +3297,7 @@ pub async fn job_queue(repos: &Repositories) {
         repos.queue.complete(job.id, QueueOutcome::Done, backoff, fair + minutes(2)).await.expect("done");
     }
     assert_eq!(
-        repos.queue.purge(&retention_at(fair + days(2))).await.expect("purge"),
+        repos.queue.purge(&retention_at(fair + days(2)), PURGE_BATCH).await.expect("purge"),
         QueuePurged { done: 4, suppressed: 0, dead: 0 }
     );
 
@@ -3343,7 +3348,7 @@ pub async fn job_queue(repos: &Repositories) {
     }
     assert_eq!(order, vec![fresh.id, retried.id], "the row that became runnable first is claimed first");
     assert_eq!(
-        repos.queue.purge(&retention_at(ladder + days(2))).await.expect("purge"),
+        repos.queue.purge(&retention_at(ladder + days(2)), PURGE_BATCH).await.expect("purge"),
         QueuePurged { done: 2, suppressed: 0, dead: 0 }
     );
 
@@ -3367,6 +3372,340 @@ pub async fn job_queue(repos: &Repositories) {
     taken.dedup();
     filed.sort_unstable();
     assert_eq!(taken, filed, "and no item was leased twice");
+}
+
+/// S-23 retention across every table that has a window (decision 30).
+///
+/// The properties worth a cross-dialect contract are the ones a single-backend test cannot see:
+/// the batch bound is real SQL in both dialects, the invitation predicate is an indexed `COALESCE`
+/// expression, the download-stats key is composite so its bound is a row value, and the audit floor
+/// is enforced in Rust on SQLite and *again* inside `pub_audit_prune` on Postgres — where the app
+/// role may execute the function and does not hold the `DELETE` it performs (S-22.a).
+pub async fn retention(repos: &Repositories) {
+    let user = repos
+        .users
+        .create(
+            NewUser { email: Some("root@corp.com".into()), email_verified: true, display_name: "Root".into() },
+            t0(),
+        )
+        .await
+        .expect("user");
+    let org = repos.orgs.create(NewOrg::new("Acme", "acme"), user.id, t0()).await.expect("org");
+
+    // --- sessions: aged from `last_seen_at`, which is what makes the predicate safe ---
+    let stale = repos
+        .sessions
+        .create(
+            NewSession {
+                user_id: user.id,
+                refresh_hash: "a".repeat(64),
+                user_agent: Some("cli".into()),
+                ip: Some("203.0.113.9".into()),
+            },
+            t0() - days(40),
+        )
+        .await
+        .expect("stale session");
+    let live = repos
+        .sessions
+        .create(
+            NewSession {
+                user_id: user.id,
+                refresh_hash: "b".repeat(64),
+                user_agent: Some("cli".into()),
+                ip: Some("203.0.113.9".into()),
+            },
+            t0() - days(2),
+        )
+        .await
+        .expect("live session");
+    // A third session created LONG ago and used recently. This is what makes the test discriminate
+    // between the two candidate anchors: `create` writes the same stamp to `created_at` and
+    // `last_seen_at`, so a fixture built only from `create` cannot tell them apart, and a predicate
+    // silently moved to `created_at` would pass. This row must survive — deleting it is a silent
+    // sign-out of exactly the long-lived sessions the window is supposed to keep.
+    let long_lived = repos
+        .sessions
+        .create(
+            NewSession {
+                user_id: user.id,
+                refresh_hash: "f".repeat(64),
+                user_agent: Some("cli".into()),
+                ip: Some("203.0.113.9".into()),
+            },
+            t0() - days(80),
+        )
+        .await
+        .expect("long-lived session");
+    assert!(
+        repos.sessions.touch(long_lived.id, Duration::from_secs(1), t0() - days(1)).await.expect("touch"),
+        "the fixture only discriminates if the activity bump actually wrote"
+    );
+
+    assert_eq!(repos.sessions.purge_before(t0() - days(30), PURGE_BATCH).await.expect("purge"), 1);
+    let remaining = repos.sessions.list_for_user(user.id).await.expect("list");
+    assert_eq!(remaining.len(), 2, "a session that can still authenticate is never retention's");
+    assert!(remaining.iter().any(|session| session.id == live.id));
+    assert!(
+        remaining.iter().any(|session| session.id == long_lived.id),
+        "a session created 80 days ago and used yesterday must survive a 30-day window: the anchor \
+         is `last_seen_at`, not `created_at`"
+    );
+    assert!(remaining.iter().all(|session| session.id != stale.id));
+    // The bound is strict on both dialects: a row written exactly at the cutoff is not older.
+    assert_eq!(repos.sessions.purge_before(t0() - days(2), PURGE_BATCH).await.expect("purge"), 0);
+
+    // And the batch bound is real SQL here too, not only on the notification path. Two more stale
+    // rows, deleted one statement at a time.
+    for (index, hash) in [(0u8, "1"), (1, "2")] {
+        repos
+            .sessions
+            .create(
+                NewSession {
+                    user_id: user.id,
+                    refresh_hash: hash.repeat(64),
+                    user_agent: Some("cli".into()),
+                    ip: Some("203.0.113.9".into()),
+                },
+                t0() - days(50 + i64::from(index)),
+            )
+            .await
+            .expect("stale session");
+    }
+    assert_eq!(repos.sessions.purge_before(t0() - days(30), 1).await.expect("purge"), 1, "one row per statement");
+    assert_eq!(repos.sessions.purge_before(t0() - days(30), 1).await.expect("purge"), 1);
+    assert_eq!(repos.sessions.purge_before(t0() - days(30), 1).await.expect("purge"), 0);
+
+    // --- invitations: aged from whenever they settled, never from creation ---
+    for (email, hash, expires) in
+        [("live@corp.com", "c".repeat(64), t0() + days(5)), ("expired@corp.com", "d".repeat(64), t0() - days(40))]
+    {
+        repos
+            .orgs
+            .create_invitation(
+                NewInvitation {
+                    org_id: org.id,
+                    email: email.into(),
+                    role: RoleLevel::READ,
+                    invited_by: user.id,
+                    token_hash: hash,
+                    expires_at: expires,
+                },
+                expires - days(7),
+            )
+            .await
+            .expect("invitation");
+    }
+    // A one-day window — shorter than the seven-day invitation TTL — and the live link survives it
+    // anyway. That property comes from the predicate, not from a validator keeping the window long.
+    assert_eq!(repos.orgs.purge_invitations_before(t0() - days(1), PURGE_BATCH).await.expect("purge"), 1);
+    let pending = repos.orgs.list_invitations(org.id).await.expect("list");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].email, "live@corp.com");
+
+    // The batch bound, on the one predicate that is an indexed expression rather than a column.
+    for (index, hash) in [(0u8, "5"), (1, "6")] {
+        repos
+            .orgs
+            .create_invitation(
+                NewInvitation {
+                    org_id: org.id,
+                    email: format!("expired{index}@corp.com"),
+                    role: RoleLevel::READ,
+                    invited_by: user.id,
+                    token_hash: hash.repeat(64),
+                    expires_at: t0() - days(40 + i64::from(index)),
+                },
+                t0() - days(50),
+            )
+            .await
+            .expect("invitation");
+    }
+    assert_eq!(repos.orgs.purge_invitations_before(t0() - days(1), 1).await.expect("purge"), 1);
+    assert_eq!(repos.orgs.purge_invitations_before(t0() - days(1), 1).await.expect("purge"), 1);
+    assert_eq!(repos.orgs.purge_invitations_before(t0() - days(1), 1).await.expect("purge"), 0);
+
+    // --- notifications: by age, across accounts, read state irrelevant ---
+    let mut written = Vec::new();
+    for (index, at) in [t0() - days(200), t0() - days(200), t0() - days(10)].into_iter().enumerate() {
+        let rows = repos
+            .notifications
+            .create_many(
+                &[NewNotification {
+                    user_id: user.id,
+                    category: NotificationCategory::Package,
+                    event_id: None,
+                    event: "package.published".into(),
+                    title: format!("row {index}"),
+                    org_id: Some(org.id),
+                    payload: serde_json::json!({}),
+                }],
+                at,
+            )
+            .await
+            .expect("notification");
+        written.push(rows[0].id);
+    }
+    repos.notifications.mark_read(user.id, &written[..1], t0()).await.expect("mark read");
+    assert_eq!(repos.notifications.purge_before(t0() - days(180), PURGE_BATCH).await.expect("purge"), 2);
+    let feed = repos.notifications.list(user.id, false, None, 50).await.expect("feed");
+    assert_eq!(feed.items.len(), 1, "one read and one unread row of the same age both went");
+    assert_eq!(feed.items[0].id, written[2]);
+
+    // --- the batch bound is real SQL, not a parameter the backends accept and ignore ---
+    for index in 0..5 {
+        repos
+            .notifications
+            .create_many(
+                &[NewNotification {
+                    user_id: user.id,
+                    category: NotificationCategory::Package,
+                    event_id: None,
+                    event: "package.published".into(),
+                    title: format!("backlog {index}"),
+                    org_id: Some(org.id),
+                    payload: serde_json::json!({}),
+                }],
+                t0() - days(300),
+            )
+            .await
+            .expect("notification");
+    }
+    assert_eq!(
+        repos.notifications.purge_before(t0() - days(180), 2).await.expect("purge"),
+        2,
+        "an ignored bound would return 5 here, and the caller's convergence loop would be deleting \
+         a released backlog in one write-lock hold — which is the whole of D47"
+    );
+    assert_eq!(repos.notifications.purge_before(t0() - days(180), 2).await.expect("purge"), 2);
+    assert_eq!(repos.notifications.purge_before(t0() - days(180), 2).await.expect("purge"), 1, "the short pass");
+    assert_eq!(repos.notifications.purge_before(t0() - days(180), 2).await.expect("purge"), 0);
+
+    // --- download stats: a composite key, so the bound is a row value ---
+    let package = repos
+        .packages
+        .create_package(
+            NewPackage {
+                format: Format::Pub,
+                name: "acme_core".into(),
+                org_id: org.id,
+                visibility: Visibility::Public,
+            },
+            t0(),
+        )
+        .await
+        .expect("package");
+    let version = repos
+        .packages
+        .create_version(
+            NewVersion {
+                format: Format::Pub,
+                package_name: "acme_core".into(),
+                org_id: org.id,
+                visibility: Visibility::Public,
+                version: SemVer::parse("1.0.0").expect("semver"),
+                pubspec: serde_json::json!({ "name": "acme_core", "version": "1.0.0" }),
+                archive_sha256: "e".repeat(64),
+                archive_size: 10,
+                published_by: Publisher { user_id: user.id, token_id: None },
+                readme_html: None,
+                changelog_html: None,
+            },
+            t0(),
+        )
+        .await
+        .expect("version");
+    for day in 1..=3 {
+        repos
+            .stats
+            .add_downloads(&[DownloadDelta {
+                package_id: package.id,
+                version_id: version.version.id,
+                date: (t0() - days(day)).date_naive(),
+                count: 1,
+            }])
+            .await
+            .expect("downloads");
+    }
+    assert_eq!(repos.stats.purge_before((t0() - days(2)).date_naive(), PURGE_BATCH).await.expect("purge"), 1);
+    assert_eq!(
+        repos.stats.package_totals(package.id, (t0() - days(30)).date_naive()).await.expect("totals").total,
+        2,
+        "only the row dated before the cutoff went"
+    );
+    // The batch bound on a row-value `IN` — the shape this table needs because its key is composite
+    // — is worth its own assertion: a backend that accepted the parameter and ignored it would take
+    // both remaining rows in one statement.
+    assert_eq!(repos.stats.purge_before((t0() + days(1)).date_naive(), 1).await.expect("purge"), 1);
+    assert_eq!(repos.stats.purge_before((t0() + days(1)).date_naive(), 1).await.expect("purge"), 1);
+    assert_eq!(repos.stats.purge_before((t0() + days(1)).date_naive(), 1).await.expect("purge"), 0);
+
+    // --- the queue's own batch bound, on the table D47 was filed about ---
+    //
+    // Every other queue scenario in this suite has one row per terminal state, so a `LIMIT` the
+    // backend accepted and ignored would be invisible there — and an ignored LIMIT is exactly D47
+    // reinstated: one unbounded DELETE per state, holding SQLite's single writer for its full scan.
+    for index in 0..3 {
+        repos
+            .queue
+            .enqueue(
+                &NewQueuedJob::suppressed(JobKind::MailSend, mail_payload(&format!("blocked{index}@evil.test"))),
+                t0() - days(2),
+            )
+            .await
+            .expect("enqueue")
+            .expect("row");
+    }
+    let released = QueueRetention { done_before: t0(), suppressed_before: t0(), dead_before: t0() };
+    assert_eq!(
+        repos.queue.purge(&released, 2).await.expect("purge"),
+        QueuePurged { done: 0, suppressed: 2, dead: 0 },
+        "a bound the backend ignored would take all three in one statement"
+    );
+    assert_eq!(repos.queue.purge(&released, 2).await.expect("purge"), QueuePurged { done: 0, suppressed: 1, dead: 0 });
+    assert_eq!(repos.queue.purge(&released, 2).await.expect("purge"), QueuePurged::default());
+
+    // --- audit: the floor is enforced below the caller, on both dialects ---
+    //
+    // Real wall-clock time here, not `t0()`: the Postgres function compares the cutoff against the
+    // database's own `now()`, so a scenario pinned to a fixture instant would be asserting against
+    // two different clocks.
+    for index in 0..3 {
+        repos
+            .audit
+            .append(
+                NewAuditEvent {
+                    actor: AuditActor::System,
+                    ip: None,
+                    user_agent: None,
+                    org_id: Some(org.id),
+                    action: format!("test.event.{index}"),
+                    target: None,
+                    result: AuditResult::Success,
+                    metadata: None,
+                },
+                Utc::now() - days(400),
+            )
+            .await
+            .expect("audit row");
+    }
+    let now = Utc::now();
+    let err = repos
+        .audit
+        .prune_before(now - days(29), now, PURGE_BATCH)
+        .await
+        .expect_err("a cutoff inside the 30-day floor must be refused, not clamped");
+    assert_eq!(err.code(), "invalid_argument");
+    assert_eq!(
+        repos.audit.list(&AuditFilter::default(), None, 50).await.expect("list").items.len(),
+        3,
+        "a refused prune deletes nothing"
+    );
+    // Outside the floor it works, and it honours its batch.
+    assert_eq!(repos.audit.prune_before(now - days(31), now, 2).await.expect("prune"), 2);
+    assert_eq!(repos.audit.prune_before(now - days(31), now, 2).await.expect("prune"), 1);
+    assert_eq!(repos.audit.prune_before(now - days(31), now, 2).await.expect("prune"), 0);
+    assert!(repos.audit.list(&AuditFilter::default(), None, 50).await.expect("list").items.is_empty());
 }
 
 /// The `mail.send` payload, as the OTP path would file it (sealed — see S-26.b).

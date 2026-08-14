@@ -1,11 +1,17 @@
-//! `AuditRepo` over SQLite (S-22): append + cursor-paginated read, nothing else.
+//! `AuditRepo` over SQLite (S-22): append, cursor-paginated read, and one floor-guarded prune.
 //!
-//! SQLite has no roles, so this repository *is* the append-only enforcement — it exposes no
-//! update and no delete, mirroring the trait.
+//! SQLite has no roles, so this repository *is* the enforcement — it exposes no update, and its
+//! only delete is [`SqliteAuditRepo::prune_before`], which refuses any cutoff newer than
+//! [`RetentionPolicy::AUDIT_FLOOR`] and deletes at most one batch per call. On Postgres the same
+//! two properties are additionally enforced *below* the application, by a `SECURITY DEFINER`
+//! function the app role can execute but whose privileges it does not hold; here there is no
+//! below, which is why the guard is written out rather than assumed
+//! ([S-22.a](../../../../docs/security.md#5-audit--abuse), [decision 30](../../../../docs/decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature)).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::audit::{AuditActor, AuditEvent, AuditFilter, AuditId, AuditResult, NewAuditEvent};
+use pub_core::retention::RetentionPolicy;
 use pub_core::traits::AuditRepo;
 use pub_core::{Error, Page, Result};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -169,5 +175,33 @@ impl AuditRepo for SqliteAuditRepo {
             rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
         let cursor = if has_more { items.last().map(|event| event.id.to_string()) } else { None };
         Ok(Page { items, cursor, has_more })
+    }
+
+    async fn prune_before(&self, cutoff: DateTime<Utc>, now: DateTime<Utc>, batch: u32) -> Result<u64> {
+        if !RetentionPolicy::audit_cutoff_is_allowed(cutoff, now) {
+            // Refused, not clamped. No legitimate path produces this — the config validator will
+            // not accept a window below the floor — so a clamp would turn a caller's mistake into
+            // a silent deletion of a month of evidence.
+            return Err(Error::Invalid {
+                message: format!(
+                    "audit retention cutoff {cutoff} is newer than the {} day floor",
+                    RetentionPolicy::AUDIT_FLOOR.num_days()
+                ),
+            });
+        }
+        // `id IN (SELECT … LIMIT ?)` because `DELETE … LIMIT` needs a non-default SQLite build
+        // option; the inner SELECT seeks `audit_created_idx`. `ORDER BY created_at` makes the
+        // batch the *oldest* rows rather than an arbitrary subset, so repeated calls converge from
+        // the far end instead of nibbling at the middle of the backlog.
+        let result = sqlx::query(
+            "DELETE FROM audit_log WHERE id IN \
+             (SELECT id FROM audit_log WHERE created_at < ? ORDER BY created_at LIMIT ?)",
+        )
+        .bind(super::ts(cutoff))
+        .bind(i64::from(batch))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
     }
 }

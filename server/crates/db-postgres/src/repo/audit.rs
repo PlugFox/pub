@@ -1,11 +1,19 @@
-//! `AuditRepo` over Postgres (S-22): append + cursor-paginated read, nothing else.
+//! `AuditRepo` over Postgres (S-22): append, cursor-paginated read, and one delete this role may
+//! not perform itself.
 //!
-//! Defense in depth: besides this repository exposing no update/delete, the migration file
-//! carries the INSERT-only role grant template applied at deploy time (docs/rules/migrations.md).
+//! Defense in depth: besides this repository exposing no update, the migration file carries the
+//! INSERT-only role grant template applied at deploy time (docs/rules/migrations.md) — and
+//! [`PgAuditRepo::prune_before`] does **not** weaken it. The template's
+//! `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log` stands; retention calls `pub_audit_prune`
+//! (migration 0012), a `SECURITY DEFINER` function owned by the migration role, on which the app
+//! role holds only `EXECUTE`. So the reachable capability is "delete audit rows older than thirty
+//! days, one bounded batch at a time" rather than "delete audit rows"
+//! ([S-22.a](../../../../docs/security.md#5-audit--abuse), [decision 30](../../../../docs/decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature)).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use pub_core::audit::{AuditActor, AuditEvent, AuditFilter, AuditId, AuditResult, NewAuditEvent};
+use pub_core::retention::RetentionPolicy;
 use pub_core::traits::AuditRepo;
 use pub_core::{Error, Page, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -172,5 +180,30 @@ impl AuditRepo for PgAuditRepo {
             rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
         let cursor = if has_more { items.last().map(|event| event.id.to_string()) } else { None };
         Ok(Page { items, cursor, has_more })
+    }
+
+    async fn prune_before(&self, cutoff: DateTime<Utc>, now: DateTime<Utc>, batch: u32) -> Result<u64> {
+        if !RetentionPolicy::audit_cutoff_is_allowed(cutoff, now) {
+            // Checked here as well as inside the function, and checked here *first*, so the
+            // contract is identical on both dialects: SQLite has no function to check it in, and a
+            // caller must not learn the floor from a Postgres-only error.
+            return Err(Error::Invalid {
+                message: format!(
+                    "audit retention cutoff {cutoff} is newer than the {} day floor",
+                    RetentionPolicy::AUDIT_FLOOR.num_days()
+                ),
+            });
+        }
+        // No direct DELETE: this role does not have one on `audit_log` and must not be given one.
+        // A missing `EXECUTE` grant surfaces as a database error the lifecycle job renders as a
+        // refusal naming the grant — never as a generic internal failure, and never as a silent
+        // skip.
+        let deleted: i64 = sqlx::query_scalar("SELECT pub_audit_prune($1, $2)")
+            .bind(cutoff)
+            .bind(i32::try_from(batch).unwrap_or(i32::MAX))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(u64::try_from(deleted).unwrap_or(0))
     }
 }

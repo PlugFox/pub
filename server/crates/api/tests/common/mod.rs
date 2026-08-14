@@ -751,6 +751,34 @@ impl TestApp {
         self.queue_worker.run_once(self.now()).await.expect("the queue drain must not fail")
     }
 
+    /// Runs the **real** S-23 retention pass over this app's own rows (decision 30).
+    ///
+    /// Separate from [`Self::drain_jobs`] because the two jobs are separate: the drain delivers and
+    /// this one deletes. Retention used to ride the drain's tick as three unbounded statements
+    /// (D47), so a test that wants a row gone advances the clock and calls this — which is exactly
+    /// what the scheduler does, fifteen minutes apart from the drain.
+    pub async fn run_retention(&self) -> pub_core::retention::RetentionReport {
+        let policy = pub_jobs::LifecyclePolicy {
+            interval: StdDuration::from_secs(900),
+            retention: pub_core::retention::RetentionPolicy {
+                audit: Some(chrono::Duration::days(730)),
+                sessions: Some(chrono::Duration::days(30)),
+                invitations: Some(chrono::Duration::days(30)),
+                notifications: Some(chrono::Duration::days(180)),
+                download_stats: None,
+                batch: 1_000,
+                budget: StdDuration::from_secs(60),
+            },
+            queue_done: chrono::Duration::hours(24),
+            queue_suppressed: chrono::Duration::hours(1),
+            queue_dead: chrono::Duration::days(30),
+        };
+        pub_jobs::LifecycleWorker::new(self.repos.clone(), policy)
+            .run_once(self.now())
+            .await
+            .expect("the retention pass must not fail")
+    }
+
     /// Requests an OTP and returns `(pending_id, code)`, where the code is `None` when no mail
     /// was sent.
     ///

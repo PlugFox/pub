@@ -9,6 +9,8 @@ use futures::future::BoxFuture;
 use pub_core::traits::JobLock;
 use tokio::time::MissedTickBehavior;
 
+use crate::lock::JobLockTtls;
+
 /// Boxed job body: a factory producing one future per tick.
 type JobFn = Arc<dyn Fn() -> BoxFuture<'static, pub_core::Result<()>> + Send + Sync>;
 
@@ -25,24 +27,19 @@ struct Job {
 /// docs/rules/rust.md), so a slow run never causes a burst of catch-up runs.
 pub struct Scheduler {
     lock: Arc<dyn JobLock>,
-    lock_ttl: Duration,
+    ttls: JobLockTtls,
     jobs: Vec<Job>,
 }
 
 impl Scheduler {
-    /// Default TTL for per-run lock acquisitions; bounds how long a crashed instance can
-    /// block a job cluster-wide.
-    pub const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(300);
-
-    /// Creates a scheduler using `lock` for leader election.
-    pub fn new(lock: Arc<dyn JobLock>) -> Self {
-        Self { lock, lock_ttl: Self::DEFAULT_LOCK_TTL, jobs: Vec::new() }
-    }
-
-    /// Overrides the per-run lock TTL (mainly for tests and fast jobs).
-    pub fn with_lock_ttl(mut self, ttl: Duration) -> Self {
-        self.lock_ttl = ttl;
-        self
+    /// Creates a scheduler using `lock` for leader election and `ttls` for lock lifetimes.
+    ///
+    /// The TTL table is passed in rather than built here because the manual-run registry
+    /// ([`crate::JobRegistry`]) takes the same one: both paths acquire the same lock under the same
+    /// name, so a per-job lifetime that differed between them would make the invariant that name
+    /// carries — one holder per job — false (D48).
+    pub fn new(lock: Arc<dyn JobLock>, ttls: JobLockTtls) -> Self {
+        Self { lock, ttls, jobs: Vec::new() }
     }
 
     /// Registers a job to run every `interval` (first run fires immediately after spawn).
@@ -54,6 +51,13 @@ impl Scheduler {
         self.jobs.push(Job { name, interval, run: Arc::new(move || job().boxed()) });
     }
 
+    /// The lock lifetime this scheduler would use for `job` — the same table the manual-run
+    /// registry reads, exposed so the pairing is assertable rather than assumed (D48).
+    #[must_use]
+    pub fn lock_ttl(&self, job: &str) -> Duration {
+        self.ttls.get(job)
+    }
+
     /// Spawns one tokio task per registered job and returns a handle that aborts them all
     /// on [`SchedulerHandle::shutdown`] or drop.
     pub fn spawn(self) -> SchedulerHandle {
@@ -62,7 +66,7 @@ impl Scheduler {
             .into_iter()
             .map(|job| {
                 let lock = Arc::clone(&self.lock);
-                let lock_ttl = self.lock_ttl;
+                let lock_ttl = self.ttls.get(job.name);
                 tokio::spawn(run_job_loop(job, lock, lock_ttl))
             })
             .collect();
@@ -129,7 +133,7 @@ mod tests {
         let runs = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&runs);
 
-        let mut scheduler = Scheduler::new(lock).with_lock_ttl(Duration::from_millis(10));
+        let mut scheduler = Scheduler::new(lock, JobLockTtls::with_default(Duration::from_millis(10)));
         scheduler.add("counter", Duration::from_millis(100), move || {
             let counted = Arc::clone(&counted);
             async move {
@@ -154,7 +158,7 @@ mod tests {
 
         let runs = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&runs);
-        let mut scheduler = Scheduler::new(Arc::clone(&lock)).with_lock_ttl(Duration::from_millis(10));
+        let mut scheduler = Scheduler::new(Arc::clone(&lock), JobLockTtls::with_default(Duration::from_millis(10)));
         scheduler.add("guarded", Duration::from_millis(50), move || {
             let counted = Arc::clone(&counted);
             async move {
@@ -179,7 +183,7 @@ mod tests {
         let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
         let runs = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&runs);
-        let mut scheduler = Scheduler::new(Arc::clone(&lock)).with_lock_ttl(Duration::from_secs(3600));
+        let mut scheduler = Scheduler::new(Arc::clone(&lock), JobLockTtls::with_default(Duration::from_secs(3600)));
         scheduler.add("flaky", Duration::from_millis(50), move || {
             let counted = Arc::clone(&counted);
             async move {

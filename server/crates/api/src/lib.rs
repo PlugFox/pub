@@ -127,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::admin::unsuspend_user))
         .routes(routes!(routes::admin::list_orgs))
         .routes(routes!(routes::admin::list_audit))
+        .routes(routes!(routes::admin::export_audit))
         .routes(routes!(routes::admin::stats))
         .routes(routes!(routes::admin::run_job))
         .routes(routes!(routes::admin::test_smtp))

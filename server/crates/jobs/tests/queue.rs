@@ -21,8 +21,10 @@
 //! | A re-run fan-out re-sends no message and files no second row | [`d2_a_fanout_retry_never_sends_a_second_copy_of_a_message`] |
 //! | A notification email that cannot be queued is not lost | [`d44_a_notification_email_that_cannot_be_queued_is_not_lost_in_silence`] |
 //! | The item is completed before its follow-ups are published | [`d2_an_item_is_completed_before_its_followups_are_published`] |
-//! | Retention deletes done rows and keeps dead ones | [`d12_retention_purges_done_rows_and_keeps_the_operators_record`] |
-//! | Every terminal state has a retention window | [`d43_retention_bounds_every_terminal_state_not_only_the_completed_one`] |
+//!
+//! Retention is **not** here. Decision 30 moved it to the lifecycle job — this worker delivers,
+//! that one deletes — so the two tests that used to prove the queue's windows now live in
+//! `tests/lifecycle.rs` against the job that actually spends them.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -771,8 +773,12 @@ async fn d2_a_fanout_that_hangs_is_bounded_by_the_deadline_its_budget_prices_it_
             self.inner.reap_expired_leases(now).await
         }
 
-        async fn purge(&self, retention: &pub_core::queue::QueueRetention) -> Result<pub_core::queue::QueuePurged> {
-            self.inner.purge(retention).await
+        async fn purge(
+            &self,
+            retention: &pub_core::queue::QueueRetention,
+            batch: u32,
+        ) -> Result<pub_core::queue::QueuePurged> {
+            self.inner.purge(retention, batch).await
         }
 
         async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>> {
@@ -815,63 +821,6 @@ async fn d2_a_fanout_that_hangs_is_bounded_by_the_deadline_its_budget_prices_it_
         }
         other => panic!("an unbounded fan-out must not report success: {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn d43_retention_bounds_every_terminal_state_not_only_the_completed_one() {
-    // Decision 26 promises the queue "does not become the next unbounded table", and retention
-    // covered exactly one of the three states a row settles in. The two it missed are the ones
-    // that matter: a suppressed row is filed by an *unauthenticated* endpoint, one per
-    // policy-rejected sign-in attempt, each carrying the attempted address in the clear and
-    // with no reader once the request that filed it returned; dead letters accumulate one per
-    // message that never arrived.
-    let harness = Harness::new(MailMode::Deliver).await;
-    let policy = QueuePolicy {
-        retain_suppressed: Duration::hours(1),
-        retain_done: Duration::hours(24),
-        retain_dead: Duration::days(30),
-        max_attempts: 1,
-        ..QueuePolicy::default()
-    };
-    let worker = harness.worker(policy);
-
-    let suppressed = harness
-        .repos
-        .queue
-        .enqueue(&NewQueuedJob::suppressed(MailJob::KIND, serde_json::json!({ "to": "blocked@evil.test" })), t0())
-        .await
-        .expect("enqueue")
-        .expect("row")
-        .id;
-    harness.enqueue_mail("alice@corp.com").await;
-    worker.run_once(t0()).await.expect("drain");
-    harness.mailer.set(MailMode::Reject);
-    harness.enqueue_mail("not an address").await;
-    worker.run_once(t0()).await.expect("drain");
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Suppressed).await, 1);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Done).await, 1);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
-
-    // Two hours on: the suppressed row is gone and nothing else is.
-    let report = worker.run_once(t0() + Duration::hours(2)).await.expect("drain");
-    assert_eq!(report.purged, 1);
-    assert_eq!(report.purged_dead, 0);
-    assert_eq!(harness.repos.queue.get(suppressed).await.expect("get"), None, "a suppressed row is not kept for a day");
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Done).await, 1);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
-
-    // A day on: the completed row goes, the dead letter stays for the operator.
-    let report = worker.run_once(t0() + Duration::hours(25)).await.expect("drain");
-    assert_eq!(report.purged, 1);
-    assert_eq!(report.purged_dead, 0);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
-
-    // A month on: the record is bounded too, and the drain reports what it destroyed.
-    let report = worker.run_once(t0() + Duration::days(31)).await.expect("drain");
-    assert_eq!(report.purged, 1);
-    assert_eq!(report.purged_dead, 1, "an operator has to be able to see that a dead letter was deleted");
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 0);
-    assert_eq!(report.dead_pending, 0);
 }
 
 #[tokio::test]
@@ -1006,8 +955,12 @@ async fn d44_a_notification_email_that_cannot_be_queued_is_not_lost_in_silence()
             self.inner.reap_expired_leases(now).await
         }
 
-        async fn purge(&self, retention: &pub_core::queue::QueueRetention) -> Result<pub_core::queue::QueuePurged> {
-            self.inner.purge(retention).await
+        async fn purge(
+            &self,
+            retention: &pub_core::queue::QueueRetention,
+            batch: u32,
+        ) -> Result<pub_core::queue::QueuePurged> {
+            self.inner.purge(retention, batch).await
         }
 
         async fn depth(&self) -> Result<Vec<(JobKind, QueueState, i64)>> {
@@ -1104,30 +1057,6 @@ async fn d2_an_item_is_completed_before_its_followups_are_published() {
         "the follow-up was published while the item was still {observed:?} — a reader would act on \
          an event whose row is not committed"
     );
-}
-
-#[tokio::test]
-async fn d12_retention_purges_done_rows_and_keeps_the_operators_record() {
-    let harness = Harness::new(MailMode::Deliver).await;
-    let policy = QueuePolicy { retain_done: Duration::hours(24), max_attempts: 1, ..QueuePolicy::default() };
-    let worker = harness.worker(policy);
-
-    harness.enqueue_mail("alice@corp.com").await;
-    worker.run_once(t0()).await.expect("drain");
-    harness.mailer.set(MailMode::Reject);
-    harness.enqueue_mail("not an address").await;
-    worker.run_once(t0()).await.expect("drain");
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Done).await, 1);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
-
-    // A tick a day later collects the completed row and leaves the dead letter alone: a
-    // dead-lettered sign-in message is an account lockout with no other visible cause, so it is
-    // the operator's record and retention must never eat it.
-    let report = worker.run_once(t0() + Duration::hours(25)).await.expect("drain");
-    assert_eq!(report.purged, 1);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Done).await, 0);
-    assert_eq!(harness.queued(JobKind::MailSend, QueueState::Dead).await, 1);
-    assert_eq!(report.dead_pending, 1);
 }
 
 #[tokio::test]

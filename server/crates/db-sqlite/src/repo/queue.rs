@@ -272,24 +272,51 @@ impl JobQueueRepo for SqliteJobQueueRepo {
         Ok(result.rows_affected())
     }
 
-    async fn purge(&self, retention: &QueueRetention) -> Result<QueuePurged> {
+    async fn purge(&self, retention: &QueueRetention, batch: u32) -> Result<QueuePurged> {
+        // `suppressed` first, deliberately: those rows are filed by an unauthenticated endpoint,
+        // one per policy-rejected sign-in, each carrying the attempted address in the clear
+        // (S-04.a), and they have the shortest window in the product. If one of these statements
+        // fails, the caller stops the pass — so the order decides which lane loses a pass to an
+        // error, and it must not be that one.
+        //
         // One statement per state rather than one `OR`-ed DELETE, and the state as a **literal**
         // rather than a bound parameter: each state has its own partial retention index, and
         // SQLite can only use one when the statement's predicate visibly implies the index's.
         // That matters here more than anywhere else in this file — a delete is a write, and an
         // unindexed one holds the single write lock against every concurrent publish and
         // sign-in for the length of its scan, on a table that only grows.
+        //
+        // The `id IN (SELECT … LIMIT ?)` shape is the bound, and it is a subquery rather than
+        // `DELETE … LIMIT` because the latter needs `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`, which is
+        // not a default build option (decision 30). The inner SELECT keeps the state literal, so
+        // the partial index still serves it.
         let mut purged = QueuePurged::default();
         for (sql, before, counter) in [
-            ("DELETE FROM job_queue WHERE state = 'done' AND updated_at < ?", retention.done_before, &mut purged.done),
             (
-                "DELETE FROM job_queue WHERE state = 'suppressed' AND updated_at < ?",
+                "DELETE FROM job_queue WHERE id IN \
+                 (SELECT id FROM job_queue WHERE state = 'suppressed' AND updated_at < ? LIMIT ?)",
                 retention.suppressed_before,
                 &mut purged.suppressed,
             ),
-            ("DELETE FROM job_queue WHERE state = 'dead' AND updated_at < ?", retention.dead_before, &mut purged.dead),
+            (
+                "DELETE FROM job_queue WHERE id IN \
+                 (SELECT id FROM job_queue WHERE state = 'done' AND updated_at < ? LIMIT ?)",
+                retention.done_before,
+                &mut purged.done,
+            ),
+            (
+                "DELETE FROM job_queue WHERE id IN \
+                 (SELECT id FROM job_queue WHERE state = 'dead' AND updated_at < ? LIMIT ?)",
+                retention.dead_before,
+                &mut purged.dead,
+            ),
         ] {
-            let result = sqlx::query(sql).bind(super::ts(before)).execute(&self.pool).await.map_err(db_err)?;
+            let result = sqlx::query(sql)
+                .bind(super::ts(before))
+                .bind(i64::from(batch))
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?;
             *counter = result.rows_affected();
         }
         Ok(purged)

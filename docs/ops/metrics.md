@@ -191,6 +191,38 @@ Labels: `state`
 
 Queue rows deleted by retention, by the terminal state they were in.
 
+## `retention_deleted_total`
+
+*counter*
+
+Labels: `table`
+
+Rows deleted by the S-23 retention pass, by table. `table="job_queue"` overlaps `queue_retention_deleted_total`, which breaks the same rows down by terminal state instead.
+
+## `retention_refused_tables`
+
+*gauge*
+
+No labels.
+
+Tables the database refused to let the retention pass delete from, as of the last pass. Non-zero means a table is growing without a bound and nothing else will say so: the expected cause is a Postgres provisioned per the hardened S-22 template without `GRANT EXECUTE ON FUNCTION pub_audit_prune(TIMESTAMPTZ, INT)`. Alert on this — the pass keeps sweeping every other table, so no other signal changes.
+
+## `retention_backlog_tables`
+
+*gauge*
+
+No labels.
+
+Tables whose backlog outlived the last pass's wall-clock budget. Transient after a window is lowered or a backup is restored — the next pass continues. Persistently non-zero means `jobs.lifecycle` cannot keep up with the row rate.
+
+## `retention_skipped_tables`
+
+*gauge*
+
+No labels.
+
+Tables the last retention pass never reached, because its wall-clock budget was already spent by the tables ahead of them. Distinct from `retention_backlog_tables`: a table counted here is getting no retention at all rather than draining slowly. Persistently non-zero means `jobs.lifecycle.budget_secs` is too small for the instance's row rate.
+
 ## `queue_depth`
 
 *gauge*

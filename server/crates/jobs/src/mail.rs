@@ -260,6 +260,10 @@ mod tests {
         ) -> Result<pub_core::page::Page<pub_core::audit::AuditEvent>> {
             unimplemented!("the health signal never reads the audit log")
         }
+
+        async fn prune_before(&self, _cutoff: DateTime<Utc>, _now: DateTime<Utc>, _batch: u32) -> Result<u64> {
+            unimplemented!("the health signal never prunes the audit log")
+        }
     }
 
     fn queued(mail: &MailJob) -> QueuedJob {

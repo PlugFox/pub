@@ -206,4 +206,21 @@ impl SessionRepo for PgSessionRepo {
             .map_err(db_err)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+
+    async fn purge_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64> {
+        // `last_seen_at` is the only anchor that makes this safe without a second condition: a row
+        // older than the idle window cannot authenticate, and a revoked row's `last_seen_at` has
+        // already stopped advancing. `sessions_last_seen_idx` (migration 0012) serves the seek; the
+        // bounded shape is kept identical to SQLite's so one contract test asserts both.
+        let result = sqlx::query(
+            "DELETE FROM sessions WHERE id IN \
+             (SELECT id FROM sessions WHERE last_seen_at < $1 ORDER BY last_seen_at LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(i64::from(batch))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
 }

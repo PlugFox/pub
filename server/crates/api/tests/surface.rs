@@ -81,6 +81,7 @@ const SURFACE: &[(&str, &str, bool)] = &[
     ("post", "/api/v1/admin/users/{id}/unsuspend", true),
     ("get", "/api/v1/admin/orgs", true),
     ("get", "/api/v1/admin/audit", true),
+    ("get", "/api/v1/admin/audit/export", true),
     ("get", "/api/v1/admin/stats", true),
     ("post", "/api/v1/admin/jobs/{job}/run", true),
 ];
@@ -90,6 +91,21 @@ async fn the_openapi_document_matches_the_route_inventory_exactly() {
     let app = TestApp::new().await;
     let response = app.get("/api/openapi.json", None).await;
     assert_eq!(response.status, StatusCode::OK);
+
+    // The frontend's `openapi.json` is a checked-in snapshot the type codegen reads, and the
+    // documented way to refresh it was "start the server and curl it" — a manual step, which is
+    // how it drifts. `UPDATE_OPENAPI=1 cargo test -p pub-api --test surface` writes it from the
+    // router this test already built, the same shape as the config reference and the metric
+    // catalogue. Nothing asserts the snapshot yet: making it a drift gate is D36's job, and it
+    // needs the codegen to be idempotent first.
+    if std::env::var_os("UPDATE_OPENAPI").is_some() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../web/packages/api/openapi.json");
+        // Compact and newline-free, byte-for-byte the shape `curl` produced, so refreshing it is
+        // a diff of the contract rather than a diff of the formatting.
+        let rendered = serde_json::to_string(&response.json).expect("render the document");
+        std::fs::write(&path, rendered).expect("write web/packages/api/openapi.json");
+    }
+
     let paths = response.json["paths"].as_object().expect("paths object");
 
     // What the spec says, minus the pub protocol (its own contract, its own suite).

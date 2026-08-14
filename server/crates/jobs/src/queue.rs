@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt as _;
 use pub_core::jobs::{JobOutcome, JobProgress, JobState};
-use pub_core::queue::{JobKind, QueueOutcome, QueueRetention, QueueState, QueuedJob};
+use pub_core::queue::{JobKind, QueueOutcome, QueueState, QueuedJob};
 use pub_core::traits::Repositories;
 use pub_core::{DomainEvent, Result};
 use pub_events::EventBus;
@@ -155,11 +155,6 @@ pub struct QueueReport {
     pub dead: u64,
     /// Leases returned to the queue because their worker never reported back.
     pub reaped: u64,
-    /// Rows retention deleted, across every terminal state.
-    pub purged: u64,
-    /// Dead letters retention deleted — reported apart from [`QueueReport::purged`] because it
-    /// is the one deletion here that destroys a record an operator may still need.
-    pub purged_dead: u64,
     /// Items sitting in `dead` **right now**.
     ///
     /// A per-run count is not what an operator needs: a dead-lettered sign-in message is an
@@ -332,7 +327,9 @@ impl QueueWorker {
             }
         }
 
-        self.apply_retention(now, &mut report).await?;
+        // Retention is deliberately absent here. It used to run on every tick — five seconds by
+        // default — as three unbounded `DELETE` statements outside this drain's wall-clock budget, which is
+        // D47. Decision 30 moved it to the lifecycle job: this worker delivers, that one deletes.
         self.record_depth(&mut report).await?;
         Ok(report)
     }
@@ -379,38 +376,6 @@ impl QueueWorker {
             self.events.publish_followup(followup).await;
         }
         Ok(outcome)
-    }
-
-    /// Deletes what every terminal state's retention window has released.
-    ///
-    /// Retention is measured from the tick's instant rather than from the drain's progress: a
-    /// day is a day, and nothing here is a lease. Dead letters are the one deletion an operator
-    /// is told about — they are the record of mail that never arrived, so a bounded lifecycle
-    /// is a promise the queue makes, and a silent one is a record that vanished.
-    async fn apply_retention(&self, now: DateTime<Utc>, report: &mut QueueReport) -> Result<()> {
-        let retention = QueueRetention {
-            done_before: now - self.policy.retain_done,
-            suppressed_before: now - self.policy.retain_suppressed,
-            dead_before: now - self.policy.retain_dead,
-        };
-        let purged = self.repos.queue.purge(&retention).await?;
-        for (state, count) in [
-            (QueueState::Done, purged.done),
-            (QueueState::Suppressed, purged.suppressed),
-            (QueueState::Dead, purged.dead),
-        ] {
-            metrics::counter!("queue_retention_deleted_total", "state" => state.as_str()).increment(count);
-        }
-        if purged.dead > 0 {
-            tracing::warn!(
-                deleted = purged.dead,
-                retained_days = self.policy.retain_dead.num_days(),
-                "retention deleted dead-lettered queue items"
-            );
-        }
-        report.purged = purged.total();
-        report.purged_dead = purged.dead;
-        Ok(())
     }
 
     /// Publishes the per-`(kind, state)` gauges and reads the standing dead-letter total.

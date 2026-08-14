@@ -19,6 +19,7 @@ pub mod org;
 pub mod package;
 pub mod page;
 pub mod queue;
+pub mod retention;
 pub mod role;
 pub mod search;
 pub mod semver;

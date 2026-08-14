@@ -20,9 +20,12 @@
 //! - [`queue`] — the durable work queue's drain (decision 26), with [`fanout`] and [`mail`] as
 //!   its two handlers. The only job with **no** `enabled` key at all: sign-in mail rides this
 //!   queue, so an operator who switched it off could not sign in to switch it back on.
+//! - [`lifecycle`] — S-23 retention (decision 30), and **the only job in the instance that deletes
+//!   rows**. On by default, because a default install that grows forever is not a default. It also
+//!   owns the queue's own retention, which used to run as three unbounded `DELETE`s on the drain's
+//!   five-second tick: this job deletes, that one delivers.
 //!
-//! Still to come with their own roadmap steps: expired session/OTP/invitation purge and audit
-//! retention. Webhook delivery (S-33) is no longer an open mechanism question — it is one more
+//! Webhook delivery (S-33) is not an open mechanism question — it is one more
 //! [`pub_core::queue::JobKind`] and one more [`queue::JobHandler`], with the retry, backoff and
 //! dead-letter machinery already built and already tested.
 //!
@@ -37,6 +40,7 @@
 pub mod downloads;
 pub mod fanout;
 pub mod gc;
+pub mod lifecycle;
 mod lock;
 pub mod mail;
 pub mod mirror;
@@ -48,7 +52,8 @@ mod scheduler;
 pub use downloads::{DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, RollupReport};
 pub use fanout::FanoutHandler;
 pub use gc::{BLOB_GC_JOB, BlobGc, GcPolicy, GcReport};
-pub use lock::InMemoryJobLock;
+pub use lifecycle::{LIFECYCLE_JOB, LifecyclePolicy, LifecycleWorker};
+pub use lock::{InMemoryJobLock, JobLockTtls};
 pub use mail::MailHandler;
 pub use mirror::{MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorReport, MirrorWorker};
 pub use queue::{HandlerReport, JobHandler, QUEUE_JOB, QueuePolicy, QueueReport, QueueWorker};

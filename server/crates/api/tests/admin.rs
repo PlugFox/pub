@@ -25,7 +25,7 @@ use pub_core::audit::AuditResult;
 use pub_core::package::{PackageOptions, Visibility};
 use pub_core::settings::SettingsCache;
 use pub_core::traits::{JobLock, JobTrigger, Mailer as _};
-use pub_jobs::{InMemoryJobLock, JobRegistry, ReindexPolicy, Reindexer};
+use pub_jobs::{InMemoryJobLock, JobLockTtls, JobRegistry, ReindexPolicy, Reindexer};
 
 /// Signs `email` in and returns their access token.
 async fn token(app: &TestApp, email: &str) -> String {
@@ -45,8 +45,10 @@ async fn app_with_jobs() -> TestApp {
     let factory: common::JobFactory = Box::new(|repos| {
         let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
         let policy = ReindexPolicy { enabled: true, resweep_after: Duration::seconds(0), ..ReindexPolicy::default() };
-        Arc::new(JobRegistry::new(lock).with_reindex(Arc::new(Reindexer::new(repos.clone(), policy))))
-            as Arc<dyn JobTrigger>
+        Arc::new(
+            JobRegistry::new(lock, JobLockTtls::default())
+                .with_reindex(Arc::new(Reindexer::new(repos.clone(), policy))),
+        ) as Arc<dyn JobTrigger>
     });
     TestApp::with_options(TestOptions { jobs: Some(factory), ..TestOptions::default() }).await
 }
@@ -1172,4 +1174,233 @@ async fn openapi_documents_the_admin_surface() {
     let smtp = &schemas["SmtpSettingsDto"]["properties"];
     assert!(smtp.get("password").is_none());
     assert!(smtp.get("password_set").is_some());
+}
+
+// --------------------------------------------------------------------- S-23 audit export
+
+/// Splits an NDJSON body into its lines, rejecting the empty trailing one.
+fn ndjson(body: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8(body.to_vec())
+        .expect("utf-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON document"))
+        .collect()
+}
+
+/// **S-23.** The export streams the whole filtered log and says when it finished.
+#[tokio::test]
+async fn s23_the_audit_export_streams_ndjson_and_terminates_with_a_count() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+    let (_, org) = app.org_owner("owner@corp.com", "acme").await;
+    let owner_access = token(&app, "owner@corp.com").await;
+    let publish_token = app.mint_token(&owner_access, org, &["publish"]).await;
+    app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", "1.0.0")).await;
+
+    let response = app
+        .send_raw(app.request(Method::GET, "/api/v1/admin/audit/export", Some(&access), None, common::DEFAULT_IP))
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.headers["content-type"], "application/x-ndjson");
+    // S-28: an export is a snapshot read through a cursor, and nothing about it is cacheable.
+    assert_eq!(response.headers["cache-control"], "no-store");
+
+    let lines = ndjson(&response.body);
+    let (events, terminator) = lines.split_at(lines.len() - 1);
+    // The terminator is the property that makes a truncated export detectable: once the head is
+    // sent there is no status code left to report a failure with.
+    assert_eq!(terminator[0]["done"], true);
+    assert_eq!(terminator[0]["count"], events.len());
+    assert!(events.iter().any(|event| event["action"] == "package.publish"));
+    // Every line is a whole event, not a fragment — the viewer's shape, one per line.
+    assert!(events.iter().all(|event| event["id"].is_string() && event["action"].is_string()));
+
+    // The request itself is on the record (S-22 already names data-export requests).
+    let audit = app.get("/api/v1/admin/audit?action=audit.export", Some(&access)).await;
+    assert_eq!(audit.json["data"]["items"].as_array().expect("items").len(), 1);
+}
+
+/// **S-23.** The export honours the viewer's filters and resumes from a cursor.
+#[tokio::test]
+async fn s23_the_audit_export_filters_and_resumes_exactly_like_the_viewer() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+    let (_, org) = app.org_owner("owner@corp.com", "acme").await;
+    let owner_access = token(&app, "owner@corp.com").await;
+    let publish_token = app.mint_token(&owner_access, org, &["publish"]).await;
+    for version in ["1.0.0", "1.1.0", "1.2.0"] {
+        app.publish("/o/acme/pub", &publish_token, &package_archive("acme_core", version)).await;
+    }
+
+    let filtered = app
+        .send_raw(app.request(
+            Method::GET,
+            "/api/v1/admin/audit/export?action=package.",
+            Some(&access),
+            None,
+            common::DEFAULT_IP,
+        ))
+        .await;
+    let lines = ndjson(&filtered.body);
+    let (events, terminator) = lines.split_at(lines.len() - 1);
+    assert!(!events.is_empty());
+    assert!(
+        events.iter().all(|event| event["action"].as_str().expect("action").starts_with("package.")),
+        "the export must resolve filters exactly as the viewer does, or it hands somebody a file \
+         that does not match what they were looking at"
+    );
+    assert_eq!(terminator[0]["count"], events.len());
+
+    // Resuming from the newest event's id yields strictly older ones: a broken connection costs
+    // the rows already written and nothing more.
+    let newest = events[0]["id"].as_str().expect("id").to_owned();
+    let resumed = app
+        .send_raw(app.request(
+            Method::GET,
+            &format!("/api/v1/admin/audit/export?action=package.&cursor={newest}"),
+            Some(&access),
+            None,
+            common::DEFAULT_IP,
+        ))
+        .await;
+    let resumed_lines = ndjson(&resumed.body);
+    let (resumed_events, _) = resumed_lines.split_at(resumed_lines.len() - 1);
+    assert!(resumed_events.iter().all(|event| event["id"].as_str().expect("id") < newest.as_str()));
+    assert_eq!(resumed_events.len(), events.len() - 1);
+}
+
+/// **S-06.c.** Bulk export is step-up gated; the paginated viewer beside it is not.
+#[tokio::test]
+async fn s06_c_the_audit_export_is_step_up_gated_and_the_viewer_is_not() {
+    let app = TestApp::with_options(TestOptions { step_up_minutes: 1, ..TestOptions::default() }).await;
+    let access = admin_token(&app, "root@corp.com").await;
+
+    // Fresh: both work.
+    assert_eq!(app.get("/api/v1/admin/audit", Some(&access)).await.status, StatusCode::OK);
+    let fresh_export = app
+        .send_raw(app.request(Method::GET, "/api/v1/admin/audit/export", Some(&access), None, common::DEFAULT_IP))
+        .await;
+    assert_eq!(fresh_export.status, StatusCode::OK);
+
+    // Stale step-up, still-valid JWT — the state a stolen session is in.
+    app.advance(Duration::minutes(2));
+    let viewer = app.get("/api/v1/admin/audit", Some(&access)).await;
+    assert_eq!(viewer.status, StatusCode::OK, "the viewer stays ungated: the line is bulk, not sensitivity");
+
+    let export = app.get("/api/v1/admin/audit/export", Some(&access)).await;
+    assert_eq!(export.status, StatusCode::FORBIDDEN, "one request hands over every actor, IP and user agent");
+    assert_eq!(export.error_code(), "step_up_required");
+}
+
+/// **Decision 30.** The export has a budget of its own, not the read path's 3000-a-minute one.
+#[tokio::test]
+async fn the_audit_export_has_its_own_budget_and_the_viewer_is_unaffected() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+
+    // Twelve is the hourly allowance; the thirteenth is refused.
+    for attempt in 1..=12 {
+        let response = app
+            .send_raw(app.request(Method::GET, "/api/v1/admin/audit/export", Some(&access), None, common::DEFAULT_IP))
+            .await;
+        assert_eq!(response.status, StatusCode::OK, "export {attempt} must be allowed");
+    }
+    let refused = app.get("/api/v1/admin/audit/export", Some(&access)).await;
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS, "a full-log walk is not a 3000/min read");
+    assert_eq!(refused.error_code(), "rate_limited");
+    assert!(refused.headers.contains_key("retry-after"));
+
+    // The paginated viewer is a different bucket entirely and is untouched by the refusal.
+    assert_eq!(app.get("/api/v1/admin/audit", Some(&access)).await.status, StatusCode::OK);
+}
+
+/// **S-23.** The export walks more than one page — the mechanism every other export test skips.
+///
+/// `EXPORT_PAGE` is 200 and the other fixtures produce a dozen audit rows, so `has_more` is always
+/// false in them and `ExportStep::Page → Page` never executes. That leaves the cursor threading,
+/// the running count across pages, and the "stops early" branches untested — and an implementation
+/// that terminated after the first page would pass all of them while handing over a truncated
+/// compliance export that declares itself whole.
+#[tokio::test]
+async fn s23_the_audit_export_walks_every_page_not_only_the_first() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+
+    // Past one page of the walk. Written straight through the repository: the point is the walk,
+    // and driving 250 audited actions through the HTTP surface would be a slower test of the
+    // same thing.
+    let actor = pub_core::audit::AuditActor::User(app.user_of("root@corp.com").await);
+    for index in 0..250 {
+        app.repos
+            .audit
+            .append(
+                pub_core::audit::NewAuditEvent {
+                    actor,
+                    ip: None,
+                    user_agent: None,
+                    org_id: None,
+                    action: format!("test.bulk.{index:03}"),
+                    target: None,
+                    result: pub_core::audit::AuditResult::Success,
+                    metadata: None,
+                },
+                app.now(),
+            )
+            .await
+            .expect("audit row");
+    }
+
+    let response = app
+        .send_raw(app.request(
+            Method::GET,
+            "/api/v1/admin/audit/export?action=test.bulk.",
+            Some(&access),
+            None,
+            common::DEFAULT_IP,
+        ))
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let lines = ndjson(&response.body);
+    let (events, terminator) = lines.split_at(lines.len() - 1);
+    assert_eq!(events.len(), 250, "every page, not just the first {}", 200);
+    assert_eq!(terminator[0]["count"], 250);
+
+    // No duplicates and no gaps across the page boundary — the two ways a keyset walk goes wrong.
+    let mut ids: Vec<&str> = events.iter().map(|event| event["id"].as_str().expect("id")).collect();
+    let before = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), before, "the walk must not hand back a row twice");
+    let actions: std::collections::BTreeSet<&str> =
+        events.iter().map(|event| event["action"].as_str().expect("action")).collect();
+    assert_eq!(actions.len(), 250, "and must not skip one");
+
+    // Strictly descending, which is what makes a resume from any line correct.
+    let ordered: Vec<&str> = events.iter().map(|event| event["id"].as_str().expect("id")).collect();
+    assert!(ordered.windows(2).all(|pair| pair[0] > pair[1]), "the walk descends across pages too");
+}
+
+/// **S-23.** A malformed resume cursor is a 400 before anything is spent or committed.
+#[tokio::test]
+async fn s23_a_malformed_export_cursor_is_refused_before_the_head_is_sent() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+
+    let refused = app.get("/api/v1/admin/audit/export?cursor=not-a-ulid", Some(&access)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.json);
+    assert_eq!(refused.error_code(), "invalid_argument");
+
+    // Nothing was spent and nothing was recorded: the budget is intact and no `audit.export` row
+    // claims a success that delivered zero bytes. Both matter — the caller's retry-on-truncation
+    // behaviour would otherwise burn the whole hourly allowance on one typo.
+    let audit = app.get("/api/v1/admin/audit?action=audit.export", Some(&access)).await;
+    assert!(audit.json["data"]["items"].as_array().expect("items").is_empty(), "a refused export is not an export");
+    for _ in 0..12 {
+        let ok = app
+            .send_raw(app.request(Method::GET, "/api/v1/admin/audit/export", Some(&access), None, common::DEFAULT_IP))
+            .await;
+        assert_eq!(ok.status, StatusCode::OK, "the malformed request must not have spent a slot");
+    }
 }

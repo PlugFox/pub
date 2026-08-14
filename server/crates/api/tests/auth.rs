@@ -644,9 +644,19 @@ async fn s31_a_blocked_address_row_is_never_claimed_and_does_not_live_forever() 
     // Past it, retention takes it: the only thing it ever had to do — make a rejected request
     // cost what an accepted one costs — was done the moment the request returned.
     app.advance(Duration::hours(2));
-    let report = app.drain_jobs().await;
-    assert_eq!(report.claimed, 0, "it is not claimed on the way out either");
-    assert_eq!(report.purged, 1);
+    assert_eq!(app.drain_jobs().await.claimed, 0, "it is not claimed on the way out either");
+    // Retention is the lifecycle job's, not the drain's (decision 30) — the drain delivers, this
+    // one deletes. The window and the property it protects are unchanged.
+    let retention = app.run_retention().await;
+    assert_eq!(
+        retention
+            .tables
+            .iter()
+            .find(|line| line.table == "job_queue:suppressed")
+            .map(|line| line.outcome.deleted())
+            .expect("job_queue:suppressed is always in the report"),
+        1
+    );
     assert!(app.repos.queue.depth().await.expect("queue depth").is_empty());
     assert!(app.mailer.sent().is_empty());
 }

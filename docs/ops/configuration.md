@@ -1114,6 +1114,127 @@ deadline of its own, and off the request path there is no `[http]` timeout left 
 truncate a hung conversation — a relay that connects and then says nothing would hold
 its lease and starve every lease behind it.
 
+## `[jobs.lifecycle]`
+
+S-23 retention — the only job that deletes rows (decision 30).
+
+Retention settings — [S-23](../security.md#5-audit--abuse),
+[decision 30](../decisions.md#30).
+
+**On by default and with no `enabled` key at all**, which is the same shape [`QueueConfig`] has
+and for a related reason. On by default because a default install whose tables only grow is not
+a default, and what makes that safe is that nothing here is a judgement call: a row goes only
+once it can no longer be used (a session outside its idle window, an invitation past its expiry)
+or once a window an operator can read has elapsed.
+
+No `enabled` key because every window is already its own switch — `0` keeps that table forever —
+so a flag would be a second, coarser way to say the same thing, and it would say more than it
+looks like it says: this job also spends the queue's three windows, which live in
+[`QueueConfig`] and are validated greater than zero there. A flag here would silently stop
+`job_queue` retention that an operator configured in a different section, and the class that
+matters is `suppressed` — one row per policy-rejected sign-in attempt, filed by an
+**unauthenticated** endpoint, each carrying the attempted address in the clear
+([S-04.a](../security.md#1-authentication)). Before decision 30 that purge rode the
+drain, which deliberately has no `enabled` key either; moving the executor must not quietly
+give it one.
+
+Every window is a number of days with `0` meaning **keep forever**, and there are no per-row-state
+sub-conditions: a read notification and an unread one age the same. The queue's own three windows
+stay in [`QueueConfig`] where they already are — they are per-*state* properties of that table —
+and this job is what spends them.
+
+Two tables are excluded by design and it is written down so nobody "finishes" the feature by
+including them: version tombstones (a tombstone is what keeps a hard-deleted version number
+unpublishable, decision 06/S-18) and, by default, `download_stats` (the only record of
+per-version daily downloads, whose honest bound is a monthly roll-up rather than a delete).
+
+### `jobs.lifecycle.interval_secs`
+
+integer · `PUB_JOBS__LIFECYCLE__INTERVAL_SECS` · default: `900`
+
+Seconds between passes.
+
+Fifteen minutes rather than an hour for one specific reason: the queue's `suppressed` rows
+carry addresses typed at a login form by unauthenticated callers on a one-hour window
+([S-04.a](../security.md#1-authentication)), and this job took their deletion over
+from a five-second drain tick. An hourly pass would have doubled their worst-case lifetime.
+
+### `jobs.lifecycle.batch`
+
+integer · `PUB_JOBS__LIFECYCLE__BATCH` · default: `1000`
+
+Rows one statement may delete.
+
+The bound on how long a delete holds a write lock. On SQLite that is the whole point: one
+unbounded `DELETE` holds the process's single writer for its full duration, and a hold past
+the busy timeout turns a concurrent publish-finalize or sign-in into an error rather than a
+wait.
+
+### `jobs.lifecycle.budget_secs`
+
+integer · `PUB_JOBS__LIFECYCLE__BUDGET_SECS` · default: `60`
+
+Wall-clock seconds one pass may spend across all tables.
+
+A released backlog — an operator lowering a window, a restored backup, a forward clock
+correction — is drained over several passes instead of one long transaction. The job's report
+says which tables are still working through one.
+
+### `jobs.lifecycle.retain_audit_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_AUDIT_DAYS` · default: `730`
+
+Days an audit event is kept. Default 730 (≈24 months), `0` keeps forever.
+
+**One window for every action**, which is where this deviates from S-23's original three
+(auth 12 mo, admin/role 24 mo, publish = package lifetime) and is recorded as
+[S-23.a](../security.md#5-audit--abuse). Three windows over one table mean one
+viewer whose history depth silently depends on which action you filtered for. It is safe
+because provenance is not in the audit log: publisher, token and timestamp are columns on the
+version row (S-21), so purging an old `package.publish` event drops the access record and
+never the provenance.
+
+Validated to be `0` or **at least 30**: below that the delete would be refused by the
+database anyway ([S-22.a](../security.md#5-audit--abuse)), and a floor an operator
+discovers from a failing job is a floor stated in the wrong place.
+
+### `jobs.lifecycle.retain_sessions_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_SESSIONS_DAYS` · default: `30`
+
+Days a session row is kept after it was last seen. Default 30, `0` keeps forever.
+
+Validated to be `0` or at least `auth.refresh_idle_days`, so a purged row is one that had
+already stopped being able to authenticate. Shorter than the audit window on purpose: the row
+carries an IP and a user agent, so this window is a privacy property and not a size one.
+
+### `jobs.lifecycle.retain_invitations_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_INVITATIONS_DAYS` · default: `30`
+
+Days a **settled** invitation is kept — accepted, revoked, or expired. Default 30, `0` keeps
+forever.
+
+Aged from whichever of those happened, never from creation, so a live pending invitation is
+undeletable at any window rather than at a well-configured one.
+
+### `jobs.lifecycle.retain_notifications_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_NOTIFICATIONS_DAYS` · default: `180`
+
+Days a notification is kept. Default 180, `0` keeps forever. Read state is not part of it.
+
+### `jobs.lifecycle.retain_download_stats_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_DOWNLOAD_STATS_DAYS` · default: `0`
+
+Days a daily download row is kept. **Default 0 — keep forever.**
+
+The one retention window this product ships disabled. These rows are the only record of
+per-version daily downloads, the charts cannot reconstruct them after the fact, and the
+honest bound on their growth is a monthly roll-up. The knob exists for an operator who would
+rather have the space than the history.
+
 ## `[branding]`
 
 White-label instance identity shown on the landing dashboard (decision 17).

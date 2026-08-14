@@ -42,6 +42,13 @@ use serde::{Deserialize, Serialize};
 /// How many quarantine and shadowing rows the stats payload carries.
 const REGISTER_SAMPLE: u32 = 20;
 
+/// Rows the audit export reads per round trip.
+///
+/// Larger than any UI page and smaller than the repository's `MAX_PAGE` clamp (200): the export is
+/// a streaming walk, so this is a round-trip count, not a response size. Every page is written to
+/// the wire before the next one is read, so it never becomes a buffer.
+const EXPORT_PAGE: u32 = 200;
+
 /// Largest SMTP password the admin surface accepts, in bytes.
 const MAX_SMTP_PASSWORD: usize = 512;
 
@@ -596,6 +603,39 @@ impl AdminService {
     /// The audit viewer (S-22/S-23), newest first.
     pub async fn list_audit(&self, filter: &AuditFilter, cursor: Option<&str>, limit: u32) -> Result<Page<AuditEvent>> {
         self.repos.audit.list(filter, cursor, limit).await
+    }
+
+    /// Records that an export was requested, before a single row leaves.
+    ///
+    /// S-22 already names "data-export requests" as an auditable event, and this is the one that
+    /// hands the caller every actor id, IP and user agent the instance has recorded. Written
+    /// **before** the walk rather than after it for the obvious reason: an export that is cut off
+    /// halfway still happened, and a row appended after a stream that never finished would not
+    /// exist. The filter is recorded, never the results.
+    pub async fn audit_export_requested(&self, actor: &ActorMeta, filter: &AuditFilter, now: DateTime<Utc>) {
+        self.audit(
+            actor,
+            "audit.export",
+            None,
+            AuditResult::Success,
+            serde_json::json!({
+                "org": filter.org.map(|org| org.to_string()),
+                "action_prefix": filter.action_prefix,
+                "from": filter.from,
+                "until": filter.until,
+                "actor_filter": filter.actor.as_ref().map(|actor| actor.id_string()),
+            }),
+            now,
+        )
+        .await;
+    }
+
+    /// One page of the export walk (S-23), newest first over the same keyset the viewer uses.
+    ///
+    /// A separate method from [`Self::list_audit`] only so the page size is the export's own: the
+    /// viewer's is a UI page, this one is a network read whose only cost model is round trips.
+    pub async fn export_audit_page(&self, filter: &AuditFilter, cursor: Option<&str>) -> Result<Page<AuditEvent>> {
+        self.repos.audit.list(filter, cursor, EXPORT_PAGE).await
     }
 
     // -------------------------------------------------------------------------------- stats

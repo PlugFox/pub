@@ -255,6 +255,18 @@ async fn job_queue_contract_s04_s31() {
     db.cleanup().await;
 }
 
+/// S-23 retention, and the one contract function that exercises a **stored procedure**.
+///
+/// On this dialect the audit prune goes through `pub_audit_prune` (migration 0012) rather than
+/// through a `DELETE` the app role is allowed to issue, so the floor, the batch bound and the
+/// return count are all properties of SQL that only ever runs here (S-22.a).
+#[tokio::test]
+async fn retention_contract_s23_s22a() {
+    let Some(db) = TestDb::create("retention_contract_s23_s22a").await else { return };
+    pub_db_tests::contract::retention(&db.repos()).await;
+    db.cleanup().await;
+}
+
 /// The indexes the drain's per-tick statements need exist on this dialect too (SF2).
 ///
 /// The SQLite leg asserts query plans; here the assertion is that the paired migration actually
@@ -265,13 +277,23 @@ async fn job_queue_contract_s04_s31() {
 async fn the_drains_per_tick_indexes_exist() {
     let Some(db) = TestDb::create("the_drains_per_tick_indexes_exist").await else { return };
     let names: Vec<(String,)> = sqlx::query_as(
-        "SELECT indexname::text FROM pg_indexes WHERE tablename IN ('job_queue', 'notifications') ORDER BY indexname",
+        "SELECT indexname::text FROM pg_indexes \
+         WHERE tablename IN ('job_queue', 'notifications', 'sessions', 'invitations', 'download_stats') \
+         ORDER BY indexname",
     )
     .fetch_all(&db.pool)
     .await
     .expect("read pg_indexes");
     let names: Vec<String> = names.into_iter().map(|row| row.0).collect();
     for expected in [
+        // Migration 0012's three. `invitations_settled_idx` is the fragile one: an *expression*
+        // index, so a predicate that drifted away from `COALESCE(accepted_at, revoked_at,
+        // expires_at)` silently stops matching it and the sweep becomes a seq scan inside a write
+        // statement — green forever without this.
+        "sessions_last_seen_idx",
+        "invitations_settled_idx",
+        "notifications_created_idx",
+        "download_stats_date_idx",
         "job_queue_claim_prio_idx",
         "job_queue_retention_done_idx",
         "job_queue_retention_suppressed_idx",
@@ -366,4 +388,143 @@ async fn the_claim_seeks_on_run_after_instead_of_filtering_the_whole_backlog() {
         buffers(&cross)
     );
     db.cleanup().await;
+}
+
+/// **S-22.a / D46.** The hardened app role prunes audit rows without ever holding `DELETE`.
+///
+/// This is the test the debt was actually about. Every other Postgres test in this file — and the
+/// compose file, and the CI service — connects as the **database owner**, which can delete from any
+/// table. So a retention job that quietly needed `DELETE ON audit_log` would pass all of them and
+/// fail only on the deployments that followed the documented S-22 hardening: the compliance-motivated
+/// ones the feature exists for.
+///
+/// So this provisions a role the way `0002_identity.sql`'s template says to — including its last
+/// line, `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log` — connects as that role, and asserts both
+/// halves of decision 30's answer: a direct delete is still refused, and the prune still works.
+#[tokio::test]
+async fn s22_a_the_hardened_app_role_prunes_audit_without_holding_delete() {
+    let Some(db) = TestDb::create("s22_a_hardened_app_role").await else { return };
+
+    // The 0002 template, executed for real for the first time anywhere in this repository.
+    let role = format!("pub_app_{}", pub_core::UserId::new().to_string().replace('-', ""));
+    for statement in [
+        format!("CREATE ROLE \"{role}\" LOGIN PASSWORD 'hardened_test_password'"),
+        format!("GRANT USAGE ON SCHEMA public TO \"{role}\""),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"{role}\""),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"{role}\""),
+        // The line that makes audit_log append-only, and the reason this test exists.
+        format!("REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM \"{role}\""),
+    ] {
+        sqlx::query(AssertSqlSafe(statement)).execute(&db.pool).await.expect("provision the hardened role");
+    }
+
+    // Seed as the owner: the hardened role may INSERT, but the rows have to be old and the
+    // fixture's clock is not the point here.
+    let user = db
+        .repos()
+        .users
+        .create(
+            pub_core::user::NewUser {
+                email: Some("root@corp.com".into()),
+                email_verified: true,
+                display_name: "Root".into(),
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("user");
+    for index in 0..3 {
+        db.repos()
+            .audit
+            .append(
+                pub_core::audit::NewAuditEvent {
+                    actor: pub_core::audit::AuditActor::User(user.id),
+                    ip: None,
+                    user_agent: None,
+                    org_id: None,
+                    action: format!("test.event.{index}"),
+                    target: None,
+                    result: pub_core::audit::AuditResult::Success,
+                    metadata: None,
+                },
+                chrono::Utc::now() - chrono::Duration::days(400),
+            )
+            .await
+            .expect("audit row");
+    }
+
+    // Now connect as the hardened role.
+    let options = PgConnectOptions::from_str(&db.admin_url)
+        .expect("parse postgres url")
+        .database(&db.name)
+        .username(&role)
+        .password("hardened_test_password");
+    let app_pool =
+        PgPoolOptions::new().max_connections(2).connect_with(options).await.expect("connect as the hardened role");
+
+    // Half one: the REVOKE is real. A direct delete is refused at the database, which is the
+    // property S-22 buys and decision 30 refused to trade away.
+    let direct = sqlx::query("DELETE FROM audit_log").execute(&app_pool).await;
+    let err = direct.expect_err("the hardened role must not be able to delete audit rows directly");
+    let message = err.to_string();
+    assert!(message.contains("permission denied"), "expected a privilege error, got: {message}");
+
+    // Half two: **without the documented grant, retention is refused** — and that is the state a
+    // hardened deployment starts in, because migration 0012 revokes EXECUTE from PUBLIC rather than
+    // relying on Postgres' default. Asserted rather than assumed: it is the exact error the
+    // lifecycle job renders as a refusal, and the reason that path exists at all.
+    let app_repos = pub_db_postgres::repo::repositories(app_pool.clone());
+    let now = chrono::Utc::now();
+    let refused = app_repos
+        .audit
+        .prune_before(now - chrono::Duration::days(31), now, 2)
+        .await
+        .expect_err("without the grant the prune must be refused, not silently skipped");
+    assert!(
+        refused.to_string().contains("permission denied"),
+        "the refusal must name the privilege so the operator can act on it, got: {refused}"
+    );
+
+    // Half three: the one documented deployment step makes it work, and nothing else does.
+    sqlx::query(AssertSqlSafe(format!("GRANT EXECUTE ON FUNCTION pub_audit_prune(TIMESTAMPTZ, INT) TO \"{role}\"")))
+        .execute(&db.pool)
+        .await
+        .expect("grant execute");
+    assert_eq!(
+        app_repos.audit.prune_before(now - chrono::Duration::days(31), now, 2).await.expect("prune"),
+        2,
+        "the hardened role must be able to spend S-23 retention through the function"
+    );
+    assert_eq!(app_repos.audit.prune_before(now - chrono::Duration::days(31), now, 2).await.expect("prune"), 1);
+
+    // And the floor holds below the application: even calling the function directly, with the Rust
+    // guard bypassed entirely, a recent cutoff is refused. That is what keeps the reachable
+    // capability "delete audit rows older than a month" rather than "delete audit rows".
+    let recent: Result<(i64,), _> =
+        sqlx::query_as("SELECT pub_audit_prune(now() - interval '1 day', 100)").fetch_one(&app_pool).await;
+    let err = recent.expect_err("the function must refuse a cutoff inside the floor");
+    assert!(err.to_string().contains("refusing a cutoff"), "expected the floor's own message, got: {err}");
+
+    // A negative batch is refused too: in Postgres `LIMIT -1` is *unbounded*, so this guard is the
+    // difference between one bounded statement and a full-table delete holding a lock.
+    let unbounded: Result<(i64,), _> =
+        sqlx::query_as("SELECT pub_audit_prune(now() - interval '400 days', -1)").fetch_one(&app_pool).await;
+    let err = unbounded.expect_err("a negative batch must be refused, because LIMIT -1 is unbounded");
+    assert!(
+        err.to_string().contains("batch must be positive"),
+        "matching any error would pass on a renamed or dropped function; got: {err}"
+    );
+
+    app_pool.close().await;
+    sqlx::query(AssertSqlSafe(format!("DROP OWNED BY \"{role}\""))).execute(&db.pool).await.expect("drop owned");
+    let admin_pool = db.pool.clone();
+    db.cleanup().await;
+    let _ = admin_pool;
+    let mut admin =
+        PgConnection::connect(&std::env::var(URL_ENV).expect("url")).await.expect("connect to postgres admin");
+    sqlx::query(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
+        .execute(&mut admin)
+        .await
+        .expect("drop the test role");
+    admin.close().await.expect("close admin connection");
 }

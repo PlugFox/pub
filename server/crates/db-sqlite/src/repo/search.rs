@@ -426,6 +426,24 @@ impl StatsRepo for SqliteStatsRepo {
             })
             .collect()
     }
+
+    async fn purge_before(&self, cutoff: NaiveDate, batch: u32) -> Result<u64> {
+        // No `id` column here — the key is `(package_id, version_id, date)` — so the batch is bound
+        // by a row-value `IN`, which both dialects support and which keeps this statement the same
+        // shape as every other retention delete. Not `rowid`/`ctid`: those are per-backend physical
+        // identifiers, and a retention statement that reads differently per dialect is one the
+        // contract suite cannot assert once.
+        let result = sqlx::query(
+            "DELETE FROM download_stats WHERE (package_id, version_id, date) IN \
+             (SELECT package_id, version_id, date FROM download_stats WHERE date < ? ORDER BY date LIMIT ?)",
+        )
+        .bind(cutoff.to_string())
+        .bind(i64::from(batch))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ----------------------------------------------------------------------------- query building

@@ -20,6 +20,7 @@ use pub_blob::ObjectStoreBlob;
 use pub_config::{BlobKind, CliArgs, DatabaseKind, KvKind, MirrorModeConfig, Settings};
 use pub_core::Format;
 use pub_core::event::EventSink;
+use pub_core::retention::RetentionPolicy;
 use pub_core::session::SessionLimits;
 use pub_core::settings::{SETTINGS_TOPIC, SettingsCache};
 use pub_core::traits::{BlobStore, JobLock, JobTrigger, Kv, Mailer, Repositories};
@@ -30,8 +31,9 @@ use pub_events::{
 };
 use pub_jobs::{
     BLOB_GC_JOB, BlobGc, DOWNLOAD_ROLLUP_JOB, DownloadRollup, DownloadRollupPolicy, FanoutHandler, GcPolicy,
-    InMemoryJobLock, JobRegistry, MIRROR_JOB, MailHandler, MirrorMode, MirrorPolicy, MirrorWorker, QUEUE_JOB,
-    QueuePolicy, REINDEX_JOB, ReindexPolicy, Reindexer, Scheduler, SchedulerHandle,
+    InMemoryJobLock, JobLockTtls, JobRegistry, LIFECYCLE_JOB, LifecyclePolicy, LifecycleWorker, MIRROR_JOB,
+    MailHandler, MirrorMode, MirrorPolicy, MirrorWorker, QUEUE_JOB, QueuePolicy, REINDEX_JOB, ReindexPolicy, Reindexer,
+    Scheduler, SchedulerHandle,
 };
 use pub_kv::{MemoryKv, RedisKv};
 use pub_mail::{BootSmtp, InMemoryMailer, RuntimeMailer, SmtpMailerBuilder};
@@ -333,6 +335,15 @@ fn build_upstream(
     Ok(Some(Arc::new(UpstreamService::new(repos, blob, client, events, policy))))
 }
 
+/// A configured retention window in days, or `None` for "keep forever".
+///
+/// The `0` sentinel is collapsed exactly once, here at the config boundary: below this line a
+/// window is an `Option<Duration>`, so no consumer can accidentally read a zero-day window as a
+/// cutoff at `now` — which would mean "keep nothing" (decision 30).
+fn window(days: i64) -> Option<chrono::Duration> {
+    (days > 0).then(|| chrono::Duration::days(days))
+}
+
 /// Registers the enabled background jobs and spawns the leader-locked scheduler
 /// (decision 03; docs/architecture.md "Background jobs").
 ///
@@ -379,16 +390,26 @@ fn spawn_jobs(
         retain_dead: chrono::Duration::days(queue_cfg.retain_dead_days),
         send_timeout: Duration::from_secs(queue_cfg.send_timeout_secs),
     };
-    // The lock TTL has to outlive the longest run it guards, and the drain's bound is derived
-    // from its lease (decision 26's amendment: it stops inside half of one). A TTL shorter than
-    // that would hand a second drain the lock while the first is still holding leases, which is
-    // exactly the double-send this wave is fixing — so an operator who raises `lease_secs` past
-    // the default TTL raises the TTL with it rather than silently breaking the invariant.
-    let mut scheduler =
-        Scheduler::new(Arc::clone(&lock)).with_lock_ttl(Scheduler::DEFAULT_LOCK_TTL.max(queue_policy.lease));
-    // The same lock, so an operator's "run now" and a scheduled tick can never both hold one
-    // job's durable cursor.
-    let mut triggers = JobRegistry::new(lock);
+    // A lock TTL has to outlive the longest run it guards, and "longest run" is a property of the
+    // job — which is why this is a table and not a number (decision 30, closing D48). Only the
+    // drain's TTL is derived from a queue lease: the drain stops inside half of one (decision 26's
+    // amendment), so a TTL shorter than the lease would hand a second drain the lock while the
+    // first still holds leases. Before this table existed that `max` was applied *globally*, so
+    // raising `lease_secs` silently set the lock lifetime of mirror sync, reindex, blob GC and the
+    // download rollup as well.
+    let lifecycle_cfg = settings.jobs.lifecycle;
+    let ttls = JobLockTtls::default()
+        .set(QUEUE_JOB, JobLockTtls::DEFAULT.max(queue_policy.lease))
+        // Twice the budget, not once. A pass is always strictly longer than its budget — the check
+        // happens between batches, so the statement in flight when it expires runs to completion,
+        // and `finish_run` plus the checkpoint follow — so a TTL equal to the budget has zero
+        // headroom at exactly the setting an operator raises when they have a backlog. Doubling
+        // mirrors the drain, whose lease is 2x its own budget for the same reason.
+        .set(LIFECYCLE_JOB, JobLockTtls::DEFAULT.max(Duration::from_secs(lifecycle_cfg.budget_secs.saturating_mul(2))));
+    let mut scheduler = Scheduler::new(Arc::clone(&lock), ttls.clone());
+    // The same lock **and the same lifetimes**, so an operator's "run now" and a scheduled tick can
+    // never both hold one job's durable cursor.
+    let mut triggers = JobRegistry::new(lock, ttls);
     let mut registered = Vec::new();
     let center = build_notification_center(settings, repos.clone(), runtime);
     let queue_worker = Arc::new(
@@ -407,6 +428,46 @@ fn spawn_jobs(
         }
     });
     registered.push(QUEUE_JOB);
+
+    // Retention (decision 30), and the only job in the instance that deletes rows. Registered
+    // unconditionally, exactly like the drain above and for a related reason. Every window is its
+    // own switch (`0` keeps that table forever), so a job-level flag would be a second and coarser
+    // way to say the same thing — and it would say more than it looks like: this pass also spends
+    // the queue's three windows, which live in `[jobs.queue]` and are validated greater than zero
+    // there. A flag here would silently stop `job_queue` retention an operator configured somewhere
+    // else, and the class that matters is `suppressed`: one row per policy-rejected sign-in filed by
+    // an unauthenticated endpoint, each holding the attempted address in the clear (S-04.a). Before
+    // decision 30 that purge rode the drain, which has no flag; moving the executor must not give it
+    // one by accident.
+    let policy = LifecyclePolicy {
+        interval: Duration::from_secs(lifecycle_cfg.interval_secs),
+        retention: RetentionPolicy {
+            audit: window(lifecycle_cfg.retain_audit_days),
+            sessions: window(lifecycle_cfg.retain_sessions_days),
+            invitations: window(lifecycle_cfg.retain_invitations_days),
+            notifications: window(lifecycle_cfg.retain_notifications_days),
+            download_stats: window(lifecycle_cfg.retain_download_stats_days),
+            batch: lifecycle_cfg.batch,
+            budget: Duration::from_secs(lifecycle_cfg.budget_secs),
+        },
+        // Read from `[jobs.queue]`, where these three already live and are already validated:
+        // they are per-*state* properties of that table, and moving the keys would break every
+        // existing config file to relocate a number nobody's behaviour depends on.
+        queue_done: queue_policy.retain_done,
+        queue_suppressed: queue_policy.retain_suppressed,
+        queue_dead: queue_policy.retain_dead,
+    };
+    let interval = policy.interval;
+    let worker = Arc::new(LifecycleWorker::new(repos.clone(), policy));
+    triggers = triggers.with_lifecycle(Arc::clone(&worker));
+    scheduler.add(LIFECYCLE_JOB, interval, move || {
+        let worker = Arc::clone(&worker);
+        async move {
+            worker.run_once(chrono::Utc::now()).await?;
+            Ok(())
+        }
+    });
+    registered.push(LIFECYCLE_JOB);
 
     let mirror_cfg = settings.upstream.mirror;
     if let Some(upstream) = upstream.filter(|_| mirror_cfg.mode.is_enabled()) {

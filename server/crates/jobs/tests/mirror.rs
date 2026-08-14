@@ -28,7 +28,7 @@ use pub_core::audit::AuditFilter;
 use pub_core::event::{DomainEvent, EventSink, NoopEventSink};
 use pub_core::traits::{BlobStore, JobLock, Repositories};
 use pub_db_sqlite::SqliteDb;
-use pub_jobs::{InMemoryJobLock, MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorWorker, Scheduler};
+use pub_jobs::{InMemoryJobLock, JobLockTtls, MIRROR_JOB, MirrorMode, MirrorPolicy, MirrorWorker, Scheduler};
 use pub_registry::upstream::{UpstreamArchive, UpstreamClient, UpstreamError, UpstreamListing, UpstreamNamePage};
 use pub_registry::{UpstreamService, UpstreamServicePolicy};
 use serde_json::json;
@@ -297,7 +297,7 @@ async fn the_leader_lock_stops_a_second_instance_from_double_fetching() {
             Format::Pub,
             MirrorPolicy { refresh_after: Duration::seconds(1), ..recent_policy() },
         ));
-        let mut scheduler = Scheduler::new(Arc::clone(&lock)).with_lock_ttl(StdDuration::from_secs(30));
+        let mut scheduler = Scheduler::new(Arc::clone(&lock), JobLockTtls::with_default(StdDuration::from_secs(30)));
         scheduler.add(MIRROR_JOB, StdDuration::from_millis(40), move || {
             let worker = Arc::clone(&worker);
             async move {

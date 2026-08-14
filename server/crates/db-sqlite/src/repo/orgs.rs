@@ -642,4 +642,25 @@ impl OrgRepo for SqliteOrgRepo {
             .map_err(db_err)?;
         Ok(row.get("n"))
     }
+
+    async fn purge_invitations_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64> {
+        // `COALESCE(accepted_at, revoked_at, expires_at)` is the settle time, and using it rather
+        // than `created_at` is what makes a **live pending invitation structurally undeletable**:
+        // its `expires_at` is in the future, so no cutoff at or before `now` can match it, whatever
+        // the operator configured. Deriving that from the predicate instead of from a validator
+        // matters because the invitation TTL is a policy value in the admin crate, not a config key
+        // the retention validator can see. `invitations_settled_idx` (migration 0012) indexes the
+        // same expression, so the sweep seeks rather than scans.
+        let result = sqlx::query(
+            "DELETE FROM invitations WHERE id IN (SELECT id FROM invitations \
+             WHERE COALESCE(accepted_at, revoked_at, expires_at) < ? \
+             ORDER BY COALESCE(accepted_at, revoked_at, expires_at) LIMIT ?)",
+        )
+        .bind(super::ts(cutoff))
+        .bind(i64::from(batch))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
 }

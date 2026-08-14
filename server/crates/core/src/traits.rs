@@ -531,15 +531,24 @@ pub trait JobQueueRepo: Send + Sync {
     /// reports how many. The attempt those items already spent is **not** given back.
     async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64>;
 
-    /// Deletes the rows of every terminal state that are older than that state's cutoff
+    /// Deletes up to `batch` rows **per terminal state** that are older than that state's cutoff
     /// ([`QueueRetention`]), and reports how many of each ([`QueuePurged`]).
     ///
     /// Every state a row can settle in has a bound, because a queue with retention for one of
     /// them still grows forever: `suppressed` rows are filed by an unauthenticated endpoint and
     /// have no reader after that request, and `dead` rows are the operator's record — kept
-    /// long, deleted eventually, never silently (decision 26; the drain warns when it takes
-    /// one). `pending` and `running` rows are work, not history, and are never retention's.
-    async fn purge(&self, retention: &QueueRetention) -> Result<QueuePurged>;
+    /// long, deleted eventually, never silently (decision 26; the lifecycle job warns when it
+    /// takes one). `pending` and `running` rows are work, not history, and are never retention's.
+    ///
+    /// `batch` is what [decision 30](../../../docs/decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature)
+    /// added, and the caller loops until a pass returns fewer than the batch for every state.
+    /// Steady state is one short statement per state; the shapes that matter are the ones that
+    /// release a whole backlog at once — an operator lowering a window, a restored backup, a
+    /// forward clock correction, a stop long enough for a block of rows to cross the cutoff.
+    /// Unbounded, that backlog is one statement holding SQLite's single writer past the busy
+    /// timeout, which turns concurrent sign-in and publish-finalize writes into errors rather
+    /// than waits.
+    async fn purge(&self, retention: &QueueRetention, batch: u32) -> Result<QueuePurged>;
 
     /// Per-`(kind, state)` item counts for `/metrics` and the admin job table, ordered by kind
     /// then state. Combinations with no rows are absent rather than reported as zero.
@@ -793,6 +802,17 @@ pub trait OrgRepo: Send + Sync {
     /// How many invitations the org sent inside `[since, now]` — the S-24 per-org invitation
     /// budget (≤20/day/org).
     async fn count_invitations_since(&self, org: OrgId, since: DateTime<Utc>) -> Result<i64>;
+
+    /// Deletes at most `batch` invitations that **settled** before `cutoff`, and returns how many
+    /// rows went (S-23 retention, spent by the lifecycle job).
+    ///
+    /// "Settled" is `COALESCE(accepted_at, revoked_at, expires_at)`: an accepted or revoked
+    /// invitation ages from the moment it stopped being live, and an untouched one ages from the
+    /// moment it expired. That makes a live pending invitation **structurally undeletable at any
+    /// window** — its `expires_at` is in the future, so no cutoff at or before `now` can match it
+    /// — instead of relying on the operator's retention setting being longer than the invitation
+    /// TTL. A one-day window on a seven-day invitation must not break somebody's link.
+    async fn purge_invitations_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64>;
 }
 
 /// Web refresh-session persistence (decision 03, S-08..S-10).
@@ -850,6 +870,18 @@ pub trait SessionRepo: Send + Sync {
     /// The user's non-revoked sessions, most recently seen first (session list UI — S-10).
     /// Idle/absolute filtering is the UI's concern; stale-but-unrevoked sessions still show.
     async fn list_for_user(&self, user: UserId) -> Result<Vec<Session>>;
+
+    /// Deletes at most `batch` sessions whose `last_seen_at` is strictly before `cutoff`, and
+    /// returns how many rows went (S-23 retention, spent by the lifecycle job).
+    ///
+    /// `last_seen_at` rather than `created_at` or `revoked_at` because it is the one anchor that
+    /// makes the predicate safe by construction: a session is unusable once it falls out of the
+    /// idle window, so a cutoff at or beyond `auth.refresh_idle_days` can only ever delete a row
+    /// that could no longer authenticate. Revoked rows are covered by the same predicate — a
+    /// revoked session's `last_seen_at` stops advancing — so there is no second condition to get
+    /// wrong. The validator keeps the configured window at or above the idle window; the
+    /// contract suite asserts a live session survives a pass.
+    async fn purge_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64>;
 }
 
 /// CLI/API token persistence — tokens are stored as SHA-256 hashes, never plaintext
@@ -896,10 +928,17 @@ pub trait TokenRepo: Send + Sync {
 
 /// Append-only audit log (S-22).
 ///
-/// The trait deliberately exposes **no update and no delete** — append and read are the whole
-/// contract. Retention trimming (S-23) is a future privileged maintenance job, not a repo
-/// capability. On Postgres the DB role is additionally INSERT-only (defense in depth); SQLite
-/// has no roles, so this trait boundary *is* the enforcement there.
+/// The trait exposes **no update**, and exactly one narrow delete: [`AuditRepo::prune_before`],
+/// which can only ever remove rows older than [`crate::retention::RetentionPolicy::AUDIT_FLOOR`]
+/// and only in bounded batches. Append, read and that one prune are the whole contract.
+///
+/// Retention used to be described here as "a future privileged maintenance job, not a repo
+/// capability". [Decision 30](../../../docs/decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature)
+/// made it a repo capability without giving up what the old sentence was protecting: on Postgres
+/// the app role still holds **no `DELETE`** on `audit_log` — the prune calls a `SECURITY DEFINER`
+/// function on which it holds only `EXECUTE`, and that function raises on a cutoff newer than the
+/// floor. SQLite has no roles, so there this trait boundary *is* the enforcement, as it always
+/// was ([S-22.a](../../../docs/security.md#5-audit--abuse)).
 #[async_trait]
 pub trait AuditRepo: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.
@@ -914,6 +953,24 @@ pub trait AuditRepo: Send + Sync {
     /// a malformed cursor is [`crate::Error::Invalid`]. `limit` is clamped to a sane range.
     /// Filters combine with AND; see [`AuditFilter`].
     async fn list(&self, filter: &AuditFilter, cursor: Option<&str>, limit: u32) -> Result<Page<AuditEvent>>;
+
+    /// Deletes at most `batch` events created strictly before `cutoff`, newest-untouched, and
+    /// returns how many rows went. S-23 retention, spent by the lifecycle job.
+    ///
+    /// Three properties are contractual and are asserted against both backends:
+    ///
+    /// 1. **One batch, never the whole backlog.** The caller loops; the implementation issues one
+    ///    bounded statement. An unbounded delete on this table is the SQLite write-lock hold that
+    ///    turns a concurrent publish into `SQLITE_BUSY`.
+    /// 2. **The floor is enforced below the caller.** A `cutoff` newer than
+    ///    [`crate::retention::RetentionPolicy::AUDIT_FLOOR`] before `now` is
+    ///    [`crate::Error::Invalid`] — refused, not clamped, because no legitimate path can produce
+    ///    one (the config validator refuses to configure it) and a clamp would silently delete a
+    ///    month of evidence on a caller's mistake.
+    /// 3. **A privilege refusal surfaces as itself.** On a Postgres provisioned per the hardened
+    ///    template without the `EXECUTE` grant, the error is returned rather than mapped to a
+    ///    generic internal failure, so the lifecycle job can name the missing grant.
+    async fn prune_before(&self, cutoff: DateTime<Utc>, now: DateTime<Utc>, batch: u32) -> Result<u64>;
 }
 
 /// Runtime-changeable instance settings, key → JSON with versions (decision 09;
@@ -1020,6 +1077,17 @@ pub trait NotificationRepo: Send + Sync {
 
     /// Marks every unread notification of the user read; returns how many rows changed.
     async fn mark_all_read(&self, user: UserId, now: DateTime<Utc>) -> Result<u64>;
+
+    /// Deletes at most `batch` notifications created strictly before `cutoff`, across every
+    /// account, and returns how many rows went (S-23 retention, spent by the lifecycle job).
+    ///
+    /// The one method on this trait that is **not** scoped to one user, and the exception is
+    /// deliberate: retention is an instance-wide sweep by age, not a feed operation. It reads
+    /// nothing back, so contract 1's "no method can return another account's notification" is
+    /// untouched. Read state is not part of the predicate — an unread notification from six
+    /// months ago is not a message somebody is about to act on, and a window that depends on read
+    /// state is a table whose growth depends on user behaviour.
+    async fn purge_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64>;
 
     /// The user's stored preference rows — categories they never touched are absent, and
     /// [`crate::notification::NotificationPreferences::from_rows`] fills them in.
@@ -1242,6 +1310,16 @@ pub trait StatsRepo: Send + Sync {
     /// The same totals for a bounded set of packages — the rollup job's write-back input.
     /// Packages with nothing recorded are omitted.
     async fn totals_for(&self, packages: &[PackageId], since: NaiveDate) -> Result<Vec<PackageDownloads>>;
+
+    /// Deletes at most `batch` daily rows dated strictly before `cutoff`, and returns how many
+    /// went (S-23 retention, spent by the lifecycle job).
+    ///
+    /// Exists but is **off by default** (`retain_download_stats_days = 0`), which is the one
+    /// retention window this product ships disabled. These rows are the only record of per-version
+    /// daily downloads, the v1.1 charts cannot reconstruct them after the fact, and the honest
+    /// bound on their growth is a monthly roll-up rather than a delete. An operator who would
+    /// rather have the space than the history has the knob.
+    async fn purge_before(&self, cutoff: NaiveDate, batch: u32) -> Result<u64>;
 }
 
 /// Outbound email delivery (OTP codes, invitations, notifications).

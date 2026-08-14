@@ -291,6 +291,7 @@ impl Settings {
         }
 
         self.validate_queue()?;
+        self.validate_lifecycle()?;
         Ok(())
     }
 
@@ -354,6 +355,92 @@ impl Settings {
                  fit in that half is work the drain can never claim",
                 queue.lease_secs, queue.interval_secs, queue.send_timeout_secs
             )));
+        }
+        Ok(())
+    }
+
+    /// Retention invariants (S-23, decision 30).
+    ///
+    /// Two of these are the difference between a feature and a data-loss bug, and both are checked
+    /// here rather than discovered from a failing job:
+    ///
+    /// - **The audit floor.** Below 30 days the database refuses the prune outright
+    ///   ([S-22.a](../../../docs/security.md#5-audit--abuse)) — the reachable capability is
+    ///   deliberately "delete audit rows older than a month", because evidence of an attack is
+    ///   recent. An operator who set 7 would otherwise get a job that fails every pass forever.
+    /// - **The session window against the idle window.** The purge predicate is
+    ///   `last_seen_at < cutoff`, which is safe *because* a row that old can no longer authenticate.
+    ///   Set the retention shorter than `auth.refresh_idle_days` and it stops being safe: retention
+    ///   would start signing people out.
+    ///
+    /// Every window accepts `0` — keep forever — so "off" is always expressible and is never what
+    /// these bounds refuse.
+    fn validate_lifecycle(&self) -> Result<(), ConfigError> {
+        /// Ceiling on `jobs.lifecycle.batch` — see the check below for why it exists.
+        const MAX_RETENTION_BATCH: u32 = 10_000;
+
+        let lifecycle = &self.jobs.lifecycle;
+        if lifecycle.interval_secs == 0 {
+            return Err(invalid("jobs.lifecycle.interval_secs must be greater than 0"));
+        }
+        if lifecycle.batch == 0 {
+            // A zero batch is a pass that deletes nothing while reporting a converged sweep on
+            // every table — retention that looks enabled and is not.
+            return Err(invalid("jobs.lifecycle.batch must be greater than 0"));
+        }
+        if lifecycle.budget_secs == 0 {
+            // With no budget the first batch of every table is already past the deadline, so no
+            // row is ever deleted and every table is reported as an unconverged backlog.
+            return Err(invalid("jobs.lifecycle.budget_secs must be greater than 0"));
+        }
+        if lifecycle.budget_secs >= lifecycle.interval_secs {
+            // A pass that may run longer than the gap to the next one has no idle period, and its
+            // lock TTL (twice the budget) would then span more than a whole tick.
+            return Err(invalid(format!(
+                "jobs.lifecycle.budget_secs = {} must be less than jobs.lifecycle.interval_secs = {}: a pass that \
+                 can outlast the gap to the next tick never lets the instance be idle",
+                lifecycle.budget_secs, lifecycle.interval_secs
+            )));
+        }
+        if lifecycle.batch > MAX_RETENTION_BATCH {
+            // `batch` is documented as the bound on how long one delete holds a write lock, and on
+            // SQLite that is literal: the process has one writer, and a statement that runs past
+            // the 5 s busy timeout turns concurrent sign-in and publish writes into errors rather
+            // than waits. Measured at roughly 6 us/row, the crossing point is on the order of
+            // 800k rows on fast local storage and proportionally fewer on a throttled disk — so a
+            // plausible "make it drain faster" setting reintroduces exactly the failure the bound
+            // exists to prevent. The ceiling keeps a statement two orders of magnitude inside it.
+            return Err(invalid(format!(
+                "jobs.lifecycle.batch = {} must be at most {MAX_RETENTION_BATCH}: the batch is the bound on how long \
+                 one delete holds SQLite's single write lock, and a larger one can outlast the busy timeout",
+                lifecycle.batch
+            )));
+        }
+        let floor = pub_core::retention::RetentionPolicy::AUDIT_FLOOR.num_days();
+        if lifecycle.retain_audit_days != 0 && lifecycle.retain_audit_days < floor {
+            return Err(invalid(format!(
+                "jobs.lifecycle.retain_audit_days = {} must be 0 (keep forever) or at least {floor}: the database \
+                 refuses to delete audit rows newer than that, because evidence of an attack is recent (S-22.a)",
+                lifecycle.retain_audit_days
+            )));
+        }
+        let idle = i64::try_from(self.auth.refresh_idle_days).unwrap_or(i64::MAX);
+        if lifecycle.retain_sessions_days != 0 && lifecycle.retain_sessions_days < idle {
+            return Err(invalid(format!(
+                "jobs.lifecycle.retain_sessions_days = {} must be 0 (keep forever) or at least \
+                 auth.refresh_idle_days = {idle}: retention ages a session from `last_seen_at`, so a shorter window \
+                 would delete sessions that can still authenticate",
+                lifecycle.retain_sessions_days
+            )));
+        }
+        for (key, days) in [
+            ("jobs.lifecycle.retain_invitations_days", lifecycle.retain_invitations_days),
+            ("jobs.lifecycle.retain_notifications_days", lifecycle.retain_notifications_days),
+            ("jobs.lifecycle.retain_download_stats_days", lifecycle.retain_download_stats_days),
+        ] {
+            if days < 0 {
+                return Err(invalid(format!("{key} = {days} must be 0 (keep forever) or positive")));
+            }
         }
         Ok(())
     }

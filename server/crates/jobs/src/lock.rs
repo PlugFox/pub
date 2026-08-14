@@ -1,6 +1,7 @@
-//! In-memory [`JobLock`] — trivial leader election for a single-instance deployment.
+//! In-memory [`JobLock`] — trivial leader election for a single-instance deployment — and
+//! [`JobLockTtls`], the one place a job's lock lifetime is decided.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -8,6 +9,60 @@ use async_trait::async_trait;
 use pub_core::Result;
 use pub_core::traits::{JobLock, LockToken};
 use tokio::time::Instant;
+
+/// Per-job lock lifetimes: the single source both the scheduler and the manual-run path read.
+///
+/// Before [decision 30](../../../../docs/decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature)
+/// there were two sources of truth for one lock ([D48](../../../../docs/roadmap.md)): the
+/// scheduler applied a single global TTL to *every* registered job — derived, after the wave-3 fix
+/// pass, from `jobs.queue.lease_secs`, so a queue lease silently set the lock lifetime of mirror
+/// sync, reindex, blob GC and the download rollup — while the manual-run registry used its own
+/// hardcoded 300 s. Both paths take the lock under the same name, and the promise attached to that
+/// name is that "run now" and a scheduled tick can never both hold one job's durable cursor; two
+/// different TTLs for one name is that promise being false.
+///
+/// A TTL has to outlive the longest run it guards, and "longest run" is a property of the job, not
+/// of the instance — which is why this is a map and not a number.
+#[derive(Clone, Debug)]
+pub struct JobLockTtls {
+    default: Duration,
+    per_job: BTreeMap<&'static str, Duration>,
+}
+
+impl Default for JobLockTtls {
+    fn default() -> Self {
+        Self { default: Self::DEFAULT, per_job: BTreeMap::new() }
+    }
+}
+
+impl JobLockTtls {
+    /// Lifetime for a job nobody configured. Bounds how long a crashed instance can block a job
+    /// cluster-wide.
+    pub const DEFAULT: Duration = Duration::from_secs(300);
+
+    /// A table whose unconfigured jobs use `ttl` instead of [`Self::DEFAULT`] (tests, mainly).
+    #[must_use]
+    pub fn with_default(ttl: Duration) -> Self {
+        Self { default: ttl, per_job: BTreeMap::new() }
+    }
+
+    /// Sets one job's lifetime.
+    #[must_use]
+    pub fn set(mut self, job: &'static str, ttl: Duration) -> Self {
+        self.per_job.insert(job, ttl);
+        self
+    }
+
+    /// The lifetime for `job`.
+    ///
+    /// An unregistered name falls back to the default rather than panicking: a job whose TTL
+    /// nobody set must still be able to run, and a missing entry is a wiring mistake that should
+    /// not take the instance down.
+    #[must_use]
+    pub fn get(&self, job: &str) -> Duration {
+        self.per_job.get(job).copied().unwrap_or(self.default)
+    }
+}
 
 /// Named locks with expiry, held in process memory. Only correct for a single instance —
 /// multi-instance deployments use the Redis or PG advisory lock implementations (later).

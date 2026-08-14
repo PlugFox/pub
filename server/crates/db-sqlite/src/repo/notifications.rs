@@ -378,4 +378,22 @@ impl NotificationRepo for SqliteNotificationRepo {
         tx.commit().await.map_err(db_err)?;
         rows.into_iter().map(TryInto::try_into).collect()
     }
+
+    async fn purge_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64> {
+        // The only statement in this file with no `user_id` in it, which is the point: retention is
+        // an instance-wide sweep by age, not a feed operation. It returns nothing, so contract 1
+        // ("no method can return another account's notification") is untouched. `read_at` is not in
+        // the predicate — a window that depends on read state is a table whose growth depends on
+        // user behaviour. `notifications_created_idx` (migration 0012) serves the seek.
+        let result = sqlx::query(
+            "DELETE FROM notifications WHERE id IN \
+             (SELECT id FROM notifications WHERE created_at < ? ORDER BY created_at LIMIT ?)",
+        )
+        .bind(super::ts(cutoff))
+        .bind(i64::from(batch))
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
 }

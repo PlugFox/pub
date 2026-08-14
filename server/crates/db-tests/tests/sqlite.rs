@@ -149,6 +149,11 @@ async fn job_queue_contract_s04_s31() {
     pub_db_tests::contract::job_queue(&fresh_repos().await).await;
 }
 
+#[tokio::test]
+async fn retention_contract_s23_s22a() {
+    pub_db_tests::contract::retention(&fresh_repos().await).await;
+}
+
 /// Every statement the drain emits on **every tick** must be an index lookup (SF2).
 ///
 /// Migration 0010 said it carried "partial indexes matching the predicates the repository
@@ -175,17 +180,66 @@ async fn the_drains_per_tick_statements_are_index_lookups() {
         rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | ")
     };
 
-    // Retention, once per state, per tick. The state is a literal in the repository precisely so
-    // these partial indexes can be inferred; a bound parameter would plan as a full scan.
+    // Retention, once per state, per pass of the lifecycle job. Two things about the shape below
+    // are load-bearing and both changed in the wave that added decision 30:
+    //
+    //   * the delete is now bounded — `id IN (SELECT … LIMIT ?)` — so the statement whose plan
+    //     matters is the inner SELECT, and a test still EXPLAINing the old bare DELETE would be
+    //     asserting an index for a statement production no longer emits (D52's exact shape);
+    //   * the timestamp is a **bind** now, not a literal. The state stays a literal precisely so
+    //     these partial indexes can be inferred, and that distinction is the thing worth pinning:
+    //     with the state bound too, SQLite cannot infer the partial index and this plans as a scan.
     for state in ["done", "suppressed", "dead"] {
-        let retention =
-            plan(&format!("DELETE FROM job_queue WHERE state = '{state}' AND updated_at < '2026-08-07T00:00:00Z'"))
-                .await;
+        let retention = plan(&format!(
+            "DELETE FROM job_queue WHERE id IN \
+             (SELECT id FROM job_queue WHERE state = '{state}' AND updated_at < ? LIMIT ?)"
+        ))
+        .await;
         assert!(
             retention.contains(&format!("job_queue_retention_{state}_idx")),
             "retention full-scans the table for {state} rows: {retention}"
         );
         assert!(!retention.contains("SCAN job_queue"), "{retention}");
+    }
+
+    // The other five retention statements, which had no plan test at all. Each is a write, so an
+    // unindexed one holds SQLite's single writer for the length of its scan — the failure class the
+    // whole batching design exists to avoid, and one that is green forever without a plan.
+    for (label, sql, index) in [
+        (
+            "sessions",
+            "DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE last_seen_at < ? ORDER BY last_seen_at \
+             LIMIT ?)",
+            "sessions_last_seen_idx",
+        ),
+        (
+            "invitations",
+            "DELETE FROM invitations WHERE id IN (SELECT id FROM invitations \
+             WHERE COALESCE(accepted_at, revoked_at, expires_at) < ? \
+             ORDER BY COALESCE(accepted_at, revoked_at, expires_at) LIMIT ?)",
+            "invitations_settled_idx",
+        ),
+        (
+            "notifications",
+            "DELETE FROM notifications WHERE id IN (SELECT id FROM notifications WHERE created_at < ? \
+             ORDER BY created_at LIMIT ?)",
+            "notifications_created_idx",
+        ),
+        (
+            "audit_log",
+            "DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < ? ORDER BY created_at \
+             LIMIT ?)",
+            "audit_created_idx",
+        ),
+        (
+            "download_stats",
+            "DELETE FROM download_stats WHERE (package_id, version_id, date) IN \
+             (SELECT package_id, version_id, date FROM download_stats WHERE date < ? ORDER BY date LIMIT ?)",
+            "download_stats_date_idx",
+        ),
+    ] {
+        let purge = plan(sql).await;
+        assert!(purge.contains(index), "{label} retention does not seek {index}: {purge}");
     }
 
     // The depth gauges, once per tick.

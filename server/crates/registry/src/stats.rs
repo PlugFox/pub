@@ -197,6 +197,10 @@ mod tests {
         async fn totals_for(&self, _packages: &[PackageId], _since: NaiveDate) -> Result<Vec<PackageDownloads>> {
             Ok(Vec::new())
         }
+
+        async fn purge_before(&self, _cutoff: NaiveDate, _batch: u32) -> Result<u64> {
+            unimplemented!("the rollup never spends download-stats retention")
+        }
     }
 
     #[tokio::test]

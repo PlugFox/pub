@@ -66,6 +66,13 @@ pub struct AppState {
     /// On the state rather than in a static so two instances in one test process cannot share
     /// a health verdict; in production there is exactly one of each per process anyway.
     pub health_probe: Arc<std::sync::Mutex<Option<(std::time::Instant, crate::routes::system::Checks)>>>,
+    /// Permits bounding audit-log exports in flight (see [`crate::routes::admin`]).
+    ///
+    /// On the state for the same reason as `health_probe`: two instances in one test process must
+    /// not share a budget. The resource it protects is this instance's database pool — an export
+    /// keeps querying after its response head has released the D8 concurrency permit, so nothing
+    /// else in the stack bounds it.
+    pub export_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -97,6 +104,7 @@ impl AppState {
             events: Arc::new(EventBus::new(EventBusPolicy::default())),
             clock: Arc::new(Utc::now),
             health_probe: Arc::default(),
+            export_slots: Arc::new(tokio::sync::Semaphore::new(crate::routes::admin::MAX_CONCURRENT_EXPORTS)),
         }
     }
 
