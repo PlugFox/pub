@@ -824,21 +824,26 @@ async fn charge_publish_budget(
     let key = format!("rl:publish:org:{}", org.id);
     match ratelimit::hit(state.kv.as_ref(), &key, limit, chrono::Duration::hours(1), now).await {
         Ok(Decision::Allowed) => Ok(()),
-        Ok(Decision::Limited { retry_after_secs }) => {
+        Ok(decision @ Decision::Limited { retry_after_secs, .. }) => {
+            metrics::counter!("rate_limit_trips_total", "limit" => "publish_per_hour_org").increment(1);
             // S-22: throttle trips are audit events, and this one names the org and the token
-            // that spent the budget — the operator's only view of a publish flood.
-            let event = NewAuditEvent {
-                actor: AuditActor::Token(ctx.token.id),
-                ip: meta.ip.clone(),
-                user_agent: meta.user_agent.clone(),
-                org_id: Some(org.id),
-                action: "package.publish.throttled".to_owned(),
-                target: None,
-                result: AuditResult::Failure,
-                metadata: Some(serde_json::json!({ "limit": "publish_per_hour_org", "value": limit })),
-            };
-            if let Err(err) = state.repos.audit.append(event, now).await {
-                tracing::error!(error = %err, "audit append failed for a publish throttle trip");
+            // that spent the budget — the operator's only view of a publish flood. One row per
+            // org per window, not one per refused upload: a client that keeps retrying past the
+            // budget would otherwise choose how many rows land in a table with no retention.
+            if decision.is_first_refusal() {
+                let event = NewAuditEvent {
+                    actor: AuditActor::Token(ctx.token.id),
+                    ip: meta.ip.clone(),
+                    user_agent: meta.user_agent.clone(),
+                    org_id: Some(org.id),
+                    action: "package.publish.throttled".to_owned(),
+                    target: None,
+                    result: AuditResult::Failure,
+                    metadata: Some(serde_json::json!({ "limit": "publish_per_hour_org", "value": limit })),
+                };
+                if let Err(err) = state.repos.audit.append(event, now).await {
+                    tracing::error!(error = %err, "audit append failed for a publish throttle trip");
+                }
             }
             Err(ProtocolError::from_domain(pub_core::Error::RateLimited { retry_after_secs }))
         }

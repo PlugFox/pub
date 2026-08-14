@@ -117,6 +117,38 @@ Global request-body cap in bytes (app API and everything else without its own li
 The publish upload subrouter overrides this with the archive cap; nothing else on the
 surface legitimately carries megabytes of request body.
 
+## `[http.rate_limit]`
+
+Read-path abuse limits (S-24.f). Boot defaults for the runtime-changeable numbers.
+
+Read-path rate limits ([S-24.f](../security.md#5-audit--abuse)).
+
+These live under `[http]` rather than `[auth]` or `[registry]` because they apply to every
+`GET`/`HEAD` on **both** planes — the app API and the pub protocol — and are a property of
+how this instance handles requests, like the deadlines and the body cap beside them.
+
+Both buckets **fail open**: a KV outage lifts the quota rather than refusing reads. They are
+quotas on cost, not access gates, and the gates that must fail closed are elsewhere.
+
+### `http.rate_limit.read_per_ip_minute`
+
+integer · `PUB_HTTP__RATE_LIMIT__READ_PER_IP_MINUTE` · default: `600`
+
+Reads per minute per client IP, for requests carrying no usable credential.
+
+Bounds an anonymous scraper at ten requests a second while leaving a human browsing the
+web UI — which fires several API calls per screen — far below it.
+
+### `http.rate_limit.read_per_identity_minute`
+
+integer · `PUB_HTTP__RATE_LIMIT__READ_PER_IDENTITY_MINUTE` · default: `3000`
+
+Reads per minute per identity: one CLI token, or one signed-in account.
+
+Sized for the burst `dart pub get` produces over a few hundred dependencies, from every
+CI job sharing one token at once. Raise it if a large fleet trips it; because the bucket
+fails open, guessing low degrades throughput rather than breaking resolution.
+
 ## `[database]`
 
 Database backend selection and connection settings.
@@ -268,13 +300,46 @@ Observability exports — each is opt-in and off by default (decision 23).
 
 boolean · `PUB_TELEMETRY__PROMETHEUS` · default: `false`
 
-Enable the Prometheus metrics recorder/exporter.
+Enable the Prometheus recorder and the metrics listener below.
 
-### `telemetry.otlp`
+With this off nothing is recorded and no second socket is bound: the instruments
+compile to no-ops, which is what "monitoring is optional" means (decision 23).
 
-boolean · `PUB_TELEMETRY__OTLP` · default: `false`
+### `telemetry.metrics_listen`
 
-Enable OTLP trace export.
+string · `PUB_TELEMETRY__METRICS_LISTEN` · default: `"127.0.0.1:9090"`
+
+Address the Prometheus exposition is served on, when `prometheus` is enabled.
+
+A **separate listener**, never a route on the application port (decision 28). The
+application listener sheds load under saturation — so a scrape would go dark exactly
+when it is needed — and publishing internal cardinality on the instance's public origin
+is not a default anyone should inherit. The default binds loopback; a deployment that
+scrapes from another host sets `0.0.0.0:9090` deliberately, having read that the surface
+is unauthenticated.
+
+### `telemetry.log_format`
+
+`pretty` | `json` · `PUB_TELEMETRY__LOG_FORMAT` · default: `"pretty"`
+
+Log output format: human-readable, or one JSON object per line for shipping.
+
+Allowed values:
+
+- `pretty` — Human-readable multi-line output for development.
+- `json` — One JSON object per line, for a log shipper.
+
+### `telemetry.server_timing`
+
+boolean · `PUB_TELEMETRY__SERVER_TIMING` · default: `false`
+
+Emit `Server-Timing` on responses, for latency debugging in a browser.
+
+**Off by default, and never emitted on `/api/v1/auth/*` whatever this says**
+([S-04.d](../security.md#1-authentication)): the header is a timing side
+channel with the network noise removed, and the authentication surface's whole defence
+is that two outcomes cost the same. The surfaces it does expose when enabled carry their
+own visibility differentials, so turning it on is an operator's deliberate trade.
 
 ## `[cluster]`
 

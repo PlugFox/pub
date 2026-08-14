@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{MatchedPath, Request, State};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tokio::sync::Semaphore;
@@ -28,7 +28,7 @@ use crate::protocol::error::{PUB_V2_MEDIA_TYPE, SpecError, SpecErrorBody};
 use crate::state::AppState;
 
 /// The SSE stream (S-32) — exempt from the request deadline, see [`budget_for`].
-const SSE_PATH: &str = "/api/v1/events";
+pub(crate) const SSE_PATH: &str = "/api/v1/events";
 
 /// Suffix of the publish-upload path on both virtual bases (docs/protocol.md endpoint 3).
 const UPLOAD_SUFFIX: &str = "/api/packages/versions/newUpload";
@@ -39,7 +39,7 @@ const FINALIZE_INFIX: &str = "/api/packages/versions/newUploadFinish/";
 
 /// Liveness must answer while the instance is melting — S-24 exempts health checks from
 /// limits, and the same logic exempts them from the shed.
-const HEALTH_PATH: &str = "/healthz";
+pub(crate) const HEALTH_PATH: &str = "/healthz";
 
 /// `Strict-Transport-Security` value sent on https deployments (S-28): two years, subdomains
 /// included — the instance origin is dedicated to the registry.
@@ -49,7 +49,7 @@ const HSTS: &str = "max-age=63072000; includeSubDomains";
 
 /// Which wire dialect a path answers in (docs/rules/api.md — "never mix them").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(crate) enum Family {
     /// `/pub/…` and `/o/{org}/pub/…`: spec error shape, pub v2 media type.
     Pub,
     /// `/api/…`: the app envelope.
@@ -59,7 +59,7 @@ enum Family {
 }
 
 /// Classifies a request path into its response family.
-fn family_of(path: &str) -> Family {
+pub(crate) fn family_of(path: &str) -> Family {
     if path == "/pub" || path.starts_with("/pub/") || is_org_pub(path) {
         Family::Pub
     } else if path == "/api" || path.starts_with("/api/") {
@@ -261,6 +261,92 @@ pub async fn response_headers(State(state): State<AppState>, request: Request, n
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     response
+}
+
+// ------------------------------------------------------------------- HTTP metrics (decision 28)
+
+/// Prefix of the authentication family, which never carries `Server-Timing` (S-04.d).
+const AUTH_PREFIX: &str = "/api/v1/auth/";
+
+/// RED metrics for every request, plus the optional `Server-Timing` header.
+///
+/// Sits **outside** the load shedder and the deadline so their 503s and 408s are counted:
+/// leaving out exactly the responses an operator is paging about would make the dashboard lie
+/// in the one situation it exists for.
+///
+/// `Server-Timing` is emitted only when `telemetry.server_timing` is on **and** the path is not
+/// on the authentication family (S-04.d) — the header is a timing side channel with the network
+/// noise removed, and those routes' whole defence is that two outcomes cost the same.
+pub async fn http_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = method_label(request.method());
+    let route = route_label(&request);
+    let started = std::time::Instant::now();
+    let timing_allowed = state.settings.telemetry.server_timing && !request.uri().path().starts_with(AUTH_PREFIX);
+
+    let mut response = next.run(request).await;
+
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16().to_string();
+    metrics::counter!("http_requests_total", "route" => route, "method" => method, "status" => status.clone())
+        .increment(1);
+    metrics::histogram!("http_request_duration_seconds", "route" => route, "method" => method, "status" => status)
+        .record(elapsed.as_secs_f64());
+
+    if timing_allowed
+        && let Ok(value) = HeaderValue::from_str(&format!("app;dur={:.1}", elapsed.as_secs_f64() * 1000.0))
+    {
+        response.headers_mut().insert(HeaderName::from_static("server-timing"), value);
+    }
+    response
+}
+
+/// The `route` label: the router's matched path, or one bounded constant per family.
+///
+/// Never `uri().path()`. Both routers' fallbacks (`assets::spa_fallback` and the pub protocol's
+/// `unimplemented_endpoint`) leave [`MatchedPath`] unset, so the textbook derivation would let
+/// any unauthenticated caller mint an unbounded number of label values — a memory leak wearing
+/// a metric's clothes.
+fn route_label(request: &Request) -> &'static str {
+    if let Some(matched) = request.extensions().get::<MatchedPath>() {
+        // Interned: the set of matched paths is the route table, which is fixed at startup, so
+        // this leaks a bounded number of short strings exactly once each.
+        return intern_route(matched.as_str());
+    }
+    match family_of(request.uri().path()) {
+        Family::Api => "{api}",
+        Family::Pub => "{pub}",
+        Family::Other => "{asset}",
+    }
+}
+
+/// Interns a matched route path to `&'static str` for the metric label.
+///
+/// Bounded by the route table (~60 entries): a path only reaches this function by having been
+/// matched by the router, so no request can add to the set.
+fn intern_route(path: &str) -> &'static str {
+    static INTERNED: std::sync::Mutex<Option<std::collections::HashSet<&'static str>>> = std::sync::Mutex::new(None);
+    let mut guard = INTERNED.lock().expect("route intern mutex poisoned");
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    if let Some(existing) = set.get(path) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(path.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
+/// The `method` label, from a closed set — an unrecognized method is one value, not a new one.
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    }
 }
 
 /// Whether the configured public URL is https (drives HSTS).

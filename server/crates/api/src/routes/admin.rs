@@ -79,6 +79,8 @@ pub async fn update_settings(
             login_per_ip_minute: limits.login_per_ip_minute,
             token_auth_fail_per_ip_minute: limits.token_auth_fail_per_ip_minute,
             publish_per_hour_org: limits.publish_per_hour_org,
+            read_per_ip_minute: limits.read_per_ip_minute,
+            read_per_identity_minute: limits.read_per_identity_minute,
         }),
         smtp: body.smtp.map(smtp_from),
         branding: body.branding.map(|branding| BrandingSettings {
@@ -465,6 +467,8 @@ fn settings_dto(view: pub_admin::SettingsView) -> AdminSettingsDto {
             login_per_ip_minute: view.rate_limits.login_per_ip_minute,
             token_auth_fail_per_ip_minute: view.rate_limits.token_auth_fail_per_ip_minute,
             publish_per_hour_org: view.rate_limits.publish_per_hour_org,
+            read_per_ip_minute: view.rate_limits.read_per_ip_minute,
+            read_per_identity_minute: view.rate_limits.read_per_identity_minute,
         },
         smtp: SmtpSettingsDto {
             host: view.smtp.host,

@@ -227,6 +227,8 @@ pub struct HttpConfig {
     /// The publish upload subrouter overrides this with the archive cap; nothing else on the
     /// surface legitimately carries megabytes of request body.
     pub max_body_bytes: usize,
+    /// Read-path abuse limits (S-24.f). Boot defaults for the runtime-changeable numbers.
+    pub rate_limit: HttpRateLimit,
 }
 
 impl Default for HttpConfig {
@@ -236,7 +238,38 @@ impl Default for HttpConfig {
             upload_timeout_secs: 300,
             concurrency_limit: 1024,
             max_body_bytes: 2 * 1024 * 1024,
+            rate_limit: HttpRateLimit::default(),
         }
+    }
+}
+
+/// Read-path rate limits ([S-24.f](../../../docs/security.md#5-audit--abuse)).
+///
+/// These live under `[http]` rather than `[auth]` or `[registry]` because they apply to every
+/// `GET`/`HEAD` on **both** planes — the app API and the pub protocol — and are a property of
+/// how this instance handles requests, like the deadlines and the body cap beside them.
+///
+/// Both buckets **fail open**: a KV outage lifts the quota rather than refusing reads. They are
+/// quotas on cost, not access gates, and the gates that must fail closed are elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpRateLimit {
+    /// Reads per minute per client IP, for requests carrying no usable credential.
+    ///
+    /// Bounds an anonymous scraper at ten requests a second while leaving a human browsing the
+    /// web UI — which fires several API calls per screen — far below it.
+    pub read_per_ip_minute: u32,
+    /// Reads per minute per identity: one CLI token, or one signed-in account.
+    ///
+    /// Sized for the burst `dart pub get` produces over a few hundred dependencies, from every
+    /// CI job sharing one token at once. Raise it if a large fleet trips it; because the bucket
+    /// fails open, guessing low degrades throughput rather than breaking resolution.
+    pub read_per_identity_minute: u32,
+}
+
+impl Default for HttpRateLimit {
+    fn default() -> Self {
+        Self { read_per_ip_minute: 600, read_per_identity_minute: 3000 }
     }
 }
 
@@ -724,13 +757,55 @@ impl Default for KvConfig {
 }
 
 /// Observability exports — each is opt-in and off by default (decision 23).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
-    /// Enable the Prometheus metrics recorder/exporter.
+    /// Enable the Prometheus recorder and the metrics listener below.
+    ///
+    /// With this off nothing is recorded and no second socket is bound: the instruments
+    /// compile to no-ops, which is what "monitoring is optional" means (decision 23).
     pub prometheus: bool,
-    /// Enable OTLP trace export.
-    pub otlp: bool,
+    /// Address the Prometheus exposition is served on, when `prometheus` is enabled.
+    ///
+    /// A **separate listener**, never a route on the application port (decision 28). The
+    /// application listener sheds load under saturation — so a scrape would go dark exactly
+    /// when it is needed — and publishing internal cardinality on the instance's public origin
+    /// is not a default anyone should inherit. The default binds loopback; a deployment that
+    /// scrapes from another host sets `0.0.0.0:9090` deliberately, having read that the surface
+    /// is unauthenticated.
+    pub metrics_listen: String,
+    /// Log output format: human-readable, or one JSON object per line for shipping.
+    pub log_format: LogFormat,
+    /// Emit `Server-Timing` on responses, for latency debugging in a browser.
+    ///
+    /// **Off by default, and never emitted on `/api/v1/auth/*` whatever this says**
+    /// ([S-04.d](../../../docs/security.md#1-authentication)): the header is a timing side
+    /// channel with the network noise removed, and the authentication surface's whole defence
+    /// is that two outcomes cost the same. The surfaces it does expose when enabled carry their
+    /// own visibility differentials, so turning it on is an operator's deliberate trade.
+    pub server_timing: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            prometheus: false,
+            metrics_listen: "127.0.0.1:9090".to_owned(),
+            log_format: LogFormat::Pretty,
+            server_timing: false,
+        }
+    }
+}
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable multi-line output for development.
+    #[default]
+    Pretty,
+    /// One JSON object per line, for a log shipper.
+    Json,
 }
 
 /// Registry ingest limits and lifecycle policy (S-20, decision 06).
@@ -1285,6 +1360,8 @@ impl Settings {
                 login_per_ip_minute: self.auth.rate_limit.login_per_ip_minute,
                 token_auth_fail_per_ip_minute: self.auth.rate_limit.token_auth_fail_per_ip_minute,
                 publish_per_hour_org: self.registry.rate_limit.publish_per_hour_org,
+                read_per_ip_minute: self.http.rate_limit.read_per_ip_minute,
+                read_per_identity_minute: self.http.rate_limit.read_per_identity_minute,
             },
             smtp: SmtpSettings {
                 host: self.smtp.host.clone(),
@@ -1361,7 +1438,9 @@ impl Settings {
             let _ = writeln!(out, "  kv.url               = {url}");
         }
         let _ = writeln!(out, "  telemetry.prometheus = {}", self.telemetry.prometheus);
-        let _ = writeln!(out, "  telemetry.otlp       = {}", self.telemetry.otlp);
+        if self.telemetry.prometheus {
+            let _ = writeln!(out, "  telemetry.metrics    = {}", self.telemetry.metrics_listen);
+        }
         let _ = writeln!(out, "  cluster.replicas     = {}", self.cluster.replicas);
         let _ = writeln!(
             out,

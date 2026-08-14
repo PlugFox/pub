@@ -1,10 +1,12 @@
-//! Request guards: the S-12 mutation guard (custom header + JSON-only bodies) and the
-//! KV-backed auth rate-limit layer (S-24).
+//! Request guards: the S-12 mutation guard (custom header + JSON-only bodies), the KV-backed
+//! auth rate-limit layer (S-24), and the read-path buckets (S-24.f).
 //!
 //! Middleware order (docs/rules/api.md): request-id → tracing → security headers → CORS →
-//! load-shed → timeout → body cap → rate limit → auth extractors. Both guards scope
-//! themselves to app-API paths — the pub protocol surface (`/o/…`, `/pub/…`) has its own
-//! contract and must never inherit these checks.
+//! load-shed → timeout → body cap → rate limit → auth extractors. The S-12 guard and the auth
+//! buckets scope themselves to app-API paths — the pub protocol surface (`/o/…`, `/pub/…`) has
+//! its own contract and must never inherit those checks. The **read** bucket is the one guard
+//! that deliberately spans both planes: `dart pub get` is where the read volume actually is,
+//! and a limit the protocol plane does not have is not a limit.
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -125,30 +127,234 @@ pub async fn auth_rate_limit(State(state): State<AppState>, request: Request, ne
         let ip = client_ip(request.headers(), request.extensions(), state.trust_proxy_headers())
             .unwrap_or_else(|| "unknown".to_owned());
         let key = format!("rl:{bucket_name}:ip:{ip}");
-        match ratelimit::hit(state.kv.as_ref(), &key, limit, window, now).await {
-            Ok(Decision::Allowed) => {}
-            Ok(Decision::Limited { retry_after_secs }) => {
-                // S-24: throttle trips are audit-logged; failures must not mask the 429.
-                let meta = client_meta(request.headers(), request.extensions(), state.trust_proxy_headers());
-                let event = NewAuditEvent {
-                    actor: AuditActor::System,
-                    ip: meta.ip,
-                    user_agent: meta.user_agent,
-                    org_id: None,
-                    action: "auth.throttled".to_owned(),
-                    target: None,
-                    result: AuditResult::Failure,
-                    metadata: Some(serde_json::json!({ "limit": limit_name })),
-                };
-                if let Err(err) = state.repos.audit.append(event, now).await {
-                    tracing::error!(error = %err, "audit append failed for throttle trip");
-                }
-                return ApiError(Error::RateLimited { retry_after_secs }).into_response();
-            }
-            Err(err) => return ApiError(err).into_response(),
+        // Fails closed onto this instance's own table when the KV is unreachable (S-24.e): the
+        // former `Err(err) => 503` took sign-in down instance-wide for the length of a Redis
+        // blip, which is the one thing an abuse limiter must never do.
+        let decision = ratelimit::hit_or_fallback(
+            state.kv.as_ref(),
+            state.auth.rate_limit_fallback(),
+            limit_name,
+            &key,
+            limit,
+            window,
+            now,
+        )
+        .await;
+        if let Decision::Limited { retry_after_secs, .. } = decision {
+            trip(
+                &state,
+                client_meta(request.headers(), request.extensions(), state.trust_proxy_headers()),
+                AUTH_THROTTLED,
+                limit_name,
+                decision,
+                now,
+            )
+            .await;
+            return ApiError(Error::RateLimited { retry_after_secs }).into_response();
         }
     }
     next.run(request).await
+}
+
+/// Audit action for a credential-plane throttle trip: sign-in, redemption, token auth.
+///
+/// Kept distinct from [`READ_THROTTLED`] because an operator filtering the audit log for
+/// credential abuse must not have that signal diluted by a scraper hitting the read quota —
+/// which, with the read path bucketed, is by far the more common trip.
+const AUTH_THROTTLED: &str = "auth.throttled";
+
+/// Audit action for a read-path throttle trip (S-24.f).
+const READ_THROTTLED: &str = "read.throttled";
+
+/// Records a throttle trip: always a counter, an audit row only on the window's **first**
+/// refusal (S-22, S-24).
+///
+/// One row per refused *request* would hand an attacker the row count of a table that has no
+/// retention yet — the throttle would become a cheaper way to fill `audit_log` than the traffic
+/// it refuses. One row per bucket per window says the same thing; the counter carries volume.
+///
+/// Takes the client metadata **by value**, not the `Request` it came from: `&Request<Body>` is
+/// not `Send` (the body is not `Sync`), so holding one across the audit `await` would make this
+/// middleware's future non-`Send` — which axum reports as an unrelated `Service` bound failure
+/// on the whole router, sixty lines away from the cause.
+async fn trip(
+    state: &AppState,
+    meta: pub_auth::flows::ClientMeta,
+    action: &'static str,
+    limit_name: &'static str,
+    decision: Decision,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    metrics::counter!("rate_limit_trips_total", "limit" => limit_name).increment(1);
+    if !decision.is_first_refusal() {
+        return;
+    }
+    let event = NewAuditEvent {
+        actor: AuditActor::System,
+        ip: meta.ip,
+        user_agent: meta.user_agent,
+        org_id: None,
+        action: action.to_owned(),
+        target: None,
+        result: AuditResult::Failure,
+        metadata: Some(serde_json::json!({ "limit": limit_name })),
+    };
+    // Failures must not mask the 429 the caller is about to receive.
+    if let Err(err) = state.repos.audit.append(event, now).await {
+        tracing::error!(error = %err, "audit append failed for throttle trip");
+    }
+}
+
+/// The identity a read bucket is keyed on (S-24.f, S-13.b, decision 27).
+///
+/// Resolved from the request alone — **no database read** — which is what lets this run in
+/// middleware on the hot path of every `dart pub get`.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadIdentity {
+    /// A syntactically valid CLI token, keyed on a truncated hash of the secret.
+    ///
+    /// The offline gate (`token::validate`: prefix, length, charset, CRC32) is the same one
+    /// `authenticate_cli_token` runs before it touches the database, so an *unknown* token is
+    /// keyed like a known one. That is deliberate and bounded: on the protocol plane an unknown
+    /// token fails authentication and spends `token_auth_fail_per_ip_minute` (30/min/IP), and on
+    /// the app API a CLI token never authenticates at all. See S-13.b for the coupling.
+    Token(String),
+    /// A **verified** access token, keyed on its subject. Verification is local (Ed25519
+    /// against the keyring, no I/O); an unverified `sub` would let anyone spend a chosen
+    /// victim's read budget by asserting their user id.
+    User(String),
+    /// Everything else, including a credential that is neither of the above.
+    Ip(String),
+}
+
+impl ReadIdentity {
+    /// Bucket key and the limit class this identity spends.
+    fn key(&self) -> String {
+        match self {
+            Self::Token(hash) => format!("rl:read:tok:{hash}"),
+            Self::User(sub) => format!("rl:read:usr:{sub}"),
+            Self::Ip(ip) => format!("rl:read:ip:{ip}"),
+        }
+    }
+
+    /// Whether this request carries an identity of its own (and so rides the larger budget).
+    fn is_identified(&self) -> bool {
+        !matches!(self, Self::Ip(_))
+    }
+
+    /// The audit/metric label — a bucket family, never the identity itself.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Token(_) => "read_per_token",
+            Self::User(_) => "read_per_user",
+            Self::Ip(_) => "read_per_ip",
+        }
+    }
+}
+
+/// Read-path abuse limits on both planes (S-24.f), keyed by identity and failing **open**.
+///
+/// Scope: `GET`/`HEAD` under `/api/…` or a registry base. Deliberately excluded —
+///
+/// - **`/healthz`**, because S-24 exempts health checks; its cost is bounded by the handler's
+///   own one-second memo instead.
+/// - **the SSE stream**, because it is one request per session rather than a rate; its bound is
+///   the S-32 heartbeat, exactly as for the request deadline.
+/// - **static assets**, which are embedded, immutable and served from memory.
+///
+/// A KV error allows the request and logs. This bucket is a quota on cost, not an access gate:
+/// closing it would let a KV outage take package resolution down for every client of the
+/// instance, which is a strictly worse failure than an unenforced quota for the same minutes.
+pub async fn read_rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) || !is_read_limited_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let now = (state.clock)();
+    let identity = read_identity(&state, &request);
+    let limits = state.runtime.current().rate_limits;
+    let limit = if identity.is_identified() { limits.read_per_identity_minute } else { limits.read_per_ip_minute };
+
+    match ratelimit::hit(state.kv.as_ref(), &identity.key(), limit, Duration::minutes(1), now).await {
+        Ok(Decision::Allowed) => {}
+        Ok(decision @ Decision::Limited { retry_after_secs, .. }) => {
+            trip(
+                &state,
+                client_meta(request.headers(), request.extensions(), state.trust_proxy_headers()),
+                READ_THROTTLED,
+                identity.label(),
+                decision,
+                now,
+            )
+            .await;
+            return refusal(request.uri().path(), retry_after_secs);
+        }
+        // Fail open (S-24.f). Logged at warn, not error: the request succeeded.
+        Err(err) => tracing::warn!(error = %err, "read-path rate limit unavailable; allowing the request (S-24.f)"),
+    }
+    next.run(request).await
+}
+
+/// The 429, in the shape of the plane that asked.
+///
+/// The read bucket is the first guard to span **both** planes, and the two speak different
+/// dialects (docs/rules/api.md — "never mix them"). The app envelope and the pub spec error
+/// happen to share a JSON *structure*, so a wrong choice here is invisible to a body assertion
+/// and visible to the client, which decides by media type: `dart pub` parses the body of every
+/// failure, and unparseable bytes turn a clear "slow down" into a decoding error. The auth
+/// guards next door can use the envelope unconditionally only because they scope themselves to
+/// `/api/…`.
+fn refusal(path: &str, retry_after_secs: u64) -> Response {
+    let error = Error::RateLimited { retry_after_secs };
+    match crate::hygiene::family_of(path) {
+        crate::hygiene::Family::Pub => crate::protocol::error::ProtocolError::from_domain(error).into_response(),
+        _ => ApiError(error).into_response(),
+    }
+}
+
+/// Whether a path spends a read bucket. See [`read_rate_limit`] for what each exclusion buys.
+fn is_read_limited_path(path: &str) -> bool {
+    if path == crate::hygiene::HEALTH_PATH || path == crate::hygiene::SSE_PATH {
+        return false;
+    }
+    matches!(crate::hygiene::family_of(path), crate::hygiene::Family::Api | crate::hygiene::Family::Pub)
+}
+
+/// Classifies the request's credential into a [`ReadIdentity`].
+fn read_identity(state: &AppState, request: &Request) -> ReadIdentity {
+    let anonymous = || {
+        // Unresolvable IPs share one bucket — still bounded, never a bypass.
+        ReadIdentity::Ip(
+            client_ip(request.headers(), request.extensions(), state.trust_proxy_headers())
+                .unwrap_or_else(|| "unknown".to_owned()),
+        )
+    };
+    let Some(secret) = bearer(request.headers()) else {
+        return anonymous();
+    };
+
+    if pub_auth::token::validate(secret, &state.auth.policy().token_prefix).is_ok() {
+        // 16 hex characters of the same SHA-256 the database stores — enough to separate
+        // tokens, and never a credential-equivalent value in a second system. A collision
+        // merges two budgets, which only ever refuses more.
+        let hash = pub_auth::token::sha256_hex(secret);
+        return ReadIdentity::Token(hash[..16].to_owned());
+    }
+    match state.auth.verify_access(secret, (state.clock)()) {
+        Ok(claims) => ReadIdentity::User(claims.sub.to_string()),
+        Err(_) => anonymous(),
+    }
+}
+
+/// The bearer credential, with the scheme matched case-insensitively.
+///
+/// Case-insensitive per RFC 9110 §11.1 and S-14.a — the protocol plane already accepts
+/// `bearer`, so keying on `Bearer` alone would quietly drop those callers into the anonymous
+/// per-IP bucket and throttle a legitimate CI fleet at the wrong number.
+fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, rest) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim()).filter(|token| !token.is_empty())
 }
 
 /// Whether a path is a credential-redemption endpoint under the S-24 "login" bucket.

@@ -152,6 +152,13 @@ pub struct RateLimitSettings {
     pub token_auth_fail_per_ip_minute: u32,
     /// Publish uploads per org per hour (S-24.c).
     pub publish_per_hour_org: u32,
+    /// Reads per minute for a request with **no** identity — bucketed on the client IP
+    /// (S-24.f). Anonymous browsing and anonymous `dart pub` traffic land here.
+    pub read_per_ip_minute: u32,
+    /// Reads per minute for a request that carries one — a CLI token or a verified session
+    /// (S-24.f, S-13.b). Deliberately far above the anonymous number: a CI fleet behind one
+    /// NAT is one IP and many tokens, so the per-IP value cannot serve both.
+    pub read_per_identity_minute: u32,
 }
 
 impl Default for RateLimitSettings {
@@ -162,6 +169,8 @@ impl Default for RateLimitSettings {
             login_per_ip_minute: 10,
             token_auth_fail_per_ip_minute: 30,
             publish_per_hour_org: 30,
+            read_per_ip_minute: 600,
+            read_per_identity_minute: 3000,
         }
     }
 }

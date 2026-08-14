@@ -930,6 +930,21 @@ pub trait SettingsRepo: Send + Sync {
     /// Returns the entry's new version.
     async fn upsert(&self, key: &str, value: &serde_json::Value, now: DateTime<Utc>) -> Result<i64>;
 
+    /// Removes the entry under `key`, returning whether one existed. Removing an absent key is
+    /// not an error.
+    ///
+    /// **This is not "write an empty section".** An empty section is a stored decision that
+    /// every field is unset; a deleted one is *no* stored decision, so the cache falls back to
+    /// the operator's boot configuration. The two produce different instances — for `smtp` the
+    /// first means "no mail", the second means "whatever the config file says" — which is why
+    /// the admin API only ever upserts and this method is reachable from the offline
+    /// `pubd reset-smtp` path alone ([decision 29](../../../docs/decisions.md#29)).
+    ///
+    /// The instance version (see [`SettingsRepo::get_version`]) *decreases* on a delete. That
+    /// is intentional and safe: the reconciliation poll compares versions for **inequality**,
+    /// so peers reload on the way down exactly as they do on the way up.
+    async fn delete(&self, key: &str) -> Result<bool>;
+
     /// The instance settings version: sum of all per-key versions — a monotonic change
     /// counter for the reconciliation version-poll. `0` when no settings exist.
     async fn get_version(&self) -> Result<i64>;

@@ -184,6 +184,14 @@ pub struct AuthService {
     runtime: Arc<SettingsCache>,
     rng: Arc<dyn RandomSource>,
     oidc: OidcClient,
+    /// The per-instance budget the auth-abuse buckets fall back to when the KV cannot answer
+    /// ([S-24.e](../../../docs/security.md#5-audit--abuse)).
+    ///
+    /// It lives here because there must be exactly **one** table per process: the API guard's
+    /// per-IP buckets and this service's per-email bucket are the same requirement, and two
+    /// tables would each enforce the limit separately, doubling the budget an outage allows.
+    /// Reachable through [`AuthService::rate_limit_fallback`] for that reason alone.
+    rate_limit_fallback: Arc<ratelimit::InProcessLimiter>,
 }
 
 impl AuthService {
@@ -202,7 +210,13 @@ impl AuthService {
         rng: Arc<dyn RandomSource>,
         oidc: OidcClient,
     ) -> Self {
-        Self { repos, kv, keyring, policy, runtime, rng, oidc }
+        Self { repos, kv, keyring, policy, runtime, rng, oidc, rate_limit_fallback: Arc::default() }
+    }
+
+    /// The process's single in-process rate-limit fallback (S-24.e) — see the field's docs for
+    /// why the API guard must borrow this one rather than build its own.
+    pub fn rate_limit_fallback(&self) -> &ratelimit::InProcessLimiter {
+        &self.rate_limit_fallback
     }
 
     /// The boot-only half of the auth policy (TTLs, pepper, KEK, token prefix).
@@ -226,16 +240,28 @@ impl AuthService {
         let email = normalize_email(email)?;
 
         // S-24: 5/h per email. The per-IP cap is enforced a layer above (API middleware).
-        let email_limit = ratelimit::hit(
+        //
+        // Fails **closed onto this instance's own table** when the KV is unreachable (S-24.e):
+        // the `?` that used to live here turned a Redis blip into a 503 on every sign-in, which
+        // is the one failure mode a limiter must not have. The mail-bomb bound survives the
+        // outage at per-instance granularity; decision 27 records the N-replica cost.
+        let email_limit = ratelimit::hit_or_fallback(
             self.kv.as_ref(),
+            self.rate_limit_fallback(),
+            "otp_email",
             &format!("rl:otp:email:{email}"),
             self.settings().rate_limits.otp_per_email_hour,
             Duration::hours(1),
             now,
         )
-        .await?;
-        if let ratelimit::Decision::Limited { retry_after_secs } = email_limit {
-            self.audit_throttled(&email, meta, "otp_per_email", now).await;
+        .await;
+        if let ratelimit::Decision::Limited { retry_after_secs, .. } = email_limit {
+            metrics::counter!("rate_limit_trips_total", "limit" => "otp_per_email").increment(1);
+            // One audit row per bucket per window, not one per refused request: the row count
+            // would otherwise be the attacker's to choose, on a table with no retention (D12).
+            if email_limit.is_first_refusal() {
+                self.audit_throttled(&email, meta, "otp_per_email", now).await;
+            }
             return Err(Error::RateLimited { retry_after_secs });
         }
 
@@ -1168,17 +1194,20 @@ impl AuthService {
         let limit = self.settings().rate_limits.token_auth_fail_per_ip_minute;
         match ratelimit::hit(self.kv.as_ref(), &key, limit, window, now).await {
             Ok(ratelimit::Decision::Allowed) => {}
-            Ok(ratelimit::Decision::Limited { retry_after_secs }) => {
-                self.audit_as(
-                    AuditActor::System,
-                    meta,
-                    "auth.throttled",
-                    None,
-                    AuditResult::Failure,
-                    serde_json::json!({ "limit": "token_auth_per_ip" }),
-                    now,
-                )
-                .await;
+            Ok(decision @ ratelimit::Decision::Limited { retry_after_secs, .. }) => {
+                metrics::counter!("rate_limit_trips_total", "limit" => "token_auth_per_ip").increment(1);
+                if decision.is_first_refusal() {
+                    self.audit_as(
+                        AuditActor::System,
+                        meta,
+                        "auth.throttled",
+                        None,
+                        AuditResult::Failure,
+                        serde_json::json!({ "limit": "token_auth_per_ip" }),
+                        now,
+                    )
+                    .await;
+                }
                 return Error::RateLimited { retry_after_secs };
             }
             Err(err) => tracing::error!(error = %err, "token-auth throttle accounting failed"),

@@ -40,8 +40,8 @@ use pub_registry::{
     ArchiveLimits, DownloadRecorder, RegistryPolicy, RegistryService, UpstreamClient, UpstreamService,
     UpstreamServicePolicy,
 };
-use pub_telemetry::LogFormat;
 
+mod reset_smtp;
 mod secrets;
 
 /// Version string surfaced by `pubd --version`: the release/crate version
@@ -69,6 +69,9 @@ struct Cli {
 enum Command {
     /// Generate production secret material: Ed25519 JWT keyring, OTP pepper, KEK (S-25).
     GenerateSecrets(secrets::GenerateSecretsArgs),
+    /// Delete the stored SMTP settings section so the boot `[smtp]` applies again — the
+    /// supported way back in when a broken mail plane is what blocks sign-in (decision 29).
+    ResetSmtp(reset_smtp::ResetSmtpArgs),
 }
 
 #[tokio::main]
@@ -86,10 +89,18 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::GenerateSecrets(args)) = &cli.command {
         return secrets::run(args);
     }
+    let command = cli.command;
     let cli = cli.config;
 
     let settings = pub_config::load(&cli).context("failed to load configuration")?;
-    let telemetry = pub_telemetry::init(LogFormat::Pretty, &settings.telemetry);
+
+    // `reset-smtp` runs after the config *loads* but before anything is served: it needs the
+    // database URL and the boot `[smtp]` it is restoring, and nothing else (decision 29).
+    if let Some(Command::ResetSmtp(args)) = &command {
+        pub_telemetry::init(&settings.telemetry);
+        return reset_smtp::run(&settings, args).await;
+    }
+    let telemetry = pub_telemetry::init(&settings.telemetry);
     tracing::info!(version, "starting pubd");
     tracing::info!("{}", settings.summary());
 
@@ -173,6 +184,27 @@ async fn main() -> anyhow::Result<()> {
     spawn_settings_watch(Arc::clone(&runtime), repos.clone(), Arc::clone(&kv));
 
     let listen = settings.server.listen.clone();
+    // The exposition rides its own socket (decision 28), started before the application
+    // listener so a bad `telemetry.metrics_listen` is a startup error rather than a surprise
+    // discovered by the first scrape. `spawn`, not `select!`: the two servers are independent,
+    // and a metrics socket must never be able to take the registry down.
+    let metrics_listen = settings.telemetry.metrics_listen.clone();
+    if let Some(handle) = telemetry.prometheus.clone() {
+        let addr: std::net::SocketAddr = metrics_listen
+            .parse()
+            .with_context(|| format!("telemetry.metrics_listen '{metrics_listen}' is not a socket address"))?;
+        // Bind here so a taken port fails startup; serve in a task so the two listeners are
+        // independent and a metrics socket can never take the registry down.
+        let metrics = pub_telemetry::bind_metrics(addr)
+            .await
+            .with_context(|| format!("failed to bind telemetry.metrics_listen {addr}"))?;
+        tokio::spawn(async move {
+            if let Err(err) = pub_telemetry::serve_metrics(metrics, handle, shutdown_signal()).await {
+                tracing::error!(error = %err, "metrics listener stopped");
+            }
+        });
+    }
+
     let state = AppState::new(settings, runtime, repos, blob, kv, auth, registry, orgs, admin)
         .with_upstream(upstream)
         .with_downloads(downloads)
@@ -362,7 +394,9 @@ fn spawn_jobs(
     let queue_worker = Arc::new(
         pub_jobs::QueueWorker::new(repos.clone(), events, queue_policy)
             .with_handler(Arc::new(FanoutHandler::new(center, Arc::clone(&repos.queue), queue_policy.send_timeout)))
-            .with_handler(Arc::new(MailHandler::new(mailer, kek, queue_policy.send_timeout))),
+            .with_handler(Arc::new(
+                MailHandler::new(mailer, kek, queue_policy.send_timeout).with_audit(Arc::clone(&repos.audit)),
+            )),
     );
     triggers = triggers.with_queue(Arc::clone(&queue_worker));
     scheduler.add(QUEUE_JOB, queue_policy.interval, move || {
@@ -634,11 +668,20 @@ fn build_mailer(settings: &Settings, runtime: Arc<SettingsCache>, kek: Vec<u8>) 
     // effective section is runtime data now, and one bad admin edit must not stop every instance
     // in the cluster from booting. It is loud, though — the error names the offending field, and
     // every message queued until it is corrected retries and then dead-letters (decision 09).
-    if let Err(error) = mailer.resolve() {
-        tracing::error!(
-            %error,
-            "the effective smtp section cannot be applied — outbound mail will retry and dead-letter until it is corrected"
-        );
+    //
+    // The gauge is set here, at boot, for the reason D43 exists: without it the first evidence
+    // an operator gets of a dead mail plane is a dead letter ~21 minutes later, on a surface
+    // that needs the session the mail plane is what delivers. This one is set before any request
+    // is served and needs no session at all (decision 29).
+    match mailer.resolve() {
+        Err(error) => {
+            metrics::gauge!("mail_transport_unusable").set(1.0);
+            tracing::error!(
+                %error,
+                "the effective smtp section cannot be applied — outbound mail will retry and dead-letter until it is corrected"
+            );
+        }
+        Ok(_) => metrics::gauge!("mail_transport_unusable").set(0.0),
     }
     let resolved = mailer.describe();
     tracing::info!(

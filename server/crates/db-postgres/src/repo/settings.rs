@@ -72,6 +72,12 @@ impl SettingsRepo for PgSettingsRepo {
         Ok(row.get("version"))
     }
 
+    async fn delete(&self, key: &str) -> Result<bool> {
+        let result =
+            sqlx::query("DELETE FROM settings WHERE key = $1").bind(key).execute(&self.pool).await.map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_version(&self) -> Result<i64> {
         // SUM over per-key versions: increases on every upsert (see core::settings docs).
         // SUM(BIGINT) yields NUMERIC in Postgres — cast back to BIGINT for decoding.

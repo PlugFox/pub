@@ -410,6 +410,11 @@ impl RegistryService {
         )
         .await;
 
+        // Catalogued since the observability plane was designed and emitted nowhere until now
+        // (decision 28). Here, after the bytes and the row are durable: a counter that includes
+        // publishes that failed halfway is not a count of publishes.
+        metrics::counter!("publishes_total", "format" => request.format.as_str()).increment(1);
+
         self.events
             .emit(DomainEvent::PackagePublished {
                 format: request.format,

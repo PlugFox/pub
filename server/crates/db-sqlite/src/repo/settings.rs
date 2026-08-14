@@ -71,6 +71,12 @@ impl SettingsRepo for SqliteSettingsRepo {
         Ok(row.get("version"))
     }
 
+    async fn delete(&self, key: &str) -> Result<bool> {
+        let result =
+            sqlx::query("DELETE FROM settings WHERE key = ?").bind(key).execute(&self.pool).await.map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_version(&self) -> Result<i64> {
         // SUM over per-key versions: increases on every upsert (see core::settings docs).
         let row: SqliteRow = sqlx::query("SELECT COALESCE(SUM(version), 0) AS version FROM settings")

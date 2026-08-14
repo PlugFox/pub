@@ -34,7 +34,10 @@ fn defaults_load_without_any_sources() {
     assert_eq!(settings.blob.path, "data/blobs");
     assert_eq!(settings.kv.kind, KvKind::Memory);
     assert!(!settings.telemetry.prometheus);
-    assert!(!settings.telemetry.otlp);
+    // Loopback by default: enabling the exporter must not publish an unauthenticated surface
+    // on every interface (decision 28).
+    assert_eq!(settings.telemetry.metrics_listen, "127.0.0.1:9090");
+    assert!(!settings.telemetry.server_timing, "S-04.d: the timing header is opt-in");
     assert_eq!(settings.cluster.replicas, 1);
 }
 

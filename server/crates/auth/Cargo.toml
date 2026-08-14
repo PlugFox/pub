@@ -15,6 +15,7 @@ crc32fast = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 hmac = { workspace = true }
+metrics = { workspace = true }
 p256 = { workspace = true }
 pub-core = { workspace = true }
 pub-mail = { workspace = true }
@@ -29,5 +30,6 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 pub-kv = { workspace = true }
 tokio = { workspace = true }

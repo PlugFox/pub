@@ -11,6 +11,7 @@ name = "pubd"
 path = "src/main.rs"
 
 [dependencies]
+metrics = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }

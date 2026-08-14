@@ -52,6 +52,31 @@ impl Settings {
         self.validate_upstream()?;
         self.validate_jobs()?;
         self.validate_realtime()?;
+        self.validate_telemetry()?;
+        Ok(())
+    }
+
+    /// Observability invariants (decision 28).
+    fn validate_telemetry(&self) -> Result<(), ConfigError> {
+        if !self.telemetry.prometheus {
+            return Ok(());
+        }
+        let listen = &self.telemetry.metrics_listen;
+        let addr = listen.parse::<std::net::SocketAddr>().map_err(|err| {
+            invalid(format!("telemetry.metrics_listen '{listen}' is not a valid socket address: {err}"))
+        })?;
+        // The exposition is unauthenticated by design (decision 28), so sharing the port with
+        // the application would publish it on the instance's own origin — which is the exact
+        // outcome the separate listener exists to prevent. Caught here rather than at bind
+        // time, where the error would be a bare "address in use".
+        if let Ok(app) = self.server.listen.parse::<std::net::SocketAddr>()
+            && app.port() == addr.port()
+        {
+            return Err(invalid(format!(
+                "telemetry.metrics_listen must not share a port with server.listen ({app}): \
+                 the Prometheus exposition is unauthenticated and belongs on its own socket"
+            )));
+        }
         Ok(())
     }
 
@@ -154,6 +179,11 @@ impl Settings {
         if http.max_body_bytes == 0 {
             // Zero would reject every request with a body while looking like a configured cap.
             return Err(invalid("http.max_body_bytes must be greater than 0"));
+        }
+        // Zero here would refuse every read on the instance — including the pub protocol's, so
+        // `dart pub get` stops working — while reading like "no limit configured" (S-24.f).
+        if http.rate_limit.read_per_ip_minute == 0 || http.rate_limit.read_per_identity_minute == 0 {
+            return Err(invalid("http.rate_limit values must be at least 1 (S-24.f)"));
         }
         Ok(())
     }

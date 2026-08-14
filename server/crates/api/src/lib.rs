@@ -170,6 +170,9 @@ pub fn router(state: AppState) -> Router {
                 .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
                 .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(TraceLayer::new_for_http())
+                // RED metrics (decision 28) outside the shed and the deadline, so the 503s and
+                // 408s an operator is paging about are counted rather than missing.
+                .layer(axum::middleware::from_fn_with_state(state.clone(), hygiene::http_metrics))
                 // S-28 baseline headers on every response. `if_not_present`, so a handler that
                 // knows better wins: assets.rs sets the hashed document CSP on HTML (S-11).
                 .layer(SetResponseHeaderLayer::if_not_present(
@@ -217,6 +220,10 @@ pub fn router(state: AppState) -> Router {
                 // Auth rate limits (S-24) run after the header layers, before handlers; the
                 // guard scopes itself to auth paths internally.
                 .layer(axum::middleware::from_fn_with_state(state.clone(), guard::auth_rate_limit))
+                // Read-path buckets (S-24.f), keyed by identity and failing open. Inside the
+                // auth buckets so a credential-endpoint POST is refused by the stricter gate
+                // first, and outside the handlers so a refused read costs no database work.
+                .layer(axum::middleware::from_fn_with_state(state.clone(), guard::read_rate_limit))
                 // S-12 mutation guard: Origin/Sec-Fetch-Site + custom header + JSON-only
                 // bodies on /api mutations.
                 .layer(axum::middleware::from_fn_with_state(state.clone(), guard::mutation_guard)),

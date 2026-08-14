@@ -962,6 +962,10 @@ pub struct RateLimitSettingsDto {
     pub token_auth_fail_per_ip_minute: u32,
     /// Publish uploads per org per hour.
     pub publish_per_hour_org: u32,
+    /// Reads per minute per client IP, for requests with no identity (S-24.f).
+    pub read_per_ip_minute: u32,
+    /// Reads per minute per CLI token or signed-in account (S-24.f, S-13.b).
+    pub read_per_identity_minute: u32,
 }
 
 /// SMTP settings as returned — the password is never among them (S-26).

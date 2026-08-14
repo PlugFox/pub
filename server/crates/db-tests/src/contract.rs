@@ -1002,6 +1002,25 @@ pub async fn settings_repo(repos: &Repositories) {
     let smtp_entry = all.iter().find(|e| e.key == "smtp").unwrap();
     assert_eq!(smtp_entry.value, smtp2);
     assert_eq!(smtp_entry.version, 2);
+
+    // `delete` (decision 29): the offline `pubd reset-smtp` path, and the only way a section
+    // returns to "no stored decision" rather than "stored as empty".
+    assert!(repos.settings.delete("smtp").await.expect("delete"), "deleting a present key reports true");
+    let all = repos.settings.get_all().await.expect("get_all after delete");
+    assert_eq!(all.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), vec!["rate_limits"]);
+    // The instance version *drops* — the deleted key's 2 leaves the sum. The reconciliation
+    // poll compares for inequality precisely so a peer still reloads on the way down; a `>`
+    // comparison there would leave every other replica serving the section this just removed.
+    assert_eq!(repos.settings.get_version().await.expect("version after delete"), 1);
+
+    // Deleting an absent key is not an error, and says so rather than pretending it worked:
+    // `reset-smtp` prints a different sentence for "there was nothing stored".
+    assert!(!repos.settings.delete("smtp").await.expect("second delete"), "deleting an absent key reports false");
+    assert!(!repos.settings.delete("never_written").await.expect("unknown key"));
+
+    // Re-writing a deleted key starts at version 1 again, not at the version it had before.
+    assert_eq!(repos.settings.upsert("smtp", &smtp, t0() + hours(2)).await.expect("re-insert"), 1);
+    assert_eq!(repos.settings.get_version().await.expect("version after re-insert"), 2);
 }
 
 /// Builds a publish payload for `(org, name, version)` with deterministic content.

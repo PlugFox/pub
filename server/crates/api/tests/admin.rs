@@ -925,7 +925,8 @@ async fn s24_rate_limits_take_effect_without_a_restart() {
     let limits = |login: u32| {
         serde_json::json!({ "rate_limits": {
             "otp_per_email_hour": 5, "otp_per_ip_hour": 20, "login_per_ip_minute": login,
-            "token_auth_fail_per_ip_minute": 30, "publish_per_hour_org": 30
+            "token_auth_fail_per_ip_minute": 30, "publish_per_hour_org": 30,
+            "read_per_ip_minute": 600, "read_per_identity_minute": 3000
         }})
     };
 

@@ -721,6 +721,8 @@ fn validate_rate_limits(limits: &RateLimitSettings) -> Result<()> {
         ("otp_per_ip_hour", limits.otp_per_ip_hour),
         ("login_per_ip_minute", limits.login_per_ip_minute),
         ("token_auth_fail_per_ip_minute", limits.token_auth_fail_per_ip_minute),
+        ("read_per_ip_minute", limits.read_per_ip_minute),
+        ("read_per_identity_minute", limits.read_per_identity_minute),
         ("publish_per_hour_org", limits.publish_per_hour_org),
     ]
     .into_iter()

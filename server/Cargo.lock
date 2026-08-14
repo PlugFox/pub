@@ -2570,6 +2570,8 @@ dependencies = [
  "futures",
  "hmac",
  "http-body-util",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mime_guess",
  "pub-admin",
  "pub-auth",
@@ -2582,6 +2584,7 @@ dependencies = [
  "pub-kv",
  "pub-mail",
  "pub-registry",
+ "pub-telemetry",
  "rand 0.8.7",
  "rsa",
  "rust-embed",
@@ -2606,12 +2609,14 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "async-trait",
  "base64 0.23.1",
  "chrono",
  "crc32fast",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hmac",
+ "metrics",
  "p256",
  "pub-core",
  "pub-kv",
@@ -2821,8 +2826,12 @@ dependencies = [
 name = "pub-telemetry"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "metrics",
  "metrics-exporter-prometheus",
  "pub-config",
+ "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2838,6 +2847,7 @@ dependencies = [
  "clap",
  "config",
  "futures",
+ "metrics",
  "pub-admin",
  "pub-api",
  "pub-auth",

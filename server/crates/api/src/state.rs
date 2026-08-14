@@ -61,6 +61,11 @@ pub struct AppState {
     pub events: Arc<EventBus>,
     /// Source of "now" for request handling.
     pub clock: Clock,
+    /// Memoized `/healthz` backend probes (see [`crate::routes::system`]).
+    ///
+    /// On the state rather than in a static so two instances in one test process cannot share
+    /// a health verdict; in production there is exactly one of each per process anyway.
+    pub health_probe: Arc<std::sync::Mutex<Option<(std::time::Instant, crate::routes::system::Checks)>>>,
 }
 
 impl AppState {
@@ -91,6 +96,7 @@ impl AppState {
             downloads: Arc::new(DownloadRecorder::default()),
             events: Arc::new(EventBus::new(EventBusPolicy::default())),
             clock: Arc::new(Utc::now),
+            health_probe: Arc::default(),
         }
     }
 

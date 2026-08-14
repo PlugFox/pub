@@ -93,6 +93,10 @@ pub struct TestOptions {
     pub jobs: Option<JobFactory>,
     /// S-24 publish-upload budget per org per hour.
     pub publish_per_hour_org: u32,
+    /// S-24.f read budget per minute for a request with no identity (keyed on the client IP).
+    pub read_per_ip_minute: u32,
+    /// S-24.f read budget per minute for a CLI token or a signed-in account (S-13.b).
+    pub read_per_identity_minute: u32,
     /// Decision 07: attach the read-through proxy over a scripted upstream. `false` leaves
     /// `AppState::upstream` empty, which is what `[upstream].enabled = false` produces.
     pub upstream: bool,
@@ -154,6 +158,11 @@ impl Default for TestOptions {
             instance_admins: Vec::new(),
             jobs: None,
             publish_per_hour_org: 30,
+            // Deliberately high in the default harness: every other suite issues reads without
+            // caring about this bucket, and a low default would make unrelated tests flaky in a
+            // way whose cause is three files away. The S-24.f suite sets its own.
+            read_per_ip_minute: 100_000,
+            read_per_identity_minute: 100_000,
             upstream: false,
             upstream_listing_ttl_secs: 300,
             upstream_max_archive_bytes: 100 * 1024 * 1024,
@@ -410,6 +419,8 @@ impl TestApp {
         settings.http.max_body_bytes = options.max_body_bytes;
         settings.registry.require_auth_for_read = options.require_auth_for_read;
         settings.registry.rate_limit.publish_per_hour_org = options.publish_per_hour_org;
+        settings.http.rate_limit.read_per_ip_minute = options.read_per_ip_minute;
+        settings.http.rate_limit.read_per_identity_minute = options.read_per_identity_minute;
         settings.smtp.host = options.smtp_host.clone();
         settings.smtp.port = options.smtp_port;
         settings.smtp.username = options.smtp_username.clone();
