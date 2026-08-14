@@ -2001,6 +2001,16 @@ adminLimitPublish:
   ru: Публикаций от организации в час
   desc: Label of the per-organization publish limit.
 
+adminLimitReadIp:
+  en: Reads per IP, per minute (anonymous)
+  ru: Чтений с IP в минуту (анонимно)
+  desc: Label of the per-IP read-path limit, which applies to requests carrying no usable credential on both the web API and the pub protocol.
+
+adminLimitReadIdentity:
+  en: Reads per token or account, per minute
+  ru: Чтений на токен или аккаунт в минуту
+  desc: Label of the per-identity read-path limit. Deliberately much higher than the anonymous one — a CI fleet behind one NAT is one IP but many tokens.
+
 adminSmtpTitle:
   en: Outgoing mail
   ru: Исходящая почта
@@ -2510,6 +2520,11 @@ adminJobFailures:
   en: Failures
   ru: Сбоев
   desc: Column header for how many job runs failed.
+
+adminJobPhase:
+  en: State
+  ru: Состояние
+  desc: Column header for a job's self-reported phase string — for the queue drain this is where a standing dead-letter count appears, which is the only place an operator sees that outbound mail is failing.
 
 resourceNotFoundTitle:
   en: Not found

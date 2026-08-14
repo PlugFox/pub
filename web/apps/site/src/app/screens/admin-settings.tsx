@@ -344,6 +344,22 @@ export function AdminSettingsPanel(): JSX.Element {
                 field="publishPerHourOrg"
                 onInput={(value) => patch({ publishPerHourOrg: value })}
               />
+              <LimitField
+                id="limit-read-ip"
+                label={t(app.adminLimitReadIp)}
+                value={current().readPerIpMinute}
+                errors={errors()}
+                field="readPerIpMinute"
+                onInput={(value) => patch({ readPerIpMinute: value })}
+              />
+              <LimitField
+                id="limit-read-identity"
+                label={t(app.adminLimitReadIdentity)}
+                value={current().readPerIdentityMinute}
+                errors={errors()}
+                field="readPerIdentityMinute"
+                onInput={(value) => patch({ readPerIdentityMinute: value })}
+              />
             </CardContent>
           </Card>
 

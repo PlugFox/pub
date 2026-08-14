@@ -3170,6 +3170,16 @@ export interface components {
             publish_per_hour_org: number;
             /**
              * Format: int32
+             * @description Reads per minute per CLI token or signed-in account (S-24.f, S-13.b).
+             */
+            read_per_identity_minute: number;
+            /**
+             * Format: int32
+             * @description Reads per minute per client IP, for requests with no identity (S-24.f).
+             */
+            read_per_ip_minute: number;
+            /**
+             * Format: int32
              * @description Failed CLI-token authentications per IP per minute.
              */
             token_auth_fail_per_ip_minute: number;

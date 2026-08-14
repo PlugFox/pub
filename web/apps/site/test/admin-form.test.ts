@@ -35,6 +35,8 @@ const SETTINGS: AdminSettingsDto = {
     login_per_ip_minute: 10,
     token_auth_fail_per_ip_minute: 30,
     publish_per_hour_org: 60,
+    read_per_ip_minute: 600,
+    read_per_identity_minute: 3000,
   },
   smtp: {
     host: "smtp.acme.com",

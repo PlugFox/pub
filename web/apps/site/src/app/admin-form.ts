@@ -50,6 +50,8 @@ export type SettingsForm = {
   readonly loginPerIpMinute: string;
   readonly tokenAuthFailPerIpMinute: string;
   readonly publishPerHourOrg: string;
+  readonly readPerIpMinute: string;
+  readonly readPerIdentityMinute: string;
   readonly smtpHost: string;
   readonly smtpPort: string;
   readonly smtpUsername: string;
@@ -72,6 +74,8 @@ export type SettingsFieldError =
   | "loginPerIpMinute"
   | "tokenAuthFailPerIpMinute"
   | "publishPerHourOrg"
+  | "readPerIpMinute"
+  | "readPerIdentityMinute"
   | "smtpPort"
   | "smtpFrom";
 
@@ -93,6 +97,8 @@ export function settingsToForm(settings: AdminSettingsDto): SettingsForm {
     loginPerIpMinute: String(settings.rate_limits.login_per_ip_minute),
     tokenAuthFailPerIpMinute: String(settings.rate_limits.token_auth_fail_per_ip_minute),
     publishPerHourOrg: String(settings.rate_limits.publish_per_hour_org),
+    readPerIpMinute: String(settings.rate_limits.read_per_ip_minute),
+    readPerIdentityMinute: String(settings.rate_limits.read_per_identity_minute),
     smtpHost: settings.smtp.host ?? "",
     smtpPort: String(settings.smtp.port),
     smtpUsername: settings.smtp.username ?? "",
@@ -139,6 +145,8 @@ export function validateSettings(form: SettingsForm): SettingsErrors {
     ["loginPerIpMinute", form.loginPerIpMinute],
     ["tokenAuthFailPerIpMinute", form.tokenAuthFailPerIpMinute],
     ["publishPerHourOrg", form.publishPerHourOrg],
+    ["readPerIpMinute", form.readPerIpMinute],
+    ["readPerIdentityMinute", form.readPerIdentityMinute],
   ];
   for (const [field, raw] of limits) {
     if (positiveInt(raw) === null) errors[field] = "positive";
@@ -197,6 +205,8 @@ export function formToPatch(form: SettingsForm): SettingsPatch {
       login_per_ip_minute: Number.parseInt(form.loginPerIpMinute.trim(), 10),
       token_auth_fail_per_ip_minute: Number.parseInt(form.tokenAuthFailPerIpMinute.trim(), 10),
       publish_per_hour_org: Number.parseInt(form.publishPerHourOrg.trim(), 10),
+      read_per_ip_minute: Number.parseInt(form.readPerIpMinute.trim(), 10),
+      read_per_identity_minute: Number.parseInt(form.readPerIdentityMinute.trim(), 10),
     },
     smtp,
     upstream: {

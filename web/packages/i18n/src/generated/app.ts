@@ -764,6 +764,10 @@ export const app = {
   adminLimitTokenFail: { id: "app.adminLimitTokenFail", en: "Failed token authentications per IP, per minute" },
   /** Label of the per-organization publish limit. */
   adminLimitPublish: { id: "app.adminLimitPublish", en: "Publishes per organization, per hour" },
+  /** Label of the per-IP read-path limit, which applies to requests carrying no usable credential on both the web API and the pub protocol. */
+  adminLimitReadIp: { id: "app.adminLimitReadIp", en: "Reads per IP, per minute (anonymous)" },
+  /** Label of the per-identity read-path limit. Deliberately much higher than the anonymous one — a CI fleet behind one NAT is one IP but many tokens. */
+  adminLimitReadIdentity: { id: "app.adminLimitReadIdentity", en: "Reads per token or account, per minute" },
   /** Heading of the SMTP section of the settings form. */
   adminSmtpTitle: { id: "app.adminSmtpTitle", en: "Outgoing mail" },
   /** Subtitle of the SMTP settings section. */
@@ -968,6 +972,8 @@ export const app = {
   adminJobProcessed: { id: "app.adminJobProcessed", en: "Processed" },
   /** Column header for how many job runs failed. */
   adminJobFailures: { id: "app.adminJobFailures", en: "Failures" },
+  /** Column header for a job's self-reported phase string — for the queue drain this is where a standing dead-letter count appears, which is the only place an operator sees that outbound mail is failing. */
+  adminJobPhase: { id: "app.adminJobPhase", en: "State" },
   /** Title of the 404 state a screen shows when the API answers 404 for the thing it was loading (an unknown name, or one the caller may not read). */
   resourceNotFoundTitle: { id: "app.resourceNotFoundTitle", en: "Not found" },
   /** Body of the 404 state a screen shows when the API answers 404 for the thing it was loading. */

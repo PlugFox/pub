@@ -286,6 +286,10 @@ function JobsPanel(): JSX.Element {
                   <TableHeaderCell>{t(app.adminJobLastSuccess)}</TableHeaderCell>
                   <TableHeaderCell>{t(app.adminJobRuns)}</TableHeaderCell>
                   <TableHeaderCell>{t(app.adminJobProcessed)}</TableHeaderCell>
+                  {/* The drain reports its standing dead-letter count here ("drain (3 dead)").
+                      Dropping this column is what made a dead mail plane invisible outside the
+                      raw stats JSON — roadmap D43, decision 29. */}
+                  <TableHeaderCell>{t(app.adminJobPhase)}</TableHeaderCell>
                   <TableHeaderCell>{t(app.adminJobFailures)}</TableHeaderCell>
                 </TableRow>
               </TableHead>
@@ -301,6 +305,15 @@ function JobsPanel(): JSX.Element {
                       </TableCell>
                       <TableCell>{formatNumber(job.runs)}</TableCell>
                       <TableCell>{formatNumber(job.processed)}</TableCell>
+                      <TableCell class="font-mono text-xs">
+                        <Show when={job.phase} fallback={<span class="text-ink-muted">—</span>}>
+                          {(phase) => (
+                            <Badge variant={/\bdead\b/.test(phase()) ? "danger" : "neutral"}>
+                              {phase()}
+                            </Badge>
+                          )}
+                        </Show>
+                      </TableCell>
                       <TableCell>
                         <Badge variant={job.failures > 0 ? "danger" : "neutral"}>
                           {formatNumber(job.failures)}
