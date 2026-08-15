@@ -14,7 +14,9 @@
 //!    instead of racing through the read-then-write below. The lock is an optimization for
 //!    clean errors; correctness rests on the database's unique indexes, which is why the lock
 //!    being unavailable is a conflict, never a bypass.
-//! 4. **Duplicate pre-check**, then **blob write**, then **the transactional DB insert**.
+//! 4. **Duplicate pre-check**, then the **storage-quota refusal** (S-20.b — the authoritative
+//!    one, immediately before the write it exists to prevent), then **blob write**, then **the
+//!    transactional DB insert**.
 //!    Bytes go in before metadata on purpose: an interrupted publish leaves an unreferenced
 //!    blob (GC's problem) rather than a version row pointing at bytes that do not exist —
 //!    which would be an unfixable 404 on a hash a client has already pinned
@@ -33,7 +35,7 @@ use pub_core::event::{DomainEvent, EventSink};
 use pub_core::package::{NewVersion, Package, PackageOptions, Publisher, Version, Visibility};
 use pub_core::token::patterns_allow;
 use pub_core::traits::{BlobStore, JobLock, Repositories};
-use pub_core::{Error, Format, OrgId, Result, SemVer, TokenId, UserId};
+use pub_core::{Error, Format, OrgId, PackageId, Result, SemVer, TokenId, UserId};
 use sha2::{Digest as _, Sha256};
 
 use crate::archive::{ArchiveContents, ArchiveError, ArchiveLimits, validate_archive};
@@ -47,6 +49,99 @@ pub const DEFAULT_UNRETRACT_WINDOW_DAYS: i64 = 7;
 /// Default TTL of the per-name publish lock — long enough to cover a slow blob write, short
 /// enough that a crashed publisher does not block the name for long.
 pub const DEFAULT_PUBLISH_LOCK_TTL_SECS: u64 = 120;
+
+/// Percentage of the effective storage quota whose crossing raises the warning event
+/// ([S-20.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+pub const STORAGE_QUOTA_WARNING_PERCENT: u64 = 80;
+
+/// The org's effective storage quota in bytes, or `None` when it may store without bound.
+///
+/// **Three states across two surfaces, and `0` means the same thing in both** (decision 32 /
+/// [S-20.b](../../../../docs/security.md#4-supply-chain--registry-integrity)) — this is the one
+/// place that rule is written, so a second call site cannot re-derive it differently:
+///
+/// | `orgs.storage_quota_bytes` | `registry.storage_quota_bytes` | effective |
+/// |---|---|---|
+/// | `NULL` | `0` | unlimited |
+/// | `NULL` | `n > 0` | `n` bytes — the org follows the instance default |
+/// | `Some(0)` | anything | **unlimited for this org**, whatever the instance default is |
+/// | `Some(n > 0)` | anything | `n` bytes — the override wins |
+///
+/// **Nothing expresses "this org may store nothing."** An operator who wants that archives the
+/// org; giving `0` a second, opposite meaning on one of the two surfaces would be a trap found
+/// by typing it. A publish therefore never fails because a quota is *zero*.
+///
+/// A **negative** override is not reachable through the admin route, which refuses one, but the
+/// column is a plain signed integer — a hand-edited row is read as unlimited here rather than as
+/// a wall no publish can clear, because the alternative is an org that can never publish again
+/// and a message that cannot explain why.
+pub fn effective_storage_quota(org_override: Option<i64>, instance_default: u64) -> Option<u64> {
+    match org_override {
+        Some(bytes) if bytes > 0 => Some(bytes as u64),
+        // `Some(0)` — and any nonsense negative row — is this org's own "unlimited". It stops
+        // following the instance default, which is the whole point of it being a distinct state
+        // from `NULL`.
+        Some(_) => None,
+        None => (instance_default > 0).then_some(instance_default),
+    }
+}
+
+/// Whether `incoming` more bytes fit under `quota` for an org already holding `used`.
+///
+/// The refusal is [`Error::Invalid`] → `invalid_argument` → a permanent **400**, never a 429:
+/// [sharp edge 2](../../../../docs/protocol.md) makes a retryable status a lie the pub client
+/// acts on seven times, and no amount of waiting frees storage. Shared by all three call sites —
+/// both publish checkpoints and the transfer guard — so the caller reads the same sentence
+/// whichever one refuses them.
+///
+/// An operation that lands *exactly* on the quota is allowed: the number is what the org may
+/// hold, not the last byte before it.
+///
+/// The verb is **"storing"** rather than "publishing" because the third caller is a transfer,
+/// where nothing is being published and the bytes already exist somewhere else. One message with
+/// a verb that is true of every path beats three messages that drift.
+///
+/// Every number in the message is the caller's own org's — usage, limit, and the size of what
+/// they are trying to add — so there is nothing cross-org to leak.
+pub fn check_storage_quota(used: i64, incoming: i64, quota: Option<u64>) -> Result<()> {
+    let Some(limit) = quota else { return Ok(()) };
+    let projected = u128::from(used.max(0) as u64) + u128::from(incoming.max(0) as u64);
+    if projected <= u128::from(limit) {
+        return Ok(());
+    }
+    Err(Error::Invalid {
+        message: format!(
+            "this organization stores {used} bytes of its {limit}-byte storage quota, and storing \
+             {incoming} more would exceed it; free space by hard-deleting versions, or ask an instance \
+             administrator to raise the quota"
+        ),
+    })
+}
+
+/// Whether adding `added` bytes to an org already holding `before` takes it from **below**
+/// [`STORAGE_QUOTA_WARNING_PERCENT`] of `quota` to **at or above** it (S-20.b).
+///
+/// Edge-triggered, so both ends matter and both are exact. The comparison is
+/// `bytes x 100 ? quota x 80` in `u128` rather than a precomputed `(quota * 80) / 100`
+/// threshold, because that division **floors**, and the floor is not a rounding nicety:
+///
+/// - at `quota == 1` the threshold floors to `0`, `before >= 0` holds for every org, and that
+///   org can never be warned at all;
+/// - at `quota == 3` the threshold floors to `2`, so an org holding 2 of 3 bytes — 66 % — is
+///   reported as having crossed 80 %.
+///
+/// No quota should have an anomaly the neighbouring quota does not, so the percentage is
+/// compared without ever materializing it. `u128` because `quota` is a `u64` an operator types
+/// and `x 100` must not wrap.
+///
+/// A quota of `0` never reaches here: [`effective_storage_quota`] maps every spelling of
+/// "unlimited" to `None`, and there is no line to cross when there is no number.
+pub fn crosses_storage_warning(before: i64, added: i64, quota: u64) -> bool {
+    let line = u128::from(quota) * u128::from(STORAGE_QUOTA_WARNING_PERCENT);
+    let before = u128::from(before.max(0) as u64);
+    let after = before + u128::from(added.max(0) as u64);
+    before * 100 < line && after * 100 >= line
+}
 
 /// Instance policy for the registry services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +215,17 @@ pub struct PublishRequest {
     /// step 1 of the publish flow carries no name at all (docs/protocol.md endpoint 2), so a
     /// pattern-scoped token has to be admitted through the door and stopped at the desk.
     pub package_patterns: Vec<String>,
+    /// The org's **effective** storage quota in bytes; `None` = unlimited
+    /// ([S-20.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+    ///
+    /// Resolved by the caller through [`effective_storage_quota`] and carried in rather than
+    /// read here, because the rule needs two inputs this service cannot see: the org row (which
+    /// the API layer has already loaded to route the request) and the *runtime* instance
+    /// setting. [`RegistryService`] holds a policy frozen at boot on purpose — decision 09 puts
+    /// runtime settings behind a cache the API layer reads per request — so resolving the limit
+    /// here would either need that cache pushed into the domain service or would pin the quota
+    /// to whatever it was when the process started.
+    pub storage_quota_bytes: Option<u64>,
 }
 
 /// What a successful publish produced.
@@ -187,6 +293,20 @@ pub struct TransferRequest {
     pub name: String,
     /// Actor.
     pub actor: ActorMeta,
+    /// The **receiving** org's effective storage quota in bytes; `None` = unlimited
+    /// ([S-20.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+    ///
+    /// Resolved by the caller through [`effective_storage_quota`], for the same reason
+    /// [`PublishRequest::storage_quota_bytes`] is: the rule needs the org row and the *runtime*
+    /// instance setting, and this service holds a policy frozen at boot.
+    ///
+    /// It is the receiver's and not the sender's because a transfer only ever *adds* bytes to
+    /// the org that has a wall to meet. `packages.org_id` is what
+    /// [`PackageRepo::org_storage_bytes`](pub_core::traits::PackageRepo::org_storage_bytes)
+    /// attributes by, so every live version re-attributes the instant the row updates: without
+    /// this an Owner of two orgs publishes into a fresh one and transfers the result into an org
+    /// at its wall, unbounded and repeatable.
+    pub storage_quota_bytes: Option<u64>,
 }
 
 /// What a hard delete produced.
@@ -365,6 +485,24 @@ impl RegistryService {
             }
         }
 
+        // S-20.b: the **authoritative** quota refusal, immediately before the blob write and
+        // after the duplicate/ownership pre-check — the last moment at which refusing costs
+        // nothing but the upload the client already spent. The upload step has a check of its
+        // own, and it is not this one made twice: that one bounds *staged* bytes, which survive
+        // the staging grace and which finalize structurally never sees.
+        //
+        // A 4xx from here makes the API layer discard the staged upload, and that is the wanted
+        // outcome rather than an accident to work around: retrying the same bytes cannot succeed
+        // (no wait frees space), so keeping them alive would park one archive per doomed publish
+        // in the very storage the quota exists to bound.
+        //
+        // The bound is loose by a stated amount. The lock above is per *name*, so N concurrent
+        // publishes of different names in one org each read this same usage and each pass; the
+        // reachable overshoot is `quota + (concurrent publishes x max_archive_bytes)`. Closing
+        // it needs a counter column maintained inside `create_version` in both dialects, which
+        // trades a stated overshoot for undetectable drift (decision 32).
+        let used_before = self.usage_under_quota(request, prepared.size).await?;
+
         let blob_key = Self::blob_key(request.format, &prepared.sha256);
         // The exact uploaded bytes, never re-compressed (docs/protocol.md sharp edge 3).
         self.blob.put(&blob_key, request.archive.clone()).await?;
@@ -428,6 +566,11 @@ impl RegistryService {
             })
             .await;
 
+        // S-20.b: one event on the crossing, nothing on the publishes above it. Emitted after
+        // the row is committed — the bytes this warns about are stored — and best-effort in the
+        // same sense every other signal here is.
+        self.warn_on_quota_crossing(request.org_id, request.storage_quota_bytes, used_before, prepared.size, now).await;
+
         // S-17: the name became locally claimed just now. If we already proxy a package under
         // it, the shadowing condition exists from this moment — and the publish path is the
         // only place that arrival order can be seen, because the read path never asks upstream
@@ -445,6 +588,56 @@ impl RegistryService {
             package_created: published.package_created,
             blob_key,
         })
+    }
+
+    /// Reads the org's live byte total and refuses the publish when `incoming` more would take
+    /// it past its effective quota (S-20.b). Returns the usage **before** this publish.
+    ///
+    /// An unlimited org (`None`) costs no query at all: the aggregate is only worth running when
+    /// there is a number to compare it against, and a default install has none.
+    async fn usage_under_quota(&self, request: &PublishRequest, incoming: i64) -> Result<Option<i64>> {
+        let Some(quota) = request.storage_quota_bytes else { return Ok(None) };
+        let used = self.repos.packages.org_storage_bytes(request.org_id).await?;
+        if let Err(err) = check_storage_quota(used, incoming, Some(quota)) {
+            metrics::counter!("storage_quota_refusals_total", "stage" => "finalize").increment(1);
+            tracing::warn!(org = %request.org_id, used, incoming, quota, "publish refused: storage quota exceeded");
+            return Err(err);
+        }
+        Ok(Some(used))
+    }
+
+    /// Emits [`DomainEvent::OrgStorageQuotaWarning`] iff this operation is the one that took
+    /// `org_id` from below [`STORAGE_QUOTA_WARNING_PERCENT`] of its quota to at or above it
+    /// (S-20.b), per [`crosses_storage_warning`].
+    ///
+    /// **Edge-triggered, not level-triggered**: both numbers the edge needs are already in hand
+    /// — the usage read by the guard above and the bytes that just landed — so "was it below
+    /// before" costs no extra state and no extra query. An operation that was already over the
+    /// line emits nothing, which is decision 29's rule reused: an org near its wall publishes
+    /// many times, and a notification per publish is a notification nobody reads.
+    ///
+    /// `before = None` means no usage was read, which happens exactly when the org is
+    /// unlimited — there is no line.
+    async fn warn_on_quota_crossing(
+        &self,
+        org_id: OrgId,
+        quota: Option<u64>,
+        before: Option<i64>,
+        added: i64,
+        now: DateTime<Utc>,
+    ) {
+        let (Some(quota), Some(before)) = (quota, before) else { return };
+        if !crosses_storage_warning(before, added, quota) {
+            return;
+        }
+        self.events
+            .emit(DomainEvent::OrgStorageQuotaWarning {
+                org_id,
+                used_bytes: before.saturating_add(added),
+                quota_bytes: quota,
+                at: now,
+            })
+            .await;
     }
 
     /// Rebuilds the package's search document after a lifecycle change (decision 11).
@@ -714,11 +907,18 @@ impl RegistryService {
     ///
     /// The package keeps its visibility. Flipping a private package public because it changed
     /// hands, or public private, would be a disclosure decision made by a side effect.
+    ///
+    /// **It also spends the receiving org's storage quota** (S-20.b). A transfer is a byte
+    /// movement, not just a metadata change: `org_storage_bytes` attributes by the current
+    /// `packages.org_id`, so every live version re-attributes the instant the row updates. Left
+    /// unchecked it is the quota's one unbounded bypass — publish into a fresh org, transfer
+    /// into the walled one, repeat — and decision 32 promises a bound that is "exact at rest".
     pub async fn transfer(&self, request: TransferRequest, now: DateTime<Utc>) -> Result<Package> {
         let current = self.owned_package(request.format, &request.name, request.from_org).await?;
         if request.from_org == request.to_org {
             return Err(Error::Invalid { message: "the package already belongs to that organization".to_owned() });
         }
+        let (moving, used_before) = self.receiver_has_room(&request, current.id).await?;
         let package = self.repos.packages.transfer(current.id, request.to_org, now).await?;
 
         self.audit(
@@ -748,8 +948,56 @@ impl RegistryService {
             })
             .await;
 
+        // **The 80 % warning fires on a transfer too, and deliberately.** A transfer is the
+        // single largest jump an org's usage can make — a whole package's history in one step —
+        // and the signal is edge-triggered, so an org that landed above the line here would
+        // never be warned *at all*: the next publish sees `before` already above 80 % and stays
+        // silent, which is exactly the state the crossing rule is designed to report once. The
+        // sending org gets nothing, because the signal is a crossing upward and dropping below
+        // the line is not news anybody has to act on.
+        self.warn_on_quota_crossing(request.to_org, request.storage_quota_bytes, used_before, moving, now).await;
+
         self.reindex(&package).await;
         Ok(package)
+    }
+
+    /// Refuses a transfer the **receiving** org has no room for, and returns
+    /// `(bytes moving, receiver usage before the move)` for the warning edge (S-20.b).
+    ///
+    /// Two reads rather than one, and only when there is a quota to check: an unlimited receiver
+    /// — which is every org on a default install — costs nothing at all, the same stance the
+    /// publish guard takes.
+    ///
+    /// The refusal is the publish path's refusal, through the same
+    /// [`check_storage_quota`]: a permanent 400 (`invalid_argument`), never a 429, because no
+    /// amount of waiting frees space and the transfer route is reached by the same clients.
+    async fn receiver_has_room(&self, request: &TransferRequest, package: PackageId) -> Result<(i64, Option<i64>)> {
+        let Some(quota) = request.storage_quota_bytes else { return Ok((0, None)) };
+        let moving = self.repos.packages.package_storage_bytes(package).await?;
+        if moving == 0 {
+            // A package with no live versions adds nothing, so there is nothing to refuse — and
+            // refusing it would be reachable: an admin who lowers a quota below an org's current
+            // usage would otherwise block even the moves that *cannot* make it worse.
+            return Ok((0, None));
+        }
+        let used = self.repos.packages.org_storage_bytes(request.to_org).await?;
+        if let Err(err) = check_storage_quota(used, moving, Some(quota)) {
+            // No `storage_quota_refusals_total` increment here, deliberately: that counter's
+            // `stage` label is documented as naming *which of the two publish checkpoints*
+            // refused, and an operator rule built on that pair must not silently start seeing a
+            // third value. A transfer refusal is a rare, authenticated, Owner-only event and the
+            // log line below is the evidence it needs. Give it a label of its own only together
+            // with the catalogue help text and `docs/ops/metrics.md`.
+            tracing::warn!(
+                org = %request.to_org,
+                used,
+                incoming = moving,
+                quota,
+                "transfer refused: the receiving organization's storage quota would be exceeded"
+            );
+            return Err(err);
+        }
+        Ok((moving, Some(used)))
     }
 
     /// Loads a package and asserts it belongs to `org`.
@@ -831,6 +1079,92 @@ mod tests {
         let policy = RegistryPolicy::default();
         assert_eq!(policy.archive.max_archive_bytes, 100 * 1024 * 1024);
         assert_eq!(policy.unretract_window, Duration::days(7));
+    }
+
+    /// **S-20.b.** All three states of the number, on both surfaces — the table in
+    /// [`effective_storage_quota`]'s doc comment, asserted.
+    #[test]
+    fn s20_b_zero_and_null_both_mean_unlimited_and_an_override_beats_the_instance_default() {
+        // NULL + unlimited instance = unlimited (the default install).
+        assert_eq!(effective_storage_quota(None, 0), None);
+        // NULL follows the instance default, whatever it becomes later.
+        assert_eq!(effective_storage_quota(None, 4096), Some(4096));
+        // An explicit 0 is *this org's* unlimited and stops following the default — the state
+        // that would not exist if `Option` were flattened away.
+        assert_eq!(effective_storage_quota(Some(0), 4096), None);
+        // A positive override wins over the instance default in both directions.
+        assert_eq!(effective_storage_quota(Some(512), 4096), Some(512));
+        assert_eq!(effective_storage_quota(Some(8192), 4096), Some(8192));
+        assert_eq!(effective_storage_quota(Some(8192), 0), Some(8192));
+        // Nothing spells "may store nothing": no input to this function produces `Some(0)`.
+        for org in [None, Some(0), Some(-1), Some(1)] {
+            for instance in [0, 1, u64::MAX] {
+                assert_ne!(effective_storage_quota(org, instance), Some(0), "{org:?} / {instance}");
+            }
+        }
+    }
+
+    /// **S-20.b.** The boundary itself: exactly at the quota publishes, one byte past it does
+    /// not, and the refusal is the permanent 4xx class rather than a retryable one.
+    #[test]
+    fn s20_b_a_publish_lands_exactly_on_the_quota_and_the_next_byte_is_refused() {
+        assert!(check_storage_quota(900, 100, Some(1000)).is_ok(), "exactly at the quota is inside it");
+        assert!(check_storage_quota(0, 1000, Some(1000)).is_ok(), "a first publish may fill the quota");
+        let err = check_storage_quota(900, 101, Some(1000)).expect_err("one byte past");
+        // `invalid_argument` maps to 400 in both API families. Never `rate_limited`: the pub
+        // client retries a 429 seven times and no wait frees storage (sharp edge 2).
+        assert_eq!(err.code(), "invalid_argument");
+        // The message has to be actionable, and every number in it is the caller's own org's.
+        let text = err.to_string();
+        assert!(text.contains("1000"), "{text}");
+        assert!(text.contains("900"), "{text}");
+        assert!(text.contains("101"), "{text}");
+    }
+
+    /// **S-20.b.** Unlimited never refuses, however much is already stored.
+    #[test]
+    fn s20_b_an_unlimited_quota_admits_anything() {
+        assert!(check_storage_quota(i64::MAX, i64::MAX, None).is_ok());
+        // And when a quota *is* set the sum is computed without wrapping: `used + incoming`
+        // overflows both `i64` and `u64` here, and an implementation that let it wrap would
+        // answer "there is room" for the largest publish this registry can express.
+        assert!(check_storage_quota(i64::MAX, i64::MAX, Some(1)).is_err());
+        assert!(
+            check_storage_quota(i64::MAX, i64::MAX, Some(u64::MAX)).is_ok(),
+            "2^63-1 twice still fits under 2^64-1"
+        );
+    }
+
+    /// **S-20.b.** The 80 % edge is exact at both ends, and no quota has an anomaly the
+    /// neighbouring quota does not.
+    ///
+    /// The previous implementation precomputed `(quota * 80) / 100`, and integer division
+    /// **floors**. That is not a rounding detail: it made the smallest quotas behave differently
+    /// from every other quota, in *both* directions.
+    #[test]
+    fn s20_b_the_eighty_percent_edge_is_exact_at_every_quota() {
+        // The ordinary case, at both ends of the edge.
+        assert!(crosses_storage_warning(79, 1, 100), "80 of 100 is at the line, and the line is crossed");
+        assert!(!crosses_storage_warning(79, 0, 100), "79 of 100 is below it");
+        assert!(!crosses_storage_warning(80, 10, 100), "already at the line: the crossing already happened");
+        assert!(!crosses_storage_warning(90, 5, 100), "already above it");
+        assert!(crosses_storage_warning(0, 100, 100), "a single publish may cross and fill at once");
+
+        // `quota == 1`: the floored threshold was `0`, `before >= 0` holds for every org, and
+        // this org could **never** be warned — not once, at any usage.
+        assert!(crosses_storage_warning(0, 1, 1), "an org with a 1-byte quota is warnable like any other");
+        assert!(!crosses_storage_warning(1, 1, 1), "…and stops being warned once it is over the line");
+
+        // `quota == 3`: the floored threshold was `2`, so 2 bytes — 66 % — reported a crossing
+        // of 80 %. The floor fired *below* the percentage here and *above* it at quota 1, which
+        // is why no single-sided fix would do.
+        assert!(!crosses_storage_warning(0, 2, 3), "2 of 3 is 66 %, which is not 80 %");
+        assert!(crosses_storage_warning(0, 3, 3), "3 of 3 is");
+
+        // The percentage is never materialized, so the largest numbers this registry can express
+        // do not wrap the comparison: `x 100` on a `u64` needs the wider type on both sides.
+        assert!(!crosses_storage_warning(0, i64::MAX, u64::MAX), "half of 2^64-1 is not yet 80 % of it");
+        assert!(crosses_storage_warning(i64::MAX, i64::MAX, u64::MAX), "…and twice that is");
     }
 
     #[test]

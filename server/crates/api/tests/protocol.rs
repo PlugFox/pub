@@ -17,7 +17,7 @@
 //! | 4 | `archive_url` lives under the credential prefix | [`listing_archive_urls_point_at_our_own_base`], [`publish_urls_stay_under_the_base`] |
 //! | 5 | Validate at finalize, not upload | [`upload_accepts_junk_and_finalize_rejects_it`] |
 //! | 6 | Absent `Accept` ⇒ v2; 406 only for version mismatch | [`accept_header_absent_defaults_to_v2`], [`unsupported_api_version_gets_406`] |
-//! | 7 | Full pubspec per version | [`listing_field_types_match_the_client_parser`] |
+//! | 7 | Full pubspec per version; a capped listing keeps its newest end | [`listing_field_types_match_the_client_parser`], [`a_listing_at_the_safety_cap_drops_the_oldest_versions_not_the_newest`] |
 //! | 8 | Subpath bases work behind a reverse proxy | [`subpath_base_is_honored`] |
 //! | 9 | Retracted stays downloadable; discontinued/replacedBy are listing fields | [`retracted_versions_stay_listed_flagged_and_downloadable`], [`discontinued_and_replaced_by_are_package_level_flags`] |
 //! | 10 | Listing field types | [`listing_field_types_match_the_client_parser`] |
@@ -29,6 +29,7 @@ mod common;
 use axum::http::{Method, StatusCode, header};
 use chrono::Duration;
 use common::{ApiResponse, PUB_ACCEPT, PUB_MEDIA_TYPE, TestApp, TestOptions, package_archive};
+use pub_api::protocol::pub_v2::MAX_LISTED_VERSIONS;
 use pub_blob::ObjectStoreBlob;
 use pub_core::package::{PackageOptions, Visibility};
 use pub_core::token::TokenScope;
@@ -1174,4 +1175,73 @@ async fn a_token_query_parameter_is_not_a_credential() {
 
     let response = app.pub_get(&format!("{}/api/packages/acme_core?token={}", acme.base(), acme.token), None).await;
     assert_eq!(response.status, StatusCode::NOT_FOUND, "a query token must not authenticate");
+}
+
+// --------------------------------------------- sharp edge 7: which end of a huge listing is cut
+
+/// Adds live versions straight through the repository.
+///
+/// Ten thousand three-step publishes would gzip, hash, untar and render ten thousand archives
+/// to prove something this test is not about. The rows are what the listing handler reads.
+async fn seed_versions(app: &TestApp, publisher: &Publisher, name: &str, versions: impl IntoIterator<Item = String>) {
+    for raw in versions {
+        app.repos
+            .packages
+            .create_version(
+                pub_core::package::NewVersion {
+                    format: pub_core::Format::Pub,
+                    package_name: name.to_owned(),
+                    org_id: publisher.org,
+                    visibility: Visibility::Private,
+                    version: SemVer::parse(&raw).expect("valid version"),
+                    pubspec: serde_json::json!({ "name": name, "version": raw }),
+                    archive_sha256: "c".repeat(64),
+                    archive_size: 512,
+                    published_by: pub_core::package::Publisher { user_id: publisher.user, token_id: None },
+                    readme_html: None,
+                    changelog_html: None,
+                },
+                app.now(),
+            )
+            .await
+            .expect("seed version");
+    }
+}
+
+#[tokio::test]
+async fn a_listing_at_the_safety_cap_drops_the_oldest_versions_not_the_newest() {
+    // The cap has to cut *somewhere*; which end it cuts is the whole question. Reading
+    // ascending — how it worked before decision 32 — a package past `MAX_LISTED_VERSIONS`
+    // served `dart pub` a listing whose newest entries were simply absent, with `latest`
+    // derived from the ~10 000th-oldest release: the package looks frozen at whatever the cap
+    // reached, and a resolve cannot see anything published since. Reading descending and
+    // reversing drops the oldest instead, which is the end a resolver can afford to lose.
+    //
+    // Built one version *over* the cap on purpose: asserted on a package that never reaches
+    // the cap, every line below would pass against either direction.
+    let app = TestApp::new().await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    publish_ok(&app, &acme, "acme_core", "1.0.0").await;
+    seed_versions(&app, &acme, "acme_core", (1..=MAX_LISTED_VERSIONS).map(|i| format!("1.{i}.0"))).await;
+    let newest = format!("1.{MAX_LISTED_VERSIONS}.0");
+
+    let response = app.pub_get(&format!("{}/api/packages/acme_core", acme.base()), Some(&acme.token)).await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    let versions: Vec<&str> = response.json["versions"]
+        .as_array()
+        .expect("versions")
+        .iter()
+        .map(|v| v["version"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(versions.len(), MAX_LISTED_VERSIONS, "the cap still bounds the listing");
+    assert_eq!(versions.last().copied(), Some(newest.as_str()), "the newest version must survive the cap");
+    assert_eq!(versions.first().copied(), Some("1.1.0"), "the oldest version is the one that gets dropped");
+    assert!(!versions.contains(&"1.0.0"), "1.0.0 is the oldest of 10 001 and is exactly what the cap should drop");
+
+    // Still ascending on the wire — the spec's order, and the order `latest` is derived from.
+    // Compared on the registry's own precedence key, because as text `1.10.0` precedes `1.9.0`.
+    let keys: Vec<String> = versions.iter().map(|raw| SemVer::parse(raw).expect("semver").sort_key()).collect();
+    assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "the emitted listing must stay ascending by precedence");
+    assert_eq!(response.json["latest"]["version"], newest, "`latest` follows the newest end, not the truncated one");
 }

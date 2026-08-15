@@ -242,6 +242,13 @@ async fn package_transfer_and_stats_contract() {
 }
 
 #[tokio::test]
+async fn storage_quota_contract_s20_b() {
+    let Some(db) = TestDb::create("storage_quota_contract_s20_b").await else { return };
+    pub_db_tests::contract::storage_quota(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn notifications_contract_decision20() {
     let Some(db) = TestDb::create("notifications_contract_decision20").await else { return };
     pub_db_tests::contract::notifications(&db.repos()).await;
@@ -515,6 +522,31 @@ async fn s22_a_the_hardened_app_role_prunes_audit_without_holding_delete() {
         "matching any error would pass on a renamed or dropped function; got: {err}"
     );
 
+    // **Migration 0014 needs no change to this template, asserted rather than reasoned about.**
+    // The template's grants are table-level, and a table-level privilege in Postgres covers every
+    // column the table has or later gains — so a column added after the role was provisioned is
+    // readable and writable without a re-grant. That is a property of the *grant*, not of the
+    // migration, and the way it would break is silent on every other test in this file: they all
+    // connect as the database owner, which can do anything. The one deployment shape that would
+    // fail is the hardened one this test exists for.
+    let quota_org = db
+        .repos()
+        .orgs
+        .create(pub_core::org::NewOrg::new("Quota", "quota"), user.id, chrono::Utc::now())
+        .await
+        .expect("seed an org as the owner");
+    let quota = app_repos
+        .orgs
+        .set_storage_quota(quota_org.id, Some(4096), chrono::Utc::now())
+        .await
+        .expect("the hardened role must be able to write a column added after it was provisioned");
+    assert_eq!(quota.storage_quota_bytes, Some(4096));
+    assert_eq!(
+        app_repos.orgs.get(quota_org.id).await.expect("read back").expect("org").storage_quota_bytes,
+        Some(4096),
+        "the hardened role must be able to read the new column too"
+    );
+
     app_pool.close().await;
     sqlx::query(AssertSqlSafe(format!("DROP OWNED BY \"{role}\""))).execute(&db.pool).await.expect("drop owned");
     let admin_pool = db.pool.clone();
@@ -527,6 +559,150 @@ async fn s22_a_the_hardened_app_role_prunes_audit_without_holding_delete() {
         .await
         .expect("drop the test role");
     admin.close().await.expect("close admin connection");
+}
+
+/// **S-20.b.** The quota's usage read is an index-only scan bounded by `package_id`, not a walk
+/// of the org's version rows.
+///
+/// The SQLite sibling asserts the same property against the same statement; this leg is the one
+/// that can answer whether the *Postgres* SQL is right, which the SQLite-only run cannot
+/// ([D16](../../../../docs/roadmap.md)). Two shapes of this test are deliberate, both from
+/// [D52](../../../../docs/roadmap.md): the SQL is read from `PgPackageRepo::ORG_STORAGE_BYTES_SQL`
+/// rather than copied here, and the assertion is on the **seek's usable columns** plus the
+/// absence of heap fetches — never on an index name alone.
+///
+/// It needs a *realistically shaped* loaded table to mean anything, and the first shape tried
+/// here was wrong in an instructive way. Postgres sequentially scans a handful of rows whatever
+/// indexes exist, so the fixture is loaded — but with the 20 000 versions split evenly between
+/// two orgs, the planner hash-joined a **sequential scan** of `versions` and was *right* to: at
+/// 50 % selectivity a seek per package is more expensive than one pass. That is not the shape a
+/// quota check runs in. An instance with one org is an instance with no quota problem; the case
+/// worth keeping fast is one org among many, whose slice is a small fraction of the whole. So
+/// the fixture below is 202 packages over two orgs where the measured org holds **1 %** of the
+/// versions, `VACUUM ANALYZE`d so the visibility map is set and an index-only scan can be one.
+#[tokio::test]
+async fn s20_b_the_org_storage_sum_is_an_index_only_scan() {
+    let Some(db) = TestDb::create("s20_b_the_org_storage_sum").await else { return };
+    let repos = db.repos();
+    let now = chrono::Utc::now();
+    let alice = repos
+        .users
+        .create(
+            pub_core::user::NewUser {
+                email: Some("alice@corp.com".into()),
+                email_verified: true,
+                display_name: "Alice".into(),
+            },
+            now,
+        )
+        .await
+        .expect("seed the publisher");
+    let measured = repos.orgs.create(pub_core::org::NewOrg::new("Measured", "measured"), alice.id, now).await;
+    let measured = measured.expect("seed the measured org").id;
+    let other = repos.orgs.create(pub_core::org::NewOrg::new("Other", "other"), alice.id, now).await;
+    let other = other.expect("seed the second org").id;
+
+    // 2 packages for the org under measurement, 200 for the rest of the instance — 100 versions
+    // each, one in fifty tombstoned so the partial predicate has something to exclude.
+    for (org, packages) in [(measured, 2), (other, 200)] {
+        sqlx::query(
+            "WITH claimed AS ( \
+               INSERT INTO name_claims (format, name, org_id, claimed_at) \
+               SELECT 'pub', 'pkg_' || $2 || '_' || i, $1, now() FROM generate_series(1, $4) AS i RETURNING name \
+             ), pkgs AS ( \
+               INSERT INTO packages (id, format, name, org_id, visibility, discontinued, replaced_by, unlisted, \
+                                     created_at, updated_at) \
+               SELECT gen_random_uuid(), 'pub', name, $1, 'private', FALSE, NULL, FALSE, now(), now() \
+               FROM claimed RETURNING id \
+             ) \
+             INSERT INTO versions (id, package_id, version, version_sort, pubspec, archive_sha256, archive_size, \
+                                   published_by, published_by_token, published_at, retracted_at, tombstone, \
+                                   readme_html, changelog_html) \
+             SELECT gen_random_uuid(), p.id, '1.0.' || v, '1.0.' || lpad(v::text, 10, '0'), '{}'::jsonb, \
+                    encode(sha256((p.id::text || v)::bytea), 'hex'), 1024, $3, NULL, now(), NULL, v % 50 = 0, \
+                    NULL, NULL \
+             FROM pkgs p, generate_series(1, 100) AS v",
+        )
+        .bind(*org.as_uuid())
+        .bind(org.to_string())
+        .bind(*alice.id.as_uuid())
+        .bind(packages)
+        .execute(&db.pool)
+        .await
+        .expect("load the version history");
+    }
+    // `VACUUM` and not just `ANALYZE`: an index-only scan still visits the heap for every row
+    // whose page is not marked all-visible, and a freshly bulk-inserted table has none marked.
+    // Without this the plan is the right one and the `Heap Fetches` assertion below fails on a
+    // property of the fixture rather than of the schema.
+    sqlx::query("VACUUM ANALYZE versions").execute(&db.pool).await.expect("vacuum analyze versions");
+    sqlx::query("VACUUM ANALYZE packages").execute(&db.pool).await.expect("vacuum analyze packages");
+
+    let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, BUFFERS) {}",
+        pub_db_postgres::repo::PgPackageRepo::ORG_STORAGE_BYTES_SQL
+    )))
+    .bind(*measured.as_uuid())
+    .fetch_all(&db.pool)
+    .await
+    .expect("explain");
+    let plan = rows.into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n");
+
+    // The seek, and what bounds it. `package_id` is the leading column of
+    // `versions_org_bytes_idx` precisely so this condition exists; without it the aggregate
+    // reads every live version on the instance and filters.
+    let cond = plan
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Index Cond:"))
+        .find(|line| line.contains("package_id"))
+        .unwrap_or_else(|| panic!("the sum does not seek `versions` on package_id at all:\n{plan}"));
+    assert!(cond.contains("package_id"), "{cond}");
+    assert!(!plan.contains("Seq Scan on versions"), "the quota sum sequentially scans `versions`:\n{plan}");
+
+    // Index **only**: `archive_size` is in the index so the sum never visits the heap. This is
+    // the assertion that carries the test, and it was demonstrated rather than assumed — with
+    // 0014's index dropped the planner still produces a nested loop with an `Index Cond` on
+    // `package_id`, so the two assertions above stay green, but the inner side becomes a
+    // `Bitmap Heap Scan on versions` over `versions_package_version_key` with a heap recheck and
+    // `Filter: (NOT tombstone)`: 13 shared buffers against 8, on a fixture where the org owns 1 %
+    // of the instance's versions. The gap is proportional to the org's history, and this runs
+    // twice per publish.
+    assert!(
+        plan.contains("Index Only Scan using versions_org_bytes_idx"),
+        "the sum reads version rows to sum one column of them:\n{plan}"
+    );
+    // The node type alone is not the property: an index-only scan that finds an unset visibility
+    // map fetches every row from the heap anyway and is an ordinary index scan wearing a hat.
+    assert!(
+        plan.contains("Heap Fetches: 0"),
+        "the index-only scan is still visiting the heap, so it is not paying for itself:\n{plan}"
+    );
+
+    // The per-**package** sum the transfer guard reads (S-20.b) needs **no index of its own**:
+    // `versions_org_bytes_idx` leads on `package_id` and carries `archive_size`, so it is the
+    // same index-only scan with the `packages` half of the join removed. Asserted rather than
+    // reasoned about, because "the index we have happens to serve it" stops being true the day
+    // somebody reorders its columns.
+    let package = sqlx::query_scalar::<_, sqlx::types::Uuid>("SELECT id FROM packages WHERE org_id = $1 LIMIT 1")
+        .bind(*measured.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("a package of the measured org");
+    let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, BUFFERS) {}",
+        pub_db_postgres::repo::PgPackageRepo::PACKAGE_STORAGE_BYTES_SQL
+    )))
+    .bind(package)
+    .fetch_all(&db.pool)
+    .await
+    .expect("explain");
+    let plan = rows.into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n");
+    assert!(!plan.contains("Seq Scan on versions"), "the per-package sum sequentially scans `versions`:\n{plan}");
+    assert!(
+        plan.contains("Index Only Scan using versions_org_bytes_idx"),
+        "the per-package sum needs no new index, but it does need this one to cover it:\n{plan}"
+    );
+    assert!(plan.contains("Heap Fetches: 0"), "the per-package sum is visiting the heap:\n{plan}");
 }
 
 /// **Decision 31.** The blob collector's reference check seeks both registers instead of

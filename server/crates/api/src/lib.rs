@@ -126,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::admin::suspend_user))
         .routes(routes!(routes::admin::unsuspend_user))
         .routes(routes!(routes::admin::list_orgs))
+        .routes(routes!(routes::admin::update_org))
         .routes(routes!(routes::admin::list_audit))
         .routes(routes!(routes::admin::export_audit))
         .routes(routes!(routes::admin::stats))
@@ -227,7 +228,11 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::middleware::from_fn_with_state(state.clone(), guard::read_rate_limit))
                 // S-12 mutation guard: Origin/Sec-Fetch-Site + custom header + JSON-only
                 // bodies on /api mutations.
-                .layer(axum::middleware::from_fn_with_state(state.clone(), guard::mutation_guard)),
+                .layer(axum::middleware::from_fn_with_state(state.clone(), guard::mutation_guard))
+                // Write-path buckets (S-24.g), keyed by identity and failing open. Innermost on
+                // purpose: a cross-origin mutation the S-12 guard above refuses spends nothing,
+                // so a page a user merely visits cannot drain that user's own write budget.
+                .layer(axum::middleware::from_fn_with_state(state.clone(), guard::write_rate_limit)),
         )
         .with_state(state)
 }

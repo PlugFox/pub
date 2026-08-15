@@ -272,7 +272,7 @@ pub async fn hard_delete(
         (status = OK, description = "Package transferred", body = OkEnvelope<PackageTransferredDto>),
         (status = FORBIDDEN, description = "Not an Owner of both orgs, or step_up_required", body = ErrorEnvelope),
         (status = NOT_FOUND, description = "Unknown package or target org", body = ErrorEnvelope),
-        (status = BAD_REQUEST, description = "confirm does not match, or the target is the current owner", body = ErrorEnvelope),
+        (status = BAD_REQUEST, description = "confirm does not match, the target is the current owner, or the target org has no room for the package (S-20.b)", body = ErrorEnvelope),
     )
 )]
 pub async fn transfer(
@@ -303,6 +303,14 @@ pub async fn transfer(
                 to_org: target.id,
                 name: package.name.clone(),
                 actor: actor_meta(&auth, &meta),
+                // The **receiving** org's wall, resolved through the one function that owns the
+                // three-state rule (S-20.b). A transfer re-attributes every live version's bytes
+                // to `target` the moment the row updates, so this is a publish-sized admission
+                // into somebody else's quota and is checked like one.
+                storage_quota_bytes: pub_registry::publish::effective_storage_quota(
+                    target.storage_quota_bytes,
+                    state.runtime.current().registry.storage_quota_bytes,
+                ),
             },
             now,
         )

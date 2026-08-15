@@ -400,7 +400,7 @@ async fn a_refused_settings_patch_writes_none_of_its_sections() {
             Some(&access),
             serde_json::json!({
                 "registration": { "mode": "closed", "allowed_email_domains": [] },
-                "registry": { "require_auth_for_read": true },
+                "registry": { "require_auth_for_read": true, "storage_quota_bytes": 0 },
                 // Refused: a login user the runtime plane has no password for.
                 "smtp": { "host": "smtp.corp.com", "port": 587, "username": "mailer",
                           "from": "Acme <noreply@corp.com>", "security": "tls", "password": "" },
@@ -780,7 +780,7 @@ async fn d31_require_auth_for_read_flips_at_runtime() {
     assert_eq!(app.pub_get("/o/acme/pub/api/packages/acme_core", None).await.status, StatusCode::OK);
     assert_eq!(app.pub_get("/o/nosuch/pub/api/packages/acme_core", None).await.status, StatusCode::NOT_FOUND);
 
-    let flag = |on: bool| serde_json::json!({ "registry": { "require_auth_for_read": on } });
+    let flag = |on: bool| serde_json::json!({ "registry": { "require_auth_for_read": on, "storage_quota_bytes": 0 } });
     let patched = app.patch("/api/v1/admin/settings", Some(&access), flag(true)).await;
     assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.json);
     assert_eq!(patched.json["data"]["registry"]["require_auth_for_read"], true);
@@ -924,11 +924,17 @@ async fn s31_the_domain_allowlist_takes_effect_without_a_restart() {
 async fn s24_rate_limits_take_effect_without_a_restart() {
     let app = TestApp::new().await;
     let access = admin_token(&app, "root@corp.com").await;
+    // The whole section, literally, because that is what the surface accepts: a section is
+    // replaced wholesale, so a key missing here is a deserialization failure rather than a
+    // field left alone. Extending this list is the cost of adding a limit, and it is the point —
+    // the four numbers decision 32 added would otherwise be reachable by no test at all.
     let limits = |login: u32| {
         serde_json::json!({ "rate_limits": {
             "otp_per_email_hour": 5, "otp_per_ip_hour": 20, "login_per_ip_minute": login,
             "token_auth_fail_per_ip_minute": 30, "publish_per_hour_org": 30,
-            "read_per_ip_minute": 600, "read_per_identity_minute": 3000
+            "read_per_ip_minute": 600, "read_per_identity_minute": 3000,
+            "write_per_ip_minute": 60, "write_per_identity_minute": 300,
+            "invitations_per_day_org": 20, "invitations_per_day_actor": 10
         }})
     };
 
@@ -940,7 +946,16 @@ async fn s24_rate_limits_take_effect_without_a_restart() {
     // Tightening the login bucket to 1 trips the *second* redemption in the window. The window
     // is a fixed minute, so step into a clean one first — the sign-ins above already spent the
     // current one.
-    assert_eq!(app.patch("/api/v1/admin/settings", Some(&access), limits(1)).await.status, StatusCode::OK);
+    let written = app.patch("/api/v1/admin/settings", Some(&access), limits(1)).await;
+    assert_eq!(written.status, StatusCode::OK, "{:?}", written.json);
+    // The numbers decision 32 made runtime-changeable survive the round trip. Without this the
+    // section could accept them on the way in and drop them on the way out, which is exactly how
+    // a limit an operator "changed" keeps enforcing the boot value.
+    let limits_back = &written.json["data"]["rate_limits"];
+    assert_eq!(limits_back["write_per_ip_minute"], 60);
+    assert_eq!(limits_back["write_per_identity_minute"], 300);
+    assert_eq!(limits_back["invitations_per_day_org"], 20);
+    assert_eq!(limits_back["invitations_per_day_actor"], 10);
     app.advance(Duration::minutes(2));
     let (pending, code) = app.request_otp("dev@corp.com").await;
     let body = serde_json::json!({ "pending_id": pending, "email": "dev@corp.com", "code": code });
@@ -948,6 +963,310 @@ async fn s24_rate_limits_take_effect_without_a_restart() {
     let throttled = app.post("/api/v1/auth/otp/verify", None, body).await;
     assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(throttled.headers.contains_key(axum::http::header::RETRY_AFTER));
+}
+
+/// **S-20.b.** The instance storage quota is a runtime setting, and `0` is one of its legal
+/// values rather than a rejected one.
+///
+/// The zero matters at the wire because every *other* number on this surface is refused at zero
+/// — a limit of zero would close a plane — and the quota's zero means the opposite: unlimited,
+/// and the default a fresh instance boots with. A validator that swept it up with the rest would
+/// make the default configuration unwritable through the surface that reports it.
+#[tokio::test]
+async fn s20_b_the_storage_quota_is_a_runtime_setting_where_zero_means_unlimited() {
+    let app = TestApp::new().await;
+    let access = admin_token(&app, "root@corp.com").await;
+    let registry = |quota: u64| {
+        serde_json::json!({ "registry": { "require_auth_for_read": false,
+                                                                  "storage_quota_bytes": quota }})
+    };
+
+    let before = app.get("/api/v1/admin/settings", Some(&access)).await;
+    assert_eq!(before.json["data"]["registry"]["storage_quota_bytes"], 0, "a default install has no wall");
+
+    let limited = app.patch("/api/v1/admin/settings", Some(&access), registry(1_048_576)).await;
+    assert_eq!(limited.status, StatusCode::OK, "{:?}", limited.json);
+    assert_eq!(limited.json["data"]["registry"]["storage_quota_bytes"], 1_048_576);
+    // Durable, not just cached: a peer instance converges onto the stored row, not onto this
+    // process's memory.
+    let peer = SettingsCache::new((*app.state.settings).runtime_defaults());
+    peer.reload(app.repos.settings.as_ref()).await.expect("peer load");
+    assert_eq!(peer.current().registry.storage_quota_bytes, 1_048_576);
+
+    // Back to unlimited — the value a zero-rejecting validator would have refused.
+    let unlimited = app.patch("/api/v1/admin/settings", Some(&access), registry(0)).await;
+    assert_eq!(unlimited.status, StatusCode::OK, "0 means unlimited, not an empty limit: {:?}", unlimited.json);
+    assert_eq!(unlimited.json["data"]["registry"]["storage_quota_bytes"], 0);
+}
+
+/// **S-20.b.** The per-org quota override is an instance-admin write, and an org Admin cannot
+/// reach it by any route.
+///
+/// This is the requirement's own sentence — *a quota an org can raise for itself is not a
+/// quota* — asserted from both sides. The admin route refuses the org's Owner, and the org's own
+/// `PATCH /api/v1/orgs/{slug}` cannot carry the field even when a caller sends it: `OrgProfile`
+/// has no quota member, so the value has nowhere to land. That is a structural separation
+/// rather than a role check somebody can relax later, and the second assertion is what pins it.
+#[tokio::test]
+async fn s20_b_an_org_admin_cannot_set_a_quota_and_an_instance_admin_can() {
+    let app = TestApp::new().await;
+    let root = admin_token(&app, "root@corp.com").await;
+    let (_stale, org) = app.org_owner("bob@corp.com", "bobs").await;
+    // A fresh access token: the one org creation returns was minted before the membership
+    // existed, so its role claims are empty (decision 19 — levels travel in the JWT).
+    let owner = token(&app, "bob@corp.com").await;
+    let route = format!("/api/v1/admin/orgs/{org}");
+
+    // The org's own Owner — the highest role the org ladder has — is not an instance admin.
+    let denied = app.patch(&route, Some(&owner), serde_json::json!({ "storage_quota_bytes": 1024 })).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "{:?}", denied.json);
+    assert_eq!(app.repos.orgs.get(org).await.unwrap().unwrap().storage_quota_bytes, None);
+
+    // Nor can they smuggle it through the route that *is* theirs: the field is not on
+    // `OrgProfile`, so a body carrying it changes the name and nothing else.
+    let smuggled = app
+        .patch(
+            "/api/v1/orgs/bobs",
+            Some(&owner),
+            serde_json::json!({ "name": "Bob's", "storage_quota_bytes": 999_999_999 }),
+        )
+        .await;
+    assert_eq!(smuggled.status, StatusCode::OK, "{:?}", smuggled.json);
+    let after = app.repos.orgs.get(org).await.unwrap().unwrap();
+    assert_eq!(after.name, "Bob's", "the fields that *are* the org's own still apply");
+    assert_eq!(after.storage_quota_bytes, None, "a quota its subject can raise is not a quota");
+
+    // An instance admin can, and the answer reports both the stored override and what it
+    // resolves to — `null` and `0` are different rows with different futures.
+    let set = app.patch(&route, Some(&root), serde_json::json!({ "storage_quota_bytes": 1024 })).await;
+    assert_eq!(set.status, StatusCode::OK, "{:?}", set.json);
+    assert_eq!(set.json["data"]["storage_quota_bytes"], 1024);
+    assert_eq!(set.json["data"]["effective_quota_bytes"], 1024);
+    assert_eq!(set.json["data"]["slug"], "bobs");
+    assert_eq!(app.repos.orgs.get(org).await.unwrap().unwrap().storage_quota_bytes, Some(1024));
+
+    // S-22: audited like every other admin action, with the before/after pair.
+    let event = app.audit_event("admin.org.quota").await.expect("the write is audited");
+    assert_eq!(event.target.as_deref(), Some(org.to_string().as_str()));
+    let metadata = event.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["before"], serde_json::Value::Null);
+    assert_eq!(metadata["after"], 1024);
+
+    // `0` is "unlimited for this org", not "may store nothing": it is a stored row, and it
+    // resolves to no limit at all.
+    let unlimited = app.patch(&route, Some(&root), serde_json::json!({ "storage_quota_bytes": 0 })).await;
+    assert_eq!(unlimited.status, StatusCode::OK, "{:?}", unlimited.json);
+    assert_eq!(unlimited.json["data"]["storage_quota_bytes"], 0);
+    assert_eq!(unlimited.json["data"]["effective_quota_bytes"], serde_json::Value::Null);
+    assert_eq!(app.repos.orgs.get(org).await.unwrap().unwrap().storage_quota_bytes, Some(0));
+
+    // An explicit `null` clears the override, which is a *different* request from sending
+    // nothing — and the difference is why the field is a double option.
+    let cleared = app.patch(&route, Some(&root), serde_json::json!({ "storage_quota_bytes": null })).await;
+    assert_eq!(cleared.status, StatusCode::OK, "{:?}", cleared.json);
+    assert_eq!(cleared.json["data"]["storage_quota_bytes"], serde_json::Value::Null);
+    assert_eq!(app.repos.orgs.get(org).await.unwrap().unwrap().storage_quota_bytes, None);
+
+    let empty = app.patch(&route, Some(&root), serde_json::json!({})).await;
+    assert_eq!(
+        empty.status,
+        StatusCode::BAD_REQUEST,
+        "an empty patch reports nothing rather than 200: {:?}",
+        empty.json
+    );
+    assert_eq!(empty.error_code(), "invalid_argument");
+
+    // A number the signed column cannot hold is refused rather than wrapped into a negative row
+    // — which `effective_storage_quota` reads as *unlimited*, the opposite of the wall asked for.
+    // Raw, because this direction is the deserializer's plain-text 422 rather than the envelope:
+    // what matters here is that it is refused and stores nothing, and the enveloping gap itself
+    // is asserted in `s20_b_a_malformed_quota_patch_is_refused_inside_the_envelope`.
+    let huge = app
+        .send_raw(app.request(
+            Method::PATCH,
+            &route,
+            Some(&root),
+            Some(serde_json::json!({ "storage_quota_bytes": u64::MAX })),
+            common::DEFAULT_IP,
+        ))
+        .await;
+    assert_eq!(
+        huge.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the deserializer's rejection, pinned rather than approximated"
+    );
+    assert_eq!(app.repos.orgs.get(org).await.unwrap().unwrap().storage_quota_bytes, None);
+
+    // An unknown org is a 404, not a silent success.
+    let missing = app
+        .patch(
+            "/api/v1/admin/orgs/00000000-0000-7000-8000-000000000000",
+            Some(&root),
+            serde_json::json!({ "storage_quota_bytes": 1 }),
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "{:?}", missing.json);
+}
+
+/// **S-20.b / S-20.a.** The three ways an operator gets this request wrong, on the wire.
+///
+/// Each was a documented behaviour the route did not have. A negative quota died inside serde
+/// on a `u64` field and answered a bare **422** outside the error envelope
+/// ([rules/api.md](../../../../docs/rules/api.md)) — which also made
+/// `AdminService::set_org_storage_quota`'s carefully worded refusal unreachable from HTTP while
+/// its doc comment claimed to be what the operator sees. A malformed id answered **404** while
+/// the OpenAPI document promised a 400. And the message reflected the raw path segment
+/// unclipped, which S-20.a forbids and `manage.rs` already handles for comparable input.
+#[tokio::test]
+async fn s20_b_a_malformed_quota_patch_is_refused_inside_the_envelope() {
+    let app = TestApp::new().await;
+    let root = admin_token(&app, "root@corp.com").await;
+    let (_owner, org) = app.org_owner("bob@corp.com", "bobs").await;
+    let route = format!("/api/v1/admin/orgs/{org}");
+    let stored = async || app.repos.orgs.get(org).await.unwrap().unwrap().storage_quota_bytes;
+
+    app.patch(&route, Some(&root), serde_json::json!({ "storage_quota_bytes": 4096 })).await;
+    assert_eq!(stored().await, Some(4096));
+
+    // `-1`: the service's refusal, reachable and enveloped. Nothing spells "may store nothing",
+    // and the message has to say what to type instead — which is the whole reason this refusal
+    // must not be a deserializer string.
+    let negative = app.patch(&route, Some(&root), serde_json::json!({ "storage_quota_bytes": -1 })).await;
+    assert_eq!(negative.status, StatusCode::BAD_REQUEST, "{:?}", negative.json);
+    assert_eq!(negative.error_code(), "invalid_argument");
+    let message = negative.json["error"]["message"].as_str().expect("message");
+    assert!(message.contains("negative"), "{message}");
+    assert!(message.contains('0') && message.contains("null"), "the two spellings that do work: {message}");
+    assert_eq!(stored().await, Some(4096), "a refused patch changes nothing");
+
+    // A non-numeric value cannot reach the handler at all — no integer type accepts a string —
+    // so this is axum's own rejection. It must at least stay a client error and change nothing.
+    // It is *not* enveloped, and that is an app-wide gap rather than this route's: closing it
+    // needs an enveloping `Json` extractor, which is a change to every route at once.
+    // Read raw, because the body is *not* JSON — asserting through the JSON helper would panic
+    // on the deserializer's plain-text rejection and hide what this case is about.
+    for value in [serde_json::json!("lots"), serde_json::json!(u64::MAX)] {
+        let raw = app
+            .send_raw(app.request(
+                Method::PATCH,
+                &route,
+                Some(&root),
+                Some(serde_json::json!({ "storage_quota_bytes": value })),
+                common::DEFAULT_IP,
+            ))
+            .await;
+        // Exactly 422, not merely "some 4xx": this is the deserializer's rejection, and pinning
+        // the status is what would notice the route matching differently or the body shape
+        // changing. That it is *not* enveloped is the app-wide gap the comment above names.
+        assert_eq!(raw.status, StatusCode::UNPROCESSABLE_ENTITY, "value {value}");
+        assert_eq!(stored().await, Some(4096), "a refused patch changes nothing");
+    }
+
+    // A malformed id is the 404 an unknown one gets (S-04: "never existed" and "cannot exist"
+    // answer alike), and the OpenAPI document now says so.
+    let malformed =
+        app.patch("/api/v1/admin/orgs/not-a-uuid", Some(&root), serde_json::json!({ "storage_quota_bytes": 1 })).await;
+    assert_eq!(malformed.status, StatusCode::NOT_FOUND, "{:?}", malformed.json);
+    assert_eq!(malformed.error_code(), "not_found");
+
+    // S-20.a: the reflected segment is clipped before it enters the message. Without the clip a
+    // caller chooses the size of the response body, the log line, and whatever reads either.
+    let long = "z".repeat(4_000);
+    let reflected = app
+        .patch(&format!("/api/v1/admin/orgs/{long}"), Some(&root), serde_json::json!({ "storage_quota_bytes": 1 }))
+        .await;
+    assert_eq!(reflected.status, StatusCode::NOT_FOUND, "{:?}", reflected.json);
+    let message = reflected.json["error"]["message"].as_str().expect("message");
+    assert!(message.len() < 200, "unbounded reflection ({} bytes): {message}", message.len());
+    assert!(!message.contains(&long), "the whole segment must not come back");
+
+    // The same clip on the sibling id this surface takes, for the same reason.
+    let user = app.patch(&format!("/api/v1/admin/users/{long}/suspend"), Some(&root), serde_json::json!({})).await;
+    assert!(user.json["error"]["message"].as_str().map(|text| text.len() < 200).unwrap_or(true), "{:?}", user.json);
+}
+
+/// **S-20.b.** The admin org listing carries what each org is *measured against*, resolved
+/// server-side.
+///
+/// The stored override alone cannot answer the operator's question, and the listing used to
+/// carry only that — so the screen re-implemented `effective_storage_quota`'s three-state rule
+/// in TypeScript to fill the gap, which made that function's "this is the one place that rule is
+/// written" false. One rule in two languages is a rule that will eventually disagree with
+/// itself, on the surface that decides whether a publish is refused.
+#[tokio::test]
+async fn s20_b_the_admin_org_listing_resolves_the_effective_quota_server_side() {
+    // A finite instance default, which is the only setting under which `null` and `0` differ.
+    let app = TestApp::with_options(TestOptions { storage_quota_bytes: 10_000, ..TestOptions::default() }).await;
+    let root = admin_token(&app, "root@corp.com").await;
+    let (_a, inherits) = app.org_owner("a@corp.com", "inherits").await;
+    let (_b, exempt) = app.org_owner("b@corp.com", "exempt").await;
+    let (_c, walled) = app.org_owner("c@corp.com", "walled").await;
+
+    app.patch(&format!("/api/v1/admin/orgs/{exempt}"), Some(&root), serde_json::json!({ "storage_quota_bytes": 0 }))
+        .await;
+    app.patch(&format!("/api/v1/admin/orgs/{walled}"), Some(&root), serde_json::json!({ "storage_quota_bytes": 512 }))
+        .await;
+    let _ = inherits;
+
+    let listing = app.get("/api/v1/admin/orgs", Some(&root)).await;
+    assert_eq!(listing.status, StatusCode::OK, "{:?}", listing.json);
+    let row = |slug: &str| {
+        listing.json["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|row| row["org"]["slug"] == slug)
+            .unwrap_or_else(|| panic!("{slug} is listed"))
+            .clone()
+    };
+
+    // `null` follows the instance default…
+    assert_eq!(row("inherits")["storage_quota_bytes"], serde_json::Value::Null);
+    assert_eq!(row("inherits")["effective_quota_bytes"], 10_000);
+    // …`0` is this org's own unlimited, and the two are indistinguishable without this field…
+    assert_eq!(row("exempt")["storage_quota_bytes"], 0);
+    assert_eq!(row("exempt")["effective_quota_bytes"], serde_json::Value::Null);
+    // …and a positive override wins.
+    assert_eq!(row("walled")["storage_quota_bytes"], 512);
+    assert_eq!(row("walled")["effective_quota_bytes"], 512);
+
+    // The listing agrees with the sibling `PATCH`, which is the point: one rule, one resolver.
+    let patched = app
+        .patch(&format!("/api/v1/admin/orgs/{walled}"), Some(&root), serde_json::json!({ "storage_quota_bytes": 512 }))
+        .await;
+    assert_eq!(patched.json["data"]["effective_quota_bytes"], row("walled")["effective_quota_bytes"]);
+}
+
+/// **S-20.b.** The admin org table carries the override, and the public org payload does not.
+///
+/// One org's quota is nobody else's business, and `GET /api/v1/orgs/{slug}` is anonymously
+/// reachable (decision 05) — so the field's *absence* there is the property, and its presence on
+/// the admin listing is what makes the override discoverable by the only person who can change
+/// it.
+#[tokio::test]
+async fn s20_b_the_quota_is_on_the_admin_org_table_and_not_on_the_public_org_payload() {
+    let app = TestApp::new().await;
+    let root = admin_token(&app, "root@corp.com").await;
+    let (_owner, org) = app.org_owner("bob@corp.com", "bobs").await;
+    app.patch(&format!("/api/v1/admin/orgs/{org}"), Some(&root), serde_json::json!({ "storage_quota_bytes": 4096 }))
+        .await;
+
+    let listing = app.get("/api/v1/admin/orgs", Some(&root)).await;
+    assert_eq!(listing.status, StatusCode::OK, "{:?}", listing.json);
+    let row = listing.json["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["org"]["slug"] == "bobs")
+        .expect("the org is listed")
+        .clone();
+    assert_eq!(row["storage_quota_bytes"], 4096);
+    // Not on the nested org payload — that is the shape the public route serves.
+    assert!(row["org"].get("storage_quota_bytes").is_none(), "{row}");
+
+    let public = app.get("/api/v1/orgs/bobs", None).await;
+    assert_eq!(public.status, StatusCode::OK, "{:?}", public.json);
+    assert!(public.json["data"].get("storage_quota_bytes").is_none(), "{:?}", public.json);
 }
 
 /// The instance-wide upstream switch is a runtime setting: an operator can stop egress without

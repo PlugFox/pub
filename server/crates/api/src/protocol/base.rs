@@ -163,6 +163,7 @@ mod tests {
             slug: slug.to_owned(),
             description: String::new(),
             upstream_policy: pub_core::org::UpstreamPolicy::Allow,
+            storage_quota_bytes: None,
             archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

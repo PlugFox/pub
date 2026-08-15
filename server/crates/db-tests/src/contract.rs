@@ -2594,6 +2594,73 @@ pub async fn org_management(repos: &Repositories) {
     assert_eq!(repos.orgs.count_invitations_since(org.id, t0() - days(1)).await.expect("count"), 1);
     assert_eq!(repos.orgs.count_invitations_since(org.id, t0() + hours(1)).await.expect("window"), 0);
 
+    // **S-24.h**, the per-actor half. Bob invites twice, an hour apart, into the same org Alice
+    // invited into. What has to hold: the actor count is *narrower* than the org count, it is
+    // scoped to one org, and its window rolls the same way the org count's does.
+    for (index, at) in [t0(), t0() + hours(1)].into_iter().enumerate() {
+        repos
+            .orgs
+            .create_invitation(
+                NewInvitation::new(
+                    org.id,
+                    format!("hire{index}@corp.com"),
+                    bob.id,
+                    format!("bob-inv-{index}"),
+                    at + days(7),
+                ),
+                at,
+            )
+            .await
+            .expect("bob invites");
+    }
+    // Alice's one and Bob's two share the org budget; Bob's own budget counts only his.
+    assert_eq!(repos.orgs.count_invitations_since(org.id, t0() - days(1)).await.expect("org budget"), 3);
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(org.id, bob.id, t0() - days(1)).await.expect("actor budget"),
+        2
+    );
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(org.id, alice.id, t0() - days(1)).await.expect("other actor"),
+        1,
+        "one member's sending must not spend another's budget"
+    );
+    // Rolling, not tumbling: `since` is an instant, so a window opened after the first send sees
+    // only what came later.
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(org.id, bob.id, t0() + minutes(30)).await.expect("window"),
+        1
+    );
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(org.id, bob.id, t0() + hours(2)).await.expect("past window"),
+        0
+    );
+    // Scoped to one org: the same actor's invitations elsewhere are somebody else's budget. This
+    // is the assertion an index-only implementation on `(invited_by, created_at)` fails if it
+    // ever drops the `org_id` predicate.
+    let elsewhere = seed_org(repos, "elsewhere", bob.id).await;
+    repos
+        .orgs
+        .create_invitation(
+            NewInvitation::new(elsewhere.id, "hire@corp.com", bob.id, "bob-inv-elsewhere", t0() + days(7)),
+            t0(),
+        )
+        .await
+        .expect("bob invites into his own org");
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(org.id, bob.id, t0() - days(1)).await.expect("still scoped"),
+        2,
+        "an invitation into another org must not spend this org's per-actor budget"
+    );
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(elsewhere.id, bob.id, t0() - days(1)).await.expect("other org"),
+        1
+    );
+    // An actor who has sent nothing here is at zero rather than an error.
+    assert_eq!(
+        repos.orgs.count_invitations_since_by_actor(org.id, UserId::new(), t0() - days(1)).await.expect("stranger"),
+        0
+    );
+
     // A revoked invitation stops being redeemable, so it stops opening the registration gate.
     let pending = repos.orgs.find_invitation_by_token_hash("inv-1").await.expect("find").expect("row");
     repos.orgs.revoke_invitation(pending.id, t0() + hours(1)).await.expect("revoke");
@@ -2791,6 +2858,153 @@ pub async fn package_transfer_and_stats(repos: &Repositories) {
     assert_eq!(cache.versions, 2);
     assert_eq!(cache.cached_versions, 1);
     assert_eq!(cache.cached_bytes, 2048);
+}
+
+/// **S-20.b.** The storage quota's two halves: the number it is checked against
+/// (`OrgRepo::set_storage_quota`) and the number it checks (`PackageRepo::org_storage_bytes`).
+///
+/// Every clause of the sum is a rule somebody could reasonably implement the other way round, so
+/// each gets its own assertion: a **retracted** version still costs storage because it is still
+/// downloadable, a **tombstoned** one does not because its bytes are collectable, another org's
+/// versions are not this org's problem, and two versions sharing one `archive_sha256` are
+/// **both** charged — the deliberate over-count decision 32 takes so that one org's quota cannot
+/// depend on another org's behaviour.
+pub async fn storage_quota(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+    let other = seed_org(repos, "other", alice.id).await;
+
+    // An org that owns nothing is at zero bytes rather than in an error state — the caller
+    // compares this against a quota, and "no packages yet" is the state every org starts in.
+    assert_eq!(repos.packages.org_storage_bytes(org.id).await.expect("empty org"), 0);
+    // An id that never existed answers the same way, for the same reason: the question is "how
+    // many bytes", and nothing has any.
+    assert_eq!(repos.packages.org_storage_bytes(OrgId::new()).await.expect("unknown org"), 0);
+
+    let publish = async |owner: OrgId, name: &str, version: &str, size: i64, sha: &str| {
+        repos
+            .packages
+            .create_version(
+                NewVersion {
+                    archive_size: size,
+                    archive_sha256: sha.to_owned(),
+                    ..new_version(owner, name, version, alice.id)
+                },
+                t0(),
+            )
+            .await
+            .expect("publish")
+    };
+    let bytes = async |owner: OrgId| repos.packages.org_storage_bytes(owner).await.expect("org bytes");
+
+    publish(org.id, "kept_pkg", "1.0.0", 1_000, &"a".repeat(64)).await;
+    assert_eq!(bytes(org.id).await, 1_000);
+
+    // Byte-identical content under a new version number: content addressing means one blob backs
+    // both rows, and both are charged. Deliberate (decision 32) — the alternative makes an org's
+    // usage fall when a stranger publishes the same bytes.
+    publish(org.id, "kept_pkg", "2.0.0", 2_000, &"a".repeat(64)).await;
+    assert_eq!(bytes(org.id).await, 3_000, "deduplicated bytes are deliberately over-counted");
+
+    // A retracted version is still downloadable (sharp edge 9), so its bytes are still stored.
+    let retracted = publish(org.id, "retracted_pkg", "1.0.0", 4_000, &"b".repeat(64)).await;
+    repos.packages.set_retracted(retracted.version.id, true, t0() + hours(1)).await.expect("retract");
+    assert_eq!(bytes(org.id).await, 7_000, "a retracted version still occupies storage");
+
+    // A tombstone does not: a hard delete is how an org frees space.
+    let deleted = publish(org.id, "deleted_pkg", "1.0.0", 8_000, &"c".repeat(64)).await;
+    assert_eq!(bytes(org.id).await, 15_000);
+    repos.packages.hard_delete_version(deleted.version.id).await.expect("hard delete");
+    assert_eq!(bytes(org.id).await, 7_000, "a tombstoned version stops being charged");
+
+    // Another org's bytes are its own. Without the join predicate this reads instance-wide, and
+    // every assertion above would still pass on a single-org fixture.
+    publish(other.id, "elsewhere_pkg", "1.0.0", 16_000, &"d".repeat(64)).await;
+    assert_eq!(bytes(org.id).await, 7_000, "another org's versions must not count against this one");
+    assert_eq!(bytes(other.id).await, 16_000);
+
+    // **Proxied upstream archives never count** — the third contract rule, and the one no
+    // fixture used to exercise. `upstream_versions` has no org column by design and the cache is
+    // instance-wide, so an implementation that unioned it in would charge every org for one
+    // org's `dart pub get` — and would pass every assertion above, because none of them puts a
+    // row in that table. Both dialects, because a UNION is a query somebody writes once.
+    repos
+        .upstream
+        .save_snapshot(
+            upstream_snapshot(vec![upstream_version("1.0.0", &"e".repeat(64), false)], false),
+            t0() + hours(1),
+        )
+        .await
+        .expect("upstream snapshot");
+    let cached = repos.upstream.get_package(Format::Pub, "http").await.expect("get").expect("row");
+    let cached_version = repos.upstream.list_versions(cached.id).await.expect("versions")[0].id;
+    // Cached, so the bytes are genuinely sitting in this instance's blob store — and still not
+    // this org's, nor anybody's.
+    repos.upstream.mark_cached(cached_version, &"e".repeat(64), 32_000, t0() + hours(1)).await.expect("mark cached");
+    assert_eq!(bytes(org.id).await, 7_000, "a proxied upstream archive is not an org's stored bytes");
+    assert_eq!(bytes(other.id).await, 16_000, "…for any org");
+
+    // --- one package's share of that total (the number a transfer moves) --------------------
+    let package_bytes = async |name: &str| {
+        let package = repos.packages.get_by_name(Format::Pub, name).await.expect("get").expect("package");
+        repos.packages.package_storage_bytes(package.id).await.expect("package bytes")
+    };
+    // The same three rules, narrowed to one package: two live versions charged (including the
+    // deduplicated pair), the retracted one still charged, the tombstoned one no longer.
+    assert_eq!(package_bytes("kept_pkg").await, 3_000, "every live version of the package, deduplication included");
+    assert_eq!(package_bytes("retracted_pkg").await, 4_000, "a retracted version still occupies storage");
+    assert_eq!(package_bytes("deleted_pkg").await, 0, "a tombstoned version stops being charged");
+    // The sum over an org's packages is the org's own total — the property the transfer guard
+    // rests on, since `transfer` re-attributes exactly these bytes.
+    assert_eq!(
+        package_bytes("kept_pkg").await + package_bytes("retracted_pkg").await + package_bytes("deleted_pkg").await,
+        bytes(org.id).await,
+        "one package's bytes are the org's bytes, partitioned by package"
+    );
+    // An id that never existed answers 0 rather than erroring, like an unknown org.
+    assert_eq!(repos.packages.package_storage_bytes(PackageId::new()).await.expect("unknown package"), 0);
+    // …and a package belonging to another org is read on its own terms: the method is keyed on
+    // the package, so it must not smuggle in the org filter its sibling has.
+    assert_eq!(package_bytes("elsewhere_pkg").await, 16_000);
+
+    // --- the override -------------------------------------------------------------------
+    assert_eq!(org.storage_quota_bytes, None, "a new org has no override and follows the instance default");
+
+    let limited = repos.orgs.set_storage_quota(org.id, Some(10_000), t0() + hours(2)).await.expect("set quota");
+    assert_eq!(limited.storage_quota_bytes, Some(10_000));
+    assert_eq!(limited.updated_at, t0() + hours(2));
+    assert_eq!(limited.created_at, t0(), "setting a quota is not a re-creation");
+    // Every read path carries it, not just the one that wrote it.
+    assert_eq!(repos.orgs.get(org.id).await.expect("get").expect("org").storage_quota_bytes, Some(10_000));
+    assert_eq!(repos.orgs.get_by_slug("ACME").await.expect("slug").expect("org").storage_quota_bytes, Some(10_000));
+    let listed = repos.orgs.list_all(None, 10).await.expect("list");
+    let row = listed.items.iter().find(|row| row.org.id == org.id).expect("acme in the admin listing");
+    assert_eq!(row.org.storage_quota_bytes, Some(10_000));
+    let memberships = repos.orgs.list_for_user(alice.id).await.expect("memberships");
+    let joined = memberships.iter().find(|row| row.org.id == org.id).expect("acme among alice's orgs");
+    assert_eq!(joined.org.storage_quota_bytes, Some(10_000), "the joined listing carries the override too");
+
+    // The separation decision 32 buys: the profile write an **org Admin** can reach must not be
+    // able to touch the quota. `OrgProfile` has no field for it, and this is the assertion that
+    // keeps it that way if somebody adds one.
+    let profile = OrgProfile {
+        name: "Acme Inc".to_owned(),
+        description: "renamed".to_owned(),
+        upstream_policy: UpstreamPolicy::Block,
+    };
+    let renamed = repos.orgs.update_profile(org.id, &profile, t0() + hours(3)).await.expect("profile write");
+    assert_eq!(renamed.storage_quota_bytes, Some(10_000), "a profile write must not disturb the quota");
+
+    // `Some(0)` is an explicit "unlimited for this org" and is a different row from `None`:
+    // `None` follows an instance default an operator may change later, `Some(0)` does not.
+    let unlimited = repos.orgs.set_storage_quota(org.id, Some(0), t0() + hours(4)).await.expect("explicit unlimited");
+    assert_eq!(unlimited.storage_quota_bytes, Some(0));
+    let cleared = repos.orgs.set_storage_quota(org.id, None, t0() + hours(5)).await.expect("clear override");
+    assert_eq!(cleared.storage_quota_bytes, None);
+    assert_eq!(repos.orgs.get(org.id).await.expect("get").expect("org").storage_quota_bytes, None);
+
+    let err = repos.orgs.set_storage_quota(OrgId::new(), Some(1), t0()).await.expect_err("unknown org");
+    assert_eq!(err.code(), "not_found");
 }
 
 /// `NotificationRepo`: the per-user feed, the unread badge, mark-read semantics, and

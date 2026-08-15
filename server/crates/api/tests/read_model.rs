@@ -24,6 +24,7 @@ use pub_core::package::{PackageOptions, Visibility};
 use pub_core::{Format, OrgId};
 use pub_jobs::{DownloadRollup, DownloadRollupPolicy};
 use pub_registry::ActorMeta;
+use pub_registry::index::LATEST_WINDOW;
 
 /// A signed-in org owner whose access token actually carries the org's role claim.
 ///
@@ -682,4 +683,90 @@ async fn openapi_documents_every_read_model_route_and_schema() {
 fn urlencoding(raw: &str) -> String {
     assert!(raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "cursor is not URL-safe: {raw}");
     raw.to_owned()
+}
+
+// ------------------------------------------------- D50: one `latest`, three surfaces, one window
+
+/// Adds live versions straight through the repository.
+///
+/// The publish pipeline is the right way to create one version and the wrong way to create a
+/// thousand: each would gzip, hash, untar and render an archive to prove something this test is
+/// not about. The rows are exactly what all three read surfaces consume.
+async fn seed_versions(app: &TestApp, owner: &Owner, name: &str, versions: impl IntoIterator<Item = String>) {
+    let user = app.user_of(&owner.email).await;
+    for raw in versions {
+        app.repos
+            .packages
+            .create_version(
+                pub_core::package::NewVersion {
+                    format: Format::Pub,
+                    package_name: name.to_owned(),
+                    org_id: owner.org,
+                    visibility: Visibility::Private,
+                    version: pub_core::SemVer::parse(&raw).expect("valid version"),
+                    pubspec: serde_json::json!({ "name": name, "version": raw, "description": "Wide fixture." }),
+                    archive_sha256: "c".repeat(64),
+                    archive_size: 512,
+                    published_by: pub_core::package::Publisher { user_id: user, token_id: None },
+                    readme_html: None,
+                    changelog_html: None,
+                },
+                app.now(),
+            )
+            .await
+            .expect("seed version");
+    }
+}
+
+#[tokio::test]
+async fn d50_latest_is_the_same_version_on_the_listing_the_page_and_the_search_document() {
+    // The package D50 is about: larger than the smallest of the three windows, with **no live
+    // stable release among the newest `LATEST_WINDOW` versions** and one live stable below
+    // them. Before decision 32 the three surfaces bounded their reads differently and answered
+    // differently — the pub protocol and the search index reached down to the old stable while
+    // the package page stopped at its own 1 000 and reported the newest pre-release.
+    let app = TestApp::new().await;
+    let acme = owner(&app, "alice@corp.com", "acme").await;
+    publish(&app, &acme, &package_archive("acme_wide", "1.0.0")).await;
+    seed_versions(&app, &acme, "acme_wide", (1..=LATEST_WINDOW).map(|i| format!("1.{i}.0-beta"))).await;
+    // Through the registry service, so the search document is written by the production
+    // indexer over the finished 1 001-version package rather than seeded by hand.
+    make_public(&app, &acme, "acme_wide").await;
+
+    let expected = format!("1.{LATEST_WINDOW}.0-beta");
+    let count = (LATEST_WINDOW + 1) as u64;
+
+    // 1. what `dart pub` is told.
+    let listing = app.pub_get(&format!("{}/api/packages/acme_wide", acme.base()), Some(&acme.token)).await;
+    assert_eq!(listing.status, StatusCode::OK, "{:?}", listing.json);
+    let protocol_latest = listing.json["latest"]["version"].as_str().expect("latest").to_owned();
+    assert_eq!(listing.json["versions"].as_array().expect("versions").len(), count as usize);
+
+    // 2. what the package page renders.
+    let page = app.get("/api/v1/packages/acme_wide", None).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.json);
+    let page_latest = page.json["data"]["latest_version"].as_str().expect("latest_version").to_owned();
+    assert_eq!(page.json["data"]["versions_count"], count);
+
+    // 3. what search says.
+    let hits = app.get("/api/v1/packages?q=acme_wide", None).await;
+    let hit = &hits.json["data"]["items"][0];
+    let search_latest = hit["latest_version"].as_str().expect("latest_version").to_owned();
+    assert_eq!(hit["versions_count"], count, "the count is an aggregate now, and it still covers every version");
+
+    assert_eq!(protocol_latest, expected, "the protocol listing must not reach below the window");
+    assert_eq!(page_latest, expected, "the page must not reach below the window");
+    assert_eq!(search_latest, expected, "the search document must not reach below the window");
+    assert_eq!(
+        (protocol_latest.as_str(), page_latest.as_str()),
+        (search_latest.as_str(), search_latest.as_str()),
+        "three surfaces of one registry may not name three different `latest` versions"
+    );
+
+    // The window is a bound on the *rule*, not on what the surfaces carry: the old stable is
+    // still listed, still installable, and still counted.
+    let versions: Vec<&str> =
+        listing.json["versions"].as_array().unwrap().iter().map(|v| v["version"].as_str().unwrap()).collect();
+    assert_eq!(versions.first().copied(), Some("1.0.0"), "the stable below the window stays in the listing");
+    assert_eq!(versions.last().copied(), Some(expected.as_str()));
 }

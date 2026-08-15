@@ -23,7 +23,8 @@ use super::{db_err, parse_col, q, write_err};
 const MAX_PAGE: u32 = 200;
 
 /// All org columns, in [`OrgRow`] order.
-const ORG_COLS: &str = "id, name, slug, description, upstream_policy, archived_at, created_at, updated_at";
+const ORG_COLS: &str =
+    "id, name, slug, description, upstream_policy, storage_quota_bytes, archived_at, created_at, updated_at";
 /// All membership columns, in [`MemberRow`] order.
 const MEMBER_COLS: &str = "org_id, user_id, role_level, created_at, updated_at";
 /// All invitation columns, in [`InvitationRow`] order.
@@ -50,6 +51,7 @@ struct OrgRow {
     slug: String,
     description: String,
     upstream_policy: String,
+    storage_quota_bytes: Option<i64>,
     archived_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -65,6 +67,7 @@ impl TryFrom<OrgRow> for Org {
             slug: row.slug,
             description: row.description,
             upstream_policy: parse_col::<UpstreamPolicy>(&row.upstream_policy)?,
+            storage_quota_bytes: row.storage_quota_bytes,
             archived_at: row.archived_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -362,6 +365,21 @@ impl OrgRepo for PgOrgRepo {
             "UPDATE orgs SET upstream_policy = $1, updated_at = $2 WHERE id = $3 RETURNING {ORG_COLS}"
         ))
         .bind(policy.as_str())
+        .bind(now)
+        .bind(*id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?.try_into()
+    }
+
+    async fn set_storage_quota(&self, id: OrgId, quota: Option<i64>, now: DateTime<Utc>) -> Result<Org> {
+        // `quota` binds as NULL when it is `None`, which is the "no override" row rather than a
+        // zero — the two are different states and the column is nullable to keep them so.
+        let row: Option<OrgRow> = sqlx::query_as(q!(
+            "UPDATE orgs SET storage_quota_bytes = $1, updated_at = $2 WHERE id = $3 RETURNING {ORG_COLS}"
+        ))
+        .bind(quota)
         .bind(now)
         .bind(*id.as_uuid())
         .fetch_optional(&self.pool)
@@ -669,6 +687,22 @@ impl OrgRepo for PgOrgRepo {
             .fetch_one(&self.pool)
             .await
             .map_err(db_err)?;
+        Ok(row.get("n"))
+    }
+
+    async fn count_invitations_since_by_actor(&self, org: OrgId, actor: UserId, since: DateTime<Utc>) -> Result<i64> {
+        // `invitations_actor_created_idx (invited_by, created_at)` (migration 0014) seeks the
+        // actor and ranges over the window; `org_id` is a residual test on the few rows that
+        // come back.
+        let row: PgRow = sqlx::query(
+            "SELECT COUNT(*) AS n FROM invitations WHERE org_id = $1 AND invited_by = $2 AND created_at >= $3",
+        )
+        .bind(*org.as_uuid())
+        .bind(*actor.as_uuid())
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(row.get("n"))
     }
 

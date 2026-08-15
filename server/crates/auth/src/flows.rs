@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 
 use base64::Engine as _;
@@ -192,6 +193,16 @@ pub struct AuthService {
     /// tables would each enforce the limit separately, doubling the budget an outage allows.
     /// Reachable through [`AuthService::rate_limit_fallback`] for that reason alone.
     rate_limit_fallback: Arc<ratelimit::InProcessLimiter>,
+    /// How many access-token signatures this process has verified since startup.
+    ///
+    /// Not telemetry, and not a limit: it is what makes "one identity per request"
+    /// ([S-24.g](../../../docs/security.md#5-audit--abuse), decision 32, closes
+    /// [D58](../../../docs/roadmap.md)) an **observable** property instead of a claim in a
+    /// comment. The identity layer stashes its verified claims and the auth extractor reuses
+    /// them, and the only way to assert that a request did not quietly verify the same token
+    /// two or three times is to count the verifications. One relaxed atomic increment on a path
+    /// that already does Ed25519.
+    access_verifications: AtomicU64,
 }
 
 impl AuthService {
@@ -210,7 +221,22 @@ impl AuthService {
         rng: Arc<dyn RandomSource>,
         oidc: OidcClient,
     ) -> Self {
-        Self { repos, kv, keyring, policy, runtime, rng, oidc, rate_limit_fallback: Arc::default() }
+        Self {
+            repos,
+            kv,
+            keyring,
+            policy,
+            runtime,
+            rng,
+            oidc,
+            rate_limit_fallback: Arc::default(),
+            access_verifications: AtomicU64::new(0),
+        }
+    }
+
+    /// How many access-token signatures this process has verified — see the field's docs.
+    pub fn access_verifications(&self) -> u64 {
+        self.access_verifications.load(Ordering::Relaxed)
     }
 
     /// The process's single in-process rate-limit fallback (S-24.e) — see the field's docs for
@@ -222,6 +248,30 @@ impl AuthService {
     /// The boot-only half of the auth policy (TTLs, pepper, KEK, token prefix).
     pub fn policy(&self) -> &AuthPolicy {
         &self.policy
+    }
+
+    /// Whether `key` is being seen for the **first time in `window`** — the once-per-window gate
+    /// a throttle outside this crate needs so its audit row cannot be written per request.
+    ///
+    /// Narrow on purpose. The caller needs one bit, and handing out the `Kv` to get it would
+    /// export OTP flow records, OIDC flow state, MFA backoff and session revocation to every
+    /// crate holding an `AuthService`.
+    ///
+    /// **Deliberately not the fail-closed path.** This spends `ratelimit::hit` against the KV
+    /// alone rather than `hit_or_fallback`: the [S-24.e](../../../../docs/security.md#5-audit--abuse)
+    /// in-process table is the credential plane's, its "a collision can only refuse *more*"
+    /// invariant holds only across keys sharing a window length, and this window is an hour
+    /// where its residents are a minute. A KV error therefore answers **true** — write the row.
+    /// That is the right direction for evidence: an outage should cost duplicate audit rows,
+    /// never a missing one.
+    pub async fn suppress_once(&self, key: &str, window: Duration, now: DateTime<Utc>) -> bool {
+        match ratelimit::hit(self.kv.as_ref(), key, 1, window, now).await {
+            Ok(decision) => matches!(decision, ratelimit::Decision::Allowed),
+            Err(err) => {
+                tracing::warn!(error = %err, "audit suppression unavailable; writing the row");
+                true
+            }
+        }
     }
 
     /// The current runtime-settings snapshot (decision 09).
@@ -1018,7 +1068,11 @@ impl AuthService {
     // --- Access-token plane (S-07, S-09) ---
 
     /// Verifies an access JWT against the boot keyring.
+    ///
+    /// Counted in [`AuthService::access_verifications`], including the failures: "how many
+    /// signatures did this request cost" is the question, and a rejected forgery costs one too.
     pub fn verify_access(&self, token: &str, now: DateTime<Utc>) -> Result<Claims> {
+        self.access_verifications.fetch_add(1, Ordering::Relaxed);
         self.keyring.verify(token, now)
     }
 

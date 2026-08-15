@@ -69,6 +69,27 @@ pub(crate) fn family_of(path: &str) -> Family {
     }
 }
 
+/// Whether `path` is on the **app-API plane**: the one predicate every layer that scopes
+/// itself to `/api` reads.
+///
+/// Three layers must agree on this to the byte — the S-12 mutation guard
+/// ([`crate::guard::mutation_guard`]), the S-24.g write bucket
+/// ([`crate::guard::write_rate_limit`]) and the router fallback that answers the app envelope
+/// ([`crate::assets::spa_fallback`]) — and for one wave they did not. Two of them spelled it
+/// `path.starts_with("/api/")` while the third went through [`family_of`], which also matches
+/// the **bare `/api`**. That single path was therefore outside the guard and inside the bucket:
+/// `fetch('/api', {method: 'POST', mode: 'no-cors'})` is a CORS-simple request, so any page on
+/// any origin could fire it without a preflight, skip every S-12 check, spend the visitor's
+/// `rl:write:ip:` budget and plant a `write.throttled` audit row carrying the visitor's IP and
+/// User-Agent — the two outcomes S-24.g and decision 32 claim the mounting order makes
+/// unreachable.
+///
+/// One function, so the drift cannot return: a path is on this plane or it is not, and every
+/// reader asks the same question.
+pub(crate) fn is_app_api(path: &str) -> bool {
+    family_of(path) == Family::Api
+}
+
 /// Whether `path` sits under an org's virtual registry base `/o/{org}/pub` (decision 01).
 fn is_org_pub(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/o/") else {
@@ -388,6 +409,23 @@ mod tests {
         }
         for path in ["/", "/healthz", "/publisher", "/o/acme", "/o//pub", "/o/acme/publish", "/app/orgs"] {
             assert_eq!(family_of(path), Family::Other, "{path}");
+        }
+    }
+
+    /// **S-12 / S-24.g.** The app-API plane is one predicate, and the bare `/api` is on it.
+    ///
+    /// The path this pins is the one the S-12 guard and the write bucket used to disagree
+    /// about: `starts_with("/api/")` excludes `/api`, [`family_of`] includes it, and a caller
+    /// only needs one layer to think a path is off-plane to reach the other one unguarded.
+    #[test]
+    fn the_app_api_plane_includes_the_bare_api_path() {
+        for path in ["/api", "/api/", "/api/v1/orgs", "/api/openapi.json"] {
+            assert!(is_app_api(path), "{path} is on the app-API plane");
+        }
+        // Neighbours that merely start with the same letters are not, and neither is the
+        // registry plane — `/api` under a pub base belongs to the protocol, not to the app.
+        for path in ["/apidocs", "/", "/healthz", "/pub/api/packages/foo", "/o/acme/pub/api/archives/x.tar.gz"] {
+            assert!(!is_app_api(path), "{path} is not on the app-API plane");
         }
     }
 

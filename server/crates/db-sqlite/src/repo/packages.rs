@@ -45,6 +45,30 @@ pub struct SqlitePackageRepo {
 }
 
 impl SqlitePackageRepo {
+    /// The exact statement [`PackageRepo::org_storage_bytes`] emits on this dialect, exported so
+    /// the query-plan test can `EXPLAIN` **it** rather than a copy of it (roadmap D52: the plan
+    /// tests that hand-copy their SQL assert an index for text production may no longer emit).
+    ///
+    /// Two literals in here are load-bearing and are what the plan test pins:
+    ///
+    /// - `v.tombstone = 0` is a **literal**, not a bind. SQLite infers a partial index only from
+    ///   a term it can evaluate against the index predicate, so binding it makes
+    ///   `versions_org_bytes_idx` unusable and the aggregate scans `versions`.
+    /// - the join is the org → packages → versions walk, so the plan is two seeks:
+    ///   `packages_org_idx (org_id=?)` and `versions_org_bytes_idx (package_id=?)`, the second
+    ///   covering because `archive_size` — the aggregated column — is in the index.
+    pub const ORG_STORAGE_BYTES_SQL: &'static str = "SELECT COALESCE(SUM(v.archive_size), 0) AS bytes \
+         FROM versions v JOIN packages p ON p.id = v.package_id \
+         WHERE p.org_id = ? AND v.tombstone = 0";
+
+    /// The exact statement [`PackageRepo::package_storage_bytes`] emits on this dialect.
+    ///
+    /// The same partial index serves it with no join at all: `versions_org_bytes_idx` leads on
+    /// `package_id` and carries `archive_size`, so this is one covering seek. `v.tombstone = 0`
+    /// is a literal here for the same reason as above.
+    pub const PACKAGE_STORAGE_BYTES_SQL: &'static str = "SELECT COALESCE(SUM(v.archive_size), 0) AS bytes \
+         FROM versions v WHERE v.package_id = ? AND v.tombstone = 0";
+
     /// Wraps a pool handle.
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -573,6 +597,27 @@ impl PackageRepo for SqlitePackageRepo {
             .await
             .map_err(db_err)?;
         Ok(row.get("n"))
+    }
+
+    async fn org_storage_bytes(&self, org: OrgId) -> Result<i64> {
+        // `COALESCE(SUM(…), 0)`: an org with no live versions must answer 0, not NULL — the
+        // caller compares this against a quota, and an org that owns nothing is at zero bytes
+        // rather than in an error state.
+        let row: SqliteRow = sqlx::query(sqlx::AssertSqlSafe(Self::ORG_STORAGE_BYTES_SQL))
+            .bind(org.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("bytes"))
+    }
+
+    async fn package_storage_bytes(&self, package: PackageId) -> Result<i64> {
+        let row: SqliteRow = sqlx::query(sqlx::AssertSqlSafe(Self::PACKAGE_STORAGE_BYTES_SQL))
+            .bind(package.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("bytes"))
     }
 
     async fn stats(&self) -> Result<pub_core::package::RegistryStats> {

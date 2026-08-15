@@ -249,8 +249,11 @@ pub async fn list_invitations(
 ///
 /// Unconditionally gated, unlike a direct member add: an invitation reaches an address that
 /// may not have an account yet, so a stolen admin session could otherwise invite an
-/// attacker-controlled mailbox and escalate around the CLI-token publish boundary. Budgeted at
-/// ≤20/day/org (S-24).
+/// attacker-controlled mailbox and escalate around the CLI-token publish boundary.
+///
+/// Budgeted twice (S-24.h): per org and per actor **within** that org, both runtime-changeable
+/// and both exact database counts over a genuinely rolling 24 hours rather than KV buckets —
+/// this is the one mutation whose cost is mail delivered to a third party.
 #[utoipa::path(
     post,
     path = "/api/v1/orgs/{slug}/invitations",
@@ -261,7 +264,7 @@ pub async fn list_invitations(
     responses(
         (status = OK, description = "Invitation created; the token is shown once", body = OkEnvelope<InvitationCreatedDto>),
         (status = FORBIDDEN, description = "Below Admin, a role at or above the caller's ceiling (D39), step_up_required, or a domain the S-31 allowlist rejects", body = ErrorEnvelope),
-        (status = TOO_MANY_REQUESTS, description = "The org's daily invitation budget is spent (S-24)", body = ErrorEnvelope),
+        (status = TOO_MANY_REQUESTS, description = "The org's or the actor's daily invitation budget is spent (S-24.h)", body = ErrorEnvelope),
         (status = NOT_FOUND, description = "Unknown or archived org", body = ErrorEnvelope),
     )
 )]

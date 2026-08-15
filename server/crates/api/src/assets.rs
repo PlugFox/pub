@@ -51,9 +51,14 @@ const NOT_FOUND_PAGE: &str = "404.html";
 const INDEX: &str = "index.html";
 
 /// Router fallback: JSON 404 for unknown API routes, the embedded frontend for everything else.
+///
+/// "Unknown API route" is [`crate::hygiene::is_app_api`], the same predicate the S-12 guard and
+/// the S-24.g write bucket scope themselves with. It used to be a third hand-written copy of
+/// the prefix test, and a fallback that answers the app envelope for a path the guard considers
+/// off-plane is precisely how the bare `/api` became reachable unguarded.
 pub async fn spa_fallback(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path();
-    if path == "/api" || path.starts_with("/api/") {
+    if crate::hygiene::is_app_api(path) {
         let body = ErrorEnvelope::new("not_found", format!("no route for {path}"));
         return (StatusCode::NOT_FOUND, Json(body)).into_response();
     }

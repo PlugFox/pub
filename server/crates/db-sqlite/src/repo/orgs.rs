@@ -17,7 +17,8 @@ use super::{db_err, parse_col, parse_ts, parse_ts_opt, q, write_err};
 const MAX_PAGE: u32 = 200;
 
 /// All org columns, in [`OrgRow`] order.
-const ORG_COLS: &str = "id, name, slug, description, upstream_policy, archived_at, created_at, updated_at";
+const ORG_COLS: &str =
+    "id, name, slug, description, upstream_policy, storage_quota_bytes, archived_at, created_at, updated_at";
 /// All membership columns, in [`MemberRow`] order.
 const MEMBER_COLS: &str = "org_id, user_id, role_level, created_at, updated_at";
 /// All invitation columns, in [`InvitationRow`] order.
@@ -44,6 +45,7 @@ struct OrgRow {
     slug: String,
     description: String,
     upstream_policy: String,
+    storage_quota_bytes: Option<i64>,
     archived_at: Option<String>,
     created_at: String,
     updated_at: String,
@@ -59,6 +61,7 @@ impl TryFrom<OrgRow> for Org {
             slug: row.slug,
             description: row.description,
             upstream_policy: parse_col::<UpstreamPolicy>(&row.upstream_policy)?,
+            storage_quota_bytes: row.storage_quota_bytes,
             archived_at: parse_ts_opt(row.archived_at.as_deref())?,
             created_at: parse_ts(&row.created_at)?,
             updated_at: parse_ts(&row.updated_at)?,
@@ -351,6 +354,21 @@ impl OrgRepo for SqliteOrgRepo {
         row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?.try_into()
     }
 
+    async fn set_storage_quota(&self, id: OrgId, quota: Option<i64>, now: DateTime<Utc>) -> Result<Org> {
+        // `quota` binds as NULL when it is `None`, which is the "no override" row rather than a
+        // zero — the two are different states and the column is nullable to keep them so.
+        let row: Option<OrgRow> = sqlx::query_as(q!(
+            "UPDATE orgs SET storage_quota_bytes = ?, updated_at = ? WHERE id = ? RETURNING {ORG_COLS}"
+        ))
+        .bind(quota)
+        .bind(super::ts(now))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.ok_or_else(|| Error::NotFound { what: format!("org {id}") })?.try_into()
+    }
+
     async fn list_for_user(&self, user: UserId) -> Result<Vec<OrgMembership>> {
         #[derive(sqlx::FromRow)]
         struct MembershipRow {
@@ -640,6 +658,22 @@ impl OrgRepo for SqliteOrgRepo {
             .fetch_one(&self.pool)
             .await
             .map_err(db_err)?;
+        Ok(row.get("n"))
+    }
+
+    async fn count_invitations_since_by_actor(&self, org: OrgId, actor: UserId, since: DateTime<Utc>) -> Result<i64> {
+        // `invitations_actor_created_idx (invited_by, created_at)` (migration 0014) seeks the
+        // actor and ranges over the window; `org_id` is a residual test on the few rows that
+        // come back. Timestamps are fixed-width RFC3339, so `>=` on TEXT is chronological.
+        let row: SqliteRow = sqlx::query(
+            "SELECT COUNT(*) AS n FROM invitations WHERE org_id = ? AND invited_by = ? AND created_at >= ?",
+        )
+        .bind(org.to_string())
+        .bind(actor.to_string())
+        .bind(super::ts(since))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
         Ok(row.get("n"))
     }
 

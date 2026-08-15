@@ -324,13 +324,17 @@ impl NotificationCenter {
 
 /// The event's own timestamp — notifications are stamped with when the thing happened, not
 /// with when the consumer got round to it.
+///
+/// It comes from [`DomainEvent::at`], an exhaustive `match` on the type, and this function is
+/// now only a name for that ([D49](../../../../docs/roadmap.md) closed). It used to serialize
+/// the event and fish out a string field called `at`, returning `Utc::now()` on any failure —
+/// absent field, non-string, unparseable. Nothing was broken at the time, because all thirteen
+/// variants carried the field; what was broken was the *next* variant. Its queue row would have
+/// been stamped at wall-clock time, and the integration suite drains behind a clock pinned to
+/// the past, so `run_after <= now` would never have claimed it: the new event's entire fan-out
+/// and every email it would have produced, gone, with every test green.
 fn event_time(event: &DomainEvent) -> DateTime<Utc> {
-    serde_json::to_value(event)
-        .ok()
-        .and_then(|value| value.get("at").and_then(|at| at.as_str().map(ToOwned::to_owned)))
-        .and_then(|at| DateTime::parse_from_rfc3339(&at).ok())
-        .map(|at| at.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now)
+    event.at()
 }
 
 #[cfg(test)]
@@ -352,6 +356,21 @@ mod tests {
             at,
         };
         assert_eq!(event_time(&event), at);
+    }
+
+    /// **D49.** The stamp comes from the type, so it can no longer silently become "now".
+    ///
+    /// The regression this pins is not a wrong millisecond: `event_time` is the `now` a fan-out
+    /// job is enqueued with, which both dialects bind straight into `run_after`. A wall-clock
+    /// stamp under a test clock pinned to the past produces a row `run_after <= now` never
+    /// claims — an event whose notifications and emails never happen, with nothing red.
+    #[test]
+    fn d49_the_stamp_is_the_events_own_and_never_the_wall_clock() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap();
+        let event =
+            DomainEvent::OrgStorageQuotaWarning { org_id: OrgId::new(), used_bytes: 900, quota_bytes: 1000, at };
+        assert_eq!(event_time(&event), at);
+        assert!(event_time(&event) < Utc::now(), "the pinned instant must not have been replaced by the wall clock");
     }
 
     #[test]

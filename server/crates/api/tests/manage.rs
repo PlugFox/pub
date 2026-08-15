@@ -819,14 +819,19 @@ async fn invitation_lifecycle_from_send_to_accept() {
     }
 }
 
-/// **S-24.** The per-org invitation budget is spent and answers 429 with a `Retry-After`.
+/// **S-24.h.** The per-actor cap is the half that was missing: with the shipped defaults
+/// (20/day/org, 10/day/actor) one member cannot spend the whole org's budget on their own.
+///
+/// The org cap is provably *not* what refuses here — the org has sent only 10 of its 20 — so
+/// this discriminates the new cap rather than re-proving the old one.
 #[tokio::test]
-async fn s24_the_org_invitation_budget_is_bounded_per_day() {
+async fn s24_h_the_per_actor_cap_refuses_before_the_org_cap() {
     let app = TestApp::new().await;
     let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
     let path = format!("/api/v1/orgs/{slug}/invitations");
+    let org = app.repos.orgs.get_by_slug(&slug).await.expect("lookup").expect("org").id;
 
-    for index in 0..20 {
+    for index in 0..10 {
         let response =
             app.post(&path, Some(&owner.access), serde_json::json!({ "email": format!("hire{index}@corp.com") })).await;
         assert_eq!(response.status, StatusCode::OK, "invite {index} failed: {:?}", response.json);
@@ -835,15 +840,163 @@ async fn s24_the_org_invitation_budget_is_bounded_per_day() {
     assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(refused.error_code(), "rate_limited");
     assert!(refused.headers.contains_key(axum::http::header::RETRY_AFTER));
-    let throttle = app.audit_event("auth.throttled").await.expect("throttle trip audited");
-    assert_eq!(throttle.metadata.expect("metadata")["limit"], "invitations_per_day_org");
 
-    // The window is rolling: a day later the budget is back.
+    // The org is at half its own budget, so only the per-actor cap can be what refused.
+    let sent = app.repos.orgs.count_invitations_since(org, app.now() - Duration::days(1)).await.expect("count");
+    assert_eq!(sent, 10, "the org cap is 20 and is not what refused this");
+    let throttle = app.audit_event("org.invitation.throttled").await.expect("throttle trip audited");
+    assert_eq!(throttle.metadata.expect("metadata")["limit"], "invitations_per_day_actor");
+    // Not the credential-plane action: an operator filtering for refused sign-ins must not have
+    // to read past an admin who invited their whole team at once (S-24.f's rule, S-24.h's site).
+    assert!(!app.audit_actions().await.iter().any(|action| action == "auth.throttled"));
+
+    // The window is rolling, not tumbling: a day later the budget is back.
     app.advance(Duration::days(1) + Duration::minutes(1));
     let fresh = app.login("owner@corp.com").await["access_token"].as_str().expect("token").to_owned();
     assert_eq!(
         app.post(&path, Some(&fresh), serde_json::json!({ "email": "tomorrow@corp.com" })).await.status,
         StatusCode::OK
+    );
+}
+
+/// **S-24.h.** The org cap still bounds the org across *different* actors — the property the
+/// per-actor cap must not have replaced. Here the refused actor is well inside their own cap,
+/// so nothing but the org cap can be what refuses.
+#[tokio::test]
+async fn s24_h_the_org_cap_still_refuses_across_different_actors() {
+    let app = TestApp::with_options(TestOptions {
+        invitations_per_day_org: 4,
+        invitations_per_day_actor: 3,
+        ..TestOptions::default()
+    })
+    .await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    app.login("second@corp.com").await;
+    add_member(&app, &owner, &slug, "second@corp.com", "admin").await;
+    let second = sign_in(&app, "second@corp.com").await;
+    let path = format!("/api/v1/orgs/{slug}/invitations");
+
+    // The owner spends their whole per-actor cap: three of the org's four.
+    for index in 0..3 {
+        let response =
+            app.post(&path, Some(&owner.access), serde_json::json!({ "email": format!("hire{index}@corp.com") })).await;
+        assert_eq!(response.status, StatusCode::OK, "owner invite {index}: {:?}", response.json);
+    }
+    // The second admin's first invitation is the org's fourth — still allowed.
+    let fourth = app.post(&path, Some(&second.access), serde_json::json!({ "email": "hire3@corp.com" })).await;
+    assert_eq!(fourth.status, StatusCode::OK, "{:?}", fourth.json);
+
+    // Their second is the org's fifth. Their own count is 1 of 3, so the actor cap cannot be
+    // what refuses it.
+    let refused = app.post(&path, Some(&second.access), serde_json::json!({ "email": "hire4@corp.com" })).await;
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    let throttle = app.audit_event("org.invitation.throttled").await.expect("throttle trip audited");
+    assert_eq!(throttle.metadata.expect("metadata")["limit"], "invitations_per_day_org");
+}
+
+/// **S-24.h / S-22.** An invitation refusal is audited **once per (org, actor) per window**,
+/// like every other throttle in the system.
+///
+/// This test asserted the opposite until the wave's own review, and the reversal is the
+/// interesting part. The argument for keeping a row per refusal was that the amplification a
+/// dedupe prevents is unreachable here — the actor is authenticated, step-up gated, org-scoped
+/// and "already bounded by S-24.g's write bucket at the same number as every other mutation".
+/// The last clause was false and load-bearing: every other site *dedupes*, so their ceiling is
+/// one row per window, while this one's was one row per **request** — 300 a minute at the
+/// default identity budget, 432 000 a day, retained for S-23's default 730 days. S-22's
+/// evidence survives at one row per window; only the repetition is gone.
+#[tokio::test]
+async fn s24_h_an_invitation_refusal_is_audited_once_per_window() {
+    let app = TestApp::with_options(TestOptions { invitations_per_day_actor: 1, ..TestOptions::default() }).await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    let path = format!("/api/v1/orgs/{slug}/invitations");
+
+    assert_eq!(
+        app.post(&path, Some(&owner.access), serde_json::json!({ "email": "hire0@corp.com" })).await.status,
+        StatusCode::OK
+    );
+    for index in 1..4 {
+        assert_eq!(
+            app.post(&path, Some(&owner.access), serde_json::json!({ "email": format!("hire{index}@corp.com") }))
+                .await
+                .status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "refusal {index}"
+        );
+    }
+    let rows = app.audit_actions().await.iter().filter(|action| *action == "org.invitation.throttled").count();
+    assert_eq!(
+        rows, 1,
+        "three refusals are one row: the refusal is deduped per (org, actor) per window like every other throttle"
+    );
+}
+
+/// **S-24.h / decision 09.** Both invitation numbers are runtime settings now — they were
+/// `OrgPolicy` constants, so an instance being spammed could not respond without a rebuild.
+///
+/// Each half is proven separately, and each time the *other* cap is set out of the way, so a
+/// refusal can only have come from the number this step changed.
+#[tokio::test]
+async fn s24_h_both_invitation_numbers_take_effect_without_a_restart() {
+    let app = TestApp::with_options(TestOptions {
+        instance_admins: vec!["owner@corp.com".to_owned()],
+        ..TestOptions::default()
+    })
+    .await;
+    let (owner, slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    let path = format!("/api/v1/orgs/{slug}/invitations");
+
+    // Read the section back and hand it in with one field changed, so this test carries no copy
+    // of the field list.
+    // Takes the credential rather than capturing it: the second half renews the session after a
+    // clock jump, and a closure holding the first token would keep sending the expired one.
+    let patch_limits = async |access: &str, field: &str, value: u32, other: &str, wide: u32| {
+        let current = app.get("/api/v1/admin/settings", Some(access)).await;
+        assert_eq!(current.status, StatusCode::OK, "{:?}", current.json);
+        let mut limits = current.json["data"]["rate_limits"].clone();
+        limits[field] = serde_json::json!(value);
+        limits[other] = serde_json::json!(wide);
+        let patched =
+            app.patch("/api/v1/admin/settings", Some(access), serde_json::json!({ "rate_limits": limits })).await;
+        assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.json);
+    };
+
+    // The per-actor number, with the org number out of the way.
+    patch_limits(&owner.access, "invitations_per_day_actor", 1, "invitations_per_day_org", 500).await;
+    assert_eq!(
+        app.post(&path, Some(&owner.access), serde_json::json!({ "email": "first@corp.com" })).await.status,
+        StatusCode::OK
+    );
+    let refused = app.post(&path, Some(&owner.access), serde_json::json!({ "email": "second@corp.com" })).await;
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS, "the lowered per-actor number took effect");
+    assert_eq!(
+        app.audit_event("org.invitation.throttled").await.expect("audited").metadata.expect("metadata")["limit"],
+        "invitations_per_day_actor"
+    );
+
+    // Past the audit suppression window (one hour) so the second refusal writes a row of its
+    // own, and well inside the invitation window (one rolling day) so the counts that produce
+    // that refusal are untouched. The access token does not survive the jump, so the session is
+    // renewed — cheaper than running this half as a second admin, and it keeps the actor (and
+    // therefore the per-actor count) the same across both halves.
+    //
+    // The label assertion below is what makes this half discriminate at all. Without it the
+    // only claim left is "some 429 happened", which a settings snapshot frozen at first use
+    // still satisfies: half 1's patch would be the one in force, its actor cap of 1 would refuse
+    // the third invitation too, and a test named "take effect without a restart" would pass
+    // against exactly the caching bug it exists to catch.
+    app.advance(Duration::hours(1) + Duration::seconds(1));
+    let owner = sign_in(&app, "owner@corp.com").await;
+
+    // The per-org number, with the actor number out of the way. One invitation already exists,
+    // so a cap of 1 refuses the next one.
+    patch_limits(&owner.access, "invitations_per_day_org", 1, "invitations_per_day_actor", 500).await;
+    let refused = app.post(&path, Some(&owner.access), serde_json::json!({ "email": "third@corp.com" })).await;
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS, "the lowered per-org number took effect");
+    assert_eq!(
+        app.audit_event("org.invitation.throttled").await.expect("audited").metadata.expect("metadata")["limit"],
+        "invitations_per_day_org",
+        "the newest row must name the cap this half lowered, not the one half 1 lowered"
     );
 }
 
@@ -1115,6 +1268,75 @@ async fn package_transfer_requires_owner_of_both_orgs() {
     assert_eq!(published.status, StatusCode::OK, "{:?}", published.json);
 
     assert!(app.audit_actions().await.contains(&"package.transfer".to_owned()));
+}
+
+/// **S-20.b.** A transfer spends the **receiving** org's storage quota, and the route resolves
+/// the *receiver's* limit rather than the sender's.
+///
+/// The quota's one unbounded bypass, and it needs no exotic setup: an Owner of two orgs
+/// publishes into a fresh one — where nothing has a wall — and transfers the result into the org
+/// that does. `org_storage_bytes` attributes by the current `packages.org_id`, so the bytes
+/// re-attribute the instant the row updates, at rest and repeatably.
+///
+/// Asserted on the wire and not only in the pipeline suite because the *side* is the mistake
+/// that is easy to make here: passing `package.org_id`'s effective quota instead of the target's
+/// leaves every service-level test green while checking a wall the transfer is moving bytes
+/// *away* from.
+#[tokio::test]
+async fn s20_b_a_transfer_is_refused_when_the_receiving_org_has_no_room() {
+    // A default install: no instance wall at all. Only the RECEIVER gets one, which is what
+    // makes the assertion below about the side rather than about the number — a sender-side
+    // resolution reads "unlimited" here and lets the transfer through.
+    let app = TestApp::new().await;
+    let (_source_access, source_slug) = owner_org(&app, "owner@corp.com", "acme").await;
+    let (_other, other_slug) = owner_org(&app, "other@corp.com", "other").await;
+    let other_owner = sign_in(&app, "other@corp.com").await;
+    add_member(&app, &other_owner, &other_slug, "owner@corp.com", "owner").await;
+    let source = sign_in(&app, "owner@corp.com").await;
+    let target_id = app.repos.orgs.get_by_slug(&other_slug).await.unwrap().unwrap().id;
+    let source_id = app.repos.orgs.get_by_slug(&source_slug).await.unwrap().unwrap().id;
+
+    let target_token = app.mint_token(&source.access, target_id, &["publish"]).await;
+    assert_eq!(
+        app.publish(&format!("/o/{other_slug}/pub"), &target_token, &package_archive("other_pkg", "1.0.0"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let source_token = app.mint_token(&source.access, source_id, &["publish"]).await;
+    assert_eq!(
+        app.publish(&format!("/o/{source_slug}/pub"), &source_token, &package_archive("acme_core", "1.0.0"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // The receiver's wall is exactly what it already holds — a gzip size no test can predict, so
+    // it is read rather than guessed. Full to the byte, with room for nothing.
+    let filled = app.repos.packages.org_storage_bytes(target_id).await.unwrap();
+    assert!(filled > 0, "the receiver holds its own archive");
+    app.repos.orgs.set_storage_quota(target_id, Some(filled), app.now()).await.expect("wall the receiver");
+
+    let path = "/api/v1/packages/acme_core/transfer";
+    let body = serde_json::json!({ "target_org": other_slug, "confirm": "acme_core" });
+    let refused = app.post(path, Some(&source.access), body.clone()).await;
+    // A permanent 400, the publish path's class: no amount of waiting frees storage.
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.json);
+    assert_eq!(refused.error_code(), "invalid_argument");
+    assert!(refused.json["error"]["message"].as_str().expect("message").contains("quota"), "{:?}", refused.json);
+    assert_eq!(
+        app.repos.packages.get_by_name(Format::Pub, "acme_core").await.unwrap().unwrap().org_id,
+        source_id,
+        "a refused transfer moves nothing"
+    );
+
+    // Raising the *receiver's* override lets it through — and it is the receiver's number that
+    // matters, which is what a sender-side resolution would have got backwards.
+    app.repos.orgs.set_storage_quota(target_id, Some(0), app.now()).await.expect("exempt the receiver");
+    let moved = app.post(path, Some(&source.access), body).await;
+    assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.json);
+    assert_eq!(app.repos.packages.get_by_name(Format::Pub, "acme_core").await.unwrap().unwrap().org_id, target_id);
+    assert_eq!(app.repos.packages.org_storage_bytes(source_id).await.unwrap(), 0, "the sender's usage drops");
 }
 
 /// Every management route is in the generated spec — the frontend's types come from it.

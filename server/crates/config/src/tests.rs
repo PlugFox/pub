@@ -729,6 +729,87 @@ fn a_default_instance_projects_a_permissive_registry_section() {
     assert!(!defaults.registry.require_auth_for_read, "anonymous read stays the default (decision 05)");
 }
 
+/// **S-20.b / S-24.g / S-24.h.** Decision 32's five new numbers: their defaults, and the runtime
+/// section each lands in.
+///
+/// Where a number lands is not cosmetic — it is what an administrator can change without a
+/// restart, and which stored section a `PATCH` has to carry to change it. The two invitation
+/// caps are the interesting case: they are not KV buckets at all (exact database counts,
+/// S-24.h), and they still belong to `rate_limits` because that is the section an operator
+/// throttling abuse reaches for.
+#[test]
+fn decision32_numbers_default_correctly_and_land_in_the_right_runtime_sections() {
+    let settings = load_from(&CliArgs::default(), no_env()).unwrap();
+    assert_eq!(settings.registry.storage_quota_bytes, 0, "S-20.b: a default install has no wall");
+    assert_eq!(settings.http.rate_limit.write_per_ip_minute, 60);
+    assert_eq!(settings.http.rate_limit.write_per_identity_minute, 300);
+    assert_eq!(
+        settings.orgs.invitations_per_day_org, 20,
+        "the org cap must preserve the OrgPolicy constant it replaces, or upgrading changes behaviour"
+    );
+    assert_eq!(settings.orgs.invitations_per_day_actor, 10);
+
+    let defaults = settings.runtime_defaults();
+    assert_eq!(defaults.registry.storage_quota_bytes, 0, "the quota is projected into `registry`, not `rate_limits`");
+    assert_eq!(defaults.rate_limits.write_per_ip_minute, 60);
+    assert_eq!(defaults.rate_limits.write_per_identity_minute, 300);
+    assert_eq!(defaults.rate_limits.invitations_per_day_org, 20);
+    assert_eq!(defaults.rate_limits.invitations_per_day_actor, 10);
+
+    let summary = settings.summary();
+    assert!(summary.contains("registry.quota       = unlimited"), "{summary}");
+    assert!(
+        summary.contains("http.rate_limit      = read 600/min/ip, 3000/min/identity; write 60/min/ip"),
+        "{summary}"
+    );
+    assert!(summary.contains("orgs.invitations     = 20/day/org, 10/day/actor"), "{summary}");
+}
+
+/// The boot layer is the *default* of the runtime document, so a configured value has to reach
+/// it — a projection that dropped a key would leave an operator's `pubd.toml` silently ignored.
+#[test]
+fn decision32_numbers_are_configurable_from_the_environment() {
+    let settings = load_from(
+        &CliArgs::default(),
+        env(&[
+            ("PUB_REGISTRY__STORAGE_QUOTA_BYTES", "1073741824"),
+            ("PUB_HTTP__RATE_LIMIT__WRITE_PER_IP_MINUTE", "5"),
+            ("PUB_HTTP__RATE_LIMIT__WRITE_PER_IDENTITY_MINUTE", "9"),
+            ("PUB_ORGS__INVITATIONS_PER_DAY_ORG", "4"),
+            ("PUB_ORGS__INVITATIONS_PER_DAY_ACTOR", "2"),
+        ]),
+    )
+    .unwrap();
+    let defaults = settings.runtime_defaults();
+    assert_eq!(defaults.registry.storage_quota_bytes, 1024 * 1024 * 1024);
+    assert_eq!(defaults.rate_limits.write_per_ip_minute, 5);
+    assert_eq!(defaults.rate_limits.write_per_identity_minute, 9);
+    assert_eq!(defaults.rate_limits.invitations_per_day_org, 4);
+    assert_eq!(defaults.rate_limits.invitations_per_day_actor, 2);
+    assert!(settings.summary().contains("registry.quota       = 1073741824 B/org"), "{}", settings.summary());
+}
+
+/// **S-20.b.** `0` is the storage quota's default *and* a legal configured value meaning
+/// unlimited, so it must survive a validator that refuses zero for everything around it.
+#[test]
+fn s20_b_a_zero_storage_quota_is_accepted_while_its_neighbours_still_reject_zero() {
+    let explicit_zero =
+        load_from(&CliArgs::default(), env(&[("PUB_REGISTRY__STORAGE_QUOTA_BYTES", "0")])).expect("0 = unlimited");
+    assert_eq!(explicit_zero.registry.storage_quota_bytes, 0);
+
+    // Every other number decision 32 adds is a positive quantity, and a zero in any of them is a
+    // plane closed rather than a limit configured.
+    for key in [
+        "PUB_HTTP__RATE_LIMIT__WRITE_PER_IP_MINUTE",
+        "PUB_HTTP__RATE_LIMIT__WRITE_PER_IDENTITY_MINUTE",
+        "PUB_ORGS__INVITATIONS_PER_DAY_ORG",
+        "PUB_ORGS__INVITATIONS_PER_DAY_ACTOR",
+    ] {
+        let err = load_from(&CliArgs::default(), env(&[(key, "0")])).expect_err("zero accepted for {key}");
+        assert!(matches!(err, ConfigError::Invalid(_)), "{key}: {err}");
+    }
+}
+
 #[test]
 fn s25_file_suffixed_env_reads_mounted_secrets() {
     let mut pepper = tempfile::NamedTempFile::new().unwrap();

@@ -126,6 +126,8 @@ pub struct Settings {
     pub smtp: SmtpConfig,
     /// Registry ingest limits and version-lifecycle policy.
     pub registry: RegistryConfig,
+    /// Organization policy: the invitation budgets of S-24.h.
+    pub orgs: OrgsConfig,
     /// Upstream proxy (decision 07): where unclaimed names are fetched from, and under what
     /// timeouts, retries, and failure budget.
     pub upstream: UpstreamConfig,
@@ -227,7 +229,8 @@ pub struct HttpConfig {
     /// The publish upload subrouter overrides this with the archive cap; nothing else on the
     /// surface legitimately carries megabytes of request body.
     pub max_body_bytes: usize,
-    /// Read-path abuse limits (S-24.f). Boot defaults for the runtime-changeable numbers.
+    /// Read- and write-path abuse limits (S-24.f, S-24.g). Boot defaults for the
+    /// runtime-changeable numbers.
     pub rate_limit: HttpRateLimit,
 }
 
@@ -243,14 +246,18 @@ impl Default for HttpConfig {
     }
 }
 
-/// Read-path rate limits ([S-24.f](../../../docs/security.md#5-audit--abuse)).
+/// Read- and write-path rate limits ([S-24.f](../../../docs/security.md#5-audit--abuse),
+/// [S-24.g](../../../docs/security.md#5-audit--abuse)).
 ///
-/// These live under `[http]` rather than `[auth]` or `[registry]` because they apply to every
-/// `GET`/`HEAD` on **both** planes — the app API and the pub protocol — and are a property of
-/// how this instance handles requests, like the deadlines and the body cap beside them.
+/// These live under `[http]` rather than `[auth]` or `[registry]` because they apply to whole
+/// planes rather than to one feature — the read pair to every `GET`/`HEAD` on both the app API
+/// and the pub protocol, the write pair to every app-API mutation — and are a property of how
+/// this instance handles requests, like the deadlines and the body cap beside them.
 ///
-/// Both buckets **fail open**: a KV outage lifts the quota rather than refusing reads. They are
-/// quotas on cost, not access gates, and the gates that must fail closed are elsewhere.
+/// All four buckets **fail open**: a KV outage lifts the quota rather than refusing traffic.
+/// They are quotas on cost, not access gates, and the gates that must fail closed are elsewhere.
+/// Each is keyed on the same three identity classes (`tok:`, `usr:`, `ip:`) decision 27
+/// introduced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpRateLimit {
@@ -265,11 +272,31 @@ pub struct HttpRateLimit {
     /// CI job sharing one token at once. Raise it if a large fleet trips it; because the bucket
     /// fails open, guessing low degrades throughput rather than breaking resolution.
     pub read_per_identity_minute: u32,
+    /// App-API **mutations** per minute per client IP, for requests carrying no usable
+    /// credential ([S-24.g](../../../docs/security.md#5-audit--abuse)).
+    ///
+    /// An order of magnitude below the read number, because writes are that much rarer in every
+    /// legitimate shape. The pub protocol is not charged here — its one write already spends the
+    /// S-24.c publish budget — and neither are the six credential endpoints, which spend their
+    /// own fail-closed buckets.
+    pub write_per_ip_minute: u32,
+    /// App-API **mutations** per minute per identity: one CLI token, or one signed-in account
+    /// (S-24.g).
+    ///
+    /// Sized so a human session and a CI token both sit comfortably below it while a runaway
+    /// loop does not. Like the read buckets it fails **open**, so a wrong guess is slow rather
+    /// than broken.
+    pub write_per_identity_minute: u32,
 }
 
 impl Default for HttpRateLimit {
     fn default() -> Self {
-        Self { read_per_ip_minute: 600, read_per_identity_minute: 3000 }
+        Self {
+            read_per_ip_minute: 600,
+            read_per_identity_minute: 3000,
+            write_per_ip_minute: 60,
+            write_per_identity_minute: 300,
+        }
     }
 }
 
@@ -825,6 +852,23 @@ pub struct RegistryConfig {
     pub max_compression_ratio: u64,
     /// Maximum size of a single captured file (pubspec, README, CHANGELOG, example).
     pub max_captured_file_bytes: u64,
+    /// Default per-org storage quota in bytes; **`0` = unlimited**
+    /// ([S-20.b](../../../docs/security.md#4-supply-chain--registry-integrity), decision 32).
+    ///
+    /// What it counts is the sum of `archive_size` over an org's live version rows: retracted
+    /// versions count (they are still downloadable), tombstoned ones do not, proxied upstream
+    /// archives never do, and byte-identical uploads are deliberately charged to each org that
+    /// published them.
+    ///
+    /// A **per-org override wins over this number** whenever one is set (`orgs.storage_quota_bytes`
+    /// on the org row, writable only by an instance admin); this key is the default for every
+    /// org that has none. The default of `0` is what keeps a self-hosted instance for one team
+    /// from meeting a wall it never asked for.
+    ///
+    /// This value is the **default** of the `registry` runtime setting
+    /// ([decision 09](../../../docs/decisions.md#09)): an administrator can raise or lower it
+    /// without a restart, and clearing the stored section falls back here.
+    pub storage_quota_bytes: u64,
     /// Days after a retraction during which the version may still be restored (decision 06;
     /// pub.dev's rule is 7).
     pub unretract_window_days: i64,
@@ -872,10 +916,43 @@ impl Default for RegistryConfig {
             max_entries: 10_000,
             max_compression_ratio: 100,
             max_captured_file_bytes: 4 * 1024 * 1024,
+            storage_quota_bytes: 0,
             unretract_window_days: 7,
             require_auth_for_read: false,
             rate_limit: RegistryRateLimit::default(),
         }
+    }
+}
+
+/// Organization policy: the invitation budgets of
+/// [S-24.h](../../../docs/security.md#5-audit--abuse).
+///
+/// A section of its own rather than two more keys under `[http].rate_limit`, because these two
+/// are not KV buckets: they are exact rolling-window `COUNT(*)`s over the `invitations` table,
+/// which is what keeps them precise and outage-proof on the one mutation whose cost is mail
+/// delivered to a third party (decision 32). What they share with the buckets is only that both
+/// are projected into the runtime `rate_limits` section, so an instance being spammed can
+/// respond without a rebuild — before decision 32 these were compile-time constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrgsConfig {
+    /// Invitations one org may send per rolling 24 hours (S-24: ≤20/day/org).
+    ///
+    /// Bounds the org. This is the number that was `OrgPolicy::invitations_per_day_org` at
+    /// compile time, and the default preserves the behaviour exactly.
+    pub invitations_per_day_org: u32,
+    /// Invitations one **member** may send per rolling 24 hours **within one org** (S-24's
+    /// "with per-actor caps", unimplemented until decision 32).
+    ///
+    /// Bounds the member, so a single one cannot spend the whole org's budget. The residue is
+    /// stated rather than hidden: somebody who is Admin in N orgs can still send N × this
+    /// number, each org bounded by its own cap.
+    pub invitations_per_day_actor: u32,
+}
+
+impl Default for OrgsConfig {
+    fn default() -> Self {
+        Self { invitations_per_day_org: 20, invitations_per_day_actor: 10 }
     }
 }
 
@@ -1523,6 +1600,11 @@ impl Settings {
                 publish_per_hour_org: self.registry.rate_limit.publish_per_hour_org,
                 read_per_ip_minute: self.http.rate_limit.read_per_ip_minute,
                 read_per_identity_minute: self.http.rate_limit.read_per_identity_minute,
+                write_per_ip_minute: self.http.rate_limit.write_per_ip_minute,
+                write_per_identity_minute: self.http.rate_limit.write_per_identity_minute,
+                // Not buckets, but limits an administrator changes — see `OrgsConfig`.
+                invitations_per_day_org: self.orgs.invitations_per_day_org,
+                invitations_per_day_actor: self.orgs.invitations_per_day_actor,
             },
             smtp: SmtpSettings {
                 host: self.smtp.host.clone(),
@@ -1539,7 +1621,10 @@ impl Settings {
                 primary_color: self.branding.primary_color.clone(),
             },
             upstream: UpstreamSettings { enabled: self.upstream.enabled, default_org_policy: Default::default() },
-            registry: RegistrySettings { require_auth_for_read: self.registry.require_auth_for_read },
+            registry: RegistrySettings {
+                require_auth_for_read: self.registry.require_auth_for_read,
+                storage_quota_bytes: self.registry.storage_quota_bytes,
+            },
         }
     }
 
@@ -1613,6 +1698,16 @@ impl Settings {
         );
         let _ = writeln!(out, "  registry.unretract   = {} d", self.registry.unretract_window_days);
         let _ = writeln!(out, "  registry.auth_read   = {}", self.registry.require_auth_for_read);
+        // Stated in the shape an operator reads it: `0` is unlimited, and saying so here is
+        // cheaper than having them look the key up to find out (S-20.b).
+        let _ = writeln!(
+            out,
+            "  registry.quota       = {}",
+            match self.registry.storage_quota_bytes {
+                0 => "unlimited".to_owned(),
+                bytes => format!("{bytes} B/org (default; per-org override wins)"),
+            }
+        );
         let _ = writeln!(out, "  branding.name        = {}", self.branding.name);
         let _ = writeln!(
             out,
@@ -1640,6 +1735,19 @@ impl Settings {
         );
         let _ =
             writeln!(out, "  registry.rate_limit  = publish {}/h/org", self.registry.rate_limit.publish_per_hour_org);
+        let _ = writeln!(
+            out,
+            "  http.rate_limit      = read {}/min/ip, {}/min/identity; write {}/min/ip, {}/min/identity",
+            self.http.rate_limit.read_per_ip_minute,
+            self.http.rate_limit.read_per_identity_minute,
+            self.http.rate_limit.write_per_ip_minute,
+            self.http.rate_limit.write_per_identity_minute
+        );
+        let _ = writeln!(
+            out,
+            "  orgs.invitations     = {}/day/org, {}/day/actor",
+            self.orgs.invitations_per_day_org, self.orgs.invitations_per_day_actor
+        );
         let _ = writeln!(
             out,
             "  realtime.sse         = heartbeat {}s, {} streams/user, replay {}",

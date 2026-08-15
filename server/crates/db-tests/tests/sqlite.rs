@@ -140,6 +140,11 @@ async fn package_transfer_and_stats_contract() {
 }
 
 #[tokio::test]
+async fn storage_quota_contract_s20_b() {
+    pub_db_tests::contract::storage_quota(&fresh_repos().await).await;
+}
+
+#[tokio::test]
 async fn notifications_contract_decision20() {
     pub_db_tests::contract::notifications(&fresh_repos().await).await;
 }
@@ -283,6 +288,79 @@ async fn the_drains_per_tick_statements_are_index_lookups() {
     )
     .await;
     assert!(dedupe.contains("notifications_event_idx"), "the exactly-once conflict check is a scan: {dedupe}");
+}
+
+/// **S-20.b.** The quota's usage read seeks two covering indexes instead of reading version rows.
+///
+/// This runs on the publish path — twice per publish, per decision 32's two checkpoints — so an
+/// org with a large version history must not pay a scan of `versions` for it. What makes that
+/// affordable is `versions_org_bytes_idx (package_id, archive_size) WHERE tombstone = 0` from
+/// migration 0014: `archive_size` is in the index because it is the column being summed, so the
+/// aggregate never touches a table row.
+///
+/// Two things about the shape of this test are deliberate, both from [D52](../../../../docs/roadmap.md):
+///
+///   * the SQL is **read from the repository** (`SqlitePackageRepo::ORG_STORAGE_BYTES_SQL`), not
+///     copied into this file, so the text under test cannot drift from the text production emits;
+///   * the assertion is on the **seek's usable columns**, not on an index name. A name-only
+///     assertion passes while the statement scans — that is exactly how the job-queue claim
+///     shipped green while reading every pending row.
+#[tokio::test]
+async fn s20_b_the_org_storage_sum_seeks_instead_of_scanning_versions() {
+    let cfg =
+        DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
+    let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
+    db.run_migrations().await.expect("migrate");
+
+    // `AssertSqlSafe`: the statement comes from the repository crate and carries no value from
+    // anywhere else; the org id below still travels as a bind, exactly as in production.
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN QUERY PLAN {}",
+        pub_db_sqlite::repo::SqlitePackageRepo::ORG_STORAGE_BYTES_SQL
+    )))
+    .bind("01890000-0000-7000-8000-000000000000")
+    .fetch_all(db.pool())
+    .await
+    .expect("explain");
+    let plan = rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | ");
+
+    // Neither side reads a table row.
+    assert!(!plan.contains("SCAN versions"), "the quota sum scans every version on the instance: {plan}");
+    assert!(!plan.contains("SCAN packages"), "the quota sum scans every package on the instance: {plan}");
+    assert!(plan.contains("packages_org_idx (org_id=?)"), "the org's package list is not a seek: {plan}");
+    // The load-bearing assertion, and all three parts of it are separate claims: the seek is into
+    // the 0014 index, it is **bounded by `package_id`** (which is why the index leads with it),
+    // and it is **covering** (which is why `archive_size` is in it at all).
+    //
+    // The last part is the one a weaker test would miss, and it was demonstrated rather than
+    // assumed: with 0014's index dropped this plans as
+    // `SEARCH v USING INDEX versions_listing_idx (package_id=?)` — still a seek, still no "SCAN",
+    // so both assertions above stay green while every live version row of the org is fetched off
+    // disk to read one integer out of it.
+    assert!(
+        plan.contains("COVERING INDEX versions_org_bytes_idx (package_id=?)"),
+        "the sum is not an index-only seek bounded by package_id — it is reading version rows: {plan}"
+    );
+
+    // The per-**package** sum the transfer guard reads (S-20.b) needs **no index of its own**:
+    // `versions_org_bytes_idx` already leads on `package_id` and already carries `archive_size`,
+    // so it is the same covering seek with the `packages` half of the join removed. Asserted
+    // rather than reasoned about, because "the index we have happens to serve it" is exactly the
+    // claim that stops being true when somebody reorders the index columns.
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN QUERY PLAN {}",
+        pub_db_sqlite::repo::SqlitePackageRepo::PACKAGE_STORAGE_BYTES_SQL
+    )))
+    .bind("01890000-0000-7000-8000-000000000001")
+    .fetch_all(db.pool())
+    .await
+    .expect("explain");
+    let plan = rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | ");
+    assert!(!plan.contains("SCAN versions"), "the per-package sum scans every version on the instance: {plan}");
+    assert!(
+        plan.contains("COVERING INDEX versions_org_bytes_idx (package_id=?)"),
+        "the per-package sum needs no new index, but it does need this one to cover it: {plan}"
+    );
 }
 
 /// The blob collector's reference check must be an index seek on **both** registers

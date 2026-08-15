@@ -139,6 +139,19 @@ pub struct TestOptions {
     /// a total mail outage: every integration boot was `starttls`, so no test could reach the
     /// operator's own `none` relay, which a transport guard refused to build at all.
     pub smtp_security: SmtpSecurityMode,
+    /// S-24.g write budget per minute for an app-API mutation with no identity (per client IP).
+    pub write_per_ip_minute: u32,
+    /// S-24.g write budget per minute for a CLI token or a signed-in account.
+    pub write_per_identity_minute: u32,
+    /// S-24.h invitations one org may send per rolling 24 hours.
+    pub invitations_per_day_org: u32,
+    /// S-24.h invitations one member may send per rolling 24 hours within one org.
+    pub invitations_per_day_actor: u32,
+    /// S-20.b instance-default storage quota in bytes; **`0` = unlimited**, which is what a
+    /// default install boots with. A per-org override is a different state and is set through
+    /// the repository or the admin route, never from here — the harness has to be able to
+    /// produce each of the three states without the others.
+    pub storage_quota_bytes: u64,
 }
 
 impl Default for TestOptions {
@@ -180,6 +193,19 @@ impl Default for TestOptions {
             smtp_username: None,
             smtp_password: None,
             smtp_security: SmtpSecurityMode::Starttls,
+            // Deliberately high, for `read_per_ip_minute`'s reason one field up: every other
+            // suite issues writes without caring about this bucket, and a low default would
+            // make unrelated tests flaky in a way whose cause is three files away. The S-24.g
+            // suite sets its own.
+            write_per_ip_minute: 100_000,
+            write_per_identity_minute: 100_000,
+            // The shipped defaults, so a suite that does not name them exercises what an
+            // operator actually gets.
+            invitations_per_day_org: 20,
+            invitations_per_day_actor: 10,
+            // S-20.b: a default install has no wall, and every suite but the quota one must
+            // keep publishing without thinking about it.
+            storage_quota_bytes: 0,
         }
     }
 }
@@ -419,8 +445,13 @@ impl TestApp {
         settings.http.max_body_bytes = options.max_body_bytes;
         settings.registry.require_auth_for_read = options.require_auth_for_read;
         settings.registry.rate_limit.publish_per_hour_org = options.publish_per_hour_org;
+        settings.registry.storage_quota_bytes = options.storage_quota_bytes;
         settings.http.rate_limit.read_per_ip_minute = options.read_per_ip_minute;
         settings.http.rate_limit.read_per_identity_minute = options.read_per_identity_minute;
+        settings.http.rate_limit.write_per_ip_minute = options.write_per_ip_minute;
+        settings.http.rate_limit.write_per_identity_minute = options.write_per_identity_minute;
+        settings.orgs.invitations_per_day_org = options.invitations_per_day_org;
+        settings.orgs.invitations_per_day_actor = options.invitations_per_day_actor;
         settings.smtp.host = options.smtp_host.clone();
         settings.smtp.port = options.smtp_port;
         settings.smtp.username = options.smtp_username.clone();

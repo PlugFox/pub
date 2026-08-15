@@ -76,6 +76,21 @@ pub struct Org {
     pub description: String,
     /// Whether this org's registry may fall through to the upstream proxy (decision 01).
     pub upstream_policy: UpstreamPolicy,
+    /// Per-org override of the instance storage quota in bytes; `None` = follow the instance
+    /// default ([S-20.b](../../../docs/security.md#4-supply-chain--registry-integrity),
+    /// [decision 32](../../../docs/decisions.md#32)).
+    ///
+    /// The `Option` is the point: "no override" and "unlimited" are different rows. The
+    /// effective limit is `override ?? registry.storage_quota_bytes`, so an org left at `None`
+    /// follows an instance default an operator changes later, while an org set to `0` keeps the
+    /// instance default's spelling of "unlimited" whatever the default becomes.
+    ///
+    /// Deliberately **not** on [`OrgProfile`]: that payload is what `PATCH /api/v1/orgs/{slug}`
+    /// writes, which an org Admin can reach, and a quota an org can raise for itself is not a
+    /// quota (decision 32). It is set by an instance admin through
+    /// [`crate::traits::OrgRepo::set_storage_quota`], the same shape
+    /// [`crate::traits::OrgRepo::set_upstream_policy`] uses for the other policy field.
+    pub storage_quota_bytes: Option<i64>,
     /// When the org was archived — the terminal state of a *forced* deletion, used when the
     /// org still owns packages and therefore cannot be erased (decision 06 keeps name claims
     /// and version rows alive forever). `None` = a normal, live org.
@@ -130,6 +145,11 @@ impl NewOrg {
 /// A *replace* payload like [`crate::package::PackageOptions`], for the same reason: the API
 /// layer resolves "unset field = keep current" against the loaded row, so the repository never
 /// has to reason about partial updates.
+///
+/// [`Org::storage_quota_bytes`] is **not** here, and that is the security property rather than
+/// an omission: this route is reachable by an org Admin, so a quota in this payload would be a
+/// quota its subject can raise (decision 32). It moves through
+/// [`crate::traits::OrgRepo::set_storage_quota`] from the instance-admin plane instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgProfile {
     /// Display name.

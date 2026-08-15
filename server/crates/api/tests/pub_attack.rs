@@ -20,10 +20,11 @@
 mod common;
 
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::http::{StatusCode, header};
 use common::{TestApp, TestOptions, package_archive};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pub_core::token::TokenScope;
 use pub_core::{Format, OrgId, RoleLevel, UserId};
 
@@ -31,6 +32,12 @@ use pub_core::{Format, OrgId, RoleLevel, UserId};
 fn base(slug: &str) -> String {
     format!("/o/{slug}/pub")
 }
+
+/// The one recorder this binary installs — `metrics` offers a single global, so the quota-label
+/// test forces it and asserts on **presence** rather than on counts, which every other test in
+/// here is free to move.
+static RECORDER: LazyLock<PrometheusHandle> =
+    LazyLock::new(|| PrometheusBuilder::new().install_recorder().expect("install the test recorder"));
 
 /// A seeded org with an owner and a `read`+`publish` token.
 struct Publisher {
@@ -78,6 +85,51 @@ fn raw_entry(out: &mut Vec<u8>, path: &str, content: &[u8]) {
     out.extend_from_slice(&header);
     out.extend_from_slice(content);
     out.extend(std::iter::repeat_n(0u8, (512 - content.len() % 512) % 512));
+}
+
+/// A [`pub_core::traits::BlobStore`] that records every key written and delegates the rest.
+///
+/// "Refused" and "refused before it cost the store anything" are different claims, and only the
+/// second one bounds storage — so the S-20.b upload guard is asserted the way
+/// `an_oversized_upload_is_rejected_before_any_storage_work` asserts its own: on what the store
+/// was asked to do, not on the status code.
+struct RecordingBlob {
+    inner: Arc<dyn pub_core::traits::BlobStore>,
+    puts: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingBlob {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(pub_blob::ObjectStoreBlob::memory()) as Arc<dyn pub_core::traits::BlobStore>,
+            puts: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Keys written under the staging prefix, in order.
+    fn staged_puts(&self) -> Vec<String> {
+        self.puts.lock().expect("blob mutex").iter().filter(|key| key.starts_with("uploads/")).cloned().collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl pub_core::traits::BlobStore for RecordingBlob {
+    async fn ping(&self) -> pub_core::Result<()> {
+        self.inner.ping().await
+    }
+
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> pub_core::Result<()> {
+        self.puts.lock().expect("blob mutex").push(key.to_owned());
+        self.inner.put(key, bytes).await
+    }
+
+    async fn download(&self, key: &str) -> pub_core::Result<pub_core::traits::DownloadPlan> {
+        self.inner.download(key).await
+    }
+
+    async fn delete(&self, key: &str) -> pub_core::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 /// A `.tar.gz` built from `(path, content)` pairs, end-of-archive marker included.
@@ -410,6 +462,258 @@ async fn a_syntactically_impossible_name_is_not_a_separate_status() {
 }
 
 // ---------------------------------------------------------------------------- blob keys
+
+// -------------------------------------------------- the per-org storage quota (S-20.b, D21)
+
+/// **S-20.b.** The upload checkpoint refuses **before** the staged write, which is the whole
+/// reason it exists next to the authoritative one at finalize.
+///
+/// Staged bytes are not published, are not counted by `org_storage_bytes`, and outlive their KV
+/// record by the two-hour staging grace (decision 31). Without this guard an org already over
+/// its quota would park `publish_per_hour_org × max_archive_bytes` an hour in the store —
+/// every upload doomed at finalize, and every one of them occupying the storage the quota
+/// exists to bound. Finalize structurally cannot catch that: it only ever runs for the uploads
+/// somebody bothers to finish.
+#[tokio::test]
+async fn s20_b_an_upload_past_the_quota_is_refused_before_the_staged_write() {
+    let archive = package_archive("acme_core", "1.0.0");
+    let blob = RecordingBlob::new();
+    // A wall exactly one archive wide: the first publish fits to the byte, the second does not.
+    let app = TestApp::with_options(TestOptions {
+        storage_quota_bytes: archive.len() as u64,
+        blob: Some(Arc::clone(&blob) as Arc<dyn pub_core::traits::BlobStore>),
+        ..TestOptions::default()
+    })
+    .await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let upload_url = format!("{}/api/packages/versions/newUpload", acme.base());
+
+    assert_eq!(app.publish(&acme.base(), &acme.token, &archive).await.status, StatusCode::OK, "the quota fits once");
+    let staged_after_first = blob.staged_puts().len();
+    assert_eq!(staged_after_first, 1, "the successful publish staged exactly one object");
+
+    let refused = app.pub_upload(&upload_url, Some(&acme.token), &package_archive("acme_core", "2.0.0")).await;
+    // Permanent 400, never 429: the pub client retries a 429 up to seven times and no amount of
+    // waiting frees storage (docs/protocol.md sharp edge 2).
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(&refused.body));
+    assert!(!refused.status.is_server_error());
+    assert_ne!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value = serde_json::from_slice(&refused.body).expect("spec error shape");
+    assert_eq!(body["error"]["code"], "invalid_argument");
+    assert!(body["error"]["message"].as_str().expect("message").contains("quota"), "{body}");
+    assert!(!refused.headers.contains_key(header::LOCATION), "a refused upload hands back no finalize URL");
+
+    // The claim this test exists for.
+    assert_eq!(blob.staged_puts().len(), staged_after_first, "the refused upload must not reach the blob store");
+}
+
+/// **S-20.b.** The authoritative refusal is at finalize, it is a permanent 400, and it discards
+/// the staged upload.
+///
+/// The scenario is the one finalize exists for: the upload passed under the quota in force when
+/// it was staged, and the quota moved before it was finalized. A runtime setting (decision 09)
+/// means that is reachable in one operator action rather than only in theory — and the refusal
+/// must be the *permanent* class even though a retry after another operator action could
+/// succeed, because the pub client's retry is immediate and seven times over, not "after the
+/// operator changes their mind".
+///
+/// Burning the staged bytes on the 4xx is the wanted behaviour, not a side effect to work
+/// around: retrying the same bytes cannot succeed, so keeping them alive would leave one
+/// archive per doomed publish in exactly the storage being bounded.
+#[tokio::test]
+async fn s20_b_a_finalize_past_the_quota_is_a_permanent_400_and_burns_the_staged_upload() {
+    let app = TestApp::with_options(TestOptions {
+        instance_admins: vec!["root@corp.com".to_owned()],
+        ..TestOptions::default()
+    })
+    .await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let admin = app.login("root@corp.com").await["access_token"].as_str().expect("access").to_owned();
+
+    // Staged while the instance was unlimited.
+    let ticket = app.pub_get(&format!("{}/api/packages/versions/new", acme.base()), Some(&acme.token)).await;
+    let url = ticket.json["url"].as_str().expect("upload url").to_owned();
+    let upload = app.pub_upload(&app.proxied(&url), Some(&acme.token), &package_archive("acme_core", "1.0.0")).await;
+    assert_eq!(upload.status, StatusCode::NO_CONTENT);
+    let finalize = app.proxied(upload.headers[header::LOCATION].to_str().expect("location"));
+
+    // The operator puts up a wall no archive clears — a runtime setting, so it is in force for
+    // the very next request rather than after a restart.
+    let patched = app
+        .patch(
+            "/api/v1/admin/settings",
+            Some(&admin),
+            serde_json::json!({ "registry": { "require_auth_for_read": false, "storage_quota_bytes": 1 } }),
+        )
+        .await;
+    assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.json);
+
+    let refused = app.pub_get(&finalize, Some(&acme.token)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.json);
+    assert_eq!(refused.json["error"]["code"], "invalid_argument");
+    assert!(refused.json["error"]["message"].as_str().expect("message").contains("quota"), "{:?}", refused.json);
+    // Nothing was published, and the version row does not exist.
+    assert!(app.repos.packages.get_by_name(Format::Pub, "acme_core").await.unwrap().is_none());
+    // The staged upload is gone: finalizing again reports an expired session rather than
+    // re-running the doomed publish. That is the existing 4xx discard path, and it is the right
+    // one here — a retry of these bytes can never succeed.
+    let again = app.pub_get(&finalize, Some(&acme.token)).await;
+    assert_eq!(again.status, StatusCode::BAD_REQUEST);
+    assert!(again.json["error"]["message"].as_str().expect("message").contains("expired"), "{:?}", again.json);
+    // S-22: the refused publish is in the audit log, named.
+    let events = app.repos.audit.list(&pub_core::audit::AuditFilter::default(), None, 100).await.expect("audit");
+    assert!(
+        events.items.iter().any(|event| event.action == "package.publish"
+            && event.result == pub_core::audit::AuditResult::Failure
+            && event.target.as_deref() == Some("acme_core@1.0.0")),
+        "a quota refusal must be visible to an operator"
+    );
+}
+
+/// **S-20.b.** The per-org override beats the instance default, and `0` means unlimited on both
+/// surfaces.
+///
+/// Three states, and the two that look like each other are the ones that matter: an org left at
+/// `NULL` follows the instance default as it changes, while an org set to `0` has opted out of
+/// it permanently. Nothing spells "may store nothing" — a publish never fails because a quota
+/// is zero, which is what makes typing `0` safe.
+#[tokio::test]
+async fn s20_b_a_per_org_override_beats_the_instance_default_and_zero_means_unlimited() {
+    // An instance-wide wall no archive clears.
+    let app = TestApp::with_options(TestOptions { storage_quota_bytes: 1, ..TestOptions::default() }).await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let other = publisher(&app, "dev@other.test", "other").await;
+    let archive = package_archive("acme_core", "1.0.0");
+    let upload = |slug: &str| format!("{}/api/packages/versions/newUpload", base(slug));
+
+    // NULL override: the org follows the instance default and cannot publish.
+    let walled = app.pub_upload(&upload("acme"), Some(&acme.token), &archive).await;
+    assert_eq!(walled.status, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(&walled.body));
+
+    // `0` is this org's own "unlimited", *whatever* the instance default is.
+    app.repos.orgs.set_storage_quota(acme.org, Some(0), app.now()).await.expect("clear the wall for acme");
+    assert_eq!(app.publish(&acme.base(), &acme.token, &archive).await.status, StatusCode::OK);
+
+    // …and it is per org: the neighbour still meets the instance wall.
+    let neighbour = app.pub_upload(&upload("other"), Some(&other.token), &package_archive("other_pkg", "1.0.0")).await;
+    assert_eq!(neighbour.status, StatusCode::BAD_REQUEST);
+
+    // A positive override wins over the instance default in the other direction too: it is not
+    // "the smaller of the two".
+    app.repos.orgs.set_storage_quota(other.org, Some(10 * 1024 * 1024), app.now()).await.expect("raise other");
+    assert_eq!(
+        app.publish(&other.base(), &other.token, &package_archive("other_pkg", "1.0.0")).await.status,
+        StatusCode::OK
+    );
+
+    // Clearing the override puts the org back under the instance default.
+    app.repos.orgs.set_storage_quota(other.org, None, app.now()).await.expect("clear other");
+    let back_under = app.pub_upload(&upload("other"), Some(&other.token), &package_archive("other_pkg", "2.0.0")).await;
+    assert_eq!(back_under.status, StatusCode::BAD_REQUEST, "NULL follows the instance default again");
+}
+
+/// **S-20.b.** A default install has no wall: `0` on both surfaces publishes normally, and the
+/// quota costs the publish path nothing it can observe.
+#[tokio::test]
+async fn s20_b_a_default_install_is_unlimited_on_both_surfaces() {
+    let app = TestApp::new().await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    assert_eq!(app.state.runtime.current().registry.storage_quota_bytes, 0, "the shipped default");
+    let org = app.repos.orgs.get(acme.org).await.expect("org").expect("exists");
+    assert_eq!(org.storage_quota_bytes, None, "a fresh org carries no override");
+
+    for version in ["1.0.0", "1.1.0", "1.2.0"] {
+        let response = app.publish(&acme.base(), &acme.token, &package_archive("acme_core", version)).await;
+        assert_eq!(response.status, StatusCode::OK, "{version}: {:?}", response.json);
+    }
+}
+
+/// **S-20.b.** Staged bytes are not counted against the quota **at all** — the third clause of
+/// the contract, asserted by staging an upload and then reading the sum.
+///
+/// Nothing else in this suite stages an upload and re-reads `org_storage_bytes`, so an
+/// implementation that folded the staging area into the number would pass every other quota
+/// test here and would refuse the retry of the very upload that filled it: staged bytes survive
+/// the two-hour staging grace, so an interrupted publish would lock the org out of finishing it.
+/// That is why the guard bounds the staging area with a *refusal* rather than by counting it.
+#[tokio::test]
+async fn s20_b_a_staged_upload_adds_nothing_to_the_org_byte_total() {
+    let app = TestApp::new().await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let bytes = async || app.repos.packages.org_storage_bytes(acme.org).await.expect("org storage bytes");
+
+    assert_eq!(bytes().await, 0, "a fresh org holds nothing");
+
+    // Step 1 + step 2: the archive is in the blob store under `uploads/…` and its session is in
+    // the KV. Nothing has been published.
+    let ticket = app.pub_get(&format!("{}/api/packages/versions/new", acme.base()), Some(&acme.token)).await;
+    let url = ticket.json["url"].as_str().expect("upload url").to_owned();
+    let archive = package_archive("acme_core", "1.0.0");
+    let upload = app.pub_upload(&app.proxied(&url), Some(&acme.token), &archive).await;
+    assert_eq!(upload.status, StatusCode::NO_CONTENT, "the upload staged");
+    let finalize = app.proxied(upload.headers[header::LOCATION].to_str().expect("location"));
+
+    assert_eq!(bytes().await, 0, "staged bytes are not counted against the quota");
+
+    // …and finalizing is what makes them count. Same bytes, different answer — which is the
+    // discriminator: a sum that already included the staged copy would double here.
+    let published = app.pub_get(&finalize, Some(&acme.token)).await;
+    assert_eq!(published.status, StatusCode::OK, "{:?}", published.json);
+    assert_eq!(bytes().await, archive.len() as i64, "a published version is counted exactly once");
+}
+
+/// **S-20.b / decision 28.** `storage_quota_refusals_total{stage}` distinguishes the two
+/// checkpoints, and each site emits **its own** label value.
+///
+/// `docs/ops/metrics.md` builds an operator rule on exactly that pair — a sustained gap between
+/// `upload` and `finalize` is a client that keeps finalizing uploads it started before the wall
+/// — so a mutant that emitted `stage="finalize"` from both sites would leave that rule reading a
+/// flat line and nothing would notice. Asserted on the **rendered exposition**: the label is a
+/// string literal at the call site, which is exactly the kind of mistake a call-site test cannot
+/// see. Presence rather than counts, because one recorder is shared by this whole binary.
+#[tokio::test]
+async fn s20_b_each_quota_checkpoint_counts_under_its_own_stage_label() {
+    let handle = LazyLock::force(&RECORDER);
+    let app = TestApp::with_options(TestOptions {
+        instance_admins: vec!["root@corp.com".to_owned()],
+        ..TestOptions::default()
+    })
+    .await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let admin = app.login("root@corp.com").await["access_token"].as_str().expect("access").to_owned();
+    let wall = |bytes: u64| serde_json::json!({ "registry": { "require_auth_for_read": false, "storage_quota_bytes": bytes } });
+
+    // --- finalize: staged while unlimited, walled before the finalize ---
+    let ticket = app.pub_get(&format!("{}/api/packages/versions/new", acme.base()), Some(&acme.token)).await;
+    let url = ticket.json["url"].as_str().expect("upload url").to_owned();
+    let staged = app.pub_upload(&app.proxied(&url), Some(&acme.token), &package_archive("acme_core", "1.0.0")).await;
+    assert_eq!(staged.status, StatusCode::NO_CONTENT);
+    let finalize = app.proxied(staged.headers[header::LOCATION].to_str().expect("location"));
+    assert_eq!(app.patch("/api/v1/admin/settings", Some(&admin), wall(1)).await.status, StatusCode::OK);
+    assert_eq!(app.pub_get(&finalize, Some(&acme.token)).await.status, StatusCode::BAD_REQUEST);
+
+    // --- upload: the wall is already up, so the archive never reaches staging ---
+    let refused = app
+        .pub_upload(
+            &format!("{}/api/packages/versions/newUpload", acme.base()),
+            Some(&acme.token),
+            &package_archive("acme_core", "2.0.0"),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(&refused.body));
+
+    let body = handle.render();
+    let quota_lines: String =
+        body.lines().filter(|line| line.contains("storage_quota_refusals_total")).collect::<Vec<_>>().join("\n");
+    assert!(
+        quota_lines.contains(r#"stage="finalize""#),
+        "the finalize checkpoint must count under its own label:\n{quota_lines}"
+    );
+    assert!(
+        quota_lines.contains(r#"stage="upload""#),
+        "the upload checkpoint must count under its own label:\n{quota_lines}"
+    );
+}
 
 #[tokio::test]
 async fn blob_keys_cannot_be_steered_by_names_or_versions() {

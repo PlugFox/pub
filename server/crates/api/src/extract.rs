@@ -65,6 +65,15 @@ impl FromRequestParts<AppState> for AuthContext {
     ///
     /// A KV failure during the revocation check propagates as `kv_error` → **503**: the
     /// fast path fails closed rather than accepting a possibly-revoked session.
+    ///
+    /// **What the identity layer's stash saves, and what it does not** (decision 32, closes
+    /// D58). The rate-limit layer verified this exact credential's Ed25519 signature a few
+    /// microseconds ago and left the resulting claims in the request extensions; reusing them
+    /// skips **only** the signature check. Every other check below runs on every request,
+    /// unchanged: revocation (S-09) here, suspension and step-up (S-06) and scope in the
+    /// extractors built on this one. A cached *authorization verdict* would be a different and
+    /// far more dangerous object — this one is a cached signature result, bound to the exact
+    /// credential bytes that produced it, and its absence simply costs the verification.
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
@@ -75,7 +84,10 @@ impl FromRequestParts<AppState> for AuthContext {
             .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
 
         let now = (state.clock)();
-        let claims = state.auth.verify_access(token, now).map_err(ApiError)?;
+        let claims = match crate::guard::stashed_claims(&parts.extensions, token) {
+            Some(claims) => claims,
+            None => state.auth.verify_access(token, now).map_err(ApiError)?,
+        };
         if state.auth.is_sid_revoked(claims.sid).await.map_err(ApiError)? {
             return Err(ApiError::unauthorized("session revoked"));
         }

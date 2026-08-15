@@ -153,6 +153,44 @@ pub trait PackageRepo: Send + Sync {
     /// Instance-wide registry totals for the admin dashboard.
     async fn stats(&self) -> Result<RegistryStats>;
 
+    /// How many bytes of archive storage the org's **live** versions account for — the number
+    /// the S-20.b quota is checked against ([decision 32](../../../docs/decisions.md#32)).
+    ///
+    /// The sum of `archive_size` over every non-tombstoned version row of every package the org
+    /// owns. The three rules below are contract, not implementation detail:
+    ///
+    /// - **Retracted versions count.** They are still downloadable (docs/protocol.md sharp edge
+    ///   9), so their bytes are still stored.
+    /// - **Tombstoned versions do not.** Their bytes are collectable, and a hard delete is how
+    ///   an org frees space.
+    /// - **Proxied upstream archives never count.** They live in `upstream_versions`, which has
+    ///   no org by design (see [`UpstreamRepo`]) and caches instance-wide, so one org's fetch
+    ///   serves everybody.
+    ///
+    /// Byte-identical uploads are **deliberately over-counted**: content addressing means two
+    /// orgs publishing the same bytes share one object, and each is charged for it. Charging
+    /// only the first uploader would make one org's quota depend on another org's behaviour.
+    /// This is the stance [`RegistryStats::archive_bytes`] already takes instance-wide.
+    ///
+    /// An org that owns nothing answers `0` rather than erroring — an unknown org id is
+    /// indistinguishable from an empty one here, because the answer to both is "no bytes".
+    async fn org_storage_bytes(&self, org: OrgId) -> Result<i64>;
+
+    /// How many bytes of archive storage **one package's** live versions account for — the
+    /// number a transfer moves between two orgs (S-20.b, [decision 32](../../../docs/decisions.md#32)).
+    ///
+    /// The same sum as [`PackageRepo::org_storage_bytes`] narrowed to one package, and it obeys
+    /// the same three contract rules for the same reasons: retracted versions count, tombstoned
+    /// ones do not, and proxied upstream archives never do. It exists because
+    /// [`PackageRepo::transfer`] re-attributes every one of these bytes the instant the row's
+    /// `org_id` changes, so the receiving org's quota has to be checked against them *before*
+    /// the move — and the alternative, "read the receiver's total before and after", cannot
+    /// refuse anything, because by then the bytes have already moved.
+    ///
+    /// An unknown package id answers `0`, like an unknown org: the question is "how many bytes",
+    /// and nothing has any.
+    async fn package_storage_bytes(&self, package: PackageId) -> Result<i64>;
+
     /// Publishes a version — atomically, per contract 1 above.
     ///
     /// Errors: the name is claimed by another org → [`crate::Error::Forbidden`]; the version
@@ -739,6 +777,21 @@ pub trait OrgRepo: Send + Sync {
     /// so it gets its own audited call site instead of riding along with a rename.
     async fn set_upstream_policy(&self, id: OrgId, policy: UpstreamPolicy, now: DateTime<Utc>) -> Result<Org>;
 
+    /// Sets or clears the org's storage-quota override in bytes and bumps `updated_at`
+    /// ([S-20.b](../../../docs/security.md#4-supply-chain--registry-integrity),
+    /// [decision 32](../../../docs/decisions.md#32)). Unknown id → `NotFound`.
+    ///
+    /// `None` clears the override, so the org follows `registry.storage_quota_bytes` again;
+    /// `Some(0)` is an explicit "unlimited for this org", which is a different row and stops
+    /// following the instance default. The repository stores the number it is given — the
+    /// effective-limit rule and any bound on the value belong to the caller.
+    ///
+    /// A dedicated setter rather than a field on [`OrgProfile`], for the same reason
+    /// [`OrgRepo::set_upstream_policy`] is one and one more: this is a *policy* field with its
+    /// own audited call site, and `OrgProfile` is written by `PATCH /api/v1/orgs/{slug}`, which
+    /// an org Admin can reach — a quota its subject can raise is not a quota.
+    async fn set_storage_quota(&self, id: OrgId, quota: Option<i64>, now: DateTime<Utc>) -> Result<Org>;
+
     /// Every org on the instance with its member and package counts, ordered by slug and
     /// keyset-paginated over it — the instance-admin org table.
     async fn list_all(&self, cursor: Option<&str>, limit: u32) -> Result<Page<OrgOverview>>;
@@ -824,6 +877,20 @@ pub trait OrgRepo: Send + Sync {
     /// How many invitations the org sent inside `[since, now]` — the S-24 per-org invitation
     /// budget (≤20/day/org).
     async fn count_invitations_since(&self, org: OrgId, since: DateTime<Utc>) -> Result<i64>;
+
+    /// How many invitations **one actor** sent in **one org** inside `[since, now]` — the
+    /// per-actor half of the same budget
+    /// ([S-24.h](../../../docs/security.md#5-audit--abuse), decision 32).
+    ///
+    /// Same rolling-window semantics as [`OrgRepo::count_invitations_since`]: `since` is a
+    /// caller-supplied instant, not a tumbling bucket, so the window genuinely rolls and the
+    /// count is exact. Every lifecycle state counts — a revoked or expired invitation still
+    /// delivered mail to a third party, which is the cost this budget bounds.
+    ///
+    /// Scoped to one org on purpose: the org cap bounds the org, this one stops a single member
+    /// spending it all. The residue is stated in decision 32 — an actor who is Admin in N orgs
+    /// can still send N × this cap, each org bounded by its own.
+    async fn count_invitations_since_by_actor(&self, org: OrgId, actor: UserId, since: DateTime<Utc>) -> Result<i64>;
 
     /// Deletes at most `batch` invitations that **settled** before `cutoff`, and returns how many
     /// rows went (S-23 retention, spent by the lifecycle job).

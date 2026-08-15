@@ -966,6 +966,15 @@ pub struct RateLimitSettingsDto {
     pub read_per_ip_minute: u32,
     /// Reads per minute per CLI token or signed-in account (S-24.f, S-13.b).
     pub read_per_identity_minute: u32,
+    /// App-API mutations per minute per client IP, for requests with no identity (S-24.g).
+    pub write_per_ip_minute: u32,
+    /// App-API mutations per minute per CLI token or signed-in account (S-24.g).
+    pub write_per_identity_minute: u32,
+    /// Invitations one org may send per rolling 24 hours (S-24.h). An exact database count
+    /// rather than a bucket, reported here because it is a limit an administrator changes.
+    pub invitations_per_day_org: u32,
+    /// Invitations one member may send per rolling 24 hours within one org (S-24.h).
+    pub invitations_per_day_actor: u32,
 }
 
 /// SMTP settings as returned — the password is never among them (S-26).
@@ -1046,6 +1055,9 @@ pub struct RegistrySettingsDto {
     /// Whether every pub-protocol read demands a CLI token. `true` also closes the S-04.c proxy
     /// timing oracle, since there is then no anonymous prober.
     pub require_auth_for_read: bool,
+    /// Default per-org storage quota in bytes; **`0` = unlimited** (S-20.b). A per-org override
+    /// set by an instance admin wins over this number for that org.
+    pub storage_quota_bytes: u64,
 }
 
 /// Response of `GET`/`PATCH /api/v1/admin/settings`.
@@ -1145,6 +1157,94 @@ pub struct AdminOrgDto {
     pub members: i64,
     /// How many packages it owns.
     pub packages: i64,
+    /// The org's storage-quota override in bytes: `null` = follow the instance default,
+    /// `0` = unlimited for this org (S-20.b).
+    ///
+    /// Admin-only on purpose. It is deliberately **not** on [`OrgDto`], which
+    /// `GET /api/v1/orgs/{slug}` serves to anonymous callers — one org's quota is nobody
+    /// else's business, and the field's absence from that payload is also what keeps
+    /// `PATCH /api/v1/orgs/{slug}` structurally unable to round-trip it.
+    pub storage_quota_bytes: Option<u64>,
+    /// What that override resolves to against the current instance default; `null` = unlimited.
+    ///
+    /// The same number the sibling `PATCH` answers with, and it is here for the same reason it
+    /// is there: the stored override alone does not answer "what is this org measured against",
+    /// and the operator's question is always the second one. Resolved **server-side** through
+    /// [`pub_registry::publish::effective_storage_quota`], which is the one place the
+    /// three-state rule is written — without this field a client has to re-derive that rule from
+    /// this override plus `GET /api/v1/admin/settings`, and a rule written in two languages is a
+    /// rule that will disagree with itself.
+    pub effective_quota_bytes: Option<u64>,
+}
+
+/// Body of `PATCH /api/v1/admin/orgs/{id}` — the instance-admin write over one org (S-20.b).
+///
+/// The field is a **double option** because all three of its states are meaningful and an
+/// absent field is a fourth thing: `{"storage_quota_bytes": 1073741824}` sets a wall,
+/// `{"storage_quota_bytes": 0}` makes this org unlimited whatever the instance default is,
+/// `{"storage_quota_bytes": null}` clears the override so the org follows the instance default
+/// again, and `{}` supplies nothing and is refused rather than silently treated as one of the
+/// three.
+///
+/// **The inner type is `i64` and the accepted range is `0..=i64::MAX`**: the *negative* half of
+/// the parsed range exists only so that refusal stays inside the error envelope
+/// ([rules/api.md](../../../../docs/rules/api.md)). A narrower Rust type moves the refusal into
+/// serde, and a serde refusal is a **422 carrying a bare deserializer string** that no client
+/// can parse as an error: with `u64` the operator's `-1` died there, which also made
+/// `AdminService::set_org_storage_quota`'s carefully worded negative refusal unreachable from
+/// HTTP while its doc comment claimed to be what the operator sees. Parsing as `i64` puts the
+/// negative back within reach, so the *handler* refuses it with a 400 that says what to type
+/// instead — which is the direction an operator actually reaches by hand.
+///
+/// The schema advertises `Option<u64>` — the **accepted** range, not the parsed one — because
+/// the accepted range is the operator's contract, and the wider parse exists only so the refusal
+/// can be spoken in the envelope. A generated client that sends a `u64` is right; one that sends
+/// `-1` gets a sentence instead of a deserializer trace.
+///
+/// The *other* out-of-range direction stays outside the envelope: a value above `i64::MAX` dies
+/// in serde as a 422, exactly as a non-numeric one does. That is an app-wide gap — every route
+/// taking plain `Json` has it — and closing it needs an enveloping extractor, not a wider
+/// integer here. `i128` was tried and does not work: `serde_json` refuses it at the number,
+/// so the negative case never reached the handler either.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct AdminOrgPatchBody {
+    /// New storage-quota override in bytes; `null` clears it, `0` means unlimited. A negative
+    /// number is a `400` naming the range; one above `i64::MAX` is a 422 from the deserializer.
+    #[serde(default, deserialize_with = "explicit_null")]
+    #[schema(value_type = Option<u64>, nullable)]
+    pub storage_quota_bytes: Option<Option<i64>>,
+}
+
+/// Distinguishes an explicit JSON `null` (`Some(None)`) from an absent field (`None`).
+///
+/// Serde collapses both into `None` for a plain `Option`, which is exactly the distinction the
+/// quota patch is built on: "clear the override" and "do not touch the override" are different
+/// requests, and a payload that meant the first would otherwise be a no-op that answered 200.
+fn explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
+/// Response of `PATCH /api/v1/admin/orgs/{id}`: the override that is now stored, and what it
+/// resolves to.
+///
+/// Both numbers, because the stored one alone does not answer the operator's question. `null`
+/// and `0` are different rows with different futures — one follows the instance default, one
+/// has opted out of it — and the effective value is what the next publish will actually be
+/// measured against.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminOrgQuotaDto {
+    /// Org id.
+    pub id: String,
+    /// Org slug.
+    pub slug: String,
+    /// The stored override: `null` = follow the instance default, `0` = unlimited for this org.
+    pub storage_quota_bytes: Option<u64>,
+    /// What that resolves to against the current instance default: `null` = unlimited.
+    pub effective_quota_bytes: Option<u64>,
 }
 
 /// One audit row (S-22).

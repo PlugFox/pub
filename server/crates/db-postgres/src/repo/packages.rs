@@ -49,6 +49,26 @@ pub struct PgPackageRepo {
 }
 
 impl PgPackageRepo {
+    /// The exact statement [`PackageRepo::org_storage_bytes`] emits on this dialect, exported so
+    /// the query-plan test can `EXPLAIN` **it** rather than a copy of it (roadmap D52: the plan
+    /// tests that hand-copy their SQL assert an index for text production may no longer emit).
+    ///
+    /// The `::bigint` cast is the same dialect trap [`PackageRepo::stats`] documents: `SUM()`
+    /// over a `BIGINT` column answers `NUMERIC` in Postgres, which does not decode into `i64`.
+    /// `NOT v.tombstone` is written to match `versions_org_bytes_idx`'s predicate exactly, so
+    /// the inner side of the join is an index-only scan rather than a heap fetch per version.
+    pub const ORG_STORAGE_BYTES_SQL: &'static str = "SELECT COALESCE(SUM(v.archive_size), 0)::bigint AS bytes \
+         FROM versions v JOIN packages p ON p.id = v.package_id \
+         WHERE p.org_id = $1 AND NOT v.tombstone";
+
+    /// The exact statement [`PackageRepo::package_storage_bytes`] emits on this dialect.
+    ///
+    /// The same partial index serves it with no join at all: `versions_org_bytes_idx` leads on
+    /// `package_id` and carries `archive_size`, so this is one index-only scan. The `::bigint`
+    /// cast and the `NOT v.tombstone` spelling are load-bearing for the reasons above.
+    pub const PACKAGE_STORAGE_BYTES_SQL: &'static str = "SELECT COALESCE(SUM(v.archive_size), 0)::bigint AS bytes \
+         FROM versions v WHERE v.package_id = $1 AND NOT v.tombstone";
+
     /// Wraps a pool handle.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -581,6 +601,27 @@ impl PackageRepo for PgPackageRepo {
             .await
             .map_err(db_err)?;
         Ok(row.get("n"))
+    }
+
+    async fn org_storage_bytes(&self, org: OrgId) -> Result<i64> {
+        // `COALESCE(SUM(…), 0)`: an org with no live versions must answer 0, not NULL — the
+        // caller compares this against a quota, and an org that owns nothing is at zero bytes
+        // rather than in an error state.
+        let row: PgRow = sqlx::query(sqlx::AssertSqlSafe(Self::ORG_STORAGE_BYTES_SQL))
+            .bind(*org.as_uuid())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("bytes"))
+    }
+
+    async fn package_storage_bytes(&self, package: PackageId) -> Result<i64> {
+        let row: PgRow = sqlx::query(sqlx::AssertSqlSafe(Self::PACKAGE_STORAGE_BYTES_SQL))
+            .bind(*package.as_uuid())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(row.get("bytes"))
     }
 
     async fn stats(&self) -> Result<pub_core::package::RegistryStats> {

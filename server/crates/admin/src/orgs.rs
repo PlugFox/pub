@@ -55,17 +55,21 @@ const MAX_FORCED_PACKAGES: u32 = 500;
 const ACCOUNT_BATCH: usize = 200;
 
 /// Instance policy for the org surface.
+///
+/// The S-24 invitation budgets used to live here as compile-time constants. They are runtime
+/// settings now ([S-24.h](../../../../docs/security.md#5-audit--abuse), decision 32) and are
+/// read from the settings cache per invitation, so an instance being spammed can respond from
+/// the admin surface instead of a rebuild — and so there is one source of truth rather than a
+/// constant and a settings row that can disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OrgPolicy {
     /// How long an invitation stays redeemable (docs/architecture.md default: 7 days).
     pub invitation_ttl: Duration,
-    /// S-24 invitation budget: invitations per org per day.
-    pub invitations_per_day_org: i64,
 }
 
 impl Default for OrgPolicy {
     fn default() -> Self {
-        Self { invitation_ttl: Duration::days(7), invitations_per_day_org: 20 }
+        Self { invitation_ttl: Duration::days(7) }
     }
 }
 
@@ -563,8 +567,14 @@ impl OrgService {
     /// The D39 ceiling applies at **creation**: the role is frozen into the row here, exactly
     /// as it always was ("an invitation never lowers"), so acceptance never re-checks it and a
     /// later demotion of the inviter does not retroactively invalidate an outstanding
-    /// invitation. The S-24 per-org budget (≤20/day) is spent here rather than in a middleware
-    /// because it is keyed on the org, which only exists once the route has resolved the slug.
+    /// invitation. The S-24.h budgets — per org **and** per actor within that org — are spent
+    /// here rather than in a middleware because they are keyed on the org, which only exists
+    /// once the route has resolved the slug.
+    ///
+    /// **Both budgets stay database counts** rather than moving onto the KV limiter that bounds
+    /// every other mutation (S-24.g). The count is exact, its 24-hour window genuinely rolls
+    /// instead of tumbling, and it survives a KV outage — three properties the buckets do not
+    /// have, on the one mutation whose cost is mail delivered to a third party.
     pub async fn invite(
         &self,
         org: &Org,
@@ -586,19 +596,24 @@ impl OrgService {
                 message: "that email domain is not allowed to sign in on this instance".to_owned(),
             });
         }
-        let sent_today = self.repos.orgs.count_invitations_since(org.id, now - Duration::days(1)).await?;
-        if sent_today >= self.policy.invitations_per_day_org {
-            self.audit(
-                actor,
-                Some(org.id),
-                "auth.throttled",
-                Some(org.slug.clone()),
-                AuditResult::Failure,
-                serde_json::json!({ "limit": "invitations_per_day_org", "value": self.policy.invitations_per_day_org }),
-                now,
-            )
-            .await;
+        // One source of truth for both numbers: the runtime settings cache (decision 09/32).
+        let limits = self.auth.settings().rate_limits;
+        let since = now - Duration::days(1);
+
+        let sent_today = self.repos.orgs.count_invitations_since(org.id, since).await?;
+        if sent_today >= i64::from(limits.invitations_per_day_org) {
+            self.invitation_throttled(org, actor, "invitations_per_day_org", limits.invitations_per_day_org, now).await;
             // The window is a rolling day; the hint is the coarse remainder of it.
+            return Err(Error::RateLimited { retry_after_secs: 3600 });
+        }
+        // The per-actor half (S-24.h): the org cap bounds the org, this one stops a single
+        // member spending the whole org's budget on their own. Scoped to this org — an actor
+        // who is Admin in N orgs can still send N × this cap, each bounded by its own org cap,
+        // which decision 32 states as the accepted residue.
+        let sent_by_actor = self.repos.orgs.count_invitations_since_by_actor(org.id, actor.user_id, since).await?;
+        if sent_by_actor >= i64::from(limits.invitations_per_day_actor) {
+            self.invitation_throttled(org, actor, "invitations_per_day_actor", limits.invitations_per_day_actor, now)
+                .await;
             return Err(Error::RateLimited { retry_after_secs: 3600 });
         }
 
@@ -860,6 +875,61 @@ impl OrgService {
         }
     }
 
+    /// Files an invitation-throttle refusal: the `rate_limit_trips_total` counter on **every**
+    /// refusal, and at most **one audit row per (org, actor) per hour**.
+    ///
+    /// **This site used to write a row per refusal, deliberately, and the reasoning was wrong.**
+    /// The argument was that the amplification `Decision::first_in_window` exists to stop is not
+    /// reachable here — the actor is authenticated, step-up gated (S-06) and org-scoped, and
+    /// "already bounded by S-24.g's write bucket at the same number as every other mutation".
+    /// That last clause is false, and it was the load-bearing one: every *other* throttle site
+    /// dedupes, so their ceiling is one row per window; without a dedupe this site's ceiling is
+    /// one row per **request**. At `write_per_identity_minute` = 300 an actor who has spent
+    /// their daily invitation cap sustains 300 rows/minute — 432 000 a day, retained for
+    /// S-23's default 730 days — which made a *refused* invitation the cheapest audit-row
+    /// primitive on the API, while a *successful* one costs real work and is capped at ten a day.
+    ///
+    /// The evidence [S-22] requires survives the dedupe: one row per hour still names the actor,
+    /// the org and which cap was hit, which is what an operator investigating invitation abuse
+    /// reads. What is lost is only the repetition.
+    ///
+    /// **Enforcement does not go through this function.** The refusal itself is still decided by
+    /// an exact rolling `COUNT(*)` (S-24.h) — that is why the caps survive a KV outage. Only the
+    /// audit row is suppressed here, so a KV outage degrades evidence rather than the cap: the
+    /// in-process fallback's slot collisions can merge two orgs' suppression keys and drop a row
+    /// that should have been written. That is the acceptable direction for a bounded table
+    /// during an outage, and it is bounded — the counter is unaffected either way.
+    ///
+    /// [S-22]: ../../../../docs/security.md#5-audit--abuse
+    async fn invitation_throttled(
+        &self,
+        org: &Org,
+        actor: &ActorMeta,
+        limit: &'static str,
+        value: u32,
+        now: DateTime<Utc>,
+    ) {
+        metrics::counter!("rate_limit_trips_total", "limit" => limit).increment(1);
+        // The key carries the **cap** as well as the org and the actor. Without it the two caps
+        // share one suppression window, so an actor refused by the per-actor cap at 10:05 and by
+        // the org cap at 10:20 leaves one row naming only the first — an operator reading the log
+        // would see the wrong reason, which is worse than seeing one row fewer.
+        let suppression_key = format!("rl:invite_audit:{}:{}:{limit}", org.id, actor.user_id);
+        if !self.auth.suppress_once(&suppression_key, Duration::hours(1), now).await {
+            return;
+        }
+        self.audit(
+            actor,
+            Some(org.id),
+            "org.invitation.throttled",
+            Some(org.slug.clone()),
+            AuditResult::Failure,
+            serde_json::json!({ "limit": limit, "value": value }),
+            now,
+        )
+        .await;
+    }
+
     /// Appends an audit event. Failures are logged, never propagated — an audit outage must
     /// not take org management down with it (the same stance as the auth and registry
     /// services).
@@ -1013,6 +1083,18 @@ mod tests {
     fn default_policy_matches_the_documented_defaults() {
         let policy = OrgPolicy::default();
         assert_eq!(policy.invitation_ttl, Duration::days(7));
-        assert_eq!(policy.invitations_per_day_org, 20);
+    }
+
+    /// **S-24.h.** The invitation budgets have exactly one source — the runtime settings
+    /// section — and it is not this struct. A compile-time constant beside a settings row is
+    /// two numbers that can disagree, and the one an operator edits would be the one that lost.
+    #[test]
+    fn s24_h_the_invitation_budgets_are_settings_not_policy_constants() {
+        let defaults = pub_core::settings::RateLimitSettings::default();
+        assert_eq!(defaults.invitations_per_day_org, 20, "the shipped org cap must survive the move");
+        assert_eq!(defaults.invitations_per_day_actor, 10);
+        // A compile-time assertion that `OrgPolicy` carries no budget any more: the struct is
+        // built from its one remaining field, so re-adding one breaks this line.
+        let _exhaustive = OrgPolicy { invitation_ttl: Duration::days(7) };
     }
 }

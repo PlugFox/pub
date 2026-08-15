@@ -28,7 +28,7 @@ use axum::extract::{Path, State};
 use pub_core::authorize::{Action, ActorContext, Resource, authorize};
 use pub_core::package::{Package, Resolution, Version};
 use pub_core::search::{SearchQuery, SearchSort, SearchView, parse_query};
-use pub_core::{Error, Format, PackageId, SemVer, UserId};
+use pub_core::{Error, Format, SemVer, UserId};
 use serde::Deserialize;
 use utoipa::IntoParams;
 
@@ -52,12 +52,6 @@ const MAX_LIMIT: u32 = 100;
 
 /// Facet buckets returned with a search page.
 const FACET_BUCKETS: u32 = 10;
-
-/// Page size of the newest-first scan behind [`latest_and_newest`].
-const VERSION_SCAN_PAGE: u32 = 100;
-
-/// Hard bound on that scan: past this many versions the answer is the best candidate seen.
-const MAX_VERSION_SCAN: usize = 1_000;
 
 /// Query parameters shared by the search and listing routes.
 #[derive(Debug, Deserialize, IntoParams)]
@@ -147,7 +141,12 @@ pub async fn detail(
     let package = readable(&state, auth.actor(), &name).await?;
     // A package row whose versions are all tombstoned is not browsable, and saying so with the
     // same 404 keeps it indistinguishable from a name nobody ever claimed.
-    let (latest, newest) = latest_and_newest(&state, package.id).await?.ok_or_else(|| missing(&name))?;
+    //
+    // `latest_and_newest` is the registry's own bounded newest-first scan, shared with the
+    // search indexer (decision 32): the page and the search document cannot disagree about
+    // which version `latest` is, because they are the same read of the same window.
+    let (latest, newest) =
+        pub_registry::index::latest_and_newest(&state.repos, package.id).await?.ok_or_else(|| missing(&name))?;
     let (latest, newest) = (&latest, &newest);
     let versions_count = state.repos.packages.count_versions(package.id).await?;
 
@@ -357,51 +356,6 @@ pub(crate) async fn readable(state: &AppState, actor: &ActorContext, name: &str)
 /// individual behind a release is not, so it is shown only inside the org.
 fn may_see_publisher(auth: &MaybeAuth, package: &Package) -> bool {
     authorize(auth.actor(), Action::ReadPackages, &Resource::Org(package.org_id)).is_ok()
-}
-
-/// The two versions a package page needs: the one `pub add` would install, and the newest one.
-///
-/// Deliberately a **bounded newest-first scan**, not a full walk. The rule
-/// ([`pub_registry::latest_index`]) is "highest live stable, else highest live pre-release,
-/// else the newest there is", and evaluated from the newest end it terminates at the first
-/// stable release — one query for essentially every package in existence. A full walk, which is
-/// what this route used to do, costs one query per hundred versions on a route anonymous
-/// callers can hit in a loop; `flutter` alone would be forty of them per page view.
-///
-/// The scan stops after [`MAX_VERSION_SCAN`] versions. Reaching that means the newest thousand
-/// releases of one package contain no stable one at all, in which case the answer is the best
-/// candidate seen so far — the same value the rule's second and third clauses would produce
-/// over that prefix.
-async fn latest_and_newest(state: &AppState, package: PackageId) -> Result<Option<(Version, Version)>, ApiError> {
-    let mut cursor: Option<String> = None;
-    let mut scanned = 0usize;
-    let mut newest: Option<Version> = None;
-    let mut best_live: Option<Version> = None;
-
-    loop {
-        let page = state.repos.packages.list_versions_desc(package, cursor.as_deref(), VERSION_SCAN_PAGE).await?;
-        for version in page.items {
-            scanned += 1;
-            if newest.is_none() {
-                newest = Some(version.clone());
-            }
-            if version.is_retracted() {
-                continue;
-            }
-            if !version.version.is_pre_release() {
-                // Highest live stable: the rule's first clause, and nothing older can beat it.
-                let newest = newest.expect("set on the first row");
-                return Ok(Some((version, newest)));
-            }
-            best_live.get_or_insert(version);
-        }
-        match page.cursor {
-            Some(next) if scanned < MAX_VERSION_SCAN => cursor = Some(next),
-            _ => break,
-        }
-    }
-
-    Ok(newest.map(|newest| (best_live.unwrap_or_else(|| newest.clone()), newest)))
 }
 
 /// Projects a domain version onto its list row.

@@ -70,9 +70,17 @@ const MULTIPART_OVERHEAD: usize = 64 * 1024;
 /// Page size used to walk a package's versions.
 const VERSION_PAGE: u32 = 200;
 
-/// Ceiling on how many versions one listing may contain. Real packages are far below this;
-/// the cap exists so a pathological package cannot turn the hot path into an OOM.
-const MAX_LISTED_VERSIONS: usize = 10_000;
+/// Ceiling on how many versions one listing **carries**. Real packages are far below this; the
+/// cap exists so a pathological package cannot turn the hot path into an OOM.
+///
+/// Deliberately not the same number as, and not the same question as,
+/// [`pub_registry::index::LATEST_WINDOW`]: this one bounds how much of a package's history goes
+/// on the wire, that one bounds how many of the newest versions the `latest` rule is evaluated
+/// over. Conflating the two is what let three surfaces disagree (decision 32, D50).
+///
+/// Public only so the conformance suite can build a package that actually *reaches* it — a test
+/// asserting which end truncates on a package below the cap would assert nothing.
+pub const MAX_LISTED_VERSIONS: usize = 10_000;
 
 // ------------------------------------------------------------------------------- wire shapes
 
@@ -144,8 +152,15 @@ pub struct SuccessMessage {
 /// different token publish someone else's bytes under its own provenance (S-21).
 ///
 /// `user_id` and `size` are written but not read by finalize (the token binding is the
-/// stricter check): they are forensic and accounting fields, kept for the per-org storage quota
-/// S-20 still owes. The abandoned-upload sweep does **not** read them — it collects staged bytes
+/// stricter check): they are forensic fields. In particular the S-20.b storage quota does
+/// **not** read `size` — staged bytes are not counted against the quota at all (a quota that
+/// flapped with in-flight publishes would refuse the retry of the upload that caused it), and
+/// the bound on the staging area is the refusal in [`guard_staged_bytes`] plus the sweep. That
+/// "not counted at all" is a contract rather than an observation, so it is asserted rather than
+/// asserted-about: `api/tests/pub_attack.rs::s20_b_a_staged_upload_adds_nothing_to_the_org_byte_total`
+/// stages an upload, reads `org_storage_bytes`, and only then finalizes — an implementation that
+/// folded the staging area into the sum would refuse the retry of the very upload that filled
+/// it. The abandoned-upload sweep does not read these fields either — it collects staged bytes
 /// by age alone and never consults this record, deliberately
 /// ([decision 31](../../../../../docs/decisions.md), `pub_jobs::staging`).
 #[derive(Debug, Serialize, Deserialize)]
@@ -310,7 +325,7 @@ pub async fn publish_start(
     request_body(content = String, description = "multipart/form-data with the archive in field `file`", content_type = "multipart/form-data"),
     responses(
         (status = NO_CONTENT, description = "Stored; `Location` points at the finalize URL"),
-        (status = BAD_REQUEST, description = "Not a readable multipart body, or no `file` field", body = SpecError),
+        (status = BAD_REQUEST, description = "Not a readable multipart body, no `file` field, or no room under the org's storage quota (S-20.b)", body = SpecError),
         (status = UNAUTHORIZED, description = "No usable token; carries WWW-Authenticate", body = SpecError),
         (status = FORBIDDEN, description = "Token lacks publish scope, org binding, or Write role", body = SpecError),
         (status = TOO_MANY_REQUESTS, description = "The org's S-24 publish budget is spent; carries Retry-After", body = SpecError),
@@ -327,6 +342,7 @@ pub async fn publish_upload(
     let org = base.org.as_ref().expect("publisher() rejects the public root");
     charge_publish_budget(&state, ctx, org, &meta).await?;
     let archive = read_archive(multipart).await?;
+    guard_staged_bytes(&state, org, archive.len()).await?;
 
     let session = new_session_id();
     // Bytes first, record second: a record pointing at absent bytes would fail finalize with
@@ -362,7 +378,7 @@ pub async fn publish_upload(
     params(("session" = String, Path, description = "Upload session id from the Location header")),
     responses(
         (status = OK, description = "Published", content_type = "application/vnd.pub.v2+json", body = PublishSuccess),
-        (status = BAD_REQUEST, description = "Any permanent rejection: bad archive, bad pubspec, duplicate version, expired session", body = SpecError),
+        (status = BAD_REQUEST, description = "Any permanent rejection: bad archive, bad pubspec, duplicate version, expired session, storage quota exceeded (S-20.b)", body = SpecError),
         (status = UNAUTHORIZED, description = "No usable token; carries WWW-Authenticate", body = SpecError),
         (status = FORBIDDEN, description = "Wrong credential for this upload, missing scope/role, or a name owned elsewhere", body = SpecError),
     )
@@ -416,6 +432,12 @@ pub async fn publish_finalize(
         archive,
         expected_name: None,
         package_patterns: ctx.token.package_patterns.clone(),
+        // S-20.b. Resolved here, not inside the service: the rule's two inputs are the org row
+        // this request already loaded to route itself and the *runtime* instance setting, and
+        // `RegistryService` deliberately holds a policy frozen at boot (decision 09 puts runtime
+        // settings behind a cache the API layer reads per request). An operator who raises the
+        // instance quota therefore affects the very next publish, not the next restart.
+        storage_quota_bytes: effective_quota(&state, org),
     };
 
     match state.registry.publish(request, now).await {
@@ -632,22 +654,39 @@ fn upstream_for<'a>(state: &'a AppState, base: &Base) -> Option<&'a pub_registry
     if allowed { state.upstream.as_deref() } else { None }
 }
 
-/// Reads every live version of a package, ascending by semver precedence.
+/// Reads a package's live versions and returns them **ascending** by semver precedence, which
+/// is the order the spec's listing is emitted in.
+///
+/// The read itself is **descending**, and reversed at the end, so the
+/// [`MAX_LISTED_VERSIONS`] cap drops the *oldest* versions rather than the newest ones. That
+/// end is the one a resolver can afford to lose: a client resolves against recent releases, and
+/// a listing missing its newest entries makes the package look frozen at whatever the cap
+/// happened to reach — while `latest` gets derived from a release nobody is installing. An
+/// ascending read is how it worked before decision 32, and the failure was silent above 10 000
+/// live versions, which an internal registry publishing per CI merge reaches.
+///
+/// Below the cap the two reads are the same set, and `list_versions_desc` is contract-tested as
+/// the exact reverse of `list_versions`, so nothing observable changes for a normal package.
 async fn load_versions(state: &AppState, package: PackageId) -> Result<Vec<Version>, ProtocolError> {
     let mut all = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = state.repos.packages.list_versions(package, cursor.as_deref(), VERSION_PAGE).await?;
+        let page = state.repos.packages.list_versions_desc(package, cursor.as_deref(), VERSION_PAGE).await?;
         all.extend(page.items);
         match page.cursor {
             Some(next) if all.len() < MAX_LISTED_VERSIONS => cursor = Some(next),
             Some(_) => {
-                tracing::warn!(%package, listed = all.len(), "version listing truncated at the safety cap");
+                tracing::warn!(
+                    %package,
+                    listed = all.len(),
+                    "version listing truncated at the safety cap; the oldest versions were dropped"
+                );
                 break;
             }
             None => break,
         }
     }
+    all.reverse();
     Ok(all)
 }
 
@@ -856,6 +895,45 @@ async fn charge_publish_budget(
     }
 }
 
+/// This org's effective storage quota right now; `None` = unlimited (S-20.b).
+///
+/// One call into [`pub_registry::publish::effective_storage_quota`] from both checkpoints, so
+/// the three-state rule — `NULL` follows the instance default, `0` is unlimited on *either*
+/// surface, a positive number is bytes — cannot be spelled two ways in one file.
+fn effective_quota(state: &AppState, org: &pub_core::org::Org) -> Option<u64> {
+    pub_registry::publish::effective_storage_quota(
+        org.storage_quota_bytes,
+        state.runtime.current().registry.storage_quota_bytes,
+    )
+}
+
+/// Refuses a staged write that the org has no room for (S-20.b, the **second** checkpoint).
+///
+/// This is not the finalize check run twice, and the difference is the reason it exists.
+/// Finalize bounds what is *published*; staged bytes are not published, are not counted by
+/// `org_storage_bytes`, and outlive their KV record by the whole staging grace (default two
+/// hours, decision 31). An org already over its quota could therefore park
+/// `publish_per_hour_org x max_archive_bytes` per hour in the blob store — every one of those
+/// uploads doomed at finalize, and every one of them occupying the storage the quota exists to
+/// bound. Neither check covers the other's case.
+///
+/// It runs **after** the S-24.c publish budget deliberately: that budget is the abuse bound and
+/// answers 429, this one is the capacity bound and answers a permanent 400, and a caller who has
+/// spent both should hear about the retryable one first.
+///
+/// Refusing here is also the cheaper refusal for the publisher — the bytes have crossed the wire
+/// either way, but nothing is written and nothing has to be collected afterwards.
+async fn guard_staged_bytes(state: &AppState, org: &pub_core::org::Org, incoming: usize) -> Result<(), ProtocolError> {
+    let Some(quota) = effective_quota(state, org) else { return Ok(()) };
+    let used = state.repos.packages.org_storage_bytes(org.id).await?;
+    if let Err(err) = pub_registry::publish::check_storage_quota(used, incoming as i64, Some(quota)) {
+        metrics::counter!("storage_quota_refusals_total", "stage" => "upload").increment(1);
+        tracing::warn!(org = %org.id, used, incoming, quota, "upload refused: storage quota exceeded");
+        return Err(ProtocolError::from_domain(err));
+    }
+    Ok(())
+}
+
 /// Pulls the archive out of the `file` field of a multipart body.
 async fn read_archive(multipart: Result<Multipart, MultipartRejection>) -> Result<Bytes, ProtocolError> {
     let mut multipart = multipart.map_err(|rejection| upload_error(rejection.status(), &rejection.body_text()))?;
@@ -891,6 +969,12 @@ fn upload_error(status: StatusCode, detail: &str) -> ProtocolError {
 }
 
 /// Builds the listing body for a local package.
+///
+/// `latest` comes from [`latest_index`] — the registry's one `latest` rule, evaluated over the
+/// newest [`pub_registry::index::LATEST_WINDOW`] entries of this array, which is the same rule
+/// over the same window the package page and the search index use (decision 32). The array
+/// itself may be far longer: what a listing *carries* and what `latest` is *derived from* are
+/// two different bounds.
 fn build_listing(base: &Base, package: &Package, versions: &[Version]) -> PackageListing {
     let infos: Vec<VersionInfo> = versions.iter().map(|v| build_version(base, &package.name, v)).collect();
     let ladder: Vec<(bool, bool)> = versions.iter().map(|v| (v.is_retracted(), v.version.is_pre_release())).collect();
@@ -933,6 +1017,11 @@ fn build_version(base: &Base, name: &str, version: &Version) -> VersionInfo {
 /// marker is tracing and metrics only (decision 07), and the service emits it once where the
 /// staleness is decided. Re-emitting it here would double every counter, and putting it on the
 /// wire would be a protocol change no client asked for.
+///
+/// `latest` is re-derived rather than copied from upstream, and through the same
+/// [`latest_index`] — same rule, same [`pub_registry::index::LATEST_WINDOW`] — as a local
+/// package. A proxied package that is indistinguishable from a local one on the wire (sharp
+/// edge 12) has to be indistinguishable here too.
 fn build_proxied_listing(base: &Base, listing: &pub_registry::ProxiedListing) -> PackageListing {
     let infos: Vec<VersionInfo> =
         listing.versions.iter().map(|version| build_proxied_version(base, &listing.name, version)).collect();

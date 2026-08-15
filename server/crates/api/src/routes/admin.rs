@@ -25,9 +25,10 @@ use serde::Deserialize;
 use utoipa::IntoParams;
 
 use crate::dto::{
-    AdminOrgDto, AdminSettingsDto, AdminSettingsPatchBody, AdminStatsDto, AdminUserDto, AuditEventDto,
-    BrandingSettingsDto, JobRunDto, JobStateDto, ListDto, OrgDto, QuarantineDto, RateLimitSettingsDto,
-    RegistrationSettingsDto, ShadowingDto, SmtpSettingsDto, UpstreamCacheStatsDto, UpstreamSettingsDto, UserCountsDto,
+    AdminOrgDto, AdminOrgPatchBody, AdminOrgQuotaDto, AdminSettingsDto, AdminSettingsPatchBody, AdminStatsDto,
+    AdminUserDto, AuditEventDto, BrandingSettingsDto, JobRunDto, JobStateDto, ListDto, OrgDto, QuarantineDto,
+    RateLimitSettingsDto, RegistrationSettingsDto, ShadowingDto, SmtpSettingsDto, UpstreamCacheStatsDto,
+    UpstreamSettingsDto, UserCountsDto,
 };
 use crate::dto::{RegistrySettingsDto, RegistryStatsDto, SmtpSettingsPatchDto, SmtpTestResultDto};
 use crate::envelope::{ErrorEnvelope, OkEnvelope};
@@ -112,6 +113,10 @@ pub async fn update_settings(
             publish_per_hour_org: limits.publish_per_hour_org,
             read_per_ip_minute: limits.read_per_ip_minute,
             read_per_identity_minute: limits.read_per_identity_minute,
+            write_per_ip_minute: limits.write_per_ip_minute,
+            write_per_identity_minute: limits.write_per_identity_minute,
+            invitations_per_day_org: limits.invitations_per_day_org,
+            invitations_per_day_actor: limits.invitations_per_day_actor,
         }),
         smtp: body.smtp.map(smtp_from),
         branding: body.branding.map(|branding| BrandingSettings {
@@ -121,9 +126,10 @@ pub async fn update_settings(
             primary_color: branding.primary_color,
         }),
         upstream: body.upstream.map(upstream_from).transpose()?,
-        registry: body
-            .registry
-            .map(|registry| RegistrySettings { require_auth_for_read: registry.require_auth_for_read }),
+        registry: body.registry.map(|registry| RegistrySettings {
+            require_auth_for_read: registry.require_auth_for_read,
+            storage_quota_bytes: registry.storage_quota_bytes,
+        }),
     };
     let now = (state.clock)();
     let view = state.admin.update_settings(patch, &actor_meta(&auth, &meta), now).await?;
@@ -261,7 +267,7 @@ async fn set_suspended(
     Path(id): Path<String>,
     suspended: bool,
 ) -> Result<Json<OkEnvelope<AdminUserDto>>, ApiError> {
-    let id: UserId = id.parse().map_err(|_| Error::NotFound { what: format!("user {id}") })?;
+    let id: UserId = id.parse().map_err(|_| Error::NotFound { what: format!("user {}", clip(&id)) })?;
     let now = (state.clock)();
     let user = state.admin.set_user_suspended(id, suspended, &actor_meta(&auth, &meta), now).await?;
     Ok(Json(OkEnvelope::new(AdminUserDto::from(&user))))
@@ -286,15 +292,115 @@ pub async fn list_orgs(
     QueryParams(params): QueryParams<PageParams>,
 ) -> Result<Json<OkEnvelope<ListDto<AdminOrgDto>>>, ApiError> {
     let page = state.admin.list_orgs(params.cursor.as_deref(), params.limit()).await?;
+    // One snapshot for the whole page: the instance default is a runtime setting, and resolving
+    // half a page against one value and half against another would report a table no operator
+    // action ever produced.
+    let instance_default = state.runtime.current().registry.storage_quota_bytes;
     Ok(Json(OkEnvelope::new(ListDto {
         items: page
             .items
             .iter()
-            .map(|row| AdminOrgDto { org: OrgDto::from(&row.org), members: row.members, packages: row.packages })
+            .map(|row| AdminOrgDto {
+                org: OrgDto::from(&row.org),
+                members: row.members,
+                packages: row.packages,
+                storage_quota_bytes: quota_out(row.org.storage_quota_bytes),
+                // Resolved here rather than by the caller, through the one function that owns
+                // the rule (S-20.b). The listing is the only surface that showed what an
+                // operator *set* and never what an org is actually measured against.
+                effective_quota_bytes: pub_registry::publish::effective_storage_quota(
+                    row.org.storage_quota_bytes,
+                    instance_default,
+                ),
+            })
             .collect(),
         cursor: page.cursor,
         has_more: page.has_more,
     })))
+}
+
+/// Sets or clears one org's storage-quota override (S-20.b, decision 32).
+///
+/// **The first write the admin plane has ever had over an org**, and the reason it is here
+/// rather than on `PATCH /api/v1/orgs/{slug}` is the requirement itself: that route is reachable
+/// by an org Admin, and a quota an org can raise for itself is not a quota. The separation is
+/// structural rather than a role check — the field is absent from
+/// [`pub_core::org::OrgProfile`], which is the only payload that route can write.
+///
+/// Not step-up gated (S-06). It escalates no authority and destroys nothing: the worst a stolen
+/// admin session does here is stop an org publishing, which is loud, audited, and reversed by
+/// one more request.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/admin/orgs/{id}",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path, description = "Org id")),
+    request_body = AdminOrgPatchBody,
+    responses(
+        (status = OK, description = "The stored override and what it resolves to", body = OkEnvelope<AdminOrgQuotaDto>),
+        (status = BAD_REQUEST, description = "No fields supplied, or a quota outside 0..=i64::MAX", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Not an instance administrator", body = ErrorEnvelope),
+        // A malformed id is the same 404 an unknown one gets, and this route documents it as
+        // such: an id that is not a UUID names no org, and S-04 gives "never existed" and
+        // "cannot exist" the same answer rather than telling a caller which of the two it hit.
+        (status = NOT_FOUND, description = "Unknown org, or a malformed org id", body = ErrorEnvelope),
+    )
+)]
+pub async fn update_org(
+    State(state): State<AppState>,
+    InstanceAdmin(auth): InstanceAdmin,
+    RequestMeta(meta): RequestMeta,
+    Path(id): Path<String>,
+    Json(body): Json<AdminOrgPatchBody>,
+) -> Result<Json<OkEnvelope<AdminOrgQuotaDto>>, ApiError> {
+    let id: OrgId = id.parse().map_err(|_| Error::NotFound { what: format!("organization {}", clip(&id)) })?;
+    // An absent field is refused rather than read as one of the three states. `null` here means
+    // "clear the override" and is a real request; `{}` means the caller sent nothing, and
+    // answering 200 to it would report a quota nobody set.
+    let Some(quota) = body.storage_quota_bytes else {
+        return Err(ApiError(Error::Invalid { message: "no fields were supplied".to_owned() }));
+    };
+    // The body parses a **signed** number (see `AdminOrgPatchBody`) so that a negative arrives
+    // here as a value rather than dying inside serde as a 422 outside the error envelope: the
+    // refusal is `AdminService::set_org_storage_quota`'s, which is where the sentence explaining
+    // `0` and `null` lives, and it is unreachable unless a negative parses. The other direction
+    // — above `i64::MAX` — is the deserializer's 422 and stays that way; widening the parse to
+    // catch it was tried and `serde_json` refuses `i128` at the number, which took the negative
+    // case down with it.
+    let now = (state.clock)();
+    let org = state.admin.set_org_storage_quota(id, quota, &actor_meta(&auth, &meta), now).await?;
+    let effective = pub_registry::publish::effective_storage_quota(
+        org.storage_quota_bytes,
+        state.runtime.current().registry.storage_quota_bytes,
+    );
+    Ok(Json(OkEnvelope::new(AdminOrgQuotaDto {
+        id: org.id.to_string(),
+        slug: org.slug.clone(),
+        storage_quota_bytes: quota_out(org.storage_quota_bytes),
+        effective_quota_bytes: effective,
+    })))
+}
+
+/// Projects the stored override onto the wire. Negative rows cannot be written through this
+/// surface; one that exists anyway is reported as absent rather than as a negative byte count,
+/// which is also how the publish path reads it.
+fn quota_out(stored: Option<i64>) -> Option<u64> {
+    stored.map(|bytes| bytes.max(0) as u64)
+}
+
+/// Clips a caller-supplied path segment before it enters an error message
+/// ([S-20.a](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+///
+/// Every id on this surface is a UUID, so 64 characters is far more than any legitimate value
+/// needs and far less than an unbounded reflection: without it a 100 KB path segment comes back
+/// in the response body, in the log line, and in whatever aggregator reads either. `manage.rs`
+/// clips its own package and version segments the same way.
+///
+/// `chars`, not bytes: slicing a UTF-8 string at a byte offset panics mid-codepoint, and the
+/// segment is attacker-chosen.
+fn clip(segment: &str) -> String {
+    segment.chars().take(64).collect()
 }
 
 /// Query parameters for the audit viewer.
@@ -720,6 +826,10 @@ fn settings_dto(view: pub_admin::SettingsView) -> AdminSettingsDto {
             publish_per_hour_org: view.rate_limits.publish_per_hour_org,
             read_per_ip_minute: view.rate_limits.read_per_ip_minute,
             read_per_identity_minute: view.rate_limits.read_per_identity_minute,
+            write_per_ip_minute: view.rate_limits.write_per_ip_minute,
+            write_per_identity_minute: view.rate_limits.write_per_identity_minute,
+            invitations_per_day_org: view.rate_limits.invitations_per_day_org,
+            invitations_per_day_actor: view.rate_limits.invitations_per_day_actor,
         },
         smtp: SmtpSettingsDto {
             host: view.smtp.host,
@@ -739,7 +849,10 @@ fn settings_dto(view: pub_admin::SettingsView) -> AdminSettingsDto {
             enabled: view.upstream.enabled,
             default_org_policy: view.upstream.default_org_policy.as_str().to_owned(),
         },
-        registry: RegistrySettingsDto { require_auth_for_read: view.registry.require_auth_for_read },
+        registry: RegistrySettingsDto {
+            require_auth_for_read: view.registry.require_auth_for_read,
+            storage_quota_bytes: view.registry.storage_quota_bytes,
+        },
     }
 }
 

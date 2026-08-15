@@ -49,6 +49,7 @@ impl Settings {
         self.validate_auth()?;
         self.validate_smtp()?;
         self.validate_registry()?;
+        self.validate_orgs()?;
         self.validate_upstream()?;
         self.validate_jobs()?;
         self.validate_realtime()?;
@@ -184,6 +185,21 @@ impl Settings {
         // `dart pub get` stops working — while reading like "no limit configured" (S-24.f).
         if http.rate_limit.read_per_ip_minute == 0 || http.rate_limit.read_per_identity_minute == 0 {
             return Err(invalid("http.rate_limit values must be at least 1 (S-24.f)"));
+        }
+        // Same argument one plane over: zero would refuse every app-API mutation, which is an
+        // instance nobody can administer, while looking like "no limit configured" (S-24.g).
+        if http.rate_limit.write_per_ip_minute == 0 || http.rate_limit.write_per_identity_minute == 0 {
+            return Err(invalid("http.rate_limit write values must be at least 1 (S-24.g)"));
+        }
+        Ok(())
+    }
+
+    /// Org policy invariants ([S-24.h](../../../docs/security.md#5-audit--abuse)).
+    fn validate_orgs(&self) -> Result<(), ConfigError> {
+        // Zero would be an org that can never invite anybody — a closed instance dressed as a
+        // budget. An operator who wants that sets the registration mode instead.
+        if self.orgs.invitations_per_day_org == 0 || self.orgs.invitations_per_day_actor == 0 {
+            return Err(invalid("orgs.invitations_per_day_org and orgs.invitations_per_day_actor must be at least 1"));
         }
         Ok(())
     }
@@ -567,6 +583,10 @@ impl Settings {
         if registry.rate_limit.publish_per_hour_org == 0 {
             return Err(invalid("registry.rate_limit.publish_per_hour_org must be greater than 0"));
         }
+        // `registry.storage_quota_bytes` is deliberately **absent** from the checks above: unlike
+        // every other number in this section, `0` is its legal and default value and means
+        // *unlimited* (S-20.b). Adding it to a zero-rejecting rule would refuse the configuration
+        // a default install boots with. Its type (`u64`) already rules out a negative.
         Ok(())
     }
 

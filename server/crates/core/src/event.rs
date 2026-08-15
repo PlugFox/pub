@@ -306,6 +306,24 @@ pub enum DomainEvent {
         /// Event time (UTC).
         at: DateTime<Utc>,
     },
+    /// An org's live storage crossed 80 % of its effective quota (`org.storage_quota`,
+    /// [S-20.b](../../../docs/security.md#4-supply-chain--registry-integrity), decision 32).
+    ///
+    /// **Edge-triggered.** It is emitted by the publish that moves the org from *below* the
+    /// threshold to *at or above* it, and by no publish after that — decision 29's rule reused:
+    /// the crossing is the signal, not the state. An org whose effective quota is unlimited
+    /// never produces one, because there is no line to cross.
+    OrgStorageQuotaWarning {
+        /// The org whose storage crossed the line — also the audience.
+        org_id: OrgId,
+        /// Live archive bytes the org holds **after** the publish that crossed.
+        used_bytes: i64,
+        /// The effective quota the crossing was measured against: the org's own override when
+        /// it has one, the instance default otherwise. Always positive — unlimited never warns.
+        quota_bytes: u64,
+        /// Event time (UTC).
+        at: DateTime<Utc>,
+    },
     /// A notification was filed for one account (`notification.new`, decision 20).
     ///
     /// Emitted by the notification center *after* the row is committed, so a client that acts
@@ -348,12 +366,42 @@ impl DomainEvent {
             | Self::PackageShadowed { org_id, .. }
             | Self::OrgMembershipChanged { org_id, .. }
             | Self::OrgUpdated { org_id, .. }
-            | Self::OrgDeleted { org_id, .. } => Some(*org_id),
+            | Self::OrgDeleted { org_id, .. }
+            | Self::OrgStorageQuotaWarning { org_id, .. } => Some(*org_id),
             Self::PackageTransferred { to_org_id, .. } => Some(*to_org_id),
             Self::UpstreamQuarantined { .. }
             | Self::UpstreamDrifted { .. }
             | Self::InstanceSettingsChanged { .. }
             | Self::UserNotified { .. } => None,
+        }
+    }
+
+    /// The instant the event describes — the one every variant carries as `at`.
+    ///
+    /// An exhaustive `match` rather than a lookup, and that is the entire point of the method
+    /// existing at all ([D49](../../../docs/roadmap.md)). The notification consumer used to
+    /// reconstruct this by serializing the event and fishing out a string field named `at`,
+    /// falling back to `Utc::now()` on any failure — so a new variant that forgot the field
+    /// compiled clean, produced a queue row stamped at wall-clock time, and (behind the
+    /// integration suite's pinned clock) an unclaimable one: the whole fan-out silently never
+    /// happened while the pipeline stayed green. With the timestamp coming from the type, a
+    /// variant that omits `at` fails to compile here instead.
+    pub fn at(&self) -> DateTime<Utc> {
+        match self {
+            Self::PackagePublished { at, .. }
+            | Self::PackageRetracted { at, .. }
+            | Self::PackageOptionsChanged { at, .. }
+            | Self::PackageVersionDeleted { at, .. }
+            | Self::PackageTransferred { at, .. }
+            | Self::OrgMembershipChanged { at, .. }
+            | Self::OrgUpdated { at, .. }
+            | Self::OrgDeleted { at, .. }
+            | Self::OrgStorageQuotaWarning { at, .. }
+            | Self::InstanceSettingsChanged { at, .. }
+            | Self::UpstreamQuarantined { at, .. }
+            | Self::PackageShadowed { at, .. }
+            | Self::UpstreamDrifted { at, .. }
+            | Self::UserNotified { at, .. } => *at,
         }
     }
 
@@ -385,6 +433,7 @@ impl DomainEvent {
             Self::OrgMembershipChanged { .. } => "org.member",
             Self::OrgUpdated { .. } => "org.updated",
             Self::OrgDeleted { .. } => "org.deleted",
+            Self::OrgStorageQuotaWarning { .. } => "org.storage_quota",
             Self::InstanceSettingsChanged { .. } => "admin.settings",
             Self::UpstreamQuarantined { .. } => "upstream.quarantine",
             Self::UpstreamDrifted { .. } => "upstream.drift",
@@ -415,6 +464,12 @@ impl DomainEvent {
             Self::OrgMembershipChanged { .. } | Self::OrgUpdated { .. } | Self::OrgDeleted { .. } => {
                 Some(NotificationCategory::Org)
             }
+            // Running out of room is an org-administration fact, not a package one: the people
+            // who can act on it are the ones who hard-delete versions or ask for a bigger quota
+            // (S-20.b). `Org` rather than `Security` for the same reason — nothing is under
+            // attack, and `Security` is the tier reserved for what an admin must not be able to
+            // mute away.
+            Self::OrgStorageQuotaWarning { .. } => Some(NotificationCategory::Org),
             // Instance admins only; routed by the absent `org_id()`, like the S-19 alarms.
             Self::InstanceSettingsChanged { .. } => Some(NotificationCategory::Security),
             // Org admins: their name is the one being shadowed (S-17).
@@ -450,6 +505,12 @@ impl DomainEvent {
                 let verb = if *archived { "archived" } else { "deleted" };
                 format!("organization {slug} was {verb}")
             }
+            Self::OrgStorageQuotaWarning { used_bytes, quota_bytes, .. } => {
+                format!(
+                    "organization storage is at {}% of its {quota_bytes}-byte quota ({used_bytes} bytes used)",
+                    percent_of(*used_bytes, *quota_bytes)
+                )
+            }
             Self::InstanceSettingsChanged { keys, .. } => format!("instance settings changed: {}", keys.join(", ")),
             Self::UpstreamQuarantined { name, version, .. } => {
                 format!("upstream archive {name} {version} failed its hash check and was refused")
@@ -461,6 +522,19 @@ impl DomainEvent {
             Self::UserNotified { title, .. } => title.clone(),
         }
     }
+}
+
+/// `used` as a whole percentage of `quota`, saturating at 100 and answering 0 for an absent
+/// quota.
+///
+/// Widened to `u128` before multiplying: `used * 100` overflows `i64` above ~92 PB, which is a
+/// number a storage quota can legitimately be set to.
+fn percent_of(used: i64, quota: u64) -> u64 {
+    if quota == 0 {
+        return 0;
+    }
+    let used = used.max(0) as u128;
+    ((used * 100) / u128::from(quota)).min(100) as u64
 }
 
 /// Consumer seam for [`DomainEvent`]s.
@@ -594,5 +668,147 @@ mod tests {
     #[tokio::test]
     async fn noop_sink_swallows_events() {
         NoopEventSink.emit(published(OrgId::new())).await;
+    }
+
+    /// **S-20.b.** The quota warning is org-scoped, lands in the `org` category, and says how
+    /// full the org is in the one line a feed row shows.
+    #[test]
+    fn s20_b_a_storage_quota_warning_is_org_scoped_and_reports_how_full_the_org_is() {
+        let org = OrgId::new();
+        let event =
+            DomainEvent::OrgStorageQuotaWarning { org_id: org, used_bytes: 850, quota_bytes: 1000, at: Utc::now() };
+        assert_eq!(event.org_id(), Some(org));
+        assert_eq!(event.audience(), EventAudience::Org(org));
+        assert_eq!(event.name(), "org.storage_quota");
+        assert_eq!(event.notification_category(), Some(NotificationCategory::Org));
+        assert!(event.summary().contains("85%"), "{}", event.summary());
+    }
+
+    /// **D49.** `at()` is the accessor the notification consumer reads instead of re-deriving
+    /// the timestamp from JSON — so the invariant "every variant carries `at`" is enforced by
+    /// the compiler. This walks every variant's serialized form as the second half of the same
+    /// claim: the field is on the wire under exactly that name for every one of them.
+    #[test]
+    fn d49_every_variant_reports_its_own_timestamp_from_the_type_and_on_the_wire() {
+        let at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 14, 9, 30, 0).unwrap();
+        let org = OrgId::new();
+        let events = vec![
+            DomainEvent::PackagePublished {
+                format: Format::Pub,
+                org_id: org,
+                package_id: PackageId::new(),
+                name: "acme_core".to_owned(),
+                version: "1.0.0".to_owned(),
+                version_id: VersionId::new(),
+                package_created: true,
+                at,
+            },
+            DomainEvent::PackageRetracted {
+                format: Format::Pub,
+                org_id: org,
+                package_id: PackageId::new(),
+                name: "acme_core".to_owned(),
+                version: "1.0.0".to_owned(),
+                version_id: VersionId::new(),
+                retracted: true,
+                at,
+            },
+            DomainEvent::PackageOptionsChanged {
+                format: Format::Pub,
+                org_id: org,
+                package_id: PackageId::new(),
+                name: "acme_core".to_owned(),
+                visibility: "private".to_owned(),
+                discontinued: false,
+                unlisted: false,
+                at,
+            },
+            DomainEvent::PackageVersionDeleted {
+                format: Format::Pub,
+                org_id: org,
+                package_id: PackageId::new(),
+                name: "acme_core".to_owned(),
+                version: "1.0.0".to_owned(),
+                version_id: VersionId::new(),
+                blob_removed: true,
+                at,
+            },
+            DomainEvent::PackageTransferred {
+                format: Format::Pub,
+                from_org_id: org,
+                to_org_id: OrgId::new(),
+                package_id: PackageId::new(),
+                name: "acme_core".to_owned(),
+                at,
+            },
+            DomainEvent::OrgMembershipChanged { org_id: org, user_id: UserId::new(), role: Some(100), at },
+            DomainEvent::OrgUpdated { org_id: org, upstream_policy: "allow".to_owned(), at },
+            DomainEvent::OrgDeleted { org_id: org, slug: "acme".to_owned(), archived: true, at },
+            DomainEvent::OrgStorageQuotaWarning { org_id: org, used_bytes: 8, quota_bytes: 10, at },
+            DomainEvent::InstanceSettingsChanged { keys: vec!["registry".to_owned()], version: 2, at },
+            DomainEvent::UpstreamQuarantined {
+                format: Format::Pub,
+                upstream: "https://pub.dev".to_owned(),
+                name: "http".to_owned(),
+                version: "1.0.0".to_owned(),
+                expected_sha256: "a".repeat(64),
+                actual_sha256: "b".repeat(64),
+                at,
+            },
+            DomainEvent::PackageShadowed {
+                format: Format::Pub,
+                org_id: org,
+                name: "acme_core".to_owned(),
+                upstream: "https://pub.dev".to_owned(),
+                upstream_version: None,
+                at,
+            },
+            DomainEvent::UpstreamDrifted {
+                format: Format::Pub,
+                upstream: "https://pub.dev".to_owned(),
+                name: "http".to_owned(),
+                version: "1.0.0".to_owned(),
+                cached_sha256: "a".repeat(64),
+                upstream_sha256: "b".repeat(64),
+                at,
+            },
+            DomainEvent::UserNotified {
+                user_id: UserId::new(),
+                notification_id: NotificationId::new(),
+                category: NotificationCategory::Org,
+                title: "hello".to_owned(),
+                unread: 1,
+                at,
+            },
+        ];
+        // Every variant, so a new one that is not added here is visible as a gap rather than
+        // as nothing: the count is asserted against the `name()` set, which the compiler forces
+        // a new variant into.
+        let mut names: Vec<&str> = events.iter().map(DomainEvent::name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), events.len(), "one event per variant, and every name distinct: {names:?}");
+        for event in &events {
+            assert_eq!(event.at(), at, "{} does not report its own timestamp", event.name());
+            let json = serde_json::to_value(event).unwrap();
+            assert!(
+                json.get("at").and_then(serde_json::Value::as_str).is_some(),
+                "{} has no `at` on the wire",
+                event.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_percentage_saturates_and_survives_a_petabyte_quota() {
+        assert_eq!(percent_of(0, 100), 0);
+        assert_eq!(percent_of(80, 100), 80);
+        // Over-quota is reachable: the bound is loose by one round of concurrent publishes
+        // (S-20.b), and "137% full" in a feed row is worse than "100%".
+        assert_eq!(percent_of(200, 100), 100);
+        // No quota, no percentage — and no division by zero.
+        assert_eq!(percent_of(5, 0), 0);
+        // `used * 100` overflows i64 above ~92 PB; the widening is what keeps this honest.
+        assert_eq!(percent_of(800 * 1024_i64.pow(5), 1000 * 1024_u64.pow(5)), 80);
     }
 }

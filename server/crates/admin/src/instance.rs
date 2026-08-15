@@ -598,6 +598,72 @@ impl AdminService {
         self.repos.orgs.list_all(cursor, limit).await
     }
 
+    /// Sets or clears one org's storage-quota override
+    /// ([S-20.b](../../../../docs/security.md#4-supply-chain--registry-integrity), decision 32).
+    ///
+    /// **The admin plane's first write over an org**, and it lives here rather than on
+    /// `OrgService` for the reason the quota exists: `PATCH /api/v1/orgs/{slug}` is reachable by
+    /// an org Admin, and a quota its subject can raise is not a quota. The field is deliberately
+    /// absent from [`pub_core::org::OrgProfile`], so there is no path from that route to this
+    /// column at all — the separation is structural, not a role check somebody can relax.
+    ///
+    /// `quota`: `None` clears the override and the org follows `registry.storage_quota_bytes`
+    /// again; `Some(0)` is an explicit "unlimited for this org" that stops following the
+    /// instance default; a positive number is bytes. A **negative** number is refused here — the
+    /// column would take it, [`pub_registry::publish::effective_storage_quota`] would read it as
+    /// unlimited, and an operator who typed `-1` expecting a wall would get the opposite of what
+    /// they asked for with nothing to tell them.
+    ///
+    /// That refusal is **reachable from HTTP**, which it has to be for this paragraph to be true
+    /// of anything an operator experiences: `AdminOrgPatchBody` parses a signed, wider number
+    /// precisely so a negative arrives here as a value rather than dying inside serde as a bare
+    /// 422 outside the error envelope. Asserted on the wire, not from here
+    /// (`api/tests/admin.rs::s20_b_a_malformed_quota_patch_is_refused_inside_the_envelope`),
+    /// because "the service refuses it" and "the operator is told" were exactly the two claims
+    /// that had come apart.
+    ///
+    /// Audited like every other admin action (S-22), with the before/after pair; no domain
+    /// event, because the number is an operator fact about the instance rather than a change to
+    /// what the org's members can see or do.
+    pub async fn set_org_storage_quota(
+        &self,
+        target: pub_core::OrgId,
+        quota: Option<i64>,
+        actor: &ActorMeta,
+        now: DateTime<Utc>,
+    ) -> Result<pub_core::org::Org> {
+        if let Some(bytes) = quota
+            && bytes < 0
+        {
+            return Err(Error::Invalid {
+                message: "storage_quota_bytes must not be negative: use 0 for unlimited, or null to follow the \
+                          instance default"
+                    .to_owned(),
+            });
+        }
+        let before = self
+            .repos
+            .orgs
+            .get(target)
+            .await?
+            .ok_or_else(|| Error::NotFound { what: format!("organization {target}") })?;
+        let org = self.repos.orgs.set_storage_quota(target, quota, now).await?;
+        self.audit(
+            actor,
+            "admin.org.quota",
+            Some(target.to_string()),
+            AuditResult::Success,
+            serde_json::json!({
+                "slug": org.slug,
+                "before": before.storage_quota_bytes,
+                "after": org.storage_quota_bytes,
+            }),
+            now,
+        )
+        .await;
+        Ok(org)
+    }
+
     // -------------------------------------------------------------------------------- audit
 
     /// The audit viewer (S-22/S-23), newest first.
@@ -763,7 +829,13 @@ fn validate_rate_limits(limits: &RateLimitSettings) -> Result<()> {
         ("token_auth_fail_per_ip_minute", limits.token_auth_fail_per_ip_minute),
         ("read_per_ip_minute", limits.read_per_ip_minute),
         ("read_per_identity_minute", limits.read_per_identity_minute),
+        ("write_per_ip_minute", limits.write_per_ip_minute),
+        ("write_per_identity_minute", limits.write_per_identity_minute),
         ("publish_per_hour_org", limits.publish_per_hour_org),
+        // Not buckets — exact rolling-window counts (S-24.h) — but a zero closes invitations for
+        // the whole instance just as thoroughly, so it belongs to the same rule.
+        ("invitations_per_day_org", limits.invitations_per_day_org),
+        ("invitations_per_day_actor", limits.invitations_per_day_actor),
     ]
     .into_iter()
     .filter(|(_, value)| *value == 0)
@@ -871,13 +943,51 @@ mod tests {
     #[test]
     fn the_view_reports_the_registry_section() {
         let settings = RuntimeSettings {
-            registry: pub_core::settings::RegistrySettings { require_auth_for_read: true },
+            registry: pub_core::settings::RegistrySettings {
+                require_auth_for_read: true,
+                storage_quota_bytes: 5 * 1024 * 1024 * 1024,
+            },
             ..RuntimeSettings::default()
         };
         let view = AdminService::view(&settings, 9);
         assert!(view.registry.require_auth_for_read);
+        assert_eq!(view.registry.storage_quota_bytes, 5 * 1024 * 1024 * 1024);
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["registry"]["require_auth_for_read"], true);
+        assert_eq!(json["registry"]["storage_quota_bytes"], 5_368_709_120_u64);
+    }
+
+    /// **S-20.b.** The quota is the one number in this document where `0` is a legal value with
+    /// a meaning — *unlimited* — so it must not be swept up by the zero-rejecting rule that
+    /// protects the rate limits, and the rate limits must not stop rejecting zero to let it
+    /// through. It sits in the `registry` section rather than in `rate_limits` for that reason.
+    #[test]
+    fn s20_b_a_zero_storage_quota_means_unlimited_and_is_not_a_rate_limit() {
+        let unlimited = RegistrySettings { require_auth_for_read: false, storage_quota_bytes: 0 };
+        let settings = RuntimeSettings { registry: unlimited, ..RuntimeSettings::default() };
+        // Nothing refuses it: the quota is not part of the rate-limit table…
+        assert!(validate_rate_limits(&settings.rate_limits).is_ok());
+        assert_eq!(AdminService::view(&settings, 1).registry.storage_quota_bytes, 0);
+        // …while every number that *is* still refuses a zero, the four new ones included.
+        for (name, limits) in [
+            ("write_per_ip_minute", RateLimitSettings { write_per_ip_minute: 0, ..RateLimitSettings::default() }),
+            (
+                "write_per_identity_minute",
+                RateLimitSettings { write_per_identity_minute: 0, ..RateLimitSettings::default() },
+            ),
+            (
+                "invitations_per_day_org",
+                RateLimitSettings { invitations_per_day_org: 0, ..RateLimitSettings::default() },
+            ),
+            (
+                "invitations_per_day_actor",
+                RateLimitSettings { invitations_per_day_actor: 0, ..RateLimitSettings::default() },
+            ),
+        ] {
+            let err = validate_rate_limits(&limits).unwrap_err();
+            assert_eq!(err.code(), "invalid_argument");
+            assert!(err.to_string().contains(name), "the refusal must name {name}: {err}");
+        }
     }
 
     #[test]

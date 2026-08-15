@@ -9,6 +9,9 @@ publish.workspace = true
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }
+# The S-24.h invitation caps emit `rate_limit_trips_total` like every other bucket in the
+# system; a limit whose trips are invisible to the operator's dashboard is not a limit.
+metrics = { workspace = true }
 # Session revocation on every authority change (S-09) and KEK sealing of the runtime SMTP
 # password (S-26) both live in the auth crate; duplicating either here is how the two copies
 # drift apart.
