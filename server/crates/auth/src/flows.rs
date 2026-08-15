@@ -41,11 +41,36 @@ use crate::oidc::{OidcClient, ProviderConfig, StartedFlow};
 use crate::random::RandomSource;
 use crate::{otp, ratelimit, token, totp};
 
-/// Default CLI-token lifetime when the caller does not pick one (S-13).
+/// The lifetime the token UI pre-fills, in days (S-13's "default expiry 90 days").
+///
+/// **Not a server-side fallback**, since [decision 33](../../../../docs/decisions.md#33): an
+/// absent `expires_days` means *never*, so there is nothing left for the mint to default. It
+/// lives here rather than in the frontend because it is the product's stated number and the
+/// OpenAPI document quotes it.
 pub const DEFAULT_TOKEN_EXPIRY_DAYS: i64 = 90;
 
 /// Upper bound on a caller-chosen token lifetime (10 years — effectively "long", still finite).
 pub const MAX_TOKEN_EXPIRY_DAYS: i64 = 3650;
+
+/// What a caller asked [`AuthService::mint_token`] for (S-13).
+///
+/// A struct rather than four more parameters: the two fields decision 33 added are the ones a
+/// future caller is most likely to forget, and a positional `None` that silently means "this
+/// token never expires" is exactly the shape that should not be spellable by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenRequest {
+    /// User-chosen label; the mint supplies a neutral default when absent.
+    pub label: Option<String>,
+    /// Requested scopes; must not be empty.
+    pub scopes: Vec<TokenScope>,
+    /// Package-name patterns narrowing the token further; empty means no narrowing. Validated
+    /// against [`pub_core::token::validate_patterns`] at the mint.
+    pub package_patterns: Vec<String>,
+    /// Lifetime in days, or `None` for a **non-expiring** token — which S-13.c permits only for
+    /// a pure-`read` token and [S-06.d](../../../../docs/security.md#1-authentication) gates
+    /// behind a fresh second factor.
+    pub expires_days: Option<i64>,
+}
 
 /// The body a **suppressed** mail row carries (S-04.a, S-31).
 ///
@@ -1086,26 +1111,42 @@ impl AuthService {
 
     /// Mints a CLI/API token bound to `org`. Returns the stored row plus the show-once
     /// plaintext secret. Requires the org role matching each requested scope (decision 19).
+    ///
+    /// Two of [`TokenRequest`]'s fields are the S-13 clauses this flow used to ignore — see
+    /// [S-13.c](../../../../docs/security.md#3-cliapi-tokens). The step-up gates that go with
+    /// them live at the route, because both depend on the parsed body (S-06, S-06.d).
     pub async fn mint_token(
         &self,
         user: UserId,
         org: OrgId,
-        label: Option<String>,
-        scopes: Vec<TokenScope>,
-        expires_days: Option<i64>,
+        request: TokenRequest,
         meta: &ClientMeta,
         now: DateTime<Utc>,
     ) -> Result<(Token, String)> {
+        let TokenRequest { label, scopes, package_patterns, expires_days } = request;
         if scopes.is_empty() {
             return Err(Error::Invalid { message: "at least one scope is required".into() });
         }
-        if let Some(days) = expires_days
-            && !(1..=MAX_TOKEN_EXPIRY_DAYS).contains(&days)
-        {
-            return Err(Error::Invalid {
-                message: format!("expires_days must be between 1 and {MAX_TOKEN_EXPIRY_DAYS}"),
-            });
-        }
+        let package_patterns = pub_core::token::validate_patterns(&package_patterns)?;
+
+        // S-13.c: `None` is "never", and a credential with no expiry may carry `read` and
+        // nothing else. Refused here rather than at the route because it is a property of the
+        // token, not of the request that asked for one — every future caller of the mint
+        // inherits it.
+        let expires_at = match expires_days {
+            Some(days) if !(1..=MAX_TOKEN_EXPIRY_DAYS).contains(&days) => {
+                return Err(Error::Invalid {
+                    message: format!("expires_days must be between 1 and {MAX_TOKEN_EXPIRY_DAYS}, or null for never"),
+                });
+            }
+            Some(days) => Some(now + Duration::days(days)),
+            None if scopes.iter().all(|scope| matches!(scope, TokenScope::Read)) => None,
+            None => {
+                return Err(Error::Invalid {
+                    message: "a non-expiring token may only carry the read scope (S-13)".into(),
+                });
+            }
+        };
 
         // Role check against the durable membership (claims may be older than a just-created
         // org). A non-member cannot see the org: uniform NotFound (S-04).
@@ -1118,7 +1159,6 @@ impl AuthService {
         }
 
         let minted = token::mint(&self.policy.token_prefix, self.rng.as_ref());
-        let expires_at = Some(now + Duration::days(expires_days.unwrap_or(DEFAULT_TOKEN_EXPIRY_DAYS)));
         let stored = self
             .repos
             .tokens
@@ -1130,7 +1170,7 @@ impl AuthService {
                     token_hash: minted.hash,
                     display_hint: minted.display_hint,
                     scopes: scopes.clone(),
-                    package_patterns: Vec::new(),
+                    package_patterns: package_patterns.clone(),
                     expires_at,
                 },
                 now,
@@ -1145,6 +1185,11 @@ impl AuthService {
             serde_json::json!({
                 "org": org.to_string(),
                 "scopes": scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                // Both recorded because both are authorization surface: a narrowing nobody can
+                // see afterwards is a narrowing nobody can audit, and "this credential never
+                // expires" is the single most consequential thing about the row.
+                "package_patterns": package_patterns,
+                "expires_at": expires_at,
             }),
             now,
         )

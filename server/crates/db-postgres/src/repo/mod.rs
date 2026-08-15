@@ -57,7 +57,7 @@ pub use search::{PgPackageSearch, PgStatsRepo};
 pub use sessions::PgSessionRepo;
 pub use settings::PgSettingsRepo;
 pub use tokens::PgTokenRepo;
-pub use upstream::PgUpstreamRepo;
+pub use upstream::{PgUpstreamRepo, quarantine_page_sql, shadowing_page_sql};
 pub use users::PgUserRepo;
 
 /// Builds a query string from **const fragments only** (column lists, table names) and marks

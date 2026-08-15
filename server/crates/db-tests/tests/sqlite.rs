@@ -100,6 +100,11 @@ async fn supply_chain_registers_contract_s17_s19() {
 }
 
 #[tokio::test]
+async fn supply_chain_register_pages_contract_s17b_s19b_s23b() {
+    pub_db_tests::contract::supply_chain_register_pages(&fresh_repos().await).await;
+}
+
+#[tokio::test]
 async fn job_repo_contract() {
     pub_db_tests::contract::job_repo(&fresh_repos().await).await;
 }
@@ -406,4 +411,98 @@ async fn the_blob_collectors_reference_check_is_an_index_lookup() {
         "the proxy-cache reference check scans `upstream_versions`: {cached}"
     );
     assert!(!cached.contains("SCAN upstream_versions"), "{cached}");
+}
+
+/// **S-17.b / S-19.b / S-23.b.** The registers' page walks and their two retention deletes seek.
+///
+/// The registers are anonymous-unreachable — every statement here is behind an instance-admin
+/// route or the retention job — so this is not about a hot path. It is about the shape a keyset
+/// walk needs to *be correct*: the whole primary key in the ORDER BY, in one direction, over an
+/// index that carries it. A walk whose tie-break columns are a post-filter still returns the
+/// right rows on a small table and starts skipping them exactly when the register fills up.
+///
+/// The SQL is read from the repository (`quarantine_page_sql` / `shadowing_page_sql`), never
+/// copied here, and the assertions name the **seek's usable columns** rather than an index —
+/// both per [D52](../../../../docs/roadmap.md) and the working agreement above it.
+#[tokio::test]
+async fn s17b_s19b_the_register_pages_and_purges_seek() {
+    let cfg =
+        DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
+    let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
+    db.run_migrations().await.expect("migrate");
+
+    // `AssertSqlSafe`: every statement below comes from the repository crate or from literals in
+    // this file, and the cursor components still travel as binds exactly as in production.
+    let plan = async |sql: &str| -> String {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("explain");
+        rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | ")
+    };
+
+    // The first page of each register: no predicate at all, so the only thing an index can buy
+    // is the ordering — and that is the whole point, because without it every page sorts the
+    // table.
+    let first = plan(pub_db_sqlite::repo::quarantine_page_sql(false)).await;
+    assert!(first.contains("upstream_quarantine_page_idx"), "the first quarantine page sorts the table: {first}");
+    assert!(!first.contains("TEMP B-TREE"), "the newest-first order must come from the index, not a sort: {first}");
+
+    // The continuation: the row-value comparison has to become a seek, not a filter over a scan.
+    let next = plan(pub_db_sqlite::repo::quarantine_page_sql(true)).await;
+    assert!(next.contains("upstream_quarantine_page_idx"), "the quarantine walk scans: {next}");
+    // The seek's usable columns, spelled the way SQLite renders a row-value seek: all four
+    // inside the parentheses. A plan that sought on `last_seen_at` alone and post-filtered the
+    // rest would still be an index search and still be wrong — that is the whole reason the
+    // assertion is on the columns and not on the index name.
+    assert!(
+        next.contains("(last_seen_at,format,name,version)<"),
+        "the keyset is a post-filter, so the walk re-reads the tied rows on every page: {next}"
+    );
+    assert!(!next.contains("TEMP B-TREE"), "{next}");
+
+    // All three shadowing slices, paged. The active one must reach the *partial* index — that is
+    // what keeps "what is asking for attention" proportional to the open alarms rather than to
+    // every alarm ever raised.
+    for (active, index) in [
+        (None, "shadowing_alarms_page_idx"),
+        (Some(true), "shadowing_alarms_active_idx"),
+        (Some(false), "shadowing_alarms_page_idx"),
+    ] {
+        let page = plan(pub_db_sqlite::repo::shadowing_page_sql(active, true)).await;
+        assert!(page.contains(index), "the {active:?} shadowing slice does not seek {index}: {page}");
+        assert!(
+            page.contains("(last_seen_at,format,name)<"),
+            "the {active:?} keyset is a post-filter over the tie-break columns: {page}"
+        );
+        assert!(!page.contains("TEMP B-TREE"), "the {active:?} slice sorts: {page}");
+    }
+
+    // The two retention deletes. Each is a write, so an unindexed one holds SQLite's single
+    // writer for its whole scan — the failure class every bounded delete in this product exists
+    // to avoid.
+    let quarantine_purge = plan(
+        "DELETE FROM upstream_quarantine WHERE (format, name, version) IN \
+         (SELECT format, name, version FROM upstream_quarantine WHERE last_seen_at < ? ORDER BY last_seen_at LIMIT ?)",
+    )
+    .await;
+    assert!(
+        quarantine_purge.contains("upstream_quarantine_page_idx"),
+        "quarantine retention full-scans the register: {quarantine_purge}"
+    );
+
+    // The shadowing purge must seek the **partial** index, because its `IS NOT NULL` half is what
+    // makes an active alarm undeletable. A plan that reached the unfiltered index here would be a
+    // plan for a statement that had dropped that half.
+    let shadowing_purge = plan(
+        "DELETE FROM shadowing_alarms WHERE (format, name) IN \
+         (SELECT format, name FROM shadowing_alarms \
+          WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ? ORDER BY acknowledged_at LIMIT ?)",
+    )
+    .await;
+    assert!(
+        shadowing_purge.contains("shadowing_alarms_ack_idx"),
+        "shadowing retention does not seek the acknowledged-only index: {shadowing_purge}"
+    );
 }

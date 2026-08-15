@@ -96,6 +96,80 @@ pub fn patterns_allow(patterns: &[String], name: &str) -> bool {
     })
 }
 
+/// Most patterns one token may carry.
+///
+/// A narrowing needs a handful of prefixes; a list this long is a caller building an allowlist
+/// out of exact names, which is a job for a second token.
+pub const MAX_TOKEN_PATTERNS: usize = 32;
+
+/// Longest single pattern, matching the package-name bound the registry enforces at publish.
+pub const MAX_PATTERN_LEN: usize = 64;
+
+/// Validates and normalizes a token's package patterns against the grammar
+/// [`patterns_allow`] actually reads ([S-13.c](../../../docs/security.md#3-cliapi-tokens)).
+///
+/// Checked at the **mint**, because the matcher never fails: a pattern it cannot satisfy does
+/// not produce a narrower token, it produces a token that authorizes **nothing**, and its owner
+/// discovers that at the first CI publish. The vocabulary is one wildcard wide — a single
+/// trailing `*` is a prefix match, anything else is an exact name — so everything outside it is
+/// refused here rather than stored as an authorization rule nobody can satisfy:
+///
+/// - a leading or interior `*`, or more than one `*` (there is no glob engine behind this, and
+///   inviting one into an authorization decision is how a pattern becomes a denial of service);
+/// - a bare `*`, because an empty list already means "no narrowing" and two spellings of one
+///   meaning is a thing an operator has to test to believe;
+/// - an empty pattern, one over [`MAX_PATTERN_LEN`], or any character outside the package-name
+///   alphabet `[a-z0-9_]` once the trailing `*` is stripped — a package name can never contain a
+///   dot, a dash, a slash or an upper-case letter, so such a pattern matches nothing forever;
+/// - more than [`MAX_TOKEN_PATTERNS`] of them.
+///
+/// Duplicates are dropped and the caller's order is preserved, so what the token list renders is
+/// what the mint stored.
+pub fn validate_patterns(patterns: &[String]) -> Result<Vec<String>, Error> {
+    if patterns.len() > MAX_TOKEN_PATTERNS {
+        return Err(Error::Invalid {
+            message: format!("at most {MAX_TOKEN_PATTERNS} package patterns per token, got {}", patterns.len()),
+        });
+    }
+    let mut normalized: Vec<String> = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let invalid = |reason: &str| Error::Invalid {
+            // The pattern is caller-supplied text going into an error message; it is bounded
+            // above by the length check below, but a rejected one may be arbitrarily long, so it
+            // is clipped rather than echoed whole.
+            message: format!("package pattern {:?} is invalid: {reason}", clip_pattern(pattern)),
+        };
+        if pattern.is_empty() {
+            return Err(invalid("it is empty"));
+        }
+        // `chars`, not bytes: the message says "characters" and a message that means bytes is
+        // the kind of unasserted claim this codebase keeps finding. A multi-byte pattern is
+        // refused by the charset rule below either way — but for the right reason.
+        if pattern.chars().count() > MAX_PATTERN_LEN {
+            return Err(invalid("it is longer than 64 characters"));
+        }
+        if pattern == "*" {
+            return Err(invalid("an empty pattern list already means every package"));
+        }
+        let stem = pattern.strip_suffix('*').unwrap_or(pattern);
+        if stem.contains('*') {
+            return Err(invalid("the only wildcard is a single trailing '*'"));
+        }
+        if !stem.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_') {
+            return Err(invalid("package names are lower-case [a-z0-9_], so this can never match"));
+        }
+        if !normalized.iter().any(|kept| kept == pattern) {
+            normalized.push(pattern.clone());
+        }
+    }
+    Ok(normalized)
+}
+
+/// First 64 characters of a rejected pattern, for an error message.
+fn clip_pattern(pattern: &str) -> String {
+    pattern.chars().take(MAX_PATTERN_LEN).collect()
+}
+
 /// A CLI/API token. The hash is deliberately not exposed on the domain struct — lookups go
 /// through hash-keyed repository methods.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,5 +294,61 @@ mod tests {
     #[test]
     fn a_lone_star_admits_everything() {
         assert!(patterns_allow(&["*".to_owned()], "whatever"));
+    }
+
+    fn patterns(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    #[test]
+    fn s13_c_the_grammar_the_matcher_reads_is_the_grammar_the_mint_accepts() {
+        let accepted = patterns(&["acme_*", "shared_utils", "a", "_", "pkg9_*"]);
+        assert_eq!(validate_patterns(&accepted).unwrap(), accepted);
+    }
+
+    #[test]
+    fn s13_c_everything_the_matcher_cannot_satisfy_is_refused() {
+        // Each of these would mint a token that authorizes nothing: `patterns_allow` reads one
+        // trailing `*` or an exact lower-case name, and a package name can carry none of these
+        // characters, so the pattern could never match anything for the life of the token.
+        for bad in ["", "*", "*acme", "ac*me", "acme_**", "acme-*", "Acme_*", "acme.core", "acme/core", "acme core"] {
+            let err = validate_patterns(&patterns(&[bad])).unwrap_err();
+            assert_eq!(err.code(), "invalid_argument", "{bad:?} should have been refused");
+        }
+        let long = "a".repeat(MAX_PATTERN_LEN + 1);
+        assert_eq!(validate_patterns(&[long]).unwrap_err().code(), "invalid_argument");
+        // Sixty-four multi-byte characters is 128 bytes and still sixty-four characters: it is
+        // refused for its alphabet, which is what the message would say, rather than for a
+        // length it does not exceed.
+        let cyrillic = "ы".repeat(MAX_PATTERN_LEN);
+        let err = validate_patterns(&[cyrillic]).unwrap_err();
+        assert!(err.to_string().contains("lower-case"), "refused for the wrong reason: {err}");
+        let many: Vec<String> = (0..=MAX_TOKEN_PATTERNS).map(|i| format!("pkg{i}")).collect();
+        assert_eq!(validate_patterns(&many).unwrap_err().code(), "invalid_argument");
+    }
+
+    #[test]
+    fn s13_c_a_pattern_at_the_bounds_is_kept() {
+        // The refusals above must be off-by-one-proof in the permissive direction too: the
+        // longest legal pattern and a full list are ordinary inputs, not edge failures.
+        let longest = "a".repeat(MAX_PATTERN_LEN);
+        assert_eq!(validate_patterns(std::slice::from_ref(&longest)).unwrap(), vec![longest]);
+        let full: Vec<String> = (0..MAX_TOKEN_PATTERNS).map(|i| format!("pkg{i}")).collect();
+        assert_eq!(validate_patterns(&full).unwrap().len(), MAX_TOKEN_PATTERNS);
+    }
+
+    #[test]
+    fn s13_c_duplicates_collapse_and_order_survives() {
+        let stored = validate_patterns(&patterns(&["b_*", "a_x", "b_*", "a_x"])).unwrap();
+        assert_eq!(stored, patterns(&["b_*", "a_x"]), "the token list renders what the mint stored");
+    }
+
+    #[test]
+    fn s13_c_a_rejected_pattern_is_clipped_out_of_the_message() {
+        // Caller-supplied text reaching an error message is clipped everywhere else in this
+        // codebase; a pattern refused *for its length* is the one input that would otherwise
+        // echo an unbounded string back.
+        let err = validate_patterns(&["Z".repeat(4096)]).unwrap_err();
+        assert!(err.to_string().len() < 200, "an over-long pattern must not be echoed whole: {err}");
     }
 }

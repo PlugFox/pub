@@ -483,6 +483,8 @@ impl Settings {
             ("jobs.lifecycle.retain_invitations_days", lifecycle.retain_invitations_days),
             ("jobs.lifecycle.retain_notifications_days", lifecycle.retain_notifications_days),
             ("jobs.lifecycle.retain_download_stats_days", lifecycle.retain_download_stats_days),
+            ("jobs.lifecycle.retain_quarantine_days", lifecycle.retain_quarantine_days),
+            ("jobs.lifecycle.retain_shadowing_days", lifecycle.retain_shadowing_days),
         ] {
             if days < 0 {
                 return Err(invalid(format!("{key} = {days} must be 0 (keep forever) or positive")));

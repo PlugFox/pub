@@ -27,8 +27,8 @@ use utoipa::IntoParams;
 use crate::dto::{
     AdminOrgDto, AdminOrgPatchBody, AdminOrgQuotaDto, AdminSettingsDto, AdminSettingsPatchBody, AdminStatsDto,
     AdminUserDto, AuditEventDto, BrandingSettingsDto, JobRunDto, JobStateDto, ListDto, OrgDto, QuarantineDto,
-    RateLimitSettingsDto, RegistrationSettingsDto, ShadowingDto, SmtpSettingsDto, UpstreamCacheStatsDto,
-    UpstreamSettingsDto, UserCountsDto,
+    RateLimitSettingsDto, RegistrationSettingsDto, ShadowingAckDto, ShadowingDto, SmtpSettingsDto,
+    UpstreamCacheStatsDto, UpstreamSettingsDto, UserCountsDto,
 };
 use crate::dto::{RegistrySettingsDto, RegistryStatsDto, SmtpSettingsPatchDto, SmtpTestResultDto};
 use crate::envelope::{ErrorEnvelope, OkEnvelope};
@@ -736,32 +736,10 @@ pub async fn stats(
             cached_versions: stats.upstream_cache.cached_versions,
             cached_bytes: stats.upstream_cache.cached_bytes,
         },
-        quarantine: stats
-            .quarantine
-            .iter()
-            .map(|entry| QuarantineDto {
-                name: entry.name.clone(),
-                version: entry.version.clone(),
-                upstream: entry.upstream.clone(),
-                expected_sha256: entry.expected_sha256.clone(),
-                actual_sha256: entry.actual_sha256.clone(),
-                occurrences: entry.occurrences,
-                last_seen_at: entry.last_seen_at,
-            })
-            .collect(),
-        shadowing: stats
-            .shadowing
-            .iter()
-            .map(|alarm| ShadowingDto {
-                name: alarm.name.clone(),
-                org_id: alarm.org_id.to_string(),
-                upstream: alarm.upstream.clone(),
-                upstream_version: alarm.upstream_version.clone(),
-                observations: alarm.observations,
-                active: alarm.is_active(),
-                last_seen_at: alarm.last_seen_at,
-            })
-            .collect(),
+        // The same conversion the full registers use, so the dashboard sample and the paged
+        // listing can never disagree about what a row looks like.
+        quarantine: stats.quarantine.iter().map(QuarantineDto::from).collect(),
+        shadowing: stats.shadowing.iter().map(ShadowingDto::from).collect(),
         shadowing_active: stats.shadowing_active,
         jobs: stats
             .jobs
@@ -806,6 +784,121 @@ pub async fn run_job(
     let now = (state.clock)();
     let summary = state.admin.run_job(&job, &actor_meta(&auth, &meta), now).await?;
     Ok(Json(OkEnvelope::new(JobRunDto { job, summary })))
+}
+
+// ------------------------------------------------------------------- supply-chain registers
+
+/// Query parameters of the shadowing register.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ShadowingQuery {
+    /// `true` = only alarms still asking for attention, `false` = only acknowledged ones,
+    /// absent = the whole register.
+    pub active: Option<bool>,
+    /// Opaque cursor from the previous page.
+    pub cursor: Option<String>,
+    /// Page size, 1..=100 (default 20).
+    pub limit: Option<u32>,
+}
+
+/// The quarantine register: upstream archives the proxy refused
+/// ([S-19.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+///
+/// Instance-admin, newest observation first. The dashboard shows the newest twenty of these
+/// inside `/admin/stats`; this is the register behind that sample, and it is the surface an
+/// operator investigating a supply-chain incident actually needs.
+///
+/// There is no delete and no acknowledge. A quarantine row is evidence written *after* the
+/// bytes were already refused, so nothing here can change what the proxy serves — and a row an
+/// admin session could clear is a row an attacker with one could clear.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/quarantine",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(PageParams),
+    responses(
+        (status = OK, description = "Refused upstream archives, newest first", body = OkEnvelope<ListDto<QuarantineDto>>),
+        (status = FORBIDDEN, description = "Not an instance administrator", body = ErrorEnvelope),
+        (status = BAD_REQUEST, description = "Malformed cursor", body = ErrorEnvelope),
+    )
+)]
+pub async fn list_quarantine(
+    State(state): State<AppState>,
+    InstanceAdmin(_auth): InstanceAdmin,
+    QueryParams(params): QueryParams<PageParams>,
+) -> Result<Json<OkEnvelope<ListDto<QuarantineDto>>>, ApiError> {
+    let page = state.admin.list_quarantine(params.cursor.as_deref(), params.limit()).await?;
+    Ok(Json(OkEnvelope::new(ListDto {
+        items: page.items.iter().map(QuarantineDto::from).collect(),
+        cursor: page.cursor,
+        has_more: page.has_more,
+    })))
+}
+
+/// The shadowing register: locally claimed names observed upstream
+/// ([S-17.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+///
+/// Instance-admin, newest sighting first, sliced by `active`. Reading it does not change
+/// resolution and never could: the local package wins by decision 01, before and after.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/shadowing",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(ShadowingQuery),
+    responses(
+        (status = OK, description = "Shadowing alarms, newest sighting first", body = OkEnvelope<ListDto<ShadowingDto>>),
+        (status = FORBIDDEN, description = "Not an instance administrator", body = ErrorEnvelope),
+        (status = BAD_REQUEST, description = "Malformed cursor", body = ErrorEnvelope),
+    )
+)]
+pub async fn list_shadowing(
+    State(state): State<AppState>,
+    InstanceAdmin(_auth): InstanceAdmin,
+    QueryParams(query): QueryParams<ShadowingQuery>,
+) -> Result<Json<OkEnvelope<ListDto<ShadowingDto>>>, ApiError> {
+    let limit = PageParams { cursor: None, limit: query.limit }.limit();
+    let page = state.admin.list_shadowing(query.active, query.cursor.as_deref(), limit).await?;
+    Ok(Json(OkEnvelope::new(ListDto {
+        items: page.items.iter().map(ShadowingDto::from).collect(),
+        cursor: page.cursor,
+        has_more: page.has_more,
+    })))
+}
+
+/// Acknowledges one shadowing alarm (S-17.b) — bookkeeping, never policy.
+///
+/// **Not step-up gated** (S-06.b: the list is about escalation). It grants nothing, deletes
+/// nothing, and changes no resolution; the next upstream sighting raises the alarm again as a
+/// new incident. `acknowledged: false` means there was no *active* alarm under that key — an
+/// unknown name and an already-acknowledged one answer the same way, and neither writes a row.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/shadowing/{format}/{name}/acknowledge",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(
+        ("format" = String, Path, description = "Artifact format, e.g. `pub`"),
+        ("name" = String, Path, description = "The shadowed package name"),
+    ),
+    responses(
+        (status = OK, description = "Whether an active alarm was acknowledged", body = OkEnvelope<ShadowingAckDto>),
+        (status = BAD_REQUEST, description = "Unknown artifact format", body = ErrorEnvelope),
+        (status = FORBIDDEN, description = "Not an instance administrator", body = ErrorEnvelope),
+    )
+)]
+pub async fn acknowledge_shadowing(
+    State(state): State<AppState>,
+    InstanceAdmin(auth): InstanceAdmin,
+    RequestMeta(meta): RequestMeta,
+    Path((format, name)): Path<(String, String)>,
+) -> Result<Json<OkEnvelope<ShadowingAckDto>>, ApiError> {
+    let format: pub_core::Format = format.parse()?;
+    let now = (state.clock)();
+    // The name is clipped before it reaches the service, like every other attacker-chosen path
+    // segment on this surface: it travels into an audit row and an error message.
+    let acknowledged = state.admin.acknowledge_shadowing(format, &clip(&name), &actor_meta(&auth, &meta), now).await?;
+    Ok(Json(OkEnvelope::new(ShadowingAckDto { acknowledged })))
 }
 
 // --------------------------------------------------------------------------------- mapping

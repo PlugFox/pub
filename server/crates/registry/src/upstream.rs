@@ -61,8 +61,7 @@ use futures::stream::BoxStream;
 use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::event::{DomainEvent, EventSink};
 use pub_core::package::{
-    NewQuarantineEntry, NewUpstreamVersion, QuarantineEntry, ShadowingAlarm, UpstreamCacheEntry, UpstreamPackage,
-    UpstreamSnapshot, UpstreamVersion,
+    NewQuarantineEntry, NewUpstreamVersion, UpstreamCacheEntry, UpstreamPackage, UpstreamSnapshot, UpstreamVersion,
 };
 use pub_core::traits::{BlobStore, Repositories};
 use pub_core::{Error, Format, Page, Result, SemVer};
@@ -758,30 +757,18 @@ impl UpstreamService {
         self.repos.upstream.list_cached(format, cursor, limit).await
     }
 
-    /// The admin quarantine register: archives the proxy refused (S-19).
-    pub async fn quarantined(&self, limit: u32) -> Result<Vec<QuarantineEntry>> {
-        self.repos.upstream.list_quarantine(limit).await
-    }
+    // Reading either register is deliberately **not** here either (decision 33), for the same
+    // reason acknowledging is not: they are instance state that outlives `[upstream].enabled`,
+    // and `AppState::upstream` is `None` on an instance whose operator turned the proxy off —
+    // very possibly *because* of what the register holds. Both listings live on `AdminService`.
 
-    /// The admin shadowing register (S-17); `active_only` hides acknowledged alarms.
-    pub async fn shadowing_alarms(&self, active_only: bool, limit: u32) -> Result<Vec<ShadowingAlarm>> {
-        self.repos.upstream.list_shadowing(active_only, limit).await
-    }
-
-    /// Acknowledges a shadowing alarm. Bookkeeping only — resolution never depended on it.
-    pub async fn acknowledge_shadowing(&self, format: Format, name: &str, now: DateTime<Utc>) -> Result<bool> {
-        let acknowledged = self.repos.upstream.acknowledge_shadowing(format, name, now).await?;
-        if acknowledged {
-            self.audit(
-                "upstream.shadowing.acknowledged",
-                Some(name.to_owned()),
-                serde_json::json!({ "format": format.as_str(), "package": name }),
-                now,
-            )
-            .await;
-        }
-        Ok(acknowledged)
-    }
+    // Acknowledging a shadowing alarm is deliberately **not** here (decision 33). It is an
+    // operator action over instance state, not a proxy operation: it must stay reachable on an
+    // instance whose `[upstream]` is disabled — the alarms outlive the setting — and it must be
+    // audited with the acting administrator, which this module's `audit()` helper cannot do
+    // (it files `AuditActor::System` with `AuditResult::Failure`, right for an integrity event
+    // the proxy observed and wrong for a person pressing a button). It lives on `AdminService`,
+    // beside the listings, and reads the same repository this module does.
 
     /// Whether the circuit is currently open, without transitioning it.
     ///

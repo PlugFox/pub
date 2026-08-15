@@ -81,6 +81,9 @@ async fn the_admin_surface_is_closed_to_every_other_principal() {
         (Method::GET, "/api/v1/admin/stats", None),
         (Method::POST, "/api/v1/admin/jobs/search-reindex/run", Some(serde_json::json!({}))),
         (Method::POST, "/api/v1/admin/settings/smtp/test", None),
+        (Method::GET, "/api/v1/admin/quarantine", None),
+        (Method::GET, "/api/v1/admin/shadowing", None),
+        (Method::POST, "/api/v1/admin/shadowing/pub/acme_core/acknowledge", Some(serde_json::json!({}))),
     ];
 
     for (method, path, body) in &routes {
@@ -1722,4 +1725,178 @@ async fn s23_a_malformed_export_cursor_is_refused_before_the_head_is_sent() {
             .await;
         assert_eq!(ok.status, StatusCode::OK, "the malformed request must not have spent a slot");
     }
+}
+
+// ------------------------------------------------------------- supply-chain registers (D26)
+
+/// **S-19.b.** The quarantine register is reachable past the dashboard's twenty-row sample, and
+/// its walk stays total when every row shares one `last_seen_at` — which is what a tampering
+/// incident across a package's versions actually produces.
+#[tokio::test]
+async fn s19_b_the_quarantine_register_pages_past_the_dashboard_sample() {
+    let app = TestApp::new().await;
+    let admin = admin_token(&app, "ops@corp.com").await;
+
+    // Twenty-five refusals of one package, all at the same instant: past `REGISTER_SAMPLE`, and
+    // indistinguishable by timestamp.
+    for index in 0..25 {
+        app.repos
+            .upstream
+            .record_quarantine(
+                pub_core::package::NewQuarantineEntry {
+                    format: pub_core::Format::Pub,
+                    name: "http".to_owned(),
+                    version: format!("1.0.{index}"),
+                    upstream: "https://pub.dev".to_owned(),
+                    expected_sha256: "a".repeat(64),
+                    actual_sha256: "b".repeat(64),
+                },
+                app.now(),
+            )
+            .await
+            .expect("quarantine");
+    }
+
+    // The dashboard sample stops at twenty; that is the whole reason this route exists.
+    let stats = app.get("/api/v1/admin/stats", Some(&admin)).await;
+    assert_eq!(stats.json["data"]["quarantine"].as_array().unwrap().len(), 20);
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let path = match &cursor {
+            Some(cursor) => format!("/api/v1/admin/quarantine?limit=10&cursor={}", urlencoding_encode(cursor)),
+            None => "/api/v1/admin/quarantine?limit=10".to_owned(),
+        };
+        let page = app.get(&path, Some(&admin)).await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.json);
+        for item in page.json["data"]["items"].as_array().unwrap() {
+            assert_eq!(item["format"], "pub", "the key's format travels to the client");
+            seen.push(item["version"].as_str().unwrap().to_owned());
+        }
+        match page.json["data"]["cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 25, "the walk skipped or repeated rows across an identical timestamp: {seen:?}");
+
+    // A malformed cursor is a 400, not a 500 and not a silently reset listing.
+    let bad = app.get("/api/v1/admin/quarantine?cursor=%25%25%25", Some(&admin)).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad.error_code(), "invalid_argument");
+}
+
+/// **S-17.b.** The shadowing register's three slices, and the one write it has: an
+/// acknowledgement that names the administrator who made it.
+#[tokio::test]
+async fn s17_b_acknowledging_an_alarm_is_audited_with_the_administrator_who_did_it() {
+    let app = TestApp::new().await;
+    let admin = admin_token(&app, "ops@corp.com").await;
+    let (_owner, org) = app.org_owner("owner@corp.com", "acme").await;
+    app.repos.packages.claim_name(pub_core::Format::Pub, "acme_core", org, app.now()).await.expect("claim");
+    app.repos
+        .upstream
+        .record_shadowing(
+            pub_core::package::NewShadowingAlarm {
+                format: pub_core::Format::Pub,
+                name: "acme_core".to_owned(),
+                org_id: org,
+                upstream: "https://pub.dev".to_owned(),
+                upstream_version: Some("9.9.9".to_owned()),
+            },
+            app.now(),
+        )
+        .await
+        .expect("raise");
+
+    let active = app.get("/api/v1/admin/shadowing?active=true", Some(&admin)).await;
+    assert_eq!(active.status, StatusCode::OK, "{:?}", active.json);
+    assert_eq!(active.json["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(active.json["data"]["items"][0]["name"], "acme_core");
+    assert_eq!(active.json["data"]["items"][0]["active"], true);
+    assert!(active.json["data"]["items"][0]["acknowledged_at"].is_null());
+    assert!(
+        app.get("/api/v1/admin/shadowing?active=false", Some(&admin)).await.json["data"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let acked =
+        app.post("/api/v1/admin/shadowing/pub/acme_core/acknowledge", Some(&admin), serde_json::json!({})).await;
+    assert_eq!(acked.status, StatusCode::OK, "{:?}", acked.json);
+    assert_eq!(acked.json["data"]["acknowledged"], true);
+
+    // The row names the person, not the system — the defect this route would have shipped with
+    // if it had reused the proxy's own audit helper, which files `System` + `Failure`.
+    let events = app.repos.audit.list(&pub_core::audit::AuditFilter::default(), None, 100).await.expect("audit").items;
+    let row = events
+        .iter()
+        .find(|event| event.action == "upstream.shadowing.acknowledged")
+        .expect("the acknowledgement must be audited");
+    assert_eq!(row.result, AuditResult::Success, "an operator's action is not a system failure");
+    assert!(
+        matches!(row.actor, pub_core::audit::AuditActor::User(_)),
+        "the audit row must name the administrator, got {:?}",
+        row.actor
+    );
+    assert_eq!(row.target.as_deref(), Some("acme_core"));
+
+    // The slices moved, and a second acknowledgement is a no-op that writes nothing.
+    assert!(
+        app.get("/api/v1/admin/shadowing?active=true", Some(&admin)).await.json["data"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        app.get("/api/v1/admin/shadowing", Some(&admin)).await.json["data"]["items"].as_array().unwrap().len(),
+        1,
+        "the unfiltered register still carries it"
+    );
+    let again =
+        app.post("/api/v1/admin/shadowing/pub/acme_core/acknowledge", Some(&admin), serde_json::json!({})).await;
+    assert_eq!(again.json["data"]["acknowledged"], false);
+    assert_eq!(
+        events_named(&app, "upstream.shadowing.acknowledged").await,
+        1,
+        "a button pressed twice is not a second event"
+    );
+
+    // An unknown name answers the same way — no row, no leak about what the register holds.
+    let unknown =
+        app.post("/api/v1/admin/shadowing/pub/nope_pkg/acknowledge", Some(&admin), serde_json::json!({})).await;
+    assert_eq!(unknown.status, StatusCode::OK);
+    assert_eq!(unknown.json["data"]["acknowledged"], false);
+    // …and an unknown *format* is a 400 rather than a silent no-op on a register that has none.
+    let bad_format =
+        app.post("/api/v1/admin/shadowing/npm/acme_core/acknowledge", Some(&admin), serde_json::json!({})).await;
+    assert_eq!(bad_format.status, StatusCode::BAD_REQUEST);
+}
+
+/// How many audit rows carry `action`.
+async fn events_named(app: &TestApp, action: &str) -> usize {
+    app.repos
+        .audit
+        .list(&pub_core::audit::AuditFilter::default(), None, 200)
+        .await
+        .expect("audit")
+        .items
+        .iter()
+        .filter(|event| event.action == action)
+        .count()
+}
+
+/// Percent-encodes a cursor for a query string (cursors are base64url, so only `=` padding and
+/// the odd `+` would matter — but the harness must not depend on that).
+fn urlencoding_encode(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => ch.to_string(),
+            other => format!("%{:02X}", other as u32),
+        })
+        .collect()
 }

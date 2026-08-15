@@ -231,6 +231,8 @@ fn policy(batch: u32, budget: StdDuration) -> LifecyclePolicy {
             invitations: Some(Duration::days(30)),
             notifications: Some(Duration::days(180)),
             download_stats: None,
+            quarantine: Some(Duration::days(730)),
+            shadowing: Some(Duration::days(730)),
             batch,
             budget,
         },
@@ -536,6 +538,11 @@ async fn d12_the_report_names_every_table_including_the_ones_kept_forever() {
             "invitations",
             "notifications",
             "download_stats",
+            // The two supply-chain registers (S-23.b): last because they are the smallest, and
+            // present because a register missing from the report is one nobody would notice
+            // growing — which is what they both did until decision 33.
+            "upstream_quarantine",
+            "shadowing_alarms",
         ]
     );
     assert_eq!(outcome_for(&report, "download_stats"), &TableOutcome::Disabled);

@@ -8,7 +8,7 @@ use axum::http::{Method, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use chrono::Duration;
-use common::{DEFAULT_IP, TestApp, TestOptions, wrong_code};
+use common::{DEFAULT_IP, TestApp, TestOptions, token_body, wrong_code};
 use pub_auth::jwt::{Claims, Keyring};
 use pub_auth::token as cli_token;
 
@@ -350,7 +350,7 @@ async fn s13_token_show_once_sha256_at_rest_crc_offline_validation() {
         .post(
             "/api/v1/tokens",
             Some(&access),
-            serde_json::json!({ "label": "ci", "org_id": org_id, "scopes": ["read", "publish"] }),
+            serde_json::json!({ "label": "ci", "org_id": org_id, "scopes": ["read", "publish"], "expires_days": 90 }),
         )
         .await;
     assert_eq!(created.status, StatusCode::OK, "{:?}", created.json);
@@ -395,8 +395,7 @@ async fn s13_revoked_token_gone() {
     let app = TestApp::new().await;
     let (access, org_id) = login_with_org(&app).await;
 
-    let created =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["read"] })).await;
+    let created = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["read"])).await;
     let secret = created.json["data"]["secret"].as_str().unwrap().to_owned();
     let token_id = created.json["data"]["token"]["id"].as_str().unwrap().to_owned();
 
@@ -532,23 +531,17 @@ async fn token_scopes_are_gated_by_org_role() {
     let org: pub_core::OrgId = org_id.parse().unwrap();
     app.repos.orgs.add_member(org, member_id, pub_core::RoleLevel::READ, app.now()).await.expect("add member");
 
-    let denied = app
-        .post("/api/v1/tokens", Some(&member_access), serde_json::json!({ "org_id": org_id, "scopes": ["publish"] }))
-        .await;
+    let denied = app.post("/api/v1/tokens", Some(&member_access), token_body(&org_id, &["publish"])).await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN, "read member must not mint publish tokens");
 
-    let allowed = app
-        .post("/api/v1/tokens", Some(&member_access), serde_json::json!({ "org_id": org_id, "scopes": ["read"] }))
-        .await;
+    let allowed = app.post("/api/v1/tokens", Some(&member_access), token_body(&org_id, &["read"])).await;
     assert_eq!(allowed.status, StatusCode::OK, "{:?}", allowed.json);
 
     // A non-member cannot even see the org: uniform 404 (S-04).
     app.advance(Duration::seconds(61));
     let outsider_login = app.login("outsider@corp.com").await;
     let outsider_access = outsider_login["access_token"].as_str().unwrap().to_owned();
-    let invisible = app
-        .post("/api/v1/tokens", Some(&outsider_access), serde_json::json!({ "org_id": org_id, "scopes": ["read"] }))
-        .await;
+    let invisible = app.post("/api/v1/tokens", Some(&outsider_access), token_body(&org_id, &["read"])).await;
     assert_eq!(invisible.status, StatusCode::NOT_FOUND);
     let _ = owner_access;
 }

@@ -5,7 +5,7 @@ mod common;
 
 use axum::http::{StatusCode, header};
 use chrono::Duration;
-use common::{TestApp, TestOptions};
+use common::{TestApp, TestOptions, token_body};
 use pub_auth::totp;
 
 const EMAIL: &str = "dev@corp.com";
@@ -323,8 +323,7 @@ async fn s06_publish_token_mint_requires_step_up_and_totp_satisfies_it() {
     let data = mfa_login(&app, EMAIL, &seed).await;
     let access = data["access_token"].as_str().unwrap().to_owned();
     let refresh = data["refresh_token"].as_str().unwrap().to_owned();
-    let fresh_mint =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["publish"] })).await;
+    let fresh_mint = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["publish"])).await;
     assert_eq!(fresh_mint.status, StatusCode::OK, "a fresh login satisfies S-06: {:?}", fresh_mint.json);
 
     // 16 minutes later the session is stale: publish/admin mints demand step-up.
@@ -334,17 +333,14 @@ async fn s06_publish_token_mint_requires_step_up_and_totp_satisfies_it() {
     let access = rotated.json["data"]["access_token"].as_str().unwrap().to_owned();
     let refresh = rotated.json["data"]["refresh_token"].as_str().unwrap().to_owned();
 
-    let stale_mint =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["publish"] })).await;
+    let stale_mint = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["publish"])).await;
     assert_eq!(stale_mint.status, StatusCode::FORBIDDEN);
     assert_eq!(stale_mint.error_code(), "step_up_required", "distinct code so the UI can prompt (S-06)");
-    let admin_mint =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["admin"] })).await;
+    let admin_mint = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["admin"])).await;
     assert_eq!(admin_mint.error_code(), "step_up_required");
 
     // Read-scoped mints stay ungated.
-    let read_mint =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["read"] })).await;
+    let read_mint = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["read"])).await;
     assert_eq!(read_mint.status, StatusCode::OK, "{:?}", read_mint.json);
 
     // Step up with a live code; the gate opens for the window.
@@ -352,16 +348,14 @@ async fn s06_publish_token_mint_requires_step_up_and_totp_satisfies_it() {
     let stepped = app.post("/api/v1/auth/step-up", Some(&access), serde_json::json!({ "code": code })).await;
     assert_eq!(stepped.status, StatusCode::OK, "{:?}", stepped.json);
     assert!(stepped.json["data"]["valid_until"].is_string());
-    let gated_mint =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["publish"] })).await;
+    let gated_mint = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["publish"])).await;
     assert_eq!(gated_mint.status, StatusCode::OK, "step-up must open the gate: {:?}", gated_mint.json);
 
     // The mark expires with the window (S-06): 16 minutes later the gate is closed again.
     app.advance(Duration::minutes(16));
     let rotated = app.post("/api/v1/auth/refresh", None, serde_json::json!({ "refresh_token": refresh })).await;
     let access = rotated.json["data"]["access_token"].as_str().unwrap().to_owned();
-    let expired_mint =
-        app.post("/api/v1/tokens", Some(&access), serde_json::json!({ "org_id": org_id, "scopes": ["publish"] })).await;
+    let expired_mint = app.post("/api/v1/tokens", Some(&access), token_body(&org_id, &["publish"])).await;
     assert_eq!(expired_mint.error_code(), "step_up_required", "step-up freshness must expire");
 }
 

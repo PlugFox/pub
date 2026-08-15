@@ -664,6 +664,69 @@ impl AdminService {
         Ok(org)
     }
 
+    // ---------------------------------------------------------------- supply-chain registers
+
+    /// The quarantine register, newest observation first
+    /// ([S-19.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+    ///
+    /// Read straight from the repository rather than through `UpstreamService`, and that is a
+    /// decision rather than a shortcut (decision 33): these rows are **instance state, not proxy
+    /// state**. An operator who has since set `[upstream].enabled = false` still has a register
+    /// full of evidence, and `AppState::upstream` is `None` on that instance — routing the
+    /// listing through the proxy service would make the evidence unreadable exactly when
+    /// somebody turned the proxy off *because* of it.
+    pub async fn list_quarantine(&self, cursor: Option<&str>, limit: u32) -> Result<Page<QuarantineEntry>> {
+        self.repos.upstream.list_quarantine(cursor, limit).await
+    }
+
+    /// The shadowing register ([S-17.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+    ///
+    /// `active` picks the slice: `Some(true)` the alarms still asking for attention,
+    /// `Some(false)` the acknowledged ones, `None` the whole register. Same reasoning as above
+    /// for reading the repository directly.
+    pub async fn list_shadowing(
+        &self,
+        active: Option<bool>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<ShadowingAlarm>> {
+        self.repos.upstream.list_shadowing(active, cursor, limit).await
+    }
+
+    /// Acknowledges one shadowing alarm on behalf of an administrator; `false` when there was no
+    /// **active** alarm to acknowledge.
+    ///
+    /// Bookkeeping, never policy: the local package won before the alarm and wins after it
+    /// ([S-17.a](../../../../docs/security.md#4-supply-chain--registry-integrity)), and the next
+    /// upstream sighting raises it again as a new incident. Two properties are deliberate:
+    ///
+    /// - **the audit row names the administrator**, their IP and their user agent — the proxy's
+    ///   own audit helper files these events as a system failure, which is right for an
+    ///   observation and wrong for an action a person took;
+    /// - **a second acknowledgement writes nothing.** A button pressed twice is not an event,
+    ///   and an audit trail that says otherwise is one an operator learns to skim.
+    pub async fn acknowledge_shadowing(
+        &self,
+        format: Format,
+        name: &str,
+        actor: &ActorMeta,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let acknowledged = self.repos.upstream.acknowledge_shadowing(format, name, now).await?;
+        if acknowledged {
+            self.audit(
+                actor,
+                "upstream.shadowing.acknowledged",
+                Some(name.to_owned()),
+                AuditResult::Success,
+                serde_json::json!({ "format": format.as_str(), "package": name }),
+                now,
+            )
+            .await;
+        }
+        Ok(acknowledged)
+    }
+
     // -------------------------------------------------------------------------------- audit
 
     /// The audit viewer (S-22/S-23), newest first.
@@ -709,8 +772,10 @@ impl AdminService {
     /// The dashboard numbers.
     pub async fn stats(&self, now: DateTime<Utc>) -> Result<InstanceStats> {
         let _ = now;
-        let quarantine = self.repos.upstream.list_quarantine(REGISTER_SAMPLE).await?;
-        let shadowing = self.repos.upstream.list_shadowing(false, REGISTER_SAMPLE).await?;
+        // The dashboard sample is the first page of the same statement the full register
+        // serves (decision 33), not a second shape: one SQL per table, one index to keep honest.
+        let quarantine = self.repos.upstream.list_quarantine(None, REGISTER_SAMPLE).await?.items;
+        let shadowing = self.repos.upstream.list_shadowing(None, None, REGISTER_SAMPLE).await?.items;
         let shadowing_active = shadowing.iter().filter(|alarm| alarm.is_active()).count() as i64;
         Ok(InstanceStats {
             users: self.repos.users.counts().await?,

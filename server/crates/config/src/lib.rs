@@ -1277,6 +1277,20 @@ pub struct LifecycleConfig {
     /// honest bound on their growth is a monthly roll-up. The knob exists for an operator who would
     /// rather have the space than the history.
     pub retain_download_stats_days: i64,
+    /// Days a quarantine record is kept **after its last sighting**. Default 730, `0` keeps forever.
+    ///
+    /// The audit log's window, because a refused upstream archive is evidence of the same class
+    /// ([S-23.b](../../../docs/security.md#5-audit--abuse)). Aging from `last_seen_at` is what makes
+    /// the number safe: a mismatch still being observed is outside every window at every setting.
+    pub retain_quarantine_days: i64,
+    /// Days an **acknowledged** shadowing alarm is kept after it was acknowledged. Default 730,
+    /// `0` keeps forever.
+    ///
+    /// An **active** alarm is undeletable at every setting — the delete carries
+    /// `acknowledged_at IS NOT NULL`, so this window can only reach alarms an administrator has
+    /// already cleared. Deleting an active one would be worse than losing a row: the mirror sweep
+    /// re-raises it with a fresh `first_seen_at`, silently rewriting the incident's start date.
+    pub retain_shadowing_days: i64,
 }
 
 impl Default for LifecycleConfig {
@@ -1290,6 +1304,8 @@ impl Default for LifecycleConfig {
             retain_invitations_days: 30,
             retain_notifications_days: 180,
             retain_download_stats_days: 0,
+            retain_quarantine_days: 730,
+            retain_shadowing_days: 730,
         }
     }
 }
@@ -1725,13 +1741,15 @@ impl Settings {
         let _ = writeln!(
             out,
             "  jobs.lifecycle       = every {}s (audit {}, sessions {}, invitations {}, notifications {}, \
-             downloads {})",
+             downloads {}, quarantine {}, shadowing {})",
             lifecycle.interval_secs,
             days_or_forever(lifecycle.retain_audit_days),
             days_or_forever(lifecycle.retain_sessions_days),
             days_or_forever(lifecycle.retain_invitations_days),
             days_or_forever(lifecycle.retain_notifications_days),
             days_or_forever(lifecycle.retain_download_stats_days),
+            days_or_forever(lifecycle.retain_quarantine_days),
+            days_or_forever(lifecycle.retain_shadowing_days),
         );
         let _ =
             writeln!(out, "  registry.rate_limit  = publish {}/h/org", self.registry.rate_limit.publish_per_hour_org);

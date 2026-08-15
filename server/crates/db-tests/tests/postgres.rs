@@ -179,6 +179,12 @@ async fn upstream_mirror_reads_contract() {
 }
 
 #[tokio::test]
+async fn supply_chain_register_pages_contract_s17b_s19b_s23b() {
+    let Some(db) = TestDb::create("supply_chain_register_pages").await else { return };
+    pub_db_tests::contract::supply_chain_register_pages(&db.repos()).await;
+}
+
+#[tokio::test]
 async fn supply_chain_registers_contract_s17_s19() {
     let Some(db) = TestDb::create("supply_chain_registers_contract_s17_s19").await else { return };
     pub_db_tests::contract::supply_chain_registers(&db.repos()).await;
@@ -769,5 +775,60 @@ async fn the_blob_collectors_reference_check_seeks_both_registers() {
     )
     .await;
     assert!(live.contains("versions_sha256_idx"), "the live-reference check is a scan:\n{live}");
+    db.cleanup().await;
+}
+
+/// **S-17.b / S-19.b.** The register page walks seek on the whole key, on a register big enough
+/// for the planner to have a choice.
+///
+/// Loaded with rows that all share one `last_seen_at`, because that is the shape the registers
+/// actually produce — one fetch loop refusing a package's versions, one sweep raising a block of
+/// alarms — and the shape that separates a seek on the whole key from a seek on the timestamp
+/// with the tie-breaks post-filtered. On an empty table every plan looks fine, which is why this
+/// one loads a backlog and runs `ANALYZE` first.
+///
+/// The SQL comes from the repository, never from a copy in this file ([D52](../../../../docs/roadmap.md)).
+#[tokio::test]
+async fn s17b_s19b_the_register_pages_seek_on_the_whole_key() {
+    let Some(db) = TestDb::create("s17b_s19b_register_pages").await else { return };
+    sqlx::query(
+        "INSERT INTO upstream_quarantine (format, name, version, upstream, expected_sha256, actual_sha256, \
+         occurrences, first_seen_at, last_seen_at) \
+         SELECT 'pub', 'pkg_' || (i / 100), '1.0.' || i, 'https://pub.dev', repeat('a', 64), repeat('b', 64), 1, \
+         now(), now() FROM generate_series(1, 20000) AS i",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("load the register");
+    sqlx::query("ANALYZE upstream_quarantine").execute(&db.pool).await.expect("analyze");
+
+    let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, BUFFERS) {}",
+        pub_db_postgres::repo::quarantine_page_sql(true)
+    )))
+    .bind(chrono::Utc::now())
+    .bind("pub")
+    .bind("pkg_50")
+    .bind("1.0.5000")
+    .bind(20_i64)
+    .fetch_all(&db.pool)
+    .await
+    .expect("explain");
+    let plan = rows.into_iter().map(|row| row.0).collect::<Vec<_>>().join("\n");
+
+    assert!(plan.contains("upstream_quarantine_page_idx"), "the register page does not use its index:\n{plan}");
+    assert!(!plan.contains("Seq Scan"), "the register page reads every row:\n{plan}");
+    // No sort node: the newest-first order has to come from the index's own direction, or every
+    // page of a large register sorts it. This is what the all-DESC index in 0015 buys.
+    assert!(!plan.contains("Sort Method"), "the page sorts instead of walking the index:\n{plan}");
+    // And the seek is bounded by the whole key, not by the timestamp with the rest filtered out.
+    let cond = plan
+        .lines()
+        .find(|line| line.trim_start().starts_with("Index Cond:"))
+        .unwrap_or_else(|| panic!("the page is not an index scan at all:\n{plan}"));
+    for column in ["last_seen_at", "format", "name", "version"] {
+        assert!(cond.contains(column), "{column} is not in the index condition, so the walk can skip rows: {cond}");
+    }
+
     db.cleanup().await;
 }

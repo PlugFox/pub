@@ -1916,10 +1916,12 @@ pub async fn supply_chain_registers(repos: &Repositories) {
     assert_eq!(again.last_seen_at, t0() + hours(1));
     assert_eq!(again.actual_sha256, "c".repeat(64), "the newest evidence wins");
 
-    let listed = repos.upstream.list_quarantine(10).await.expect("list");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].name, "http");
-    assert_eq!(listed[0].expected_sha256, "a".repeat(64));
+    let listed = repos.upstream.list_quarantine(None, 10).await.expect("list");
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].name, "http");
+    assert_eq!(listed.items[0].expected_sha256, "a".repeat(64));
+    assert!(!listed.has_more);
+    assert!(listed.cursor.is_none(), "a complete page carries no cursor");
 
     // --- S-17 shadowing: raised once per incident, counted thereafter ---
     let alarm = |version: Option<&str>| pub_core::package::NewShadowingAlarm {
@@ -1943,16 +1945,20 @@ pub async fn supply_chain_registers(repos: &Repositories) {
     assert_eq!(again.last_seen_at, t0() + hours(1));
     assert_eq!(again.upstream_version.as_deref(), Some("9.9.10"), "the newest sighting wins");
 
-    assert_eq!(repos.upstream.list_shadowing(true, 10).await.expect("active").len(), 1);
+    assert_eq!(repos.upstream.list_shadowing(Some(true), None, 10).await.expect("active").items.len(), 1);
 
     // Acknowledging is bookkeeping — and idempotent.
     assert!(repos.upstream.acknowledge_shadowing(Format::Pub, "acme_core", t0() + hours(2)).await.expect("ack"));
     assert!(!repos.upstream.acknowledge_shadowing(Format::Pub, "acme_core", t0() + hours(3)).await.expect("ack again"));
     assert!(!repos.upstream.acknowledge_shadowing(Format::Pub, "nope_pkg", t0()).await.expect("unknown"));
-    assert!(repos.upstream.list_shadowing(true, 10).await.expect("active").is_empty());
-    let all = repos.upstream.list_shadowing(false, 10).await.expect("all");
-    assert_eq!(all.len(), 1);
-    assert!(!all[0].is_active());
+    assert!(repos.upstream.list_shadowing(Some(true), None, 10).await.expect("active").items.is_empty());
+    // The three slices of one register: open, acknowledged, everything.
+    let acknowledged = repos.upstream.list_shadowing(Some(false), None, 10).await.expect("acknowledged");
+    assert_eq!(acknowledged.items.len(), 1);
+    assert!(!acknowledged.items[0].is_active());
+    let all = repos.upstream.list_shadowing(None, None, 10).await.expect("all");
+    assert_eq!(all.items.len(), 1);
+    assert!(!all.items[0].is_active());
 
     // A sighting after an acknowledgement is a *new* incident: it raises again and restarts the
     // clock, so an admin who cleared the alarm hears about it coming back.
@@ -1961,6 +1967,101 @@ pub async fn supply_chain_registers(repos: &Repositories) {
     assert!(reraised.is_active());
     assert_eq!(reraised.observations, 1);
     assert_eq!(reraised.first_seen_at, t0() + days(1));
+}
+
+/// The registers' operator surface: a keyset walk that is total across ties, and two retention
+/// windows that cannot delete evidence somebody still needs
+/// ([decision 33](../../../docs/decisions.md#33), S-17.b, S-19.b, S-23.b).
+pub async fn supply_chain_register_pages(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let org = seed_org(repos, "acme", alice.id).await;
+
+    // **Every row shares one `last_seen_at`.** This is the shape the register actually produces —
+    // one fetch loop refusing a package's versions, one sweep raising a block of alarms — and the
+    // shape a cursor over the timestamp alone gets wrong.
+    for index in 0..5 {
+        repos
+            .upstream
+            .record_quarantine(
+                pub_core::package::NewQuarantineEntry {
+                    format: Format::Pub,
+                    name: "http".to_owned(),
+                    version: format!("1.0.{index}"),
+                    upstream: "https://pub.dev".to_owned(),
+                    expected_sha256: "a".repeat(64),
+                    actual_sha256: "b".repeat(64),
+                },
+                t0(),
+            )
+            .await
+            .expect("quarantine");
+    }
+
+    // Walk it two at a time and assert the walk is total: five distinct rows, no repeats, no gaps.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let page = repos.upstream.list_quarantine(cursor.as_deref(), 2).await.expect("page");
+        assert!(page.items.len() <= 2, "the page must respect its limit");
+        seen.extend(page.items.iter().map(|entry| entry.version.clone()));
+        match page.cursor {
+            Some(next) => {
+                assert!(page.has_more, "a cursor without has_more is a page that lies about the walk");
+                cursor = Some(next);
+            }
+            None => {
+                assert!(!page.has_more);
+                break;
+            }
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 5, "the walk skipped or repeated rows across an identical timestamp: {seen:?}");
+
+    // A malformed cursor is a clean 400, never a database error — including one whose envelope
+    // decodes but whose timestamp does not, which is the component a caller can most easily
+    // corrupt by hand.
+    assert_eq!(
+        repos.upstream.list_quarantine(Some("!!not-base64!!"), 10).await.unwrap_err().code(),
+        "invalid_argument"
+    );
+    let bad_time = pub_core::page::encode_cursor(&["not-a-timestamp", "pub", "http", "1.0.0"]);
+    assert_eq!(repos.upstream.list_quarantine(Some(&bad_time), 10).await.unwrap_err().code(), "invalid_argument");
+
+    // --- S-23.b: what each window can and cannot reach ---
+    let deleted = repos.upstream.purge_quarantine_before(t0() - days(1), 100).await.expect("purge none");
+    assert_eq!(deleted, 0, "a refusal still being observed is outside every window");
+    let deleted = repos.upstream.purge_quarantine_before(t0() + days(1), 2).await.expect("purge batch");
+    assert_eq!(deleted, 2, "the delete is bounded by its batch, so one statement cannot hold the write lock");
+    let deleted = repos.upstream.purge_quarantine_before(t0() + days(1), 100).await.expect("purge rest");
+    assert_eq!(deleted, 3, "the caller's loop converges");
+    assert!(repos.upstream.list_quarantine(None, 10).await.expect("empty").items.is_empty());
+
+    // An **active** alarm is undeletable at every window. This is the property that makes the
+    // number harmless: retention that could reach an open alarm would have the mirror sweep
+    // re-raise it with a fresh `first_seen_at`, silently rewriting the incident's start date.
+    repos.packages.claim_name(Format::Pub, "acme_core", org.id, t0()).await.expect("claim");
+    let alarm = pub_core::package::NewShadowingAlarm {
+        format: Format::Pub,
+        name: "acme_core".to_owned(),
+        org_id: org.id,
+        upstream: "https://pub.dev".to_owned(),
+        upstream_version: None,
+    };
+    repos.upstream.record_shadowing(alarm, t0()).await.expect("raise");
+    let deleted = repos.upstream.purge_shadowing_before(t0() + days(10_000), 100).await.expect("purge active");
+    assert_eq!(deleted, 0, "an active alarm survives even an absurd window");
+    assert_eq!(repos.upstream.list_shadowing(Some(true), None, 10).await.expect("active").items.len(), 1);
+
+    // Once acknowledged it ages from the acknowledgement, never from the sighting: a window
+    // shorter than the alarm's age still keeps it until it has been *cleared* that long.
+    repos.upstream.acknowledge_shadowing(Format::Pub, "acme_core", t0() + days(5)).await.expect("ack");
+    let deleted = repos.upstream.purge_shadowing_before(t0() + days(4), 100).await.expect("purge before ack");
+    assert_eq!(deleted, 0, "the age is the acknowledgement, not the sighting");
+    let deleted = repos.upstream.purge_shadowing_before(t0() + days(6), 100).await.expect("purge after ack");
+    assert_eq!(deleted, 1);
+    assert!(repos.upstream.list_shadowing(None, None, 10).await.expect("all").items.is_empty());
 }
 
 /// `JobRepo` (decision 03): resume-across-restart semantics, additive counters, and the

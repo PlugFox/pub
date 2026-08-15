@@ -500,7 +500,7 @@ async fn a_shadowed_name_alarms_once_and_is_never_mirrored() {
     // Audited, alarmed, and listable by the admin surface.
     assert!(harness.audit_actions().await.contains(&"upstream.shadowing".to_owned()));
     assert!(harness.events.names().contains(&"upstream.shadowing"));
-    let alarms = harness.service.shadowing_alarms(true, 10).await.expect("alarms");
+    let alarms = harness.repos.upstream.list_shadowing(Some(true), None, 10).await.expect("alarms").items;
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0].name, "acme_core");
     assert_eq!(alarms[0].org_id, org.id, "the claim holder is the audience");
@@ -513,7 +513,10 @@ async fn a_shadowed_name_alarms_once_and_is_never_mirrored() {
     let again = restarted.run_once(t0() + Duration::hours(30)).await.expect("sweep again");
     assert_eq!(again.shadowed, 1);
     assert_eq!(again.alarms_raised, 0, "an ongoing condition is a counter, not a new page");
-    assert_eq!(harness.service.shadowing_alarms(true, 10).await.expect("alarms")[0].observations, 2);
+    assert_eq!(
+        harness.repos.upstream.list_shadowing(Some(true), None, 10).await.expect("alarms").items[0].observations,
+        2
+    );
     assert_eq!(
         harness.audit_actions().await.iter().filter(|action| *action == "upstream.shadowing").count(),
         1,

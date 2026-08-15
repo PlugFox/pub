@@ -47,7 +47,7 @@ pub use search::{SqlitePackageSearch, SqliteStatsRepo};
 pub use sessions::SqliteSessionRepo;
 pub use settings::SqliteSettingsRepo;
 pub use tokens::SqliteTokenRepo;
-pub use upstream::SqliteUpstreamRepo;
+pub use upstream::{SqliteUpstreamRepo, quarantine_page_sql, shadowing_page_sql};
 pub use users::SqliteUserRepo;
 
 /// Builds a query string from **const fragments only** (column lists, table names) and marks

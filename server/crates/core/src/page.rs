@@ -3,6 +3,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -59,9 +60,55 @@ pub fn decode_cursor(cursor: &str, arity: usize) -> Result<Vec<String>> {
     Ok(parts)
 }
 
+/// Cursor spelling of an instant: fixed-width, microsecond precision, UTC.
+///
+/// Shared by both backends so a keyset cursor over a timestamp column means the same thing
+/// whichever one issued it — SQLite stores these as TEXT and compares them lexicographically,
+/// which this format is ordered under, while Postgres parses it back into a `TIMESTAMPTZ` bind.
+/// Microseconds because that is Postgres' storage precision: a nanosecond kept in the cursor
+/// and dropped by the column would make the seek skip the row it is meant to resume at.
+pub fn encode_cursor_time(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+/// Parses a timestamp component out of a caller-supplied cursor.
+///
+/// [`Error::Invalid`], never a database error: a cursor is untrusted input, so a malformed
+/// instant inside one is a clean 400 exactly like a malformed cursor envelope.
+pub fn decode_cursor_time(raw: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| Error::Invalid { message: format!("malformed cursor timestamp: {raw}") })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_time_round_trips_at_microsecond_precision() {
+        let value = DateTime::parse_from_rfc3339("2026-08-15T12:34:56.123456Z").unwrap().with_timezone(&Utc);
+        assert_eq!(decode_cursor_time(&encode_cursor_time(value)).unwrap(), value);
+    }
+
+    #[test]
+    fn cursor_time_is_lexicographically_ordered() {
+        // SQLite compares these as TEXT, so the format has to sort like the instant does —
+        // fixed width, zero-padded, always UTC. A `%.f` that dropped trailing zeros would break
+        // exactly here, and only for the rows whose microseconds happen to end in one.
+        let earlier = DateTime::parse_from_rfc3339("2026-08-15T12:34:56.100000Z").unwrap().with_timezone(&Utc);
+        let later = DateTime::parse_from_rfc3339("2026-08-15T12:34:56.100001Z").unwrap().with_timezone(&Utc);
+        assert!(encode_cursor_time(earlier) < encode_cursor_time(later));
+        let midnight = DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(encode_cursor_time(later) < encode_cursor_time(midnight));
+    }
+
+    #[test]
+    fn a_malformed_cursor_timestamp_is_invalid_argument_not_a_database_error() {
+        for raw in ["", "not-a-time", "2026-08-15", "0"] {
+            assert_eq!(decode_cursor_time(raw).unwrap_err().code(), "invalid_argument", "accepted {raw:?}");
+        }
+    }
 
     #[test]
     fn cursor_round_trips_every_component() {

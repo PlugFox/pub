@@ -85,6 +85,10 @@ const SURFACE: &[(&str, &str, bool)] = &[
     ("get", "/api/v1/admin/audit/export", true),
     ("get", "/api/v1/admin/stats", true),
     ("post", "/api/v1/admin/jobs/{job}/run", true),
+    // The two supply-chain registers and the one write they have (decision 33).
+    ("get", "/api/v1/admin/quarantine", true),
+    ("get", "/api/v1/admin/shadowing", true),
+    ("post", "/api/v1/admin/shadowing/{format}/{name}/acknowledge", true),
 ];
 
 #[tokio::test]

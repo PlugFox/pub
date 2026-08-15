@@ -360,7 +360,9 @@ async fn d58_a_request_verifies_its_access_token_once() {
         .post(
             "/api/v1/tokens",
             Some(&access),
-            serde_json::json!({ "org_id": created.json["data"]["id"], "scopes": ["publish"], "label": "one" }),
+            serde_json::json!({
+                "org_id": created.json["data"]["id"], "scopes": ["publish"], "label": "one", "expires_days": 90,
+            }),
         )
         .await;
     assert_eq!(minted.status, StatusCode::OK, "{:?}", minted.json);

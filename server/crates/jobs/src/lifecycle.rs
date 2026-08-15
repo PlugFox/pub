@@ -223,6 +223,29 @@ impl LifecycleWorker {
             .await;
         report.record("download_stats", outcome);
 
+        // The two supply-chain registers (S-23.b). Last because they are the smallest and the
+        // least urgent — one row per shadowed name, one per refused `(name, version)` — and the
+        // sweep order decides who starves on a backlogged instance.
+        let quarantine = RetentionPolicy::cutoff(policy.quarantine, now);
+        let outcome = self
+            .sweep_table(started, quarantine, |cutoff, batch| {
+                let repos = self.repos.clone();
+                async move { repos.upstream.purge_quarantine_before(cutoff, batch).await }
+            })
+            .await;
+        report.record("upstream_quarantine", outcome);
+
+        // Only *acknowledged* alarms are reachable from here — the predicate lives in the
+        // repository, not in this cutoff, so an active alarm survives every window.
+        let shadowing = RetentionPolicy::cutoff(policy.shadowing, now);
+        let outcome = self
+            .sweep_table(started, shadowing, |cutoff, batch| {
+                let repos = self.repos.clone();
+                async move { repos.upstream.purge_shadowing_before(cutoff, batch).await }
+            })
+            .await;
+        report.record("shadowing_alarms", outcome);
+
         Ok(report)
     }
 
@@ -386,6 +409,8 @@ mod tests {
                 invitations: Some(Duration::days(30)),
                 notifications: Some(Duration::days(180)),
                 download_stats: None,
+                quarantine: Some(Duration::days(730)),
+                shadowing: Some(Duration::days(730)),
                 batch,
                 budget,
             },

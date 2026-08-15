@@ -737,7 +737,10 @@ async fn a_truncated_archive_body_poisons_nothing_and_does_not_cry_tampering() {
     h.client.set_mode(Mode::Truncated);
     assert!(h.service.archive(Format::Pub, "acme_core", &version, t0()).await.unwrap().is_none());
     assert_eq!(h.blob.len(), 0, "a truncated body must never reach storage");
-    assert!(h.repos.upstream.list_quarantine(10).await.unwrap().is_empty(), "a dropped connection is not tampering");
+    assert!(
+        h.repos.upstream.list_quarantine(None, 10).await.unwrap().items.is_empty(),
+        "a dropped connection is not tampering"
+    );
     assert!(!h.audit_actions().await.contains(&"upstream.quarantine".to_owned()));
     assert!(!h.events.names().contains(&"upstream.quarantined"));
 
@@ -895,7 +898,7 @@ async fn a_quarantine_is_recorded_for_the_admin_surface() {
     let version = SemVer::parse("1.0.0").unwrap();
     assert!(h.service.archive(Format::Pub, "acme_core", &version, t0()).await.unwrap().is_none());
 
-    let quarantined = h.service.quarantined(10).await.unwrap();
+    let quarantined = h.repos.upstream.list_quarantine(None, 10).await.unwrap().items;
     assert_eq!(quarantined.len(), 1);
     assert_eq!(quarantined[0].name, "acme_core");
     assert_eq!(quarantined[0].version, "1.0.0");
@@ -905,8 +908,8 @@ async fn a_quarantine_is_recorded_for_the_admin_surface() {
 
     // A second attempt is the same incident, counted — not a second row to scroll past.
     assert!(h.service.archive(Format::Pub, "acme_core", &version, t0()).await.unwrap().is_none());
-    assert_eq!(h.service.quarantined(10).await.unwrap()[0].occurrences, 2);
-    assert_eq!(h.service.quarantined(10).await.unwrap().len(), 1);
+    assert_eq!(h.repos.upstream.list_quarantine(None, 10).await.unwrap().items[0].occurrences, 2);
+    assert_eq!(h.repos.upstream.list_quarantine(None, 10).await.unwrap().items.len(), 1);
 }
 
 #[tokio::test]

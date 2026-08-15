@@ -1386,6 +1386,28 @@ per-version daily downloads, the charts cannot reconstruct them after the fact, 
 honest bound on their growth is a monthly roll-up. The knob exists for an operator who would
 rather have the space than the history.
 
+### `jobs.lifecycle.retain_quarantine_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_QUARANTINE_DAYS` · default: `730`
+
+Days a quarantine record is kept **after its last sighting**. Default 730, `0` keeps forever.
+
+The audit log's window, because a refused upstream archive is evidence of the same class
+([S-23.b](../security.md#5-audit--abuse)). Aging from `last_seen_at` is what makes
+the number safe: a mismatch still being observed is outside every window at every setting.
+
+### `jobs.lifecycle.retain_shadowing_days`
+
+integer · `PUB_JOBS__LIFECYCLE__RETAIN_SHADOWING_DAYS` · default: `730`
+
+Days an **acknowledged** shadowing alarm is kept after it was acknowledged. Default 730,
+`0` keeps forever.
+
+An **active** alarm is undeletable at every setting — the delete carries
+`acknowledged_at IS NOT NULL`, so this window can only reach alarms an administrator has
+already cleared. Deleting an active one would be worse than losing a row: the mirror sweep
+re-raises it with a fresh `first_seen_at`, silently rewriting the incident's start date.
+
 ## `[branding]`
 
 White-label instance identity shown on the landing dashboard (decision 17).

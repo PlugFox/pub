@@ -11,7 +11,7 @@ use std::time::Duration as StdDuration;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::Duration;
-use common::{ApiResponse, DEFAULT_IP, FailingKv, INSTANCE_ORIGIN, TestApp, TestOptions, wrong_code};
+use common::{ApiResponse, DEFAULT_IP, FailingKv, INSTANCE_ORIGIN, TestApp, TestOptions, token_body, wrong_code};
 use pub_auth::jwt::{Claims, Keyring};
 use pub_auth::otp;
 use pub_auth::token as cli_token;
@@ -370,15 +370,17 @@ async fn s13_admin_scope_requires_admin_role_even_when_bundled() {
         .expect("add writer");
 
     // Permitted on its own…
-    let publish = app
-        .post("/api/v1/tokens", Some(&writer_access), serde_json::json!({ "org_id": org_id, "scopes": ["publish"] }))
-        .await;
+    let publish = app.post("/api/v1/tokens", Some(&writer_access), token_body(&org_id, &["publish"])).await;
     assert_eq!(publish.status, StatusCode::OK, "{:?}", publish.json);
 
     // …but `admin` demands Admin, alone or smuggled next to a permitted scope.
     for scopes in [serde_json::json!(["admin"]), serde_json::json!(["read", "admin"])] {
         let denied = app
-            .post("/api/v1/tokens", Some(&writer_access), serde_json::json!({ "org_id": org_id, "scopes": scopes }))
+            .post(
+                "/api/v1/tokens",
+                Some(&writer_access),
+                serde_json::json!({ "org_id": org_id, "scopes": scopes, "expires_days": 90 }),
+            )
             .await;
         assert_eq!(denied.status, StatusCode::FORBIDDEN, "write member minted {scopes:?}");
     }

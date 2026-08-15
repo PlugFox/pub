@@ -452,8 +452,23 @@ pub trait UpstreamRepo: Send + Sync {
     /// `last_seen_at` advances.
     async fn record_quarantine(&self, entry: NewQuarantineEntry, now: DateTime<Utc>) -> Result<QuarantineEntry>;
 
-    /// Quarantined items, most recently observed first.
-    async fn list_quarantine(&self, limit: u32) -> Result<Vec<QuarantineEntry>>;
+    /// Quarantined items, most recently observed first, keyset-paginated
+    /// ([S-19.b](../../../docs/security.md#4-supply-chain--registry-integrity)).
+    ///
+    /// The keyset is the **whole primary key** after the timestamp — `(last_seen_at, format,
+    /// name, version)`, every component descending — and that is a correctness property, not a
+    /// tidiness one: a tampering incident across a package's versions writes a block of rows
+    /// inside one fetch loop, so ties on `last_seen_at` are this table's normal shape. A cursor
+    /// carrying the timestamp alone would skip or repeat rows exactly when the register matters.
+    /// A malformed cursor is [`crate::Error::Invalid`].
+    async fn list_quarantine(&self, cursor: Option<&str>, limit: u32) -> Result<Page<QuarantineEntry>>;
+
+    /// Deletes at most `batch` quarantine rows last observed before `cutoff`, returning how many
+    /// ([S-23.b](../../../docs/security.md#5-audit--abuse)).
+    ///
+    /// Aged from `last_seen_at`, so a mismatch still being observed is outside every window at
+    /// every setting. Bounded and looped by the caller like every other retention delete.
+    async fn purge_quarantine_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64>;
 
     /// Records that a locally claimed name was observed upstream (S-17).
     ///
@@ -463,8 +478,29 @@ pub trait UpstreamRepo: Send + Sync {
     /// mirror worker would re-alert on every sweep for as long as the condition holds.
     async fn record_shadowing(&self, alarm: NewShadowingAlarm, now: DateTime<Utc>) -> Result<(ShadowingAlarm, bool)>;
 
-    /// Shadowing alarms, newest observation first. `active_only` hides acknowledged ones.
-    async fn list_shadowing(&self, active_only: bool, limit: u32) -> Result<Vec<ShadowingAlarm>>;
+    /// Shadowing alarms, newest observation first, keyset-paginated over `(last_seen_at, format,
+    /// name)` with every component descending ([S-17.b](../../../docs/security.md#4-supply-chain--registry-integrity)).
+    ///
+    /// `active` selects a slice of the register: `Some(true)` is the alarms still asking for
+    /// attention, `Some(false)` the acknowledged ones, `None` the whole register. One mirror
+    /// sweep stamps every alarm it raises with the same instant, which is why the name is in the
+    /// cursor. A malformed cursor is [`crate::Error::Invalid`].
+    async fn list_shadowing(
+        &self,
+        active: Option<bool>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<ShadowingAlarm>>;
+
+    /// Deletes at most `batch` **acknowledged** shadowing alarms acknowledged before `cutoff`,
+    /// returning how many ([S-23.b](../../../docs/security.md#5-audit--abuse)).
+    ///
+    /// An **active** alarm is undeletable at every window — the predicate is
+    /// `acknowledged_at IS NOT NULL AND acknowledged_at < cutoff`, so this is safe by
+    /// construction rather than by a well-chosen number. Deleting an active alarm would be worse
+    /// than losing a row: the mirror sweep re-raises it on the next pass with a fresh
+    /// `first_seen_at`, so retention would silently rewrite the incident's start date.
+    async fn purge_shadowing_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64>;
 
     /// Acknowledges a shadowing alarm; returns whether an active alarm was acknowledged.
     ///

@@ -26,7 +26,7 @@ use pub_core::package::{
     NewQuarantineEntry, NewShadowingAlarm, QuarantineEntry, ShadowingAlarm, UpstreamCacheEntry, UpstreamPackage,
     UpstreamSnapshot, UpstreamVersion,
 };
-use pub_core::page::{decode_cursor, encode_cursor};
+use pub_core::page::{decode_cursor, decode_cursor_time, encode_cursor, encode_cursor_time};
 use pub_core::traits::UpstreamRepo;
 use pub_core::{Error, Format, OrgId, PackageId, Page, Result, SemVer, VersionId};
 use sqlx::postgres::PgRow;
@@ -37,6 +37,83 @@ use super::{db_err, parse_col, q, write_err};
 
 /// Hard cap on page size; requests are clamped into `1..=MAX_PAGE`.
 const MAX_PAGE: u32 = 200;
+
+/// The quarantine page statement, with or without its keyset predicate
+/// ([S-19.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+///
+/// **Exported so the plan test can EXPLAIN the statement production emits instead of a copy of
+/// it** — the drift roadmap [D52](../../../../docs/roadmap.md) describes, avoided here rather
+/// than repeated. Binds, in order: the four cursor components when `with_cursor` (the first as a
+/// `TIMESTAMPTZ`), then the row limit.
+///
+/// The seek is one row-value comparison over the whole key, descending in every component, which
+/// is the direction pattern `upstream_quarantine_page_idx` (0015) carries. `last_seen_at` alone
+/// is not a total order on this table — a tampering incident writes a block of rows inside one
+/// fetch loop — so a cursor over it would skip or repeat rows.
+pub fn quarantine_page_sql(with_cursor: bool) -> &'static str {
+    if with_cursor {
+        concat!(
+            "SELECT format, name, version, upstream, expected_sha256, actual_sha256, occurrences, ",
+            "first_seen_at, last_seen_at FROM upstream_quarantine ",
+            "WHERE (last_seen_at, format, name, version) < ($1, $2, $3, $4) ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC, version DESC LIMIT $5",
+        )
+    } else {
+        concat!(
+            "SELECT format, name, version, upstream, expected_sha256, actual_sha256, occurrences, ",
+            "first_seen_at, last_seen_at FROM upstream_quarantine ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC, version DESC LIMIT $1",
+        )
+    }
+}
+
+/// The shadowing page statement for one filter slice, with or without its keyset predicate
+/// ([S-17.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+///
+/// Exported for the same reason as [`quarantine_page_sql`]. Binds, in order: the three cursor
+/// components when `with_cursor`, then the row limit.
+///
+/// The filter is baked into the statement rather than passed as a parameter: the old
+/// `WHERE (NOT $1 OR acknowledged_at IS NULL)` shape cannot use a partial index at all, because
+/// the planner has to assume the branch that reads every row. `Some(true)` seeks
+/// `shadowing_alarms_active_idx`, the other two seek `shadowing_alarms_page_idx`.
+pub fn shadowing_page_sql(active: Option<bool>, with_cursor: bool) -> &'static str {
+    match (active, with_cursor) {
+        (None, false) => concat!(
+            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, ",
+            "last_seen_at, acknowledged_at FROM shadowing_alarms ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC LIMIT $1",
+        ),
+        (None, true) => concat!(
+            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, ",
+            "last_seen_at, acknowledged_at FROM shadowing_alarms ",
+            "WHERE (last_seen_at, format, name) < ($1, $2, $3) ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC LIMIT $4",
+        ),
+        (Some(true), false) => concat!(
+            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, ",
+            "last_seen_at, acknowledged_at FROM shadowing_alarms WHERE acknowledged_at IS NULL ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC LIMIT $1",
+        ),
+        (Some(true), true) => concat!(
+            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, ",
+            "last_seen_at, acknowledged_at FROM shadowing_alarms WHERE acknowledged_at IS NULL ",
+            "AND (last_seen_at, format, name) < ($1, $2, $3) ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC LIMIT $4",
+        ),
+        (Some(false), false) => concat!(
+            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, ",
+            "last_seen_at, acknowledged_at FROM shadowing_alarms WHERE acknowledged_at IS NOT NULL ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC LIMIT $1",
+        ),
+        (Some(false), true) => concat!(
+            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, ",
+            "last_seen_at, acknowledged_at FROM shadowing_alarms WHERE acknowledged_at IS NOT NULL ",
+            "AND (last_seen_at, format, name) < ($1, $2, $3) ",
+            "ORDER BY last_seen_at DESC, format DESC, name DESC LIMIT $4",
+        ),
+    }
+}
 
 /// All upstream-package columns, in [`UpstreamPackageRow`] order.
 const PKG_COLS: &str = "id, format, name, upstream, discontinued, replaced_by, advisories_updated, \
@@ -457,16 +534,56 @@ impl UpstreamRepo for PgUpstreamRepo {
         row.try_into()
     }
 
-    async fn list_quarantine(&self, limit: u32) -> Result<Vec<QuarantineEntry>> {
-        let rows: Vec<QuarantineRow> = sqlx::query_as(
-            "SELECT format, name, version, upstream, expected_sha256, actual_sha256, occurrences, first_seen_at, \
-             last_seen_at FROM upstream_quarantine ORDER BY last_seen_at DESC, name LIMIT $1",
+    async fn list_quarantine(&self, cursor: Option<&str>, limit: u32) -> Result<Page<QuarantineEntry>> {
+        let limit = i64::from(limit.clamp(1, MAX_PAGE));
+        let keyset = cursor.map(|cursor| decode_cursor(cursor, 4)).transpose()?;
+        let mut query = sqlx::query_as(quarantine_page_sql(keyset.is_some()));
+        if let Some(parts) = &keyset {
+            // The instant is parsed rather than bound as text: the column is `TIMESTAMPTZ`, and
+            // a string bind would either fail the comparison or force a per-row cast that no
+            // index can serve. A malformed instant inside a caller's cursor is `Invalid` — a
+            // 400 — exactly like a malformed cursor envelope.
+            query = query
+                .bind(decode_cursor_time(&parts[0])?)
+                .bind(parts[1].clone())
+                .bind(parts[2].clone())
+                .bind(parts[3].clone());
+        }
+        let rows: Vec<QuarantineRow> = query.bind(limit + 1).fetch_all(&self.pool).await.map_err(db_err)?;
+
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<QuarantineEntry> =
+            rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
+        let cursor = if has_more {
+            items.last().map(|entry| {
+                encode_cursor(&[
+                    &encode_cursor_time(entry.last_seen_at),
+                    entry.format.as_str(),
+                    &entry.name,
+                    &entry.version,
+                ])
+            })
+        } else {
+            None
+        };
+        Ok(Page { items, cursor, has_more })
+    }
+
+    async fn purge_quarantine_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64> {
+        // Bounded like every other retention delete (decision 30). The inner `ORDER BY
+        // last_seen_at` takes the oldest rows first, so the caller's loop converges instead of
+        // revisiting an arbitrary slice of the same backlog.
+        let deleted = sqlx::query(
+            "DELETE FROM upstream_quarantine WHERE (format, name, version) IN \
+             (SELECT format, name, version FROM upstream_quarantine WHERE last_seen_at < $1 \
+              ORDER BY last_seen_at LIMIT $2)",
         )
-        .bind(i64::from(limit.clamp(1, MAX_PAGE)))
-        .fetch_all(&self.pool)
+        .bind(cutoff)
+        .bind(i64::from(batch))
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        rows.into_iter().map(TryInto::try_into).collect()
+        Ok(deleted.rows_affected())
     }
 
     async fn record_shadowing(&self, alarm: NewShadowingAlarm, now: DateTime<Utc>) -> Result<(ShadowingAlarm, bool)> {
@@ -517,18 +634,49 @@ impl UpstreamRepo for PgUpstreamRepo {
         Ok((row.try_into()?, raised))
     }
 
-    async fn list_shadowing(&self, active_only: bool, limit: u32) -> Result<Vec<ShadowingAlarm>> {
-        let rows: Vec<ShadowingRow> = sqlx::query_as(
-            "SELECT format, name, org_id, upstream, upstream_version, observations, first_seen_at, last_seen_at, \
-             acknowledged_at FROM shadowing_alarms WHERE (NOT $1 OR acknowledged_at IS NULL) \
-             ORDER BY last_seen_at DESC, name LIMIT $2",
+    async fn list_shadowing(
+        &self,
+        active: Option<bool>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Page<ShadowingAlarm>> {
+        let limit = i64::from(limit.clamp(1, MAX_PAGE));
+        let keyset = cursor.map(|cursor| decode_cursor(cursor, 3)).transpose()?;
+        let mut query = sqlx::query_as(shadowing_page_sql(active, keyset.is_some()));
+        if let Some(parts) = &keyset {
+            query = query.bind(decode_cursor_time(&parts[0])?).bind(parts[1].clone()).bind(parts[2].clone());
+        }
+        let rows: Vec<ShadowingRow> = query.bind(limit + 1).fetch_all(&self.pool).await.map_err(db_err)?;
+
+        let has_more = rows.len() as i64 > limit;
+        let items: Vec<ShadowingAlarm> =
+            rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;
+        let cursor = if has_more {
+            items.last().map(|alarm| {
+                encode_cursor(&[&encode_cursor_time(alarm.last_seen_at), alarm.format.as_str(), &alarm.name])
+            })
+        } else {
+            None
+        };
+        Ok(Page { items, cursor, has_more })
+    }
+
+    async fn purge_shadowing_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64> {
+        // `acknowledged_at IS NOT NULL` is not redundant next to the comparison: it is what
+        // makes an **active** alarm undeletable at every window (S-23.b), and it is the
+        // predicate `shadowing_alarms_ack_idx` is partial on. The age is the acknowledgement,
+        // never the sighting.
+        let deleted = sqlx::query(
+            "DELETE FROM shadowing_alarms WHERE (format, name) IN \
+             (SELECT format, name FROM shadowing_alarms \
+              WHERE acknowledged_at IS NOT NULL AND acknowledged_at < $1 ORDER BY acknowledged_at LIMIT $2)",
         )
-        .bind(active_only)
-        .bind(i64::from(limit.clamp(1, MAX_PAGE)))
-        .fetch_all(&self.pool)
+        .bind(cutoff)
+        .bind(i64::from(batch))
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        rows.into_iter().map(TryInto::try_into).collect()
+        Ok(deleted.rows_affected())
     }
 
     async fn acknowledge_shadowing(&self, format: Format, name: &str, now: DateTime<Utc>) -> Result<bool> {

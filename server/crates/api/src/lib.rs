@@ -131,6 +131,10 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::admin::export_audit))
         .routes(routes!(routes::admin::stats))
         .routes(routes!(routes::admin::run_job))
+        // The two supply-chain registers and the one write they have (decision 33).
+        .routes(routes!(routes::admin::list_quarantine))
+        .routes(routes!(routes::admin::list_shadowing))
+        .routes(routes!(routes::admin::acknowledge_shadowing))
         .routes(routes!(routes::admin::test_smtp))
         // Public read model (decision 11 search + the package/org/home screens of
         // docs/product.md). All GET, all anonymous-reachable, all visibility-filtered.

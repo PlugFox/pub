@@ -797,6 +797,8 @@ impl TestApp {
                 invitations: Some(chrono::Duration::days(30)),
                 notifications: Some(chrono::Duration::days(180)),
                 download_stats: None,
+                quarantine: Some(chrono::Duration::days(730)),
+                shadowing: Some(chrono::Duration::days(730)),
                 batch: 1_000,
                 budget: StdDuration::from_secs(60),
             },
@@ -971,9 +973,21 @@ impl TestApp {
         (access, org)
     }
 
-    /// Mints a CLI token through the real app API (S-13 show-once path).
+    /// Mints an ordinary 90-day CLI token through the real app API (S-13 show-once path).
+    ///
+    /// `expires_days` is sent explicitly because since [decision 33] an absent field means
+    /// *never*, which S-06.d gates behind a fresh second factor and S-13.c refuses outright for
+    /// a write scope. A harness that omitted it would be asking for a different credential than
+    /// the one every caller of this helper wants.
+    ///
+    /// [decision 33]: ../../../../../docs/decisions.md#33
     pub async fn mint_token(&self, access: &str, org: OrgId, scopes: &[&str]) -> String {
-        let body = serde_json::json!({ "org_id": org.to_string(), "scopes": scopes, "label": "conformance" });
+        let body = serde_json::json!({
+            "org_id": org.to_string(),
+            "scopes": scopes,
+            "label": "conformance",
+            "expires_days": pub_auth::flows::DEFAULT_TOKEN_EXPIRY_DAYS,
+        });
         let response = self.post("/api/v1/tokens", Some(access), body).await;
         assert_eq!(response.status, StatusCode::OK, "token mint failed: {:?}", response.json);
         response.json["data"]["secret"].as_str().expect("secret").to_owned()
@@ -981,8 +995,10 @@ impl TestApp {
 
     /// Inserts a CLI token straight into the repository, returning its plaintext.
     ///
-    /// The mint API does not expose package patterns or custom expiry yet; the conformance
-    /// suite needs both to exercise S-13 narrowing and expired-credential handling.
+    /// The mint API exposes package patterns and every legal expiry since decision 33, and the
+    /// wire tests for both live in `tokens.rs`. This stays because two shapes remain unmintable
+    /// by construction: a token that has **already** expired, and a token whose patterns predate
+    /// the S-13.c grammar. Tests that exercise *enforcement* rather than minting use it.
     pub async fn insert_token(
         &self,
         user: UserId,
@@ -1324,4 +1340,16 @@ pub fn extract_code(text: &str) -> String {
 /// A code guaranteed to differ from `code` while staying 8 digits.
 pub fn wrong_code(code: &str) -> String {
     if code == "00000000" { "00000001".to_owned() } else { "00000000".to_owned() }
+}
+
+/// Body of an ordinary token mint — one that expires.
+///
+/// The explicit lifetime is the point: since [decision 33] an absent `expires_days` asks for a
+/// **non-expiring** token, which S-13.c allows only for `read` and S-06.d gates behind a fresh
+/// factor. Tests about scopes, roles or step-up must not accidentally be tests about expiry, so
+/// they say what they want. The tests that *are* about expiry spell their body out in place.
+///
+/// [decision 33]: ../../../../../docs/decisions.md#33
+pub fn token_body(org_id: &str, scopes: &[&str]) -> serde_json::Value {
+    serde_json::json!({ "org_id": org_id, "scopes": scopes, "expires_days": 90 })
 }

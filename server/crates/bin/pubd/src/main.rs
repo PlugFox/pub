@@ -455,6 +455,8 @@ fn spawn_jobs(
             invitations: window(lifecycle_cfg.retain_invitations_days),
             notifications: window(lifecycle_cfg.retain_notifications_days),
             download_stats: window(lifecycle_cfg.retain_download_stats_days),
+            quarantine: window(lifecycle_cfg.retain_quarantine_days),
+            shadowing: window(lifecycle_cfg.retain_shadowing_days),
             batch: lifecycle_cfg.batch,
             budget: Duration::from_secs(lifecycle_cfg.budget_secs),
         },

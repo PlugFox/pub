@@ -123,8 +123,20 @@ pub struct TokenCreateBody {
     pub org_id: String,
     /// Requested scopes: `read` | `publish` | `retract` | `admin`.
     pub scopes: Vec<String>,
-    /// Lifetime in days; defaults to 90 (S-13).
+    /// Lifetime in days (1…3650), or `null` for a token that **never expires**.
+    ///
+    /// Since [decision 33](../../../../docs/decisions.md#33) this field is explicit and `null`
+    /// is not "use the default": a non-expiring token may carry only the `read` scope
+    /// ([S-13.c](../../../../docs/security.md#3-cliapi-tokens)) and minting one demands a fresh
+    /// second factor at every scope ([S-06.d](../../../../docs/security.md#1-authentication)).
+    /// `0` is refused. The UI sends 90 explicitly, which is where the product's default now lives.
     pub expires_days: Option<i64>,
+    /// Package-name patterns narrowing the token further; absent or empty means no narrowing.
+    ///
+    /// One trailing `*` is a prefix match (`acme_*`), anything else is an exact package name.
+    /// Validated at the mint against the matcher that enforces it (S-13.c), so a pattern that
+    /// could never match is a 400 rather than a token that authorizes nothing.
+    pub package_patterns: Option<Vec<String>>,
 }
 
 /// Body of `POST /api/v1/orgs`.
@@ -350,9 +362,15 @@ pub struct TokenDto {
     pub display_hint: String,
     /// Granted scopes.
     pub scopes: Vec<String>,
+    /// Package-name patterns narrowing the token; empty means no narrowing (S-13).
+    ///
+    /// Rendered by the token list because the mint validates the pattern's *grammar* and never
+    /// its intent: `acme_x*` is a well-formed pattern for an org whose packages are `acme_y*`,
+    /// and the only way its owner finds that out before CI does is by reading it back.
+    pub package_patterns: Vec<String>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
-    /// Expiry, if any.
+    /// Expiry; `null` means the token never expires (S-13.c — `read` scope only).
     pub expires_at: Option<DateTime<Utc>>,
     /// Last use (write-throttled), if any.
     pub last_used_at: Option<DateTime<Utc>>,
@@ -366,6 +384,7 @@ impl From<&Token> for TokenDto {
             name: token.name.clone(),
             display_hint: token.display_hint.clone(),
             scopes: token.scopes.iter().map(|scope| scope.as_str().to_owned()).collect(),
+            package_patterns: token.package_patterns.clone(),
             created_at: token.created_at,
             expires_at: token.expires_at,
             last_used_at: token.last_used_at,
@@ -1341,6 +1360,8 @@ pub struct UpstreamCacheStatsDto {
 /// One quarantined upstream archive (S-19).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuarantineDto {
+    /// Artifact format the name lives in — part of the register's key (decision 21).
+    pub format: String,
     /// Package name upstream.
     pub name: String,
     /// The refused version.
@@ -1353,6 +1374,8 @@ pub struct QuarantineDto {
     pub actual_sha256: String,
     /// How many times this has been observed.
     pub occurrences: i64,
+    /// First observation — the incident's start.
+    pub first_seen_at: DateTime<Utc>,
     /// Most recent observation.
     pub last_seen_at: DateTime<Utc>,
 }
@@ -1360,6 +1383,8 @@ pub struct QuarantineDto {
 /// One shadowing alarm (S-17).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ShadowingDto {
+    /// Artifact format the name lives in — with `name`, the key an acknowledgement addresses.
+    pub format: String,
     /// The shadowed name.
     pub name: String,
     /// Org holding the local claim.
@@ -1372,8 +1397,55 @@ pub struct ShadowingDto {
     pub observations: i64,
     /// Whether it still wants attention.
     pub active: bool,
+    /// First sighting of the **current** incident: an acknowledged alarm that is seen again
+    /// starts a new one (S-17.a), so this moves rather than recording the original sighting.
+    pub first_seen_at: DateTime<Utc>,
     /// Most recent sighting.
     pub last_seen_at: DateTime<Utc>,
+    /// When an administrator acknowledged it; `null` while it is still active.
+    pub acknowledged_at: Option<DateTime<Utc>>,
+}
+
+/// Response of `POST /api/v1/admin/shadowing/{format}/{name}/acknowledge`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ShadowingAckDto {
+    /// Whether an **active** alarm was acknowledged by this call. `false` means there was
+    /// nothing to acknowledge — an unknown name or one already cleared — and nothing was
+    /// written: a button pressed twice is not an event.
+    pub acknowledged: bool,
+}
+
+impl From<&pub_core::package::QuarantineEntry> for QuarantineDto {
+    fn from(entry: &pub_core::package::QuarantineEntry) -> Self {
+        Self {
+            format: entry.format.as_str().to_owned(),
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            upstream: entry.upstream.clone(),
+            expected_sha256: entry.expected_sha256.clone(),
+            actual_sha256: entry.actual_sha256.clone(),
+            occurrences: entry.occurrences,
+            first_seen_at: entry.first_seen_at,
+            last_seen_at: entry.last_seen_at,
+        }
+    }
+}
+
+impl From<&pub_core::package::ShadowingAlarm> for ShadowingDto {
+    fn from(alarm: &pub_core::package::ShadowingAlarm) -> Self {
+        Self {
+            format: alarm.format.as_str().to_owned(),
+            name: alarm.name.clone(),
+            org_id: alarm.org_id.to_string(),
+            upstream: alarm.upstream.clone(),
+            upstream_version: alarm.upstream_version.clone(),
+            observations: alarm.observations,
+            active: alarm.is_active(),
+            first_seen_at: alarm.first_seen_at,
+            last_seen_at: alarm.last_seen_at,
+            acknowledged_at: alarm.acknowledged_at,
+        }
+    }
 }
 
 /// Durable state of one background job.

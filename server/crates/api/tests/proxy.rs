@@ -435,7 +435,10 @@ async fn s17_claiming_a_proxied_name_alarms_and_the_local_package_still_wins() {
         app.pub_get(&format!("{}/api/packages/acme_core", base(&slug)), Some(&token)).await.status,
         StatusCode::OK
     );
-    assert!(app.repos.upstream.list_shadowing(true, 10).await.unwrap().is_empty(), "nothing is claimed yet");
+    assert!(
+        app.repos.upstream.list_shadowing(Some(true), None, 10).await.unwrap().items.is_empty(),
+        "nothing is claimed yet"
+    );
 
     let archive = common::package_archive("acme_core", "1.0.0");
     assert_eq!(app.publish(&base(&slug), &token, &archive).await.status, StatusCode::OK);
@@ -454,7 +457,7 @@ async fn s17_claiming_a_proxied_name_alarms_and_the_local_package_still_wins() {
 
     // …and the alarm is raised, audited, and listable for the org's admins.
     assert!(audit_actions(&app).await.contains(&"upstream.shadowing".to_owned()), "S-17 requires an audit trail");
-    let alarms = app.repos.upstream.list_shadowing(true, 10).await.unwrap();
+    let alarms = app.repos.upstream.list_shadowing(Some(true), None, 10).await.unwrap().items;
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0].name, "acme_core");
     assert_eq!(alarms[0].org_id, org, "the claim holder is the audience, not the instance");
@@ -473,7 +476,7 @@ async fn s17_claiming_a_proxied_name_alarms_and_the_local_package_still_wins() {
 
     // Acknowledging is bookkeeping — resolution never depended on it and still does not.
     assert!(app.repos.upstream.acknowledge_shadowing(Format::Pub, "acme_core", app.now()).await.unwrap());
-    assert!(app.repos.upstream.list_shadowing(true, 10).await.unwrap().is_empty());
+    assert!(app.repos.upstream.list_shadowing(Some(true), None, 10).await.unwrap().items.is_empty());
     let after = app.pub_get(&format!("{}/api/packages/acme_core", base(&slug)), Some(&token)).await;
     assert_eq!(after.status, StatusCode::OK);
     assert_eq!(after.json["versions"].as_array().unwrap().len(), 2);
@@ -490,7 +493,7 @@ async fn s17_a_name_nobody_has_seen_upstream_raises_no_alarm() {
     let archive = common::package_archive("acme_core", "1.0.0");
     assert_eq!(app.publish(&base(&slug), &token, &archive).await.status, StatusCode::OK);
 
-    assert!(app.repos.upstream.list_shadowing(false, 10).await.unwrap().is_empty());
+    assert!(app.repos.upstream.list_shadowing(None, None, 10).await.unwrap().items.is_empty());
     assert!(!audit_actions(&app).await.contains(&"upstream.shadowing".to_owned()));
     assert_eq!(app.mock_upstream().listing_calls(), 0, "a publish must not go asking upstream about the name");
 }

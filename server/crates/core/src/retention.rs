@@ -45,6 +45,20 @@ pub struct RetentionPolicy {
     pub notifications: Option<Duration>,
     /// Daily download-rollup window. `None` by default, deliberately.
     pub download_stats: Option<Duration>,
+    /// Quarantine-register window, aged from `last_seen_at`
+    /// ([S-23.b](../../../docs/security.md#5-audit--abuse)).
+    ///
+    /// Aging from the last sighting is what makes the number harmless: a mismatch still being
+    /// observed is outside every window at every setting, so only a refusal nobody has
+    /// re-triggered for the whole window can be deleted.
+    pub quarantine: Option<Duration>,
+    /// Shadowing-register window, aged from `acknowledged_at` — **never** from the sighting.
+    ///
+    /// An active alarm is undeletable at every setting. Deleting one would be worse than losing
+    /// a row: the mirror sweep re-raises it on the next pass with a fresh `first_seen_at`
+    /// ([S-17.a](../../../docs/security.md#4-supply-chain--registry-integrity)), so retention
+    /// would silently rewrite the incident's start date.
+    pub shadowing: Option<Duration>,
     /// Rows one statement may delete. Bounds the write-lock hold, which on SQLite is the whole
     /// point: one unbounded `DELETE` holds the process's single writer for its full duration,
     /// and a hold past the busy timeout turns a concurrent publish or sign-in into
@@ -206,6 +220,8 @@ mod tests {
             invitations: Some(Duration::days(30)),
             notifications: Some(Duration::days(180)),
             download_stats: None,
+            quarantine: Some(Duration::days(730)),
+            shadowing: Some(Duration::days(730)),
             batch: 1_000,
             budget: StdDuration::from_secs(60),
         }
