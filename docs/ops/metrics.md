@@ -29,7 +29,7 @@ Time to the response head, in seconds. Excludes streaming bodies: an archive dow
 
 Labels: `limit`
 
-Requests refused by a rate limit, by bucket family. This is the volume signal: the audit log records one row per bucket per window, deliberately, so it cannot be filled by the traffic it refuses.
+Requests refused by a rate limit, by bucket family — credential buckets (otp_email, otp_ip, login_ip, token_auth_ip), read buckets (read_per_ip, read_per_token, read_per_user), write buckets (write_per_ip, write_per_token, write_per_user), the per-org publish budget, the audit-export budget, and the two invitation caps. This is the volume signal, and it is the only one: the audit log records at most one row per bucket per window everywhere, so row count measures windows entered rather than requests refused.
 
 ## `rate_limit_fallback_total`
 
@@ -38,6 +38,14 @@ Requests refused by a rate limit, by bucket family. This is the volume signal: t
 Labels: `bucket`
 
 Auth-abuse limit decisions taken by this instance's in-process fallback because the KV was unreachable (S-24.e). Non-zero means the shared limiter is down and the effective budget is per instance — up to N x the limit across N replicas.
+
+## `latest_window_exhausted_total`
+
+*counter*
+
+No labels.
+
+Times the `latest` rule ran out of its 1 000-version window before finding a live stable release, so the answer came from the newest versions alone (decision 32). A counter rather than a log line because the scan runs on the anonymous package page, where a read loop would otherwise choose the log volume.
 
 ## `publishes_total`
 
@@ -54,6 +62,14 @@ Versions successfully published, by artifact format (decision 21).
 No labels.
 
 Archive downloads folded into the durable counters by the rollup job.
+
+## `storage_quota_refusals_total`
+
+*counter*
+
+Labels: `stage`
+
+Publishes refused because the organization is at its storage quota (S-20.b), by which of the two checkpoints refused. `stage="upload"` means the archive never reached the staging area; `stage="finalize"` means it did and the bytes were then discarded — a sustained gap between the two is a client that keeps finalizing uploads it started before the wall.
 
 ## `search_reindex_documents_total`
 

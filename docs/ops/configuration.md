@@ -119,16 +119,21 @@ surface legitimately carries megabytes of request body.
 
 ## `[http.rate_limit]`
 
-Read-path abuse limits (S-24.f). Boot defaults for the runtime-changeable numbers.
+Read- and write-path abuse limits (S-24.f, S-24.g). Boot defaults for the
+runtime-changeable numbers.
 
-Read-path rate limits ([S-24.f](../security.md#5-audit--abuse)).
+Read- and write-path rate limits ([S-24.f](../security.md#5-audit--abuse),
+[S-24.g](../security.md#5-audit--abuse)).
 
-These live under `[http]` rather than `[auth]` or `[registry]` because they apply to every
-`GET`/`HEAD` on **both** planes — the app API and the pub protocol — and are a property of
-how this instance handles requests, like the deadlines and the body cap beside them.
+These live under `[http]` rather than `[auth]` or `[registry]` because they apply to whole
+planes rather than to one feature — the read pair to every `GET`/`HEAD` on both the app API
+and the pub protocol, the write pair to every app-API mutation — and are a property of how
+this instance handles requests, like the deadlines and the body cap beside them.
 
-Both buckets **fail open**: a KV outage lifts the quota rather than refusing reads. They are
-quotas on cost, not access gates, and the gates that must fail closed are elsewhere.
+All four buckets **fail open**: a KV outage lifts the quota rather than refusing traffic.
+They are quotas on cost, not access gates, and the gates that must fail closed are elsewhere.
+Each is keyed on the same three identity classes (`tok:`, `usr:`, `ip:`) decision 27
+introduced.
 
 ### `http.rate_limit.read_per_ip_minute`
 
@@ -148,6 +153,29 @@ Reads per minute per identity: one CLI token, or one signed-in account.
 Sized for the burst `dart pub get` produces over a few hundred dependencies, from every
 CI job sharing one token at once. Raise it if a large fleet trips it; because the bucket
 fails open, guessing low degrades throughput rather than breaking resolution.
+
+### `http.rate_limit.write_per_ip_minute`
+
+integer · `PUB_HTTP__RATE_LIMIT__WRITE_PER_IP_MINUTE` · default: `60`
+
+App-API **mutations** per minute per client IP, for requests carrying no usable
+credential ([S-24.g](../security.md#5-audit--abuse)).
+
+An order of magnitude below the read number, because writes are that much rarer in every
+legitimate shape. The pub protocol is not charged here — its one write already spends the
+S-24.c publish budget — and neither are the six credential endpoints, which spend their
+own fail-closed buckets.
+
+### `http.rate_limit.write_per_identity_minute`
+
+integer · `PUB_HTTP__RATE_LIMIT__WRITE_PER_IDENTITY_MINUTE` · default: `300`
+
+App-API **mutations** per minute per identity: one CLI token, or one signed-in account
+(S-24.g).
+
+Sized so a human session and a CI token both sit comfortably below it while a runaway
+loop does not. Like the read buckets it fails **open**, so a wrong guess is slow rather
+than broken.
 
 ## `[database]`
 
@@ -664,6 +692,27 @@ integer · `PUB_REGISTRY__MAX_CAPTURED_FILE_BYTES` · default: `4194304`
 
 Maximum size of a single captured file (pubspec, README, CHANGELOG, example).
 
+### `registry.storage_quota_bytes`
+
+integer · `PUB_REGISTRY__STORAGE_QUOTA_BYTES` · default: `0`
+
+Default per-org storage quota in bytes; **`0` = unlimited**
+([S-20.b](../security.md#4-supply-chain--registry-integrity), decision 32).
+
+What it counts is the sum of `archive_size` over an org's live version rows: retracted
+versions count (they are still downloadable), tombstoned ones do not, proxied upstream
+archives never do, and byte-identical uploads are deliberately charged to each org that
+published them.
+
+A **per-org override wins over this number** whenever one is set (`orgs.storage_quota_bytes`
+on the org row, writable only by an instance admin); this key is the default for every
+org that has none. The default of `0` is what keeps a self-hosted instance for one team
+from meeting a wall it never asked for.
+
+This value is the **default** of the `registry` runtime setting
+([decision 09](../decisions.md#09)): an administrator can raise or lower it
+without a restart, and clearing the stored section falls back here.
+
 ### `registry.unretract_window_days`
 
 integer · `PUB_REGISTRY__UNRETRACT_WINDOW_DAYS` · default: `7`
@@ -704,6 +753,40 @@ Publish uploads accepted per org per hour (S-24: 30).
 The budget is spent by the *upload* step, which is where an attempt costs storage:
 step 1 hands out a URL, step 3 only finishes what was already paid for. It bounds the
 staging area an org can occupy with uploads it never finalizes.
+
+## `[orgs]`
+
+Organization policy: the invitation budgets of S-24.h.
+
+Organization policy: the invitation budgets of
+[S-24.h](../security.md#5-audit--abuse).
+
+A section of its own rather than two more keys under `[http].rate_limit`, because these two
+are not KV buckets: they are exact rolling-window `COUNT(*)`s over the `invitations` table,
+which is what keeps them precise and outage-proof on the one mutation whose cost is mail
+delivered to a third party (decision 32). What they share with the buckets is only that both
+are projected into the runtime `rate_limits` section, so an instance being spammed can
+respond without a rebuild — before decision 32 these were compile-time constants.
+
+### `orgs.invitations_per_day_org`
+
+integer · `PUB_ORGS__INVITATIONS_PER_DAY_ORG` · default: `20`
+
+Invitations one org may send per rolling 24 hours (S-24: ≤20/day/org).
+
+Bounds the org. This is the number that was `OrgPolicy::invitations_per_day_org` at
+compile time, and the default preserves the behaviour exactly.
+
+### `orgs.invitations_per_day_actor`
+
+integer · `PUB_ORGS__INVITATIONS_PER_DAY_ACTOR` · default: `10`
+
+Invitations one **member** may send per rolling 24 hours **within one org** (S-24's
+"with per-actor caps", unimplemented until decision 32).
+
+Bounds the member, so a single one cannot spend the whole org's budget. The residue is
+stated rather than hidden: somebody who is Admin in N orgs can still send N × this
+number, each org bounded by its own cap.
 
 ## `[upstream]`
 
