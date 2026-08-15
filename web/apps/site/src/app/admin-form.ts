@@ -7,6 +7,7 @@ import type {
   SmtpSettingsPatchDto,
   UpstreamSettingsDto,
 } from "@pub/api/types";
+import { parseQuotaBytes } from "./storage-quota";
 
 /*
  * Instance-settings form model and validation.
@@ -16,11 +17,20 @@ import type {
  * instead of a round trip and a toast. The rules below mirror that module
  * one-for-one — when it changes, this changes with it:
  *
- *   - every rate limit ≥ 1 (a zero locks the instance out of its own sign-in);
+ *   - every rate limit ≥ 1 (a zero locks the instance out of its own sign-in),
+ *     including the two invitation caps, which are exact database counts
+ *     rather than buckets but whose zero closes invitations just as thoroughly
+ *     (S-24.h);
  *   - `smtp.port` ≥ 1, `smtp.security` ∈ {tls, starttls, none};
  *   - `branding.name` non-empty;
  *   - each allowed email domain lowercased, no `@`, no whitespace, one dot at
  *     least — a typo'd allowlist is a lockout, not a filter.
+ *
+ * ONE NUMBER ON THIS FORM IS NOT A RATE LIMIT. `registry.storage_quota_bytes`
+ * (S-20.b) is a `u64` where **`0` means unlimited**, so the "at least 1" rule
+ * would refuse the value an instance ships with. It is validated as a whole
+ * NON-NEGATIVE integer instead, and the screen says what `0` means rather than
+ * leaving an operator to discover it by typing it.
  *
  * One server rule is deliberately NOT mirrored: `smtp.username` requires a
  * password. Whether one is available depends on the boot `[smtp]` credential,
@@ -52,6 +62,10 @@ export type SettingsForm = {
   readonly publishPerHourOrg: string;
   readonly readPerIpMinute: string;
   readonly readPerIdentityMinute: string;
+  readonly writePerIpMinute: string;
+  readonly writePerIdentityMinute: string;
+  readonly invitationsPerDayOrg: string;
+  readonly invitationsPerDayActor: string;
   readonly smtpHost: string;
   readonly smtpPort: string;
   readonly smtpUsername: string;
@@ -63,6 +77,8 @@ export type SettingsForm = {
   readonly upstreamEnabled: boolean;
   readonly upstreamDefaultPolicy: string;
   readonly registryRequireAuthForRead: boolean;
+  /** Bytes, as typed. `"0"` is the shipped value and means unlimited (S-20.b). */
+  readonly storageQuotaBytes: string;
 };
 
 /** Field keys the validator can flag; the screen maps them to i18n messages. */
@@ -76,11 +92,16 @@ export type SettingsFieldError =
   | "publishPerHourOrg"
   | "readPerIpMinute"
   | "readPerIdentityMinute"
+  | "writePerIpMinute"
+  | "writePerIdentityMinute"
+  | "invitationsPerDayOrg"
+  | "invitationsPerDayActor"
   | "smtpPort"
-  | "smtpFrom";
+  | "smtpFrom"
+  | "storageQuotaBytes";
 
 export type SettingsErrors = Partial<
-  Record<SettingsFieldError, "required" | "positive" | "domain">
+  Record<SettingsFieldError, "required" | "positive" | "domain" | "bytes">
 >;
 
 /** Builds the editable form from a loaded settings document. */
@@ -99,6 +120,10 @@ export function settingsToForm(settings: AdminSettingsDto): SettingsForm {
     publishPerHourOrg: String(settings.rate_limits.publish_per_hour_org),
     readPerIpMinute: String(settings.rate_limits.read_per_ip_minute),
     readPerIdentityMinute: String(settings.rate_limits.read_per_identity_minute),
+    writePerIpMinute: String(settings.rate_limits.write_per_ip_minute),
+    writePerIdentityMinute: String(settings.rate_limits.write_per_identity_minute),
+    invitationsPerDayOrg: String(settings.rate_limits.invitations_per_day_org),
+    invitationsPerDayActor: String(settings.rate_limits.invitations_per_day_actor),
     smtpHost: settings.smtp.host ?? "",
     smtpPort: String(settings.smtp.port),
     smtpUsername: settings.smtp.username ?? "",
@@ -109,6 +134,7 @@ export function settingsToForm(settings: AdminSettingsDto): SettingsForm {
     upstreamEnabled: settings.upstream.enabled,
     upstreamDefaultPolicy: settings.upstream.default_org_policy,
     registryRequireAuthForRead: settings.registry.require_auth_for_read,
+    storageQuotaBytes: String(settings.registry.storage_quota_bytes),
   };
 }
 
@@ -127,10 +153,8 @@ export function isEmailDomain(value: string): boolean {
 
 /** Whole positive integer, as the rate-limit fields require. */
 function positiveInt(raw: string): number | null {
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  const value = Number.parseInt(trimmed, 10);
-  return value >= 1 ? value : null;
+  const value = parseQuotaBytes(raw);
+  return value !== null && value >= 1 ? value : null;
 }
 
 export function validateSettings(form: SettingsForm): SettingsErrors {
@@ -147,12 +171,18 @@ export function validateSettings(form: SettingsForm): SettingsErrors {
     ["publishPerHourOrg", form.publishPerHourOrg],
     ["readPerIpMinute", form.readPerIpMinute],
     ["readPerIdentityMinute", form.readPerIdentityMinute],
+    ["writePerIpMinute", form.writePerIpMinute],
+    ["writePerIdentityMinute", form.writePerIdentityMinute],
+    ["invitationsPerDayOrg", form.invitationsPerDayOrg],
+    ["invitationsPerDayActor", form.invitationsPerDayActor],
   ];
   for (const [field, raw] of limits) {
     if (positiveInt(raw) === null) errors[field] = "positive";
   }
   if (positiveInt(form.smtpPort) === null) errors.smtpPort = "positive";
   if (form.smtpFrom.trim() === "") errors.smtpFrom = "required";
+  // Deliberately NOT in the table above: `0` is this field's shipped value.
+  if (parseQuotaBytes(form.storageQuotaBytes) === null) errors.storageQuotaBytes = "bytes";
   return errors;
 }
 
@@ -207,6 +237,10 @@ export function formToPatch(form: SettingsForm): SettingsPatch {
       publish_per_hour_org: Number.parseInt(form.publishPerHourOrg.trim(), 10),
       read_per_ip_minute: Number.parseInt(form.readPerIpMinute.trim(), 10),
       read_per_identity_minute: Number.parseInt(form.readPerIdentityMinute.trim(), 10),
+      write_per_ip_minute: Number.parseInt(form.writePerIpMinute.trim(), 10),
+      write_per_identity_minute: Number.parseInt(form.writePerIdentityMinute.trim(), 10),
+      invitations_per_day_org: Number.parseInt(form.invitationsPerDayOrg.trim(), 10),
+      invitations_per_day_actor: Number.parseInt(form.invitationsPerDayActor.trim(), 10),
     },
     smtp,
     upstream: {
@@ -215,6 +249,7 @@ export function formToPatch(form: SettingsForm): SettingsPatch {
     },
     registry: {
       require_auth_for_read: form.registryRequireAuthForRead,
+      storage_quota_bytes: Number.parseInt(form.storageQuotaBytes.trim(), 10),
     },
   };
 }

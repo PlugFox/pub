@@ -1906,6 +1906,11 @@ adminFieldDomain:
   ru: В каждой строке должен быть домен — без @ и хотя бы с одной точкой.
   desc: Inline validation message for a malformed entry in the email domain allowlist.
 
+adminFieldBytes:
+  en: Enter a whole number of bytes, or 0 for no limit.
+  ru: Введите целое число байтов или 0, если ограничения не нужно.
+  desc: Inline validation message for the storage quota field, which unlike every rate limit beside it accepts 0.
+
 adminBrandingTitle:
   en: Branding
   ru: Оформление
@@ -2010,6 +2015,26 @@ adminLimitReadIdentity:
   en: Reads per token or account, per minute
   ru: Чтений на токен или аккаунт в минуту
   desc: Label of the per-identity read-path limit. Deliberately much higher than the anonymous one — a CI fleet behind one NAT is one IP but many tokens.
+
+adminLimitWriteIp:
+  en: Writes per IP, per minute (anonymous)
+  ru: Изменений с IP в минуту (анонимно)
+  desc: Label of the per-IP write-path limit, which covers every app-API mutation that carries no usable credential.
+
+adminLimitWriteIdentity:
+  en: Writes per token or account, per minute
+  ru: Изменений на токен или аккаунт в минуту
+  desc: Label of the per-identity write-path limit. Covers app-API mutations only — publishing spends the per-organization publish budget instead, and sign-in spends its own.
+
+adminLimitInvitationsOrg:
+  en: Invitations per organization, per day
+  ru: Приглашений от организации в сутки
+  desc: Label of the per-organization invitation cap. Counted over a rolling 24 hours rather than a calendar day.
+
+adminLimitInvitationsActor:
+  en: Invitations per member, per day
+  ru: Приглашений от участника в сутки
+  desc: Label of the per-member invitation cap, counted within one organization over a rolling 24 hours. It stops one member spending the whole organization's daily budget.
 
 adminSmtpTitle:
   en: Outgoing mail
@@ -2161,6 +2186,31 @@ adminRegistryRequireAuthHint:
   ru: Анонимные запросы будут получать 401 с инструкцией по настройке токена вместо данных пакета. Действует со следующего запроса здесь и в течение минуты на остальных серверах.
   desc: Hint under the require-a-token checkbox — what anonymous callers receive and when the change reaches other instances.
 
+adminStorageTitle:
+  en: Storage quota
+  ru: Квота хранилища
+  desc: Heading of the storage-quota section of the settings form. Not part of the rate limit section — this bounds what is stored, not how often anyone calls.
+
+adminStorageBody:
+  en: How many bytes of published archives one organization may hold. A publish that would cross the line is refused permanently, not throttled — waiting frees no space.
+  ru: "Сколько байтов опубликованных архивов может занимать одна организация. Публикация, выходящая за границу, отклоняется окончательно, а не откладывается: ожидание места не освободит."
+  desc: Subtitle of the storage-quota settings section, explaining that a refusal is permanent rather than a retryable throttle.
+
+adminStorageQuota:
+  en: Default quota per organization, in bytes
+  ru: Квота по умолчанию на организацию, в байтах
+  desc: Label of the instance-wide default storage quota field.
+
+adminStorageQuotaHint:
+  en: 0 means no limit, which is what a new instance ships with. Retracted versions count toward the total; hard-deleted ones do not, and proxied upstream archives never do. A single organization can be given its own quota on the Organizations tab, and that one wins.
+  ru: 0 означает отсутствие ограничений — именно так настроен новый сервер. Отозванные версии учитываются в сумме, безвозвратно удалённые — нет, а проксированные архивы не учитываются никогда. Отдельной организации можно назначить свою квоту на вкладке «Организации», и она будет главнее.
+  desc: Hint under the default storage quota field — what 0 means, what counts toward the total, and that a per-organization override wins.
+
+adminStorageUnlimited:
+  en: No limit
+  ru: Без ограничений
+  desc: Live echo under the default storage quota field when the typed value is 0.
+
 adminUsersTitle:
   en: Accounts
   ru: Аккаунты
@@ -2245,6 +2295,86 @@ adminOrgCreated:
   en: Created
   ru: Создана
   desc: Column header for an organization's creation date.
+
+adminOrgsLoading:
+  en: Loading organizations…
+  ru: Загружаем организации…
+  desc: Live-region and placeholder text while the admin organization table and the instance settings it needs are still loading.
+
+adminOrgsLoaded:
+  en: Organizations loaded.
+  ru: Организации загружены.
+  desc: Live-region text announced once the admin organization table has finished loading.
+
+adminOrgQuota:
+  en: Storage quota
+  ru: Квота хранилища
+  desc: Column header for an organization's effective storage quota.
+
+adminOrgQuotaInherited:
+  en: Instance default
+  ru: Значение по умолчанию
+  desc: Second line of the quota column when the organization has no override of its own and follows the instance-wide default.
+
+adminOrgQuotaOverride:
+  en: Override
+  ru: Своя настройка
+  desc: Second line of the quota column when the organization has its own quota, set by an instance administrator.
+
+adminOrgQuotaUnlimited:
+  en: Unlimited
+  ru: Без ограничений
+  desc: Value shown wherever a storage quota resolves to no limit at all.
+
+adminOrgQuotaEdit:
+  en: Set quota
+  ru: Изменить квоту
+  desc: Button in each organization row that opens the storage-quota editor.
+
+adminOrgQuotaTitle:
+  en: "Storage quota: {org}"
+  ru: "Квота хранилища: {org}"
+  desc: Title of the per-organization storage quota dialog; {org} is the organization's display name.
+
+adminOrgQuotaBody:
+  en: The total size of the archives this organization may store. Retracted versions still count — they are still downloadable; hard-deleted ones do not.
+  ru: Суммарный размер архивов, которые может хранить эта организация. Отозванные версии учитываются — их всё ещё можно скачать; удалённые безвозвратно — нет.
+  desc: Description under the title of the per-organization storage quota dialog.
+
+adminOrgQuotaLegend:
+  en: Quota for this organization
+  ru: Квота для этой организации
+  desc: Legend of the three-way choice between following the instance default, no limit, and a specific size.
+
+adminOrgQuotaModeDefault:
+  en: Follow the instance default ({value})
+  ru: Использовать значение по умолчанию ({value})
+  desc: Radio choice that clears the override; {value} is the size the instance default currently resolves to.
+
+adminOrgQuotaModeUnlimited:
+  en: No limit for this organization, whatever the default becomes
+  ru: Без ограничений для этой организации, каким бы ни стало значение по умолчанию
+  desc: Radio choice that opts this organization out of the instance default permanently.
+
+adminOrgQuotaModeLimit:
+  en: Limit to a specific size
+  ru: Ограничить конкретным размером
+  desc: Radio choice that sets a byte limit for this organization.
+
+adminOrgQuotaBytes:
+  en: Bytes
+  ru: Байты
+  desc: Label of the byte-count field in the per-organization storage quota dialog.
+
+adminOrgQuotaBytesError:
+  en: Enter a whole number of at least 1 byte, or choose the no-limit option above.
+  ru: Введите целое число не меньше 1 байта или выберите вариант «без ограничений» выше.
+  desc: Inline validation message when the per-organization quota size is missing, fractional, or zero.
+
+adminOrgQuotaSaved:
+  en: "{org} may now store {quota}."
+  ru: "{org} теперь может хранить {quota}."
+  desc: Toast after a successful quota change; {org} is the organization slug and {quota} is the effective limit the server reported.
 
 adminAuditTitle:
   en: Audit log

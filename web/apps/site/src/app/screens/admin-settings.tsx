@@ -12,7 +12,7 @@ import { Button } from "@pub/ui/button";
 import { Card, CardContent, CardHeader } from "@pub/ui/card";
 import { Input } from "@pub/ui/input";
 import { Label } from "@pub/ui/label";
-import { createAsync, query, revalidate } from "@solidjs/router";
+import { createAsync, revalidate } from "@solidjs/router";
 import { createSignal, For, type JSX, Show } from "solid-js";
 import {
   formToPatch,
@@ -23,8 +23,11 @@ import {
   settingsToForm,
   validateSettings,
 } from "../admin-form";
+import { formatBytes } from "../format";
+import { ADMIN_SETTINGS_KEY, adminSettingsQuery } from "../state/admin-queries";
 import { api, describeError } from "../state/api";
 import { pushToast } from "../state/toast-store";
+import { parseQuotaBytes } from "../storage-quota";
 
 /*
  * Runtime instance settings (decision 09 + decision 17 branding).
@@ -55,13 +58,30 @@ import { pushToast } from "../state/toast-store";
  * reads it per request and is the thing that refuses anonymous callers.
  */
 
-const settingsQuery = query(() => api.admin.settings(), "admin-settings");
-
 const ERROR_MESSAGES: Record<string, { readonly id: string; readonly en: string }> = {
   required: app.adminFieldRequired,
   positive: app.adminFieldPositive,
   domain: app.adminFieldDomain,
+  bytes: app.adminFieldBytes,
 };
+
+/**
+ * Id of a field's inline error, so the control can point at it.
+ *
+ * `aria-invalid` alone tells a screen-reader user that something is wrong and
+ * not what — the gap D33 records for nine fields on this very form. Every
+ * control below that can turn invalid now carries `aria-describedby`, pointed
+ * at this id and dropped again when the error clears (a dangling reference is
+ * its own defect).
+ */
+function errorId(field: SettingsFieldError): string {
+  return `settings-error-${field}`;
+}
+
+/** The described-by value for a field: its error id, or nothing when it is valid. */
+function describedBy(errors: SettingsErrors, field: SettingsFieldError): string | undefined {
+  return errors[field] === undefined ? undefined : errorId(field);
+}
 
 function FieldError(props: {
   readonly errors: SettingsErrors;
@@ -70,13 +90,21 @@ function FieldError(props: {
   return (
     <Show when={props.errors[props.field]}>
       {(kind) => (
-        <p class="text-xs text-danger-ink">{t(ERROR_MESSAGES[kind()] ?? app.adminFieldRequired)}</p>
+        <p id={errorId(props.field)} class="text-xs text-danger-ink">
+          {t(ERROR_MESSAGES[kind()] ?? app.adminFieldRequired)}
+        </p>
       )}
     </Show>
   );
 }
 
-/** A numeric rate-limit row: label, input, inline error. */
+/**
+ * A numeric rate-limit row: label, input, inline error.
+ *
+ * `min={1}` is the contract of every field that uses it — this component is
+ * for the numbers where a zero is a lockout. The storage quota does NOT use
+ * it: `0` is that field's shipped value and means unlimited (S-20.b).
+ */
 function LimitField(props: {
   readonly id: string;
   readonly label: string;
@@ -94,11 +122,24 @@ function LimitField(props: {
         min={1}
         value={props.value}
         aria-invalid={props.errors[props.field] !== undefined}
+        aria-describedby={describedBy(props.errors, props.field)}
         onInput={(event) => props.onInput(event.currentTarget.value)}
       />
       <FieldError errors={props.errors} field={props.field} />
     </div>
   );
+}
+
+/**
+ * Echoes the typed byte count back as a size, or names the `0` case.
+ *
+ * Empty while the field does not parse — the inline error is what speaks then,
+ * and a stale size next to a rejected value would contradict it.
+ */
+function quotaEcho(raw: string): string {
+  const bytes = parseQuotaBytes(raw);
+  if (bytes === null) return "";
+  return bytes === 0 ? t(app.adminStorageUnlimited) : formatBytes(bytes);
 }
 
 /**
@@ -144,7 +185,7 @@ function TestMailResult(props: { readonly result: SmtpTestResultDto }): JSX.Elem
 }
 
 export function AdminSettingsPanel(): JSX.Element {
-  const settings = createAsync(() => settingsQuery());
+  const settings = createAsync(() => adminSettingsQuery());
   const [draft, setDraft] = createSignal<SettingsForm | null>(null);
   const [errors, setErrors] = createSignal<SettingsErrors>({});
   const [busy, setBusy] = createSignal(false);
@@ -180,7 +221,7 @@ export function AdminSettingsPanel(): JSX.Element {
       // the new one.
       setTestResult(null);
       pushToast(t(app.adminSettingsSaved, { version: updated.version }), "success");
-      await revalidate("admin-settings");
+      await revalidate(ADMIN_SETTINGS_KEY);
       // The landing payload carries branding; a rename must not wait for a
       // reload to reach the header.
       await revalidate("home");
@@ -229,6 +270,7 @@ export function AdminSettingsPanel(): JSX.Element {
                   id="branding-name"
                   value={current().brandingName}
                   aria-invalid={errors().brandingName !== undefined}
+                  aria-describedby={describedBy(errors(), "brandingName")}
                   onInput={(event) => patch({ brandingName: event.currentTarget.value })}
                 />
                 <FieldError errors={errors()} field="brandingName" />
@@ -289,6 +331,7 @@ export function AdminSettingsPanel(): JSX.Element {
                   rows={4}
                   value={current().allowedDomains}
                   aria-invalid={errors().allowedDomains !== undefined}
+                  aria-describedby={describedBy(errors(), "allowedDomains")}
                   onInput={(event) => patch({ allowedDomains: event.currentTarget.value })}
                   class="w-full rounded-md border border-line bg-surface px-3 py-2 font-mono text-sm text-ink outline-none focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
                 />
@@ -360,6 +403,45 @@ export function AdminSettingsPanel(): JSX.Element {
                 field="readPerIdentityMinute"
                 onInput={(value) => patch({ readPerIdentityMinute: value })}
               />
+              {/* S-24.g: the write buckets. Deliberately an order of magnitude
+                  below the read numbers beside them — writes are that much
+                  rarer in every legitimate shape — and, like the reads, they
+                  fail OPEN, so these are quotas on cost and not access gates. */}
+              <LimitField
+                id="limit-write-ip"
+                label={t(app.adminLimitWriteIp)}
+                value={current().writePerIpMinute}
+                errors={errors()}
+                field="writePerIpMinute"
+                onInput={(value) => patch({ writePerIpMinute: value })}
+              />
+              <LimitField
+                id="limit-write-identity"
+                label={t(app.adminLimitWriteIdentity)}
+                value={current().writePerIdentityMinute}
+                errors={errors()}
+                field="writePerIdentityMinute"
+                onInput={(value) => patch({ writePerIdentityMinute: value })}
+              />
+              {/* S-24.h: not buckets at all — exact rolling 24-hour database
+                  counts. They live in this section because they are limits an
+                  administrator changes, not because they share a mechanism. */}
+              <LimitField
+                id="limit-invitations-org"
+                label={t(app.adminLimitInvitationsOrg)}
+                value={current().invitationsPerDayOrg}
+                errors={errors()}
+                field="invitationsPerDayOrg"
+                onInput={(value) => patch({ invitationsPerDayOrg: value })}
+              />
+              <LimitField
+                id="limit-invitations-actor"
+                label={t(app.adminLimitInvitationsActor)}
+                value={current().invitationsPerDayActor}
+                errors={errors()}
+                field="invitationsPerDayActor"
+                onInput={(value) => patch({ invitationsPerDayActor: value })}
+              />
             </CardContent>
           </Card>
 
@@ -410,6 +492,7 @@ export function AdminSettingsPanel(): JSX.Element {
                   class="font-mono"
                   value={current().smtpFrom}
                   aria-invalid={errors().smtpFrom !== undefined}
+                  aria-describedby={describedBy(errors(), "smtpFrom")}
                   onInput={(event) => patch({ smtpFrom: event.currentTarget.value })}
                 />
                 <FieldError errors={errors()} field="smtpFrom" />
@@ -517,6 +600,50 @@ export function AdminSettingsPanel(): JSX.Element {
                 <span>{t(app.adminRegistryRequireAuth)}</span>
               </label>
               <p class="text-xs text-ink-muted">{t(app.adminRegistryRequireAuthHint)}</p>
+            </CardContent>
+          </Card>
+
+          {/*
+            THE QUOTA IS NOT A RATE LIMIT, so it is not in that card.
+
+            It rides the `registry` wire section together with the flag above —
+            two cards, one section, which the wholesale patch handles because
+            `formToPatch` always builds the section from the whole form. They
+            are separate cards because they answer different questions: the one
+            above is who may READ, this one is how much an org may STORE.
+
+            Keeping it out of "Rate limits" is the load-bearing part. That card
+            promises "every value at least 1"; here `0` is the shipped value and
+            means unlimited, and a refusal is a permanent 400 rather than a 429
+            with a Retry-After (S-20.b) — no amount of waiting frees storage.
+          */}
+          <Card>
+            <CardHeader>
+              <h2 class="text-lg font-semibold text-ink">{t(app.adminStorageTitle)}</h2>
+              <p class="text-sm text-ink-muted">{t(app.adminStorageBody)}</p>
+            </CardHeader>
+            <CardContent class="flex flex-col gap-2">
+              <div class="grid max-w-sm gap-1.5">
+                <Label for="registry-storage-quota">{t(app.adminStorageQuota)}</Label>
+                <Input
+                  id="registry-storage-quota"
+                  type="number"
+                  min={0}
+                  value={current().storageQuotaBytes}
+                  aria-invalid={errors().storageQuotaBytes !== undefined}
+                  aria-describedby={describedBy(errors(), "storageQuotaBytes")}
+                  onInput={(event) => patch({ storageQuotaBytes: event.currentTarget.value })}
+                />
+                {/* The number is bytes, which nobody reads at a glance: the
+                    echo turns 10737418240 into "10.0 GiB" while it is typed,
+                    and names the 0 case rather than leaving it to be
+                    discovered. */}
+                <Show when={quotaEcho(current().storageQuotaBytes)}>
+                  {(echo) => <p class="text-xs font-medium text-ink">{echo()}</p>}
+                </Show>
+                <FieldError errors={errors()} field="storageQuotaBytes" />
+                <p class="text-xs text-ink-muted">{t(app.adminStorageQuotaHint)}</p>
+              </div>
             </CardContent>
           </Card>
 

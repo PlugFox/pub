@@ -726,6 +726,8 @@ export const app = {
   adminFieldPositive: { id: "app.adminFieldPositive", en: "Enter a whole number of at least 1." },
   /** Inline validation message for a malformed entry in the email domain allowlist. */
   adminFieldDomain: { id: "app.adminFieldDomain", en: "Each line must be a domain, without an @ and with at least one dot." },
+  /** Inline validation message for the storage quota field, which unlike every rate limit beside it accepts 0. */
+  adminFieldBytes: { id: "app.adminFieldBytes", en: "Enter a whole number of bytes, or 0 for no limit." },
   /** Heading of the branding section of the settings form. */
   adminBrandingTitle: { id: "app.adminBrandingTitle", en: "Branding" },
   /** Subtitle of the branding settings section. */
@@ -768,6 +770,14 @@ export const app = {
   adminLimitReadIp: { id: "app.adminLimitReadIp", en: "Reads per IP, per minute (anonymous)" },
   /** Label of the per-identity read-path limit. Deliberately much higher than the anonymous one — a CI fleet behind one NAT is one IP but many tokens. */
   adminLimitReadIdentity: { id: "app.adminLimitReadIdentity", en: "Reads per token or account, per minute" },
+  /** Label of the per-IP write-path limit, which covers every app-API mutation that carries no usable credential. */
+  adminLimitWriteIp: { id: "app.adminLimitWriteIp", en: "Writes per IP, per minute (anonymous)" },
+  /** Label of the per-identity write-path limit. Covers app-API mutations only — publishing spends the per-organization publish budget instead, and sign-in spends its own. */
+  adminLimitWriteIdentity: { id: "app.adminLimitWriteIdentity", en: "Writes per token or account, per minute" },
+  /** Label of the per-organization invitation cap. Counted over a rolling 24 hours rather than a calendar day. */
+  adminLimitInvitationsOrg: { id: "app.adminLimitInvitationsOrg", en: "Invitations per organization, per day" },
+  /** Label of the per-member invitation cap, counted within one organization over a rolling 24 hours. It stops one member spending the whole organization's daily budget. */
+  adminLimitInvitationsActor: { id: "app.adminLimitInvitationsActor", en: "Invitations per member, per day" },
   /** Heading of the SMTP section of the settings form. */
   adminSmtpTitle: { id: "app.adminSmtpTitle", en: "Outgoing mail" },
   /** Subtitle of the SMTP settings section. */
@@ -828,6 +838,16 @@ export const app = {
   adminRegistryRequireAuth: { id: "app.adminRegistryRequireAuth", en: "Require a token for every package read" },
   /** Hint under the require-a-token checkbox — what anonymous callers receive and when the change reaches other instances. */
   adminRegistryRequireAuthHint: { id: "app.adminRegistryRequireAuthHint", en: "Anonymous requests then answer 401 with the token setup instructions instead of package data. Applies from the next request here, and within a minute on the other instances." },
+  /** Heading of the storage-quota section of the settings form. Not part of the rate limit section — this bounds what is stored, not how often anyone calls. */
+  adminStorageTitle: { id: "app.adminStorageTitle", en: "Storage quota" },
+  /** Subtitle of the storage-quota settings section, explaining that a refusal is permanent rather than a retryable throttle. */
+  adminStorageBody: { id: "app.adminStorageBody", en: "How many bytes of published archives one organization may hold. A publish that would cross the line is refused permanently, not throttled — waiting frees no space." },
+  /** Label of the instance-wide default storage quota field. */
+  adminStorageQuota: { id: "app.adminStorageQuota", en: "Default quota per organization, in bytes" },
+  /** Hint under the default storage quota field — what 0 means, what counts toward the total, and that a per-organization override wins. */
+  adminStorageQuotaHint: { id: "app.adminStorageQuotaHint", en: "0 means no limit, which is what a new instance ships with. Retracted versions count toward the total; hard-deleted ones do not, and proxied upstream archives never do. A single organization can be given its own quota on the Organizations tab, and that one wins." },
+  /** Live echo under the default storage quota field when the typed value is 0. */
+  adminStorageUnlimited: { id: "app.adminStorageUnlimited", en: "No limit" },
   /** Accessible name of the admin user table. */
   adminUsersTitle: { id: "app.adminUsersTitle", en: "Accounts" },
   /** Empty state of the admin user table. */
@@ -862,6 +882,38 @@ export const app = {
   adminOrgPackages: { id: "app.adminOrgPackages", en: "Packages" },
   /** Column header for an organization's creation date. */
   adminOrgCreated: { id: "app.adminOrgCreated", en: "Created" },
+  /** Live-region and placeholder text while the admin organization table and the instance settings it needs are still loading. */
+  adminOrgsLoading: { id: "app.adminOrgsLoading", en: "Loading organizations…" },
+  /** Live-region text announced once the admin organization table has finished loading. */
+  adminOrgsLoaded: { id: "app.adminOrgsLoaded", en: "Organizations loaded." },
+  /** Column header for an organization's effective storage quota. */
+  adminOrgQuota: { id: "app.adminOrgQuota", en: "Storage quota" },
+  /** Second line of the quota column when the organization has no override of its own and follows the instance-wide default. */
+  adminOrgQuotaInherited: { id: "app.adminOrgQuotaInherited", en: "Instance default" },
+  /** Second line of the quota column when the organization has its own quota, set by an instance administrator. */
+  adminOrgQuotaOverride: { id: "app.adminOrgQuotaOverride", en: "Override" },
+  /** Value shown wherever a storage quota resolves to no limit at all. */
+  adminOrgQuotaUnlimited: { id: "app.adminOrgQuotaUnlimited", en: "Unlimited" },
+  /** Button in each organization row that opens the storage-quota editor. */
+  adminOrgQuotaEdit: { id: "app.adminOrgQuotaEdit", en: "Set quota" },
+  /** Title of the per-organization storage quota dialog; {org} is the organization's display name. */
+  adminOrgQuotaTitle: { id: "app.adminOrgQuotaTitle", en: "Storage quota: {org}" },
+  /** Description under the title of the per-organization storage quota dialog. */
+  adminOrgQuotaBody: { id: "app.adminOrgQuotaBody", en: "The total size of the archives this organization may store. Retracted versions still count — they are still downloadable; hard-deleted ones do not." },
+  /** Legend of the three-way choice between following the instance default, no limit, and a specific size. */
+  adminOrgQuotaLegend: { id: "app.adminOrgQuotaLegend", en: "Quota for this organization" },
+  /** Radio choice that clears the override; {value} is the size the instance default currently resolves to. */
+  adminOrgQuotaModeDefault: { id: "app.adminOrgQuotaModeDefault", en: "Follow the instance default ({value})" },
+  /** Radio choice that opts this organization out of the instance default permanently. */
+  adminOrgQuotaModeUnlimited: { id: "app.adminOrgQuotaModeUnlimited", en: "No limit for this organization, whatever the default becomes" },
+  /** Radio choice that sets a byte limit for this organization. */
+  adminOrgQuotaModeLimit: { id: "app.adminOrgQuotaModeLimit", en: "Limit to a specific size" },
+  /** Label of the byte-count field in the per-organization storage quota dialog. */
+  adminOrgQuotaBytes: { id: "app.adminOrgQuotaBytes", en: "Bytes" },
+  /** Inline validation message when the per-organization quota size is missing, fractional, or zero. */
+  adminOrgQuotaBytesError: { id: "app.adminOrgQuotaBytesError", en: "Enter a whole number of at least 1 byte, or choose the no-limit option above." },
+  /** Toast after a successful quota change; {org} is the organization slug and {quota} is the effective limit the server reported. */
+  adminOrgQuotaSaved: { id: "app.adminOrgQuotaSaved", en: "{org} may now store {quota}." },
   /** Accessible name of the audit log table. */
   adminAuditTitle: { id: "app.adminAuditTitle", en: "Audit log" },
   /** Empty state of the audit log viewer. */

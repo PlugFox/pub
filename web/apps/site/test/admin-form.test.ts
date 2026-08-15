@@ -5,6 +5,7 @@ import {
   hasErrors,
   isEmailDomain,
   parseDomains,
+  type SettingsFieldError,
   type SettingsForm,
   settingsToForm,
   validateSettings,
@@ -37,6 +38,10 @@ const SETTINGS: AdminSettingsDto = {
     publish_per_hour_org: 60,
     read_per_ip_minute: 600,
     read_per_identity_minute: 3000,
+    write_per_ip_minute: 60,
+    write_per_identity_minute: 300,
+    invitations_per_day_org: 20,
+    invitations_per_day_actor: 10,
   },
   smtp: {
     host: "smtp.acme.com",
@@ -47,11 +52,21 @@ const SETTINGS: AdminSettingsDto = {
     password_set: true,
   },
   upstream: { enabled: true, default_org_policy: "allow" },
-  registry: { require_auth_for_read: true },
+  registry: { require_auth_for_read: true, storage_quota_bytes: 10_737_418_240 },
 };
 
 function form(overrides: Partial<SettingsForm> = {}): SettingsForm {
   return { ...settingsToForm(SETTINGS), ...overrides };
+}
+
+/**
+ * `read_per_ip_minute` → `readPerIpMinute`.
+ *
+ * The form's naming rule, applied rather than restated as a lookup table, so
+ * the coverage tests below stay true for fields nobody has added yet.
+ */
+function camelCase(wire: string): string {
+  return wire.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
 
 describe("settingsToForm", () => {
@@ -70,9 +85,19 @@ describe("settingsToForm", () => {
   test("carries the registry flag through as a boolean, not a string", () => {
     expect(settingsToForm(SETTINGS).registryRequireAuthForRead).toBe(true);
     expect(
-      settingsToForm({ ...SETTINGS, registry: { require_auth_for_read: false } })
-        .registryRequireAuthForRead,
+      settingsToForm({
+        ...SETTINGS,
+        registry: { ...SETTINGS.registry, require_auth_for_read: false },
+      }).registryRequireAuthForRead,
     ).toBe(false);
+  });
+
+  test("the storage quota arrives as a byte string, and 0 stays 0", () => {
+    expect(settingsToForm(SETTINGS).storageQuotaBytes).toBe("10737418240");
+    expect(
+      settingsToForm({ ...SETTINGS, registry: { ...SETTINGS.registry, storage_quota_bytes: 0 } })
+        .storageQuotaBytes,
+    ).toBe("0");
   });
 
   test("a null host and username become empty strings, not the word null", () => {
@@ -96,18 +121,65 @@ describe("validateSettings", () => {
     expect(validateSettings(form({ brandingName: "   " })).brandingName).toBe("required");
   });
 
+  // Every numeric field the server's `validate_rate_limits` covers, including
+  // the two read limits the table forgot when they landed and the four
+  // decision 32 added. The list is the whole rule, not a sample: a field that
+  // is added to the form and left out of the validator is exactly the shape of
+  // bug this table exists to refuse.
   test.each([
     ["otpPerEmailHour"],
     ["otpPerIpHour"],
     ["loginPerIpMinute"],
     ["tokenAuthFailPerIpMinute"],
     ["publishPerHourOrg"],
+    ["readPerIpMinute"],
+    ["readPerIdentityMinute"],
+    ["writePerIpMinute"],
+    ["writePerIdentityMinute"],
+    ["invitationsPerDayOrg"],
+    ["invitationsPerDayActor"],
   ] as const)(
     "%s must be at least 1 — a zero locks the instance out of its own sign-in",
     (field) => {
       expect(validateSettings(form({ [field]: "0" }))[field]).toBe("positive");
     },
   );
+
+  test("every field the server validates as a rate limit is in that table", () => {
+    // `validate_rate_limits` walks the whole `rate_limits` section, so a limit
+    // the form does not check is a red field the operator never sees and a 400
+    // they cannot explain. Derived from the DTO rather than restated, so an
+    // eleventh limit fails here the day it is added — no table to remember.
+    const unchecked = Object.keys(SETTINGS.rate_limits).filter((wire) => {
+      const field = camelCase(wire) as SettingsFieldError;
+      const errors = validateSettings(form({ [field]: "0" } as Partial<SettingsForm>));
+      return errors[field] !== "positive";
+    });
+    expect(unchecked).toEqual([]);
+  });
+
+  test("the storage quota accepts 0 — the one number here where 0 is the shipped value", () => {
+    // S-20.b: `registry.storage_quota_bytes` is `0 = unlimited`, so the
+    // positive-integer rule its neighbours share would refuse the default a
+    // fresh instance boots with.
+    expect(validateSettings(form({ storageQuotaBytes: "0" })).storageQuotaBytes).toBeUndefined();
+    expect(hasErrors(validateSettings(form({ storageQuotaBytes: "0" })))).toBe(false);
+  });
+
+  test.each(["-1", "-0", "", " ", "1.5", "1e9", "abc", "0x10", "1_000", "10 GiB"])(
+    "a storage quota of %p is refused — 0 is unlimited, but a negative or fuzzy value is nothing",
+    (raw) => {
+      expect(validateSettings(form({ storageQuotaBytes: raw })).storageQuotaBytes).toBe("bytes");
+    },
+  );
+
+  test("a storage quota beyond 2^53 is refused rather than silently rounded", () => {
+    // JSON.stringify would send a DIFFERENT number than the one typed, storing
+    // a wall the operator never asked for.
+    expect(
+      validateSettings(form({ storageQuotaBytes: "9007199254740993" })).storageQuotaBytes,
+    ).toBe("bytes");
+  });
 
   test.each(["", " ", "-1", "1.5", "abc", "1e3", "0x10", " 1 2"])(
     "a rate limit of %p is refused",
@@ -231,10 +303,62 @@ describe("formToPatch", () => {
     expect(patch.rate_limits.login_per_ip_minute).toBe(42);
   });
 
+  /*
+   * THE REGRESSION THIS FILE EXISTS FOR.
+   *
+   * `PATCH /admin/settings` replaces each section WHOLESALE, so a field that
+   * the server grows and the form never learns about is not a missing input —
+   * it is a 400 (`missing field storage_quota_bytes`) on every save the
+   * operator attempts, including saves that have nothing to do with the new
+   * field. That is precisely what happened when decision 32 added four rate
+   * limits and the storage quota: the form kept building sections from the
+   * fields it knew, and every one of them was now incomplete.
+   *
+   * The assertion is written against the DTO's own keys rather than a list, so
+   * the NEXT field to land fails here on the day the types are regenerated —
+   * before anybody opens the screen.
+   */
+  test("every field of every section survives settingsToForm → formToPatch", () => {
+    const patch = formToPatch(settingsToForm(SETTINGS));
+    const missing: string[] = [];
+    const changed: string[] = [];
+    for (const section of [
+      "branding",
+      "registration",
+      "rate_limits",
+      "upstream",
+      "registry",
+    ] as const) {
+      const before = SETTINGS[section] as Record<string, unknown>;
+      const after = patch[section] as Record<string, unknown>;
+      for (const key of Object.keys(before)) {
+        if (!(key in after)) missing.push(`${section}.${key}`);
+        else if (JSON.stringify(after[key]) !== JSON.stringify(before[key])) {
+          changed.push(`${section}.${key}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+    expect(changed).toEqual([]);
+  });
+
+  test("the SMTP section round-trips too, minus the two fields that cannot", () => {
+    // `password_set` is a report, not a setting (S-26), and there is no
+    // `password` to carry back — so this section is checked by name against
+    // what it CAN carry rather than against the whole document.
+    const patch = formToPatch(settingsToForm(SETTINGS));
+    const { password_set: _reported, ...writable } = SETTINGS.smtp;
+    expect(patch.smtp).toEqual(writable);
+  });
+
   test("carries the registry flag both ways — editing anything else must not flip it", () => {
-    expect(formToPatch(form()).registry).toEqual({ require_auth_for_read: true });
+    expect(formToPatch(form()).registry).toEqual({
+      require_auth_for_read: true,
+      storage_quota_bytes: 10_737_418_240,
+    });
     expect(formToPatch(form({ registryRequireAuthForRead: false })).registry).toEqual({
       require_auth_for_read: false,
+      storage_quota_bytes: 10_737_418_240,
     });
     // The section is written wholesale on every save, so a branding edit
     // resubmits the loaded flag rather than an absent one that would reset it.

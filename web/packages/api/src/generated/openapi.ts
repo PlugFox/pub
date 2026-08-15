@@ -106,6 +106,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/orgs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Sets or clears one org's storage-quota override (S-20.b, decision 32).
+         * @description **The first write the admin plane has ever had over an org**, and the reason it is here
+         *     rather than on `PATCH /api/v1/orgs/{slug}` is the requirement itself: that route is reachable
+         *     by an org Admin, and a quota an org can raise for itself is not a quota. The separation is
+         *     structural rather than a role check — the field is absent from
+         *     [`pub_core::org::OrgProfile`], which is the only payload that route can write.
+         *
+         *     Not step-up gated (S-06). It escalates no authority and destroys nothing: the worst a stolen
+         *     admin session does here is stop an org publishing, which is loud, audited, and reversed by
+         *     one more request.
+         */
+        patch: operations["update_org"];
+        trace?: never;
+    };
     "/api/v1/admin/settings": {
         parameters: {
             query?: never;
@@ -641,8 +669,11 @@ export interface paths {
          * Sends an invitation (Admin+ and **always** step-up gated — S-06).
          * @description Unconditionally gated, unlike a direct member add: an invitation reaches an address that
          *     may not have an account yet, so a stolen admin session could otherwise invite an
-         *     attacker-controlled mailbox and escalate around the CLI-token publish boundary. Budgeted at
-         *     ≤20/day/org (S-24).
+         *     attacker-controlled mailbox and escalate around the CLI-token publish boundary.
+         *
+         *     Budgeted twice (S-24.h): per org and per actor **within** that org, both runtime-changeable
+         *     and both exact database counts over a genuinely rolling 24 hours rather than KV buckets —
+         *     this is the one mutation whose cost is mail delivered to a third party.
          */
         post: operations["invite"];
         delete?: never;
@@ -1316,6 +1347,19 @@ export interface components {
         AdminOrgDto: {
             /**
              * Format: int64
+             * @description What that override resolves to against the current instance default; `null` = unlimited.
+             *
+             *     The same number the sibling `PATCH` answers with, and it is here for the same reason it
+             *     is there: the stored override alone does not answer "what is this org measured against",
+             *     and the operator's question is always the second one. Resolved **server-side** through
+             *     [`pub_registry::publish::effective_storage_quota`], which is the one place the
+             *     three-state rule is written — without this field a client has to re-derive that rule from
+             *     this override plus `GET /api/v1/admin/settings`, and a rule written in two languages is a
+             *     rule that will disagree with itself.
+             */
+            effective_quota_bytes?: number | null;
+            /**
+             * Format: int64
              * @description How many members it has.
              */
             members: number;
@@ -1326,6 +1370,81 @@ export interface components {
              * @description How many packages it owns.
              */
             packages: number;
+            /**
+             * Format: int64
+             * @description The org's storage-quota override in bytes: `null` = follow the instance default,
+             *     `0` = unlimited for this org (S-20.b).
+             *
+             *     Admin-only on purpose. It is deliberately **not** on [`OrgDto`], which
+             *     `GET /api/v1/orgs/{slug}` serves to anonymous callers — one org's quota is nobody
+             *     else's business, and the field's absence from that payload is also what keeps
+             *     `PATCH /api/v1/orgs/{slug}` structurally unable to round-trip it.
+             */
+            storage_quota_bytes?: number | null;
+        };
+        /**
+         * @description Body of `PATCH /api/v1/admin/orgs/{id}` — the instance-admin write over one org (S-20.b).
+         *
+         *     The field is a **double option** because all three of its states are meaningful and an
+         *     absent field is a fourth thing: `{"storage_quota_bytes": 1073741824}` sets a wall,
+         *     `{"storage_quota_bytes": 0}` makes this org unlimited whatever the instance default is,
+         *     `{"storage_quota_bytes": null}` clears the override so the org follows the instance default
+         *     again, and `{}` supplies nothing and is refused rather than silently treated as one of the
+         *     three.
+         *
+         *     **The inner type is `i128` and the accepted range is `0..=i64::MAX`**, which is not a
+         *     contradiction — it is what keeps every refusal inside the error envelope
+         *     ([rules/api.md](../../../../docs/rules/api.md)). A narrower Rust type moves the refusal into
+         *     serde, and a serde refusal is a **422 carrying a bare deserializer string** that no client
+         *     can parse as an error: with `u64` the operator's `-1` died there, which also made
+         *     `AdminService::set_org_storage_quota`'s carefully worded negative refusal unreachable from
+         *     HTTP while its doc comment claimed to be what the operator sees. Parsing as `i64` puts the
+         *     negative back within reach, so the *handler* refuses it with a 400 that says what to type
+         *     instead — which is the direction an operator actually reaches by hand.
+         *
+         *     The schema advertises `Option<u64>` — the **accepted** range, not the parsed one — because
+         *     the accepted range is the operator's contract, and the wider parse exists only so the refusal
+         *     can be spoken in the envelope. A generated client that sends a `u64` is right; one that sends
+         *     `-1` gets a sentence instead of a deserializer trace.
+         *
+         *     The *other* out-of-range direction stays outside the envelope: a value above `i64::MAX` dies
+         *     in serde as a 422, exactly as a non-numeric one does. That is an app-wide gap — every route
+         *     taking plain `Json` has it — and closing it needs an enveloping extractor, not a wider
+         *     integer here. `i128` was tried and does not work: `serde_json` refuses it at the number,
+         *     so the negative case never reached the handler either.
+         */
+        AdminOrgPatchBody: {
+            /**
+             * Format: int64
+             * @description New storage-quota override in bytes; `null` clears it, `0` means unlimited. A negative
+             *     number is a `400` naming the range; one above `i64::MAX` is a 422 from the deserializer.
+             */
+            storage_quota_bytes?: number | null;
+        };
+        /**
+         * @description Response of `PATCH /api/v1/admin/orgs/{id}`: the override that is now stored, and what it
+         *     resolves to.
+         *
+         *     Both numbers, because the stored one alone does not answer the operator's question. `null`
+         *     and `0` are different rows with different futures — one follows the instance default, one
+         *     has opted out of it — and the effective value is what the next publish will actually be
+         *     measured against.
+         */
+        AdminOrgQuotaDto: {
+            /**
+             * Format: int64
+             * @description What that resolves to against the current instance default: `null` = unlimited.
+             */
+            effective_quota_bytes?: number | null;
+            /** @description Org id. */
+            id: string;
+            /** @description Org slug. */
+            slug: string;
+            /**
+             * Format: int64
+             * @description The stored override: `null` = follow the instance default, `0` = unlimited for this org.
+             */
+            storage_quota_bytes?: number | null;
         };
         /** @description Response of `GET`/`PATCH /api/v1/admin/settings`. */
         AdminSettingsDto: {
@@ -1918,6 +2037,36 @@ export interface components {
             flow_id: string;
         };
         /** @description Successful app API response. */
+        OkEnvelope_AdminOrgQuotaDto: {
+            /**
+             * @description Response of `PATCH /api/v1/admin/orgs/{id}`: the override that is now stored, and what it
+             *     resolves to.
+             *
+             *     Both numbers, because the stored one alone does not answer the operator's question. `null`
+             *     and `0` are different rows with different futures — one follows the instance default, one
+             *     has opted out of it — and the effective value is what the next publish will actually be
+             *     measured against.
+             */
+            data: {
+                /**
+                 * Format: int64
+                 * @description What that resolves to against the current instance default: `null` = unlimited.
+                 */
+                effective_quota_bytes?: number | null;
+                /** @description Org id. */
+                id: string;
+                /** @description Org slug. */
+                slug: string;
+                /**
+                 * Format: int64
+                 * @description The stored override: `null` = follow the instance default, `0` = unlimited for this org.
+                 */
+                storage_quota_bytes?: number | null;
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
         OkEnvelope_AdminSettingsDto: {
             /** @description Response of `GET`/`PATCH /api/v1/admin/settings`. */
             data: {
@@ -2104,6 +2253,19 @@ export interface components {
                 items: {
                     /**
                      * Format: int64
+                     * @description What that override resolves to against the current instance default; `null` = unlimited.
+                     *
+                     *     The same number the sibling `PATCH` answers with, and it is here for the same reason it
+                     *     is there: the stored override alone does not answer "what is this org measured against",
+                     *     and the operator's question is always the second one. Resolved **server-side** through
+                     *     [`pub_registry::publish::effective_storage_quota`], which is the one place the
+                     *     three-state rule is written — without this field a client has to re-derive that rule from
+                     *     this override plus `GET /api/v1/admin/settings`, and a rule written in two languages is a
+                     *     rule that will disagree with itself.
+                     */
+                    effective_quota_bytes?: number | null;
+                    /**
+                     * Format: int64
                      * @description How many members it has.
                      */
                     members: number;
@@ -2114,6 +2276,17 @@ export interface components {
                      * @description How many packages it owns.
                      */
                     packages: number;
+                    /**
+                     * Format: int64
+                     * @description The org's storage-quota override in bytes: `null` = follow the instance default,
+                     *     `0` = unlimited for this org (S-20.b).
+                     *
+                     *     Admin-only on purpose. It is deliberately **not** on [`OrgDto`], which
+                     *     `GET /api/v1/orgs/{slug}` serves to anonymous callers — one org's quota is nobody
+                     *     else's business, and the field's absence from that payload is also what keeps
+                     *     `PATCH /api/v1/orgs/{slug}` structurally unable to round-trip it.
+                     */
+                    storage_quota_bytes?: number | null;
                 }[];
             };
             /** @description Always `"ok"`. */
@@ -3187,6 +3360,17 @@ export interface components {
         RateLimitSettingsDto: {
             /**
              * Format: int32
+             * @description Invitations one member may send per rolling 24 hours within one org (S-24.h).
+             */
+            invitations_per_day_actor: number;
+            /**
+             * Format: int32
+             * @description Invitations one org may send per rolling 24 hours (S-24.h). An exact database count
+             *     rather than a bucket, reported here because it is a limit an administrator changes.
+             */
+            invitations_per_day_org: number;
+            /**
+             * Format: int32
              * @description Credential redemptions per IP per minute.
              */
             login_per_ip_minute: number;
@@ -3220,6 +3404,16 @@ export interface components {
              * @description Failed CLI-token authentications per IP per minute.
              */
             token_auth_fail_per_ip_minute: number;
+            /**
+             * Format: int32
+             * @description App-API mutations per minute per CLI token or signed-in account (S-24.g).
+             */
+            write_per_identity_minute: number;
+            /**
+             * Format: int32
+             * @description App-API mutations per minute per client IP, for requests with no identity (S-24.g).
+             */
+            write_per_ip_minute: number;
         };
         /** @description Body of `POST /api/v1/auth/refresh`. */
         RefreshBody: {
@@ -3240,6 +3434,12 @@ export interface components {
              *     timing oracle, since there is then no anonymous prober.
              */
             require_auth_for_read: boolean;
+            /**
+             * Format: int64
+             * @description Default per-org storage quota in bytes; **`0` = unlimited** (S-20.b). A per-org override
+             *     set by an instance admin wins over this number for that org.
+             */
+            storage_quota_bytes: number;
         };
         /** @description Registry totals. */
         RegistryStatsDto: {
@@ -3932,6 +4132,60 @@ export interface operations {
             };
             /** @description Not an instance administrator */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    update_org: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Org id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminOrgPatchBody"];
+            };
+        };
+        responses: {
+            /** @description The stored override and what it resolves to */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_AdminOrgQuotaDto"];
+                };
+            };
+            /** @description No fields supplied, or a quota outside 0..=i64::MAX */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an instance administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Unknown org, or a malformed org id */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5242,7 +5496,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
-            /** @description The org's daily invitation budget is spent (S-24) */
+            /** @description The org's or the actor's daily invitation budget is spent (S-24.h) */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -5707,7 +5961,7 @@ export interface operations {
                     "application/json": components["schemas"]["OkEnvelope_PackageTransferredDto"];
                 };
             };
-            /** @description confirm does not match, or the target is the current owner */
+            /** @description confirm does not match, the target is the current owner, or the target org has no room for the package (S-20.b) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6324,7 +6578,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Not a readable multipart body, or no `file` field */
+            /** @description Not a readable multipart body, no `file` field, or no room under the org's storage quota (S-20.b) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6383,7 +6637,7 @@ export interface operations {
                     "application/vnd.pub.v2+json": components["schemas"]["PublishSuccess"];
                 };
             };
-            /** @description Any permanent rejection: bad archive, bad pubspec, duplicate version, expired session */
+            /** @description Any permanent rejection: bad archive, bad pubspec, duplicate version, expired session, storage quota exceeded (S-20.b) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6644,7 +6898,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Not a readable multipart body, or no `file` field */
+            /** @description Not a readable multipart body, no `file` field, or no room under the org's storage quota (S-20.b) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6703,7 +6957,7 @@ export interface operations {
                     "application/vnd.pub.v2+json": components["schemas"]["PublishSuccess"];
                 };
             };
-            /** @description Any permanent rejection: bad archive, bad pubspec, duplicate version, expired session */
+            /** @description Any permanent rejection: bad archive, bad pubspec, duplicate version, expired session, storage quota exceeded (S-20.b) */
             400: {
                 headers: {
                     [name: string]: unknown;

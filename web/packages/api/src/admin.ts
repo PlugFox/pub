@@ -1,6 +1,7 @@
 import { type ApiClient, jsonBody } from "./client";
 import type {
   AdminOrgDto,
+  AdminOrgQuotaDto,
   AdminSettingsDto,
   AdminSettingsPatchBody,
   AdminStatsDto,
@@ -111,6 +112,27 @@ export function createAdminApi(client: ApiClient) {
       options: { readonly cursor?: string; readonly limit?: number } = {},
     ): Promise<ListDto<AdminOrgDto>> {
       return client.request<ListDto<AdminOrgDto>>(`/admin/orgs${queryString({ ...options })}`);
+    },
+
+    /**
+     * Sets or clears one org's storage-quota override (S-20.b) — the admin
+     * plane's only write over an org.
+     *
+     * `quota` is sent VERBATIM, including `null`: the server distinguishes an
+     * explicit `null` ("clear the override, follow the instance default")
+     * from an absent field, which it refuses with a 400 rather than reading as
+     * one of the three states. `0` means unlimited for this org, whatever the
+     * instance default is; a positive number is bytes.
+     *
+     * It is deliberately NOT reachable through `PATCH /api/v1/orgs/{slug}`,
+     * which an org Admin can call — a quota its subject can raise is not a
+     * quota.
+     */
+    setOrgQuota(id: string, quota: number | null): Promise<AdminOrgQuotaDto> {
+      return client.request<AdminOrgQuotaDto>(
+        `/admin/orgs/${encodeURIComponent(id)}`,
+        jsonBody("PATCH", { storage_quota_bytes: quota }),
+      );
     },
 
     /** Append-only audit log, newest first; the row id is also the cursor (S-22/S-23). */

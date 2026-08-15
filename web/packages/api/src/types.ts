@@ -175,6 +175,7 @@ export type RegistrySettingsDto = Schemas["RegistrySettingsDto"];
 export type SmtpTestResultDto = Schemas["SmtpTestResultDto"];
 export type AdminUserDto = Schemas["AdminUserDto"];
 export type AdminOrgDto = Schemas["AdminOrgDto"];
+export type AdminOrgQuotaDto = Schemas["AdminOrgQuotaDto"];
 export type AdminStatsDto = Schemas["AdminStatsDto"];
 export type AuditEventDto = Schemas["AuditEventDto"];
 export type JobRunDto = Schemas["JobRunDto"];
