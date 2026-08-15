@@ -120,6 +120,81 @@ genericError:
   ru: Что-то пошло не так. Попробуйте ещё раз.
   desc: Fallback error message when the server refused a request for an unrecognized reason.
 
+errorNotFound:
+  en: Not found, or not visible to you.
+  ru: Не найдено — или недоступно вам.
+  desc: >-
+    Error for HTTP 404. Deliberately vague: the server answers "unknown" and "not yours" the
+    same way (S-04), so this message must not distinguish them either.
+
+errorUnauthorized:
+  en: Sign in to continue.
+  ru: Войдите, чтобы продолжить.
+  desc: Error for a refused credential (401) outside the session-expiry path.
+
+errorServer:
+  en: The server could not complete this. Try again shortly.
+  ru: Сервер не смог выполнить запрос. Попробуйте чуть позже.
+  desc: >-
+    Error for the backend failure codes (internal, database, blob, kv, config). The server's own
+    message is never shown for these — it carries operator detail, not user detail.
+
+errorUnimplemented:
+  en: This is not available on this instance yet.
+  ru: На этом сервере это пока недоступно.
+  desc: Error for a declared-but-unbuilt endpoint (`unimplemented`).
+
+errorInvalid:
+  en: That request was refused
+  ru: Запрос отклонён
+  desc: >-
+    Headline for `invalid_argument`; the server's own sentence follows it after a colon, so this
+    must read as an opening clause rather than a full sentence.
+
+errorConflict:
+  en: That conflicts with something that already exists
+  ru: Конфликт с тем, что уже существует
+  desc: Headline for `conflict` (duplicate slug, name already claimed); server detail follows.
+
+errorForbidden:
+  en: You do not have permission for that
+  ru: Недостаточно прав для этого действия
+  desc: Headline for `forbidden`; server detail follows after a colon.
+
+errorExpired:
+  en: That has expired
+  ru: Срок действия истёк
+  desc: Headline for `expired` (invitation, session, token); server detail follows.
+
+errorBusy:
+  en: Someone else is working on that right now
+  ru: Сейчас с этим работает кто-то ещё
+  desc: >-
+    Headline for `busy` — a transient lock (a concurrent publish of the same package), not a
+    permanent refusal, so the wording invites a retry.
+
+errorLastOwner:
+  en: An organization must keep at least one owner
+  ru: В организации должен остаться хотя бы один владелец
+  desc: Headline for `last_owner`; server detail follows.
+
+errorInvalidCode:
+  en: That code is not valid.
+  ru: Код неверен.
+  desc: >-
+    Error for `invalid_code`. One message for wrong, expired and already-used codes — they are
+    indistinguishable by design (S-03/S-04).
+
+errorStepUpRequired:
+  en: This action needs a fresh second factor.
+  ru: Для этого действия нужен свежий второй фактор.
+  desc: Fallback for `step_up_required` when the prompt could not be opened.
+
+errorRefreshReused:
+  en: This session was ended for security reasons. Sign in again.
+  ru: Сеанс завершён по соображениям безопасности. Войдите заново.
+  desc: Error for `refresh_reused` — a rotated-out refresh token was replayed (S-08).
+
 networkError:
   en: Could not reach the server. Check your connection and try again.
   ru: Не удалось связаться с сервером. Проверьте соединение и попробуйте ещё раз.
@@ -623,10 +698,60 @@ tokensExpiryField:
   ru: Срок действия (дней)
   desc: Label of the numeric lifetime field in the token creation dialog; the default is 90.
 
+tokensPatternsField:
+  en: Package patterns (optional)
+  ru: Шаблоны пакетов (необязательно)
+  desc: >-
+    Label of the package-pattern field in the token creation dialog (S-13). Empty means the
+    token is limited only by its organization and scopes.
+
+tokensPatternsPlaceholder:
+  en: acme_*, shared_utils
+  ru: acme_*, shared_utils
+  desc: Placeholder showing the two pattern shapes — a trailing star, or an exact package name.
+
+tokensPatternsHelp:
+  en: A trailing "*" matches a prefix; anything else is an exact package name. Separate with commas.
+  ru: Звёздочка в конце — совпадение по префиксу; иначе точное имя пакета. Разделяйте запятыми.
+  desc: Help text under the package-pattern field explaining the one-wildcard grammar.
+
+tokensPatterns:
+  en: Packages
+  ru: Пакеты
+  desc: Column header for the package patterns a token is narrowed to.
+
+tokensPatternsAny:
+  en: any
+  ru: любые
+  desc: >-
+    Cell value in the token table when a token carries no package patterns — it may reach every
+    package its organization and scopes allow.
+
+tokensNeverExpires:
+  en: Never expires
+  ru: Бессрочный
+  desc: >-
+    Checkbox in the token dialog that mints a token with no expiry (S-13.c). Only available for
+    read-only tokens.
+
+tokensNeverExpiresReadOnly:
+  en: Only read-only tokens can be non-expiring.
+  ru: Бессрочными могут быть только токены с правом чтения.
+  desc: Help text explaining why the never-expires checkbox is disabled (S-13.c).
+
+tokensExpiryRequired:
+  en: Enter a lifetime in days, or tick "never expires".
+  ru: Укажите срок в днях или отметьте «бессрочный».
+  desc: >-
+    Validation message when the expiry field is empty. An empty field must not be read as "no
+    expiry" — that is a different, longer-lived credential (S-13.c).
+
 tokensStepUpNotice:
-  en: Publishing and administrative scopes ask for a second-factor code before the token is issued.
-  ru: Для прав публикации и администрирования перед выдачей токена потребуется код второго фактора.
-  desc: Notice in the token dialog when a step-up-gated scope is selected (S-06).
+  en: This token asks for a second-factor code before it is issued.
+  ru: Перед выдачей этого токена потребуется код второго фактора.
+  desc: >-
+    Notice in the token dialog when the mint will be step-up gated — a publishing or
+    administrative scope (S-06), or a token with no expiry whatever its scope (S-06.d).
 
 tokensOrgRequired:
   en: Choose an organization for this token.
@@ -2540,6 +2665,83 @@ adminStatShadowingActive:
   en: Open shadowing alarms
   ru: Открытых оповещений о затенении
   desc: Admin statistic — unacknowledged shadowing alarms.
+
+adminTabSupplyChain:
+  en: Supply chain
+  ru: Цепочка поставок
+  desc: >-
+    Admin tab holding the two supply-chain registers — shadowed names (S-17) and refused upstream
+    archives (S-19).
+
+adminRegisterOpen:
+  en: Open the register
+  ru: Открыть журнал
+  desc: >-
+    Link from the dashboard's twenty-row alarm table to the full, paginated register behind it.
+
+adminRegisterLoading:
+  en: Loading the register…
+  ru: Загружаем журнал…
+  desc: Live-region text while a supply-chain register page is in flight.
+
+adminRegisterLoaded:
+  en: Register loaded.
+  ru: Журнал загружен.
+  desc: Live-region text once a supply-chain register page has arrived.
+
+adminShadowingFilterActive:
+  en: Needs attention
+  ru: Требуют внимания
+  desc: Filter showing only unacknowledged shadowing alarms.
+
+adminShadowingFilterAcknowledged:
+  en: Acknowledged
+  ru: Подтверждённые
+  desc: Filter showing only shadowing alarms an administrator has already cleared.
+
+adminShadowingFilterAll:
+  en: All
+  ru: Все
+  desc: Filter showing the whole shadowing register, acknowledged or not.
+
+adminShadowingAcknowledge:
+  en: Acknowledge
+  ru: Подтвердить
+  desc: >-
+    Button that clears one shadowing alarm. Bookkeeping only — resolution never depended on it,
+    and a later sighting raises the alarm again.
+
+adminShadowingAcknowledged:
+  en: Alarm acknowledged. Resolution is unchanged — the local package still wins.
+  ru: Сигнал подтверждён. На выдачу это не влияет — локальный пакет по-прежнему в приоритете.
+  desc: Success toast after acknowledging a shadowing alarm; states what did NOT change.
+
+adminShadowingAlreadyAcknowledged:
+  en: Nothing to acknowledge — that alarm was already cleared.
+  ru: Подтверждать нечего — сигнал уже снят.
+  desc: >-
+    Toast when an acknowledgement matched no active alarm: somebody else cleared it, or the page
+    was stale.
+
+adminShadowingEmpty:
+  en: No shadowed names
+  ru: Затенённых имён нет
+  desc: Empty state of the shadowing register.
+
+adminShadowingEmptyBody:
+  en: No name claimed on this instance has been seen upstream.
+  ru: Ни одно имя, занятое на этом сервере, не встречалось у вышестоящего реестра.
+  desc: Empty-state body of the shadowing register.
+
+adminQuarantineEmpty:
+  en: Nothing quarantined
+  ru: Ничего не в карантине
+  desc: Empty state of the quarantine register.
+
+adminQuarantineEmptyBody:
+  en: Every upstream archive fetched so far matched the hash upstream advertised.
+  ru: Все скачанные архивы совпали с хешем, заявленным вышестоящим реестром.
+  desc: Empty-state body of the quarantine register.
 
 adminShadowingTitle:
   en: Shadowing alarms

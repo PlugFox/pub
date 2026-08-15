@@ -1,4 +1,9 @@
-import { scopesNeedStepUp } from "@pub/api/tokens";
+import {
+  expiryIsSubmittable,
+  mintNeedsStepUp,
+  neverExpiresAllowed,
+  parsePatterns,
+} from "@pub/api/tokens";
 import {
   type OrgMembershipDto,
   TOKEN_SCOPES,
@@ -22,6 +27,7 @@ import { createAsync, query, revalidate } from "@solidjs/router";
 import { createMemo, createSignal, For, type JSX, Show } from "solid-js";
 import { formatDate, formatDateTime } from "../format";
 import { api, describeError, withStepUp } from "../state/api";
+import { instancePublicUrl } from "../state/instance-store";
 import { pushToast } from "../state/toast-store";
 import { registryBase } from "../urls";
 
@@ -58,6 +64,8 @@ function CreateTokenDialog(props: {
   const [orgId, setOrgId] = createSignal("");
   const [scopes, setScopes] = createSignal<readonly TokenScope[]>(["read"]);
   const [expiresDays, setExpiresDays] = createSignal(90);
+  const [neverExpires, setNeverExpires] = createSignal(false);
+  const [patterns, setPatterns] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
 
@@ -66,6 +74,8 @@ function CreateTokenDialog(props: {
     setOrgId(props.orgs[0]?.org.id ?? "");
     setScopes(["read"]);
     setExpiresDays(90);
+    setNeverExpires(false);
+    setPatterns("");
     setError(null);
     setBusy(false);
   };
@@ -74,6 +84,10 @@ function CreateTokenDialog(props: {
     setScopes((current) =>
       current.includes(scope) ? current.filter((item) => item !== scope) : [...current, scope],
     );
+    // Adding `publish` to a non-expiring token would otherwise leave the box
+    // ticked, disabled, and still submitted — a 400 from a control the user can
+    // no longer see the state of.
+    if (!neverExpiresAllowed(scopes())) setNeverExpires(false);
   };
 
   const submit = async (event: Event): Promise<void> => {
@@ -87,15 +101,28 @@ function CreateTokenDialog(props: {
       setError(t(app.tokensScopesRequired));
       return;
     }
+    // A non-finite lifetime (`1e999` is valid syntax in a numeric field)
+    // serializes to `null`, which is the wire spelling of "never expires" —
+    // so it would quietly request a different kind of credential.
+    if (!expiryIsSubmittable(expiresDays(), neverExpires())) {
+      setError(t(app.tokensExpiryRequired));
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
+      const parsed = parsePatterns(patterns());
       const created = await withStepUp(() =>
         api.tokens.create({
           label: label().trim() === "" ? undefined : label().trim(),
           org_id: orgId(),
           scopes: scopes(),
-          expires_days: expiresDays() > 0 ? expiresDays() : undefined,
+          // `null` is "never" and `undefined` would MEAN the same thing on the
+          // wire (decision 33) — so the expiring case always sends a number
+          // rather than leaving the field out and hoping for a default that no
+          // longer exists.
+          expires_days: neverExpires() ? null : expiresDays(),
+          package_patterns: parsed.length === 0 ? undefined : parsed,
         }),
       );
       setOpen(false);
@@ -172,9 +199,19 @@ function CreateTokenDialog(props: {
             </For>
           </fieldset>
 
-          <Show when={scopesNeedStepUp(scopes())}>
-            <Alert intent="warning">{t(app.tokensStepUpNotice)}</Alert>
-          </Show>
+          <div class="grid gap-1.5">
+            <Label for="token-patterns">{t(app.tokensPatternsField)}</Label>
+            <Input
+              id="token-patterns"
+              value={patterns()}
+              placeholder={t(app.tokensPatternsPlaceholder)}
+              aria-describedby="token-patterns-help"
+              onInput={(event) => setPatterns(event.currentTarget.value)}
+            />
+            <p id="token-patterns-help" class="text-xs text-ink-muted">
+              {t(app.tokensPatternsHelp)}
+            </p>
+          </div>
 
           <div class="grid gap-1.5">
             <Label for="token-expiry">{t(app.tokensExpiryField)}</Label>
@@ -184,9 +221,32 @@ function CreateTokenDialog(props: {
               min={1}
               max={3650}
               value={String(expiresDays())}
+              disabled={neverExpires()}
               onInput={(event) => setExpiresDays(Number(event.currentTarget.value))}
             />
+            {/*
+              A non-expiring token is `read`-only by requirement (S-13.c), so the
+              control is disabled rather than merely refused: a checkbox that can
+              be ticked and then rejected teaches nothing about why.
+            */}
+            <label class="flex cursor-pointer items-center gap-2 text-sm text-ink">
+              <input
+                type="checkbox"
+                checked={neverExpires()}
+                disabled={!neverExpiresAllowed(scopes())}
+                onChange={(event) => setNeverExpires(event.currentTarget.checked)}
+                class="size-4 accent-accent outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:opacity-50"
+              />
+              <span>{t(app.tokensNeverExpires)}</span>
+            </label>
+            <Show when={!neverExpiresAllowed(scopes())}>
+              <p class="text-xs text-ink-muted">{t(app.tokensNeverExpiresReadOnly)}</p>
+            </Show>
           </div>
+
+          <Show when={mintNeedsStepUp(scopes(), neverExpires())}>
+            <Alert intent="warning">{t(app.tokensStepUpNotice)}</Alert>
+          </Show>
 
           <Show when={error()}>{(message) => <Alert intent="danger">{message()}</Alert>}</Show>
 
@@ -255,9 +315,11 @@ export function TokensScreen(): JSX.Element {
     const value = created();
     if (value === null) return "";
     const slug = orgList().find((m) => m.org.id === value.token.org_id)?.org.slug;
-    return slug === undefined
-      ? `${window.location.origin}/pub`
-      : registryBase(slug, window.location.origin);
+    // The instance's OWN public URL, never `window.location.origin`: behind a
+    // reverse proxy those differ, and a token pasted against the wrong base is
+    // unrecoverable without minting a new one (D32).
+    const origin = instancePublicUrl();
+    return slug === undefined ? `${origin}/pub` : registryBase(slug, origin);
   });
 
   const confirmRevoke = async (): Promise<void> => {
@@ -308,6 +370,7 @@ export function TokensScreen(): JSX.Element {
             <TableRow>
               <TableHeaderCell>{t(app.tokensHint)}</TableHeaderCell>
               <TableHeaderCell>{t(app.tokensScopes)}</TableHeaderCell>
+              <TableHeaderCell>{t(app.tokensPatterns)}</TableHeaderCell>
               <TableHeaderCell>{t(app.tokensOrg)}</TableHeaderCell>
               <TableHeaderCell>{t(app.tokensExpires)}</TableHeaderCell>
               <TableHeaderCell>{t(app.tokensLastUsed)}</TableHeaderCell>
@@ -341,6 +404,19 @@ export function TokensScreen(): JSX.Element {
                         )}
                       </For>
                     </div>
+                  </TableCell>
+                  {/*
+                    Rendered because the mint validates the pattern's GRAMMAR and never its
+                    intent: `acme_x*` is well-formed for an org whose packages are `acme_y*`,
+                    and reading it back here is the only way its owner finds out before CI does.
+                  */}
+                  <TableCell class="font-mono text-xs text-ink-muted">
+                    <Show
+                      when={token.package_patterns.length > 0}
+                      fallback={t(app.tokensPatternsAny)}
+                    >
+                      {token.package_patterns.join(", ")}
+                    </Show>
                   </TableCell>
                   <TableCell class="whitespace-nowrap">{orgName(token.org_id)}</TableCell>
                   <TableCell class="whitespace-nowrap text-ink-muted">

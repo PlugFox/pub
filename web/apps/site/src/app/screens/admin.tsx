@@ -15,6 +15,7 @@ import { pushToast } from "../state/toast-store";
 import { AdminAuditPanel } from "./admin-audit";
 import { AdminOrgsPanel, AdminUsersPanel } from "./admin-people";
 import { AdminSettingsPanel } from "./admin-settings";
+import { AdminSupplyChainPanel } from "./admin-supply-chain";
 
 /*
  * Instance administration.
@@ -31,7 +32,7 @@ import { AdminSettingsPanel } from "./admin-settings";
  * renders that, rather than pretending to gate what it cannot decide.
  */
 
-const ADMIN_TABS = ["stats", "settings", "users", "orgs", "audit", "jobs"] as const;
+const ADMIN_TABS = ["stats", "settings", "users", "orgs", "supply-chain", "audit", "jobs"] as const;
 type AdminTab = (typeof ADMIN_TABS)[number];
 const DEFAULT_TAB: AdminTab = "stats";
 
@@ -40,6 +41,7 @@ const TAB_LABELS: Record<AdminTab, { readonly id: string; readonly en: string }>
   settings: app.adminTabSettings,
   users: app.adminTabUsers,
   orgs: app.adminTabOrgs,
+  "supply-chain": app.adminTabSupplyChain,
   audit: app.adminTabAudit,
   jobs: app.adminTabJobs,
 };
@@ -140,7 +142,19 @@ function StatsPanel(): JSX.Element {
           */}
           <Show when={loaded().shadowing.length > 0}>
             <section class="flex flex-col gap-3">
-              <h2 class="text-lg font-semibold text-ink">{t(app.adminShadowingTitle)}</h2>
+              <div class="flex flex-wrap items-baseline justify-between gap-3">
+                <h2 class="text-lg font-semibold text-ink">{t(app.adminShadowingTitle)}</h2>
+                {/*
+                  The dashboard is the alarm and shows the newest twenty; the
+                  register behind it is where an operator investigates.
+                */}
+                <A
+                  href="/admin/supply-chain"
+                  class="text-sm text-accent underline-offset-4 hover:underline"
+                >
+                  {t(app.adminRegisterOpen)}
+                </A>
+              </div>
               <Alert intent="warning">{t(app.adminShadowingBody)}</Alert>
               <Table label={t(app.adminShadowingTitle)}>
                 <TableHead>
@@ -177,7 +191,15 @@ function StatsPanel(): JSX.Element {
 
           <Show when={loaded().quarantine.length > 0}>
             <section class="flex flex-col gap-3">
-              <h2 class="text-lg font-semibold text-ink">{t(app.adminQuarantineTitle)}</h2>
+              <div class="flex flex-wrap items-baseline justify-between gap-3">
+                <h2 class="text-lg font-semibold text-ink">{t(app.adminQuarantineTitle)}</h2>
+                <A
+                  href="/admin/supply-chain"
+                  class="text-sm text-accent underline-offset-4 hover:underline"
+                >
+                  {t(app.adminRegisterOpen)}
+                </A>
+              </div>
               <Alert intent="danger">{t(app.adminQuarantineBody)}</Alert>
               <Table label={t(app.adminQuarantineTitle)}>
                 <TableHead>
@@ -382,6 +404,9 @@ export function AdminScreen(): JSX.Element {
         </Show>
         <Show when={tab() === "orgs"}>
           <AdminOrgsPanel />
+        </Show>
+        <Show when={tab() === "supply-chain"}>
+          <AdminSupplyChainPanel />
         </Show>
         <Show when={tab() === "audit"}>
           <AdminAuditPanel />

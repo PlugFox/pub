@@ -44,6 +44,32 @@ export const app = {
   revoke: { id: "app.revoke", en: "Revoke" },
   /** Fallback error message when the server refused a request for an unrecognized reason. */
   genericError: { id: "app.genericError", en: "Something went wrong. Try again." },
+  /** Error for HTTP 404. Deliberately vague: the server answers "unknown" and "not yours" the same way (S-04), so this message must not distinguish them either. */
+  errorNotFound: { id: "app.errorNotFound", en: "Not found, or not visible to you." },
+  /** Error for a refused credential (401) outside the session-expiry path. */
+  errorUnauthorized: { id: "app.errorUnauthorized", en: "Sign in to continue." },
+  /** Error for the backend failure codes (internal, database, blob, kv, config). The server's own message is never shown for these — it carries operator detail, not user detail. */
+  errorServer: { id: "app.errorServer", en: "The server could not complete this. Try again shortly." },
+  /** Error for a declared-but-unbuilt endpoint (`unimplemented`). */
+  errorUnimplemented: { id: "app.errorUnimplemented", en: "This is not available on this instance yet." },
+  /** Headline for `invalid_argument`; the server's own sentence follows it after a colon, so this must read as an opening clause rather than a full sentence. */
+  errorInvalid: { id: "app.errorInvalid", en: "That request was refused" },
+  /** Headline for `conflict` (duplicate slug, name already claimed); server detail follows. */
+  errorConflict: { id: "app.errorConflict", en: "That conflicts with something that already exists" },
+  /** Headline for `forbidden`; server detail follows after a colon. */
+  errorForbidden: { id: "app.errorForbidden", en: "You do not have permission for that" },
+  /** Headline for `expired` (invitation, session, token); server detail follows. */
+  errorExpired: { id: "app.errorExpired", en: "That has expired" },
+  /** Headline for `busy` — a transient lock (a concurrent publish of the same package), not a permanent refusal, so the wording invites a retry. */
+  errorBusy: { id: "app.errorBusy", en: "Someone else is working on that right now" },
+  /** Headline for `last_owner`; server detail follows. */
+  errorLastOwner: { id: "app.errorLastOwner", en: "An organization must keep at least one owner" },
+  /** Error for `invalid_code`. One message for wrong, expired and already-used codes — they are indistinguishable by design (S-03/S-04). */
+  errorInvalidCode: { id: "app.errorInvalidCode", en: "That code is not valid." },
+  /** Fallback for `step_up_required` when the prompt could not be opened. */
+  errorStepUpRequired: { id: "app.errorStepUpRequired", en: "This action needs a fresh second factor." },
+  /** Error for `refresh_reused` — a rotated-out refresh token was replayed (S-08). */
+  errorRefreshReused: { id: "app.errorRefreshReused", en: "This session was ended for security reasons. Sign in again." },
   /** Error shown when the request never completed (offline, DNS, aborted) — not a refusal. */
   networkError: { id: "app.networkError", en: "Could not reach the server. Check your connection and try again." },
   /** Error for HTTP 429; `{seconds}` is the cool-down from the Retry-After header. */
@@ -238,8 +264,24 @@ export const app = {
   tokensScopeAdmin: { id: "app.tokensScopeAdmin", en: "admin — manage organization settings" },
   /** Label of the numeric lifetime field in the token creation dialog; the default is 90. */
   tokensExpiryField: { id: "app.tokensExpiryField", en: "Expires in (days)" },
-  /** Notice in the token dialog when a step-up-gated scope is selected (S-06). */
-  tokensStepUpNotice: { id: "app.tokensStepUpNotice", en: "Publishing and administrative scopes ask for a second-factor code before the token is issued." },
+  /** Label of the package-pattern field in the token creation dialog (S-13). Empty means the token is limited only by its organization and scopes. */
+  tokensPatternsField: { id: "app.tokensPatternsField", en: "Package patterns (optional)" },
+  /** Placeholder showing the two pattern shapes — a trailing star, or an exact package name. */
+  tokensPatternsPlaceholder: { id: "app.tokensPatternsPlaceholder", en: "acme_*, shared_utils" },
+  /** Help text under the package-pattern field explaining the one-wildcard grammar. */
+  tokensPatternsHelp: { id: "app.tokensPatternsHelp", en: "A trailing \"*\" matches a prefix; anything else is an exact package name. Separate with commas." },
+  /** Column header for the package patterns a token is narrowed to. */
+  tokensPatterns: { id: "app.tokensPatterns", en: "Packages" },
+  /** Cell value in the token table when a token carries no package patterns — it may reach every package its organization and scopes allow. */
+  tokensPatternsAny: { id: "app.tokensPatternsAny", en: "any" },
+  /** Checkbox in the token dialog that mints a token with no expiry (S-13.c). Only available for read-only tokens. */
+  tokensNeverExpires: { id: "app.tokensNeverExpires", en: "Never expires" },
+  /** Help text explaining why the never-expires checkbox is disabled (S-13.c). */
+  tokensNeverExpiresReadOnly: { id: "app.tokensNeverExpiresReadOnly", en: "Only read-only tokens can be non-expiring." },
+  /** Validation message when the expiry field is empty. An empty field must not be read as "no expiry" — that is a different, longer-lived credential (S-13.c). */
+  tokensExpiryRequired: { id: "app.tokensExpiryRequired", en: "Enter a lifetime in days, or tick \"never expires\"." },
+  /** Notice in the token dialog when the mint will be step-up gated — a publishing or administrative scope (S-06), or a token with no expiry whatever its scope (S-06.d). */
+  tokensStepUpNotice: { id: "app.tokensStepUpNotice", en: "This token asks for a second-factor code before it is issued." },
   /** Validation message when the token dialog is submitted without an organization. */
   tokensOrgRequired: { id: "app.tokensOrgRequired", en: "Choose an organization for this token." },
   /** Validation message when the token dialog is submitted with no scope selected. */
@@ -980,6 +1022,34 @@ export const app = {
   adminStatCachedBytes: { id: "app.adminStatCachedBytes", en: "Cached bytes" },
   /** Admin statistic — unacknowledged shadowing alarms. */
   adminStatShadowingActive: { id: "app.adminStatShadowingActive", en: "Open shadowing alarms" },
+  /** Admin tab holding the two supply-chain registers — shadowed names (S-17) and refused upstream archives (S-19). */
+  adminTabSupplyChain: { id: "app.adminTabSupplyChain", en: "Supply chain" },
+  /** Link from the dashboard's twenty-row alarm table to the full, paginated register behind it. */
+  adminRegisterOpen: { id: "app.adminRegisterOpen", en: "Open the register" },
+  /** Live-region text while a supply-chain register page is in flight. */
+  adminRegisterLoading: { id: "app.adminRegisterLoading", en: "Loading the register…" },
+  /** Live-region text once a supply-chain register page has arrived. */
+  adminRegisterLoaded: { id: "app.adminRegisterLoaded", en: "Register loaded." },
+  /** Filter showing only unacknowledged shadowing alarms. */
+  adminShadowingFilterActive: { id: "app.adminShadowingFilterActive", en: "Needs attention" },
+  /** Filter showing only shadowing alarms an administrator has already cleared. */
+  adminShadowingFilterAcknowledged: { id: "app.adminShadowingFilterAcknowledged", en: "Acknowledged" },
+  /** Filter showing the whole shadowing register, acknowledged or not. */
+  adminShadowingFilterAll: { id: "app.adminShadowingFilterAll", en: "All" },
+  /** Button that clears one shadowing alarm. Bookkeeping only — resolution never depended on it, and a later sighting raises the alarm again. */
+  adminShadowingAcknowledge: { id: "app.adminShadowingAcknowledge", en: "Acknowledge" },
+  /** Success toast after acknowledging a shadowing alarm; states what did NOT change. */
+  adminShadowingAcknowledged: { id: "app.adminShadowingAcknowledged", en: "Alarm acknowledged. Resolution is unchanged — the local package still wins." },
+  /** Toast when an acknowledgement matched no active alarm: somebody else cleared it, or the page was stale. */
+  adminShadowingAlreadyAcknowledged: { id: "app.adminShadowingAlreadyAcknowledged", en: "Nothing to acknowledge — that alarm was already cleared." },
+  /** Empty state of the shadowing register. */
+  adminShadowingEmpty: { id: "app.adminShadowingEmpty", en: "No shadowed names" },
+  /** Empty-state body of the shadowing register. */
+  adminShadowingEmptyBody: { id: "app.adminShadowingEmptyBody", en: "No name claimed on this instance has been seen upstream." },
+  /** Empty state of the quarantine register. */
+  adminQuarantineEmpty: { id: "app.adminQuarantineEmpty", en: "Nothing quarantined" },
+  /** Empty-state body of the quarantine register. */
+  adminQuarantineEmptyBody: { id: "app.adminQuarantineEmptyBody", en: "Every upstream archive fetched so far matched the hash upstream advertised." },
   /** Heading of the shadowing alarm table on the admin dashboard. */
   adminShadowingTitle: { id: "app.adminShadowingTitle", en: "Shadowing alarms" },
   /** Alert above the shadowing alarm table explaining what the alarm means. */

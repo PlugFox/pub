@@ -134,6 +134,33 @@ export interface paths {
         patch: operations["update_org"];
         trace?: never;
     };
+    "/api/v1/admin/quarantine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The quarantine register: upstream archives the proxy refused
+         *     ([S-19.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+         * @description Instance-admin, newest observation first. The dashboard shows the newest twenty of these
+         *     inside `/admin/stats`; this is the register behind that sample, and it is the surface an
+         *     operator investigating a supply-chain incident actually needs.
+         *
+         *     There is no delete and no acknowledge. A quarantine row is evidence written *after* the
+         *     bytes were already refused, so nothing here can change what the proxy serves — and a row an
+         *     admin session could clear is a row an attacker with one could clear.
+         */
+        get: operations["list_quarantine"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/settings": {
         parameters: {
             query?: never;
@@ -169,6 +196,51 @@ export interface paths {
          *     because synchronous diagnosis is the whole purpose.
          */
         post: operations["test_smtp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/shadowing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The shadowing register: locally claimed names observed upstream
+         *     ([S-17.b](../../../../docs/security.md#4-supply-chain--registry-integrity)).
+         * @description Instance-admin, newest sighting first, sliced by `active`. Reading it does not change
+         *     resolution and never could: the local package wins by decision 01, before and after.
+         */
+        get: operations["list_shadowing"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/shadowing/{format}/{name}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledges one shadowing alarm (S-17.b) — bookkeeping, never policy.
+         * @description **Not step-up gated** (S-06.b: the list is about escalation). It grants nothing, deletes
+         *     nothing, and changes no resolution; the next upstream sighting raises the alarm again as a
+         *     new incident. `acknowledged: false` means there was no *active* alarm under that key — an
+         *     unknown name and an already-acknowledged one answer the same way, and neither writes a row.
+         */
+        post: operations["acknowledge_shadowing"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1018,9 +1090,11 @@ export interface paths {
         /**
          * Mints a CLI/API token. The secret appears in this response and never again (S-13
          *     show-once); at rest only its SHA-256 and a first-8-chars hint survive.
-         * @description Minting `publish` or `admin` scopes is **step-up gated** (S-06): a stolen stale web
-         *     session must not escalate around the CLI-token publish boundary. `read`/`retract` mints
-         *     stay ungated.
+         * @description Two independent step-up gates, both decided here because both depend on the parsed body:
+         *     minting `publish`/`admin` scopes (S-06 — a stolen stale web session must not escalate
+         *     around the CLI-token publish boundary), and minting a **non-expiring** token at any scope
+         *     ([S-06.d](../../../../docs/security.md#1-authentication) — the lifetime is what is
+         *     dangerous there, not the scope). An expiring `read`/`retract` mint stays ungated.
          */
         post: operations["create_post_api_v1_tokens"];
         delete?: never;
@@ -1392,8 +1466,8 @@ export interface components {
          *     again, and `{}` supplies nothing and is refused rather than silently treated as one of the
          *     three.
          *
-         *     **The inner type is `i128` and the accepted range is `0..=i64::MAX`**, which is not a
-         *     contradiction — it is what keeps every refusal inside the error envelope
+         *     **The inner type is `i64` and the accepted range is `0..=i64::MAX`**: the *negative* half of
+         *     the parsed range exists only so that refusal stays inside the error envelope
          *     ([rules/api.md](../../../../docs/rules/api.md)). A narrower Rust type moves the refusal into
          *     serde, and a serde refusal is a **422 carrying a bare deserializer string** that no client
          *     can parse as an error: with `u64` the operator's `-1` died there, which also made
@@ -2504,6 +2578,48 @@ export interface components {
             status: string;
         };
         /** @description Successful app API response. */
+        OkEnvelope_ListDto_QuarantineDto: {
+            /** @description Cursor-paginated list envelope (docs/rules/api.md: cursor pagination only). */
+            data: {
+                /** @description Opaque continuation cursor; `null` on the last page. */
+                cursor?: string | null;
+                /** @description Whether more items exist. */
+                has_more: boolean;
+                /** @description Items of this page. */
+                items: {
+                    /** @description The sha256 of the bytes it served. */
+                    actual_sha256: string;
+                    /** @description The sha256 upstream advertised. */
+                    expected_sha256: string;
+                    /**
+                     * Format: date-time
+                     * @description First observation — the incident's start.
+                     */
+                    first_seen_at: string;
+                    /** @description Artifact format the name lives in — part of the register's key (decision 21). */
+                    format: string;
+                    /**
+                     * Format: date-time
+                     * @description Most recent observation.
+                     */
+                    last_seen_at: string;
+                    /** @description Package name upstream. */
+                    name: string;
+                    /**
+                     * Format: int64
+                     * @description How many times this has been observed.
+                     */
+                    occurrences: number;
+                    /** @description Upstream base URL. */
+                    upstream: string;
+                    /** @description The refused version. */
+                    version: string;
+                }[];
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
         OkEnvelope_ListDto_SessionDto: {
             /** @description Cursor-paginated list envelope (docs/rules/api.md: cursor pagination only). */
             data: {
@@ -2537,6 +2653,54 @@ export interface components {
             status: string;
         };
         /** @description Successful app API response. */
+        OkEnvelope_ListDto_ShadowingDto: {
+            /** @description Cursor-paginated list envelope (docs/rules/api.md: cursor pagination only). */
+            data: {
+                /** @description Opaque continuation cursor; `null` on the last page. */
+                cursor?: string | null;
+                /** @description Whether more items exist. */
+                has_more: boolean;
+                /** @description Items of this page. */
+                items: {
+                    /**
+                     * Format: date-time
+                     * @description When an administrator acknowledged it; `null` while it is still active.
+                     */
+                    acknowledged_at?: string | null;
+                    /** @description Whether it still wants attention. */
+                    active: boolean;
+                    /**
+                     * Format: date-time
+                     * @description First sighting of the **current** incident: an acknowledged alarm that is seen again
+                     *     starts a new one (S-17.a), so this moves rather than recording the original sighting.
+                     */
+                    first_seen_at: string;
+                    /** @description Artifact format the name lives in — with `name`, the key an acknowledgement addresses. */
+                    format: string;
+                    /**
+                     * Format: date-time
+                     * @description Most recent sighting.
+                     */
+                    last_seen_at: string;
+                    /** @description The shadowed name. */
+                    name: string;
+                    /**
+                     * Format: int64
+                     * @description How many sightings.
+                     */
+                    observations: number;
+                    /** @description Org holding the local claim. */
+                    org_id: string;
+                    /** @description Upstream base URL where it was observed. */
+                    upstream: string;
+                    /** @description The highest version upstream advertises, when known. */
+                    upstream_version?: string | null;
+                }[];
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
         OkEnvelope_ListDto_TokenDto: {
             /** @description Cursor-paginated list envelope (docs/rules/api.md: cursor pagination only). */
             data: {
@@ -2555,7 +2719,7 @@ export interface components {
                     display_hint: string;
                     /**
                      * Format: date-time
-                     * @description Expiry, if any.
+                     * @description Expiry; `null` means the token never expires (S-13.c — `read` scope only).
                      */
                     expires_at?: string | null;
                     /** @description Token id. */
@@ -2569,6 +2733,14 @@ export interface components {
                     name: string;
                     /** @description Org the token is bound to. */
                     org_id: string;
+                    /**
+                     * @description Package-name patterns narrowing the token; empty means no narrowing (S-13).
+                     *
+                     *     Rendered by the token list because the mint validates the pattern's *grammar* and never
+                     *     its intent: `acme_x*` is a well-formed pattern for an org whose packages are `acme_y*`,
+                     *     and the only way its owner finds that out before CI does is by reading it back.
+                     */
+                    package_patterns: string[];
                     /** @description Granted scopes. */
                     scopes: string[];
                 }[];
@@ -2937,6 +3109,20 @@ export interface components {
                 total: number;
                 /** @description Query tokens the parser did not understand, verbatim. */
                 unknown_filters: string[];
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
+        OkEnvelope_ShadowingAckDto: {
+            /** @description Response of `POST /api/v1/admin/shadowing/{format}/{name}/acknowledge`. */
+            data: {
+                /**
+                 * @description Whether an **active** alarm was acknowledged by this call. `false` means there was
+                 *     nothing to acknowledge — an unknown name or one already cleared — and nothing was
+                 *     written: a button pressed twice is not an event.
+                 */
+                acknowledged: boolean;
             };
             /** @description Always `"ok"`. */
             status: string;
@@ -3341,6 +3527,13 @@ export interface components {
             expected_sha256: string;
             /**
              * Format: date-time
+             * @description First observation — the incident's start.
+             */
+            first_seen_at: string;
+            /** @description Artifact format the name lives in — part of the register's key (decision 21). */
+            format: string;
+            /**
+             * Format: date-time
              * @description Most recent observation.
              */
             last_seen_at: string;
@@ -3533,10 +3726,32 @@ export interface components {
             /** @description Coarse user agent captured at sign-in. */
             user_agent?: string | null;
         };
+        /** @description Response of `POST /api/v1/admin/shadowing/{format}/{name}/acknowledge`. */
+        ShadowingAckDto: {
+            /**
+             * @description Whether an **active** alarm was acknowledged by this call. `false` means there was
+             *     nothing to acknowledge — an unknown name or one already cleared — and nothing was
+             *     written: a button pressed twice is not an event.
+             */
+            acknowledged: boolean;
+        };
         /** @description One shadowing alarm (S-17). */
         ShadowingDto: {
+            /**
+             * Format: date-time
+             * @description When an administrator acknowledged it; `null` while it is still active.
+             */
+            acknowledged_at?: string | null;
             /** @description Whether it still wants attention. */
             active: boolean;
+            /**
+             * Format: date-time
+             * @description First sighting of the **current** incident: an acknowledged alarm that is seen again
+             *     starts a new one (S-17.a), so this moves rather than recording the original sighting.
+             */
+            first_seen_at: string;
+            /** @description Artifact format the name lives in — with `name`, the key an acknowledgement addresses. */
+            format: string;
             /**
              * Format: date-time
              * @description Most recent sighting.
@@ -3698,13 +3913,27 @@ export interface components {
         TokenCreateBody: {
             /**
              * Format: int64
-             * @description Lifetime in days; defaults to 90 (S-13).
+             * @description Lifetime in days (1…3650), or `null` for a token that **never expires**.
+             *
+             *     Since [decision 33](../../../../docs/decisions.md#33) this field is explicit and `null`
+             *     is not "use the default": a non-expiring token may carry only the `read` scope
+             *     ([S-13.c](../../../../docs/security.md#3-cliapi-tokens)) and minting one demands a fresh
+             *     second factor at every scope ([S-06.d](../../../../docs/security.md#1-authentication)).
+             *     `0` is refused. The UI sends 90 explicitly, which is where the product's default now lives.
              */
             expires_days?: number | null;
             /** @description Optional label shown in the token list. */
             label?: string | null;
             /** @description Org the token is bound to (S-13). */
             org_id: string;
+            /**
+             * @description Package-name patterns narrowing the token further; absent or empty means no narrowing.
+             *
+             *     One trailing `*` is a prefix match (`acme_*`), anything else is an exact package name.
+             *     Validated at the mint against the matcher that enforces it (S-13.c), so a pattern that
+             *     could never match is a 400 rather than a token that authorizes nothing.
+             */
+            package_patterns?: string[] | null;
             /** @description Requested scopes: `read` | `publish` | `retract` | `admin`. */
             scopes: string[];
         };
@@ -3726,7 +3955,7 @@ export interface components {
             display_hint: string;
             /**
              * Format: date-time
-             * @description Expiry, if any.
+             * @description Expiry; `null` means the token never expires (S-13.c — `read` scope only).
              */
             expires_at?: string | null;
             /** @description Token id. */
@@ -3740,6 +3969,14 @@ export interface components {
             name: string;
             /** @description Org the token is bound to. */
             org_id: string;
+            /**
+             * @description Package-name patterns narrowing the token; empty means no narrowing (S-13).
+             *
+             *     Rendered by the token list because the mint validates the pattern's *grammar* and never
+             *     its intent: `acme_x*` is a well-formed pattern for an org whose packages are `acme_y*`,
+             *     and the only way its owner finds that out before CI does is by reading it back.
+             */
+            package_patterns: string[];
             /** @description Granted scopes. */
             scopes: string[];
         };
@@ -4195,6 +4432,49 @@ export interface operations {
             };
         };
     };
+    list_quarantine: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Opaque cursor from the previous page. */
+                cursor: string | null;
+                /** @description Page size, 1..=100 (default 20). */
+                limit: number | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Refused upstream archives, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_ListDto_QuarantineDto"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an instance administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     get_settings: {
         parameters: {
             query?: never;
@@ -4285,6 +4565,97 @@ export interface operations {
                 };
             };
             /** @description The acting administrator has no verified email address */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an instance administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    list_shadowing: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description `true` = only alarms still asking for attention, `false` = only acknowledged ones,
+                 *     absent = the whole register.
+                 */
+                active: boolean | null;
+                /** @description Opaque cursor from the previous page. */
+                cursor: string | null;
+                /** @description Page size, 1..=100 (default 20). */
+                limit: number | null;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Shadowing alarms, newest sighting first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_ListDto_ShadowingDto"];
+                };
+            };
+            /** @description Malformed cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Not an instance administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    acknowledge_shadowing: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Artifact format, e.g. `pub` */
+                format: string;
+                /** @description The shadowed package name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Whether an active alarm was acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_ShadowingAckDto"];
+                };
+            };
+            /** @description Unknown artifact format */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6399,7 +6770,16 @@ export interface operations {
                     "application/json": components["schemas"]["OkEnvelope_TokenCreatedDto"];
                 };
             };
-            /** @description Org role below the requested scopes, or step_up_required for publish/admin scopes */
+            /** @description Malformed pattern, expires_days outside 1..=3650, or a non-expiring token with a write scope */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Org role below the requested scopes, or step_up_required for publish/admin scopes and for a non-expiring token */
             403: {
                 headers: {
                     [name: string]: unknown;

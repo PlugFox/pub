@@ -1,4 +1,4 @@
-import { isStepUpRequired, NetworkError } from "@pub/api/errors";
+import { isStepUpRequired } from "@pub/api/errors";
 import { createPubApi, loginTokenPair, type PubApi } from "@pub/api/pub-api";
 import type { LoginDto } from "@pub/api/types";
 import { t } from "@pub/i18n";
@@ -116,7 +116,11 @@ export async function withStepUp<T>(action: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Human-readable message for an arbitrary failure, used by the action toasts. */
-export function describeError(error: unknown): string {
-  return error instanceof NetworkError ? t(app.networkError) : t(app.genericError);
-}
+/*
+ * `describeError` lives in `../error-message` (D18): the mapping is a pure
+ * function of the error, it has real behaviour worth testing without a DOM,
+ * and it must not be able to reach the stores. Re-exported here because every
+ * screen already imports it from this module, and moving that import would
+ * touch a dozen files to say nothing new.
+ */
+export { describeError } from "../error-message";

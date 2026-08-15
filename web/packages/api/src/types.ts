@@ -182,6 +182,7 @@ export type JobRunDto = Schemas["JobRunDto"];
 export type JobStateDto = Schemas["JobStateDto"];
 export type ShadowingDto = Schemas["ShadowingDto"];
 export type QuarantineDto = Schemas["QuarantineDto"];
+export type ShadowingAckDto = Schemas["ShadowingAckDto"];
 
 export const REGISTRATION_MODES = ["open", "invite", "closed"] as const;
 export type RegistrationMode = (typeof REGISTRATION_MODES)[number];

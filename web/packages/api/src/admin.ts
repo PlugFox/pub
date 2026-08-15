@@ -9,6 +9,9 @@ import type {
   AuditEventDto,
   JobRunDto,
   ListDto,
+  QuarantineDto,
+  ShadowingAckDto,
+  ShadowingDto,
   SmtpTestResultDto,
   UserStatus,
 } from "./types";
@@ -46,6 +49,16 @@ export type AuditFilters = {
   readonly until?: string;
   readonly cursor?: string;
   readonly limit?: number;
+};
+
+export type RegisterPage = {
+  readonly cursor?: string;
+  readonly limit?: number;
+};
+
+export type ShadowingPage = RegisterPage & {
+  /** `true` = active only, `false` = acknowledged only, absent = both. */
+  readonly active?: boolean;
 };
 
 export type UserFilters = {
@@ -153,6 +166,41 @@ export function createAdminApi(client: ApiClient) {
 
     stats(): Promise<AdminStatsDto> {
       return client.request<AdminStatsDto>("/admin/stats");
+    },
+
+    /*
+     * The two supply-chain registers (S-17.b / S-19.b). `stats()` above carries
+     * the newest twenty rows of each for the dashboard; these are the registers
+     * behind that sample, keyset-paginated and — for shadowing — sliceable.
+     *
+     * `active` is a THREE-state filter and `undefined` is one of the three:
+     * `true` = still asking for attention, `false` = acknowledged, absent = the
+     * whole register. `queryString` drops `undefined`, which is exactly right.
+     */
+    quarantine(params: RegisterPage = {}): Promise<ListDto<QuarantineDto>> {
+      return client.request<ListDto<QuarantineDto>>(
+        `/admin/quarantine${queryString({ cursor: params.cursor, limit: params.limit })}`,
+      );
+    },
+
+    shadowing(params: ShadowingPage = {}): Promise<ListDto<ShadowingDto>> {
+      return client.request<ListDto<ShadowingDto>>(
+        `/admin/shadowing${queryString({ active: params.active, cursor: params.cursor, limit: params.limit })}`,
+      );
+    },
+
+    /*
+     * Acknowledging is bookkeeping, never policy: the local package won before
+     * the alarm and wins after it, and the next upstream sighting raises it
+     * again as a new incident. `acknowledged: false` means there was nothing
+     * active under that key — an unknown name and an already-cleared alarm
+     * answer the same way.
+     */
+    acknowledgeShadowing(format: string, name: string): Promise<ShadowingAckDto> {
+      return client.request<ShadowingAckDto>(
+        `/admin/shadowing/${encodeURIComponent(format)}/${encodeURIComponent(name)}/acknowledge`,
+        { method: "POST" },
+      );
     },
 
     /** 409 when the job already holds the cluster-wide leader lock. */
