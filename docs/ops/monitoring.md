@@ -119,7 +119,9 @@ groups:
 
       # --- supply chain (decision 07, S-21) -----------------------------------------------
       # Any of these is worth a human look. They are not errors; they are the signals the
-      # upstream proxy exists to produce.
+      # upstream proxy exists to produce. What each one *means* is in the register behind it:
+      # the admin surface's "Supply chain" tab (`/app/admin/supply-chain`) pages the full
+      # quarantine and shadowing registers, which the dashboard only samples twenty rows of.
       - alert: PubUpstreamQuarantine
         expr: increase(quarantine_total[15m]) > 0
         labels: { severity: critical }

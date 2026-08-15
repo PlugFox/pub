@@ -6,7 +6,7 @@ Monorepo: Rust backend (`server/`), Bun/Astro/SolidJS frontend (`web/`), design 
 
 | When                                     | Read                                                                  |
 | ---------------------------------------- | --------------------------------------------------------------------- |
-| Any design/architecture question         | `docs/decisions.md` (normative, 29 decisions), `docs/architecture.md` |
+| Any design/architecture question         | `docs/decisions.md` (normative, 33 decisions), `docs/architecture.md` |
 | Touching pub protocol endpoints          | `docs/protocol.md` — violating a sharp edge breaks `dart pub` clients |
 | Auth, tokens, sessions, limits, webhooks | `docs/security.md` — normative S-01…S-33, referenced from tests       |
 | Writing Rust                             | `docs/rules/rust.md`                                                  |
