@@ -15,6 +15,8 @@
 use std::str::FromStr as _;
 
 use pub_core::traits::Repositories;
+// `Migrate` is what lets one test stop the migrator where a past release did (D64).
+use sqlx::migrate::Migrate as _;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Connection as _, PgConnection, PgPool};
 
@@ -34,6 +36,18 @@ impl TestDb {
     /// When neither `PUB_TEST_POSTGRES_URL` nor `PUB_TEST_NO_POSTGRES` is set — see
     /// [`pub_test_support::OptionalBackend::gate`].
     async fn create(test: &str) -> Option<Self> {
+        Self::create_at_version(test, i64::MAX).await
+    }
+
+    /// Like [`TestDb::create`], but stops the migrator after `version` — the shape a deployment
+    /// provisioned on an older release has before it upgrades, which is the only vantage point
+    /// from which a privilege granted "on all tables" can be seen to fall short (D64).
+    ///
+    /// # Panics
+    ///
+    /// When neither `PUB_TEST_POSTGRES_URL` nor `PUB_TEST_NO_POSTGRES` is set — see
+    /// [`pub_test_support::OptionalBackend::gate`].
+    async fn create_at_version(test: &str, version: i64) -> Option<Self> {
         let admin_url = match pub_test_support::POSTGRES.gate(test) {
             pub_test_support::Gate::Run(url) => url,
             pub_test_support::Gate::Skipped => return None,
@@ -51,7 +65,16 @@ impl TestDb {
         let options = PgConnectOptions::from_str(&admin_url).expect("parse postgres url").database(&name);
         let pool =
             PgPoolOptions::new().max_connections(5).connect_with(options).await.expect("connect throwaway database");
-        pub_db_postgres::MIGRATOR.run(&pool).await.expect("migrate throwaway database");
+        if version == i64::MAX {
+            pub_db_postgres::MIGRATOR.run(&pool).await.expect("migrate throwaway database");
+        } else {
+            let migrator = &pub_db_postgres::MIGRATOR;
+            let mut conn = pool.acquire().await.expect("connection for a partial migration");
+            conn.ensure_migrations_table(&migrator.table_name).await.expect("migrations table");
+            for migration in migrator.iter().filter(|m| m.version <= version) {
+                conn.apply(&migrator.table_name, migration).await.expect("apply one migration");
+            }
+        }
         Some(Self { admin_url, name, pool })
     }
 
@@ -598,6 +621,190 @@ async fn s22_a_the_hardened_app_role_prunes_audit_without_holding_delete() {
     let admin_pool = db.pool.clone();
     db.cleanup().await;
     let _ = admin_pool;
+    let mut admin = PgConnection::connect(&std::env::var(pub_test_support::POSTGRES.url_env).expect("url"))
+        .await
+        .expect("connect to postgres admin");
+    sqlx::query(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
+        .execute(&mut admin)
+        .await
+        .expect("drop the test role");
+    admin.close().await.expect("close admin connection");
+}
+
+/// Every ordinary table in `public`, sorted the way `pub_role_grant_gaps()` reports them.
+async fn table_names(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT c.relname::TEXT FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY c.relname",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("list the schema's tables")
+}
+
+/// **S-22.a / D64.** A role provisioned from the template can use a table a later migration adds
+/// — with the corrected recipe, and demonstrably not without it.
+///
+/// The sibling above proves the template's *restriction* is real. This one proves its **reach**,
+/// which nothing did: `GRANT … ON ALL TABLES IN SCHEMA public` covers the tables that exist when
+/// it runs and no others, so every deployment that followed the hardening before this migration
+/// holds nothing on anything migrations 0004-0016 added — fatally on `job_locks`, taken by every
+/// publish and every job tick. Both halves of that are asserted here rather than argued: the old
+/// recipe's refusal is the first arm, the corrected recipe's success is the second, and the
+/// difference between them is exactly the `ALTER DEFAULT PRIVILEGES` pair
+/// ([decision 37](../../../../docs/decisions.md#37--a-grant-that-reaches-the-tables-that-do-not-exist-yet-default-privileges-a-one-time-repair-and-an-upgrade-that-says-so)).
+///
+/// Owner-connected tests cannot see any of this, which is why it went unnoticed from 0004 to 0016:
+/// compose, CI and every other test in this file connect as the database owner, which can do
+/// anything to anything.
+///
+/// **Seen red** three ways before it was kept. Without the `ALTER DEFAULT PRIVILEGES` pair, the
+/// insert into `an_even_later_table` fails with `permission denied for table an_even_later_table`
+/// — the half a re-grant cannot buy. Without the one-time re-grant, the lock acquire fails with
+/// `permission denied for table job_locks` — the half default privileges cannot buy, because they
+/// are not retroactive. And with the `REVOKE` moved to the head of the corrected recipe instead of
+/// its foot, the direct `DELETE FROM audit_log` **succeeds**: the re-grant hands back `DELETE` on
+/// every table, so a recipe in the wrong order fixes D64 by undoing S-22.
+#[tokio::test]
+async fn s22_a_a_provisioned_role_reaches_a_table_added_after_it_d64() {
+    // The database as an operator's was when they read the S-22 hardening: migration 0003, which
+    // is where `audit_log` and its REVOKE already exist and none of the tables this defect is
+    // about do. Provisioning against the *current* schema would prove nothing — every grant would
+    // land, which is exactly why owner-connected tests and fresh installs never see this.
+    let Some(db) = TestDb::create_at_version("s22_a_default_privileges", 3).await else { return };
+    // The role migrations run as — `database.url`'s role, and the owner of every table here. It
+    // is read rather than assumed because the corrected recipe is keyed on it: default privileges
+    // belong to the role that CREATEs the object, not to the one being granted to.
+    let owner: String = sqlx::query_scalar("SELECT current_user").fetch_one(&db.pool).await.expect("current user");
+    let role = format!("pub_app_{}", pub_core::UserId::new().to_string().replace('-', ""));
+
+    // Arm one: the template exactly as it shipped from 0002 through 0016, run when it was correct.
+    for statement in [
+        format!("CREATE ROLE \"{role}\" LOGIN PASSWORD 'hardened_test_password'"),
+        format!("GRANT USAGE ON SCHEMA public TO \"{role}\""),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"{role}\""),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"{role}\""),
+        format!("REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM \"{role}\""),
+    ] {
+        sqlx::query(AssertSqlSafe(statement)).execute(&db.pool).await.expect("provision per the shipped template");
+    }
+
+    // Now the release upgrade: 0004 through 0017, every table in them created by the migration
+    // role after the grant above. Nothing here fails, which is the point — the outage is later.
+    let before = table_names(&db.pool).await;
+    pub_db_postgres::MIGRATOR.run(&db.pool).await.expect("upgrade the deployment");
+    let added: Vec<String> = table_names(&db.pool).await.into_iter().filter(|t| !before.contains(t)).collect();
+    assert!(added.len() > 10, "the upgrade under test has to add tables for any of this to mean anything: {added:?}");
+
+    let options = PgConnectOptions::from_str(&db.admin_url)
+        .expect("parse postgres url")
+        .database(&db.name)
+        .username(&role)
+        .password("hardened_test_password");
+    let app_pool =
+        PgPoolOptions::new().max_connections(2).connect_with(options).await.expect("connect as the app role");
+    let app_repos = pub_db_postgres::repo::repositories(app_pool.clone());
+
+    // The damage, at the surface an operator meets: `job_locks` arrived in 0016, so the first
+    // publish and the first job tick after the upgrade fail — with nothing having gone wrong at
+    // upgrade time and nothing in the application at fault.
+    let lock = app_repos
+        .locks
+        .try_acquire("blob-gc", std::time::Duration::from_secs(60))
+        .await
+        .expect_err("a lock taken on every publish must be refused for a role granted before 0016");
+    assert!(
+        lock.to_string().contains("job_locks"),
+        "the failure must name the table, because that log line is all the operator gets: {lock}"
+    );
+
+    // It is not one table, either. Everything 0004 onwards added is out of reach, and the
+    // migration's self-check names them — during the upgrade, rather than after the outage.
+    let gaps: Vec<(String, Vec<String>)> =
+        sqlx::query_as("SELECT role_name, missing_tables FROM pub_role_grant_gaps() ORDER BY role_name")
+            .fetch_all(&db.pool)
+            .await
+            .expect("the self-check runs");
+    let (_, missing) = gaps.iter().find(|(name, _)| name == &role).expect("the self-check must name the role");
+    assert!(missing.contains(&"job_locks".to_owned()), "the fatal one must be named: {missing:?}");
+    assert_eq!(
+        missing, &added,
+        "the gap is exactly the set of tables the upgrade added — no more, so the report stays readable, \
+         and no less, so no table is quietly left out of it"
+    );
+    assert!(!missing.contains(&"audit_log".to_owned()), "and a table the role *can* write is not a gap: {missing:?}");
+
+    // Arm two: the corrected recipe. The re-grant repairs what exists, the default privileges
+    // reach what does not exist yet, and the REVOKE runs last because the re-grant hands back
+    // precisely what it takes away.
+    for statement in [
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"{role}\""),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE \"{owner}\" IN SCHEMA public \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"{role}\""
+        ),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE \"{owner}\" IN SCHEMA public \
+             GRANT USAGE, SELECT ON SEQUENCES TO \"{role}\""
+        ),
+        format!("REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM \"{role}\""),
+    ] {
+        sqlx::query(AssertSqlSafe(statement)).execute(&db.pool).await.expect("apply the corrected recipe");
+    }
+
+    let held = app_repos
+        .locks
+        .try_acquire("blob-gc", std::time::Duration::from_secs(60))
+        .await
+        .expect("the one-time re-grant must repair every table the upgrade added")
+        .expect("a free name");
+    app_repos.locks.release("blob-gc", held).await.expect("release");
+
+    // The half a re-grant can never buy: a table that does not exist at recipe time. This is the
+    // whole of the fix — without the two `ALTER DEFAULT PRIVILEGES` statements above, this insert
+    // is refused exactly like arm one's was.
+    sqlx::query("CREATE TABLE an_even_later_table (id TEXT PRIMARY KEY, note TEXT)")
+        .execute(&db.pool)
+        .await
+        .expect("a table from the next migration");
+    sqlx::query("INSERT INTO an_even_later_table (id, note) VALUES ('a', 'first')")
+        .execute(&app_pool)
+        .await
+        .expect("default privileges must reach a table created after the recipe ran");
+    sqlx::query("UPDATE an_even_later_table SET note = 'second' WHERE id = 'a'")
+        .execute(&app_pool)
+        .await
+        .expect("all four privileges, not merely INSERT");
+    let note: String = sqlx::query_scalar("SELECT note FROM an_even_later_table WHERE id = 'a'")
+        .fetch_one(&app_pool)
+        .await
+        .expect("read back");
+    assert_eq!(note, "second");
+    sqlx::query("DELETE FROM an_even_later_table WHERE id = 'a'").execute(&app_pool).await.expect("and DELETE");
+
+    // The exception survives the repair. The re-grant re-granted UPDATE and DELETE on *every*
+    // table including `audit_log`, so a recipe that put the REVOKE anywhere but last would have
+    // quietly undone S-22 while fixing D64 — which is why the ordering is asserted, not described.
+    let direct = sqlx::query("DELETE FROM audit_log").execute(&app_pool).await;
+    assert!(
+        direct.expect_err("audit_log must still be append-only for the app role").to_string().contains("permission"),
+        "the corrected recipe must not cost S-22 its defence in depth"
+    );
+
+    // And the self-check agrees, which is the state an operator can now confirm for themselves.
+    let gaps: Vec<(String, Vec<String>)> =
+        sqlx::query_as("SELECT role_name, missing_tables FROM pub_role_grant_gaps()")
+            .fetch_all(&db.pool)
+            .await
+            .expect("the self-check runs");
+    assert!(
+        !gaps.iter().any(|(name, _)| name == &role),
+        "a correctly provisioned role must not be reported as a gap: {gaps:?}"
+    );
+
+    app_pool.close().await;
+    sqlx::query(AssertSqlSafe(format!("DROP OWNED BY \"{role}\""))).execute(&db.pool).await.expect("drop owned");
+    db.cleanup().await;
     let mut admin = PgConnection::connect(&std::env::var(pub_test_support::POSTGRES.url_env).expect("url"))
         .await
         .expect("connect to postgres admin");

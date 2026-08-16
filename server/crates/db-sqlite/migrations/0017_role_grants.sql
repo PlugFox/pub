@@ -1,0 +1,16 @@
+-- 0017_role_grants (sqlite): nothing to do, on purpose — and the file exists so that saying so
+-- costs one comment rather than a permanent numbering skew between the two migration sets
+-- ([decision 37], [rules/migrations.md](../../../../docs/rules/migrations.md): identical logical
+-- numbering across both backends).
+--
+-- The Postgres sibling corrects the provisioning template for the application *role*: `GRANT …
+-- ON ALL TABLES IN SCHEMA public` reaches only the tables that exist when it runs, so every table
+-- a later migration adds is unreachable until ALTER DEFAULT PRIVILEGES is in the recipe (roadmap
+-- D64). SQLite has no roles and no grants — its enforcement of the same requirements is the
+-- repository surface itself (`AuditRepo` exposes no update and no unbounded delete, S-22.a), and a
+-- process that can open the file can read and write every table in it. There is therefore no
+-- SQLite-side privilege to correct, and nothing here to migrate.
+--
+-- The statement below is a no-op that keeps this a valid migration in every sqlx version rather
+-- than a file whose behaviour depends on how comment-only input is parsed.
+SELECT 1;
