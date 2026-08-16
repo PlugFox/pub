@@ -7,6 +7,8 @@
 #   redis  — Valkey 8               docker compose -f docker/docker-compose.yml --profile redis up -d
 #   mail   — Mailpit dev mail sink  docker compose -f docker/docker-compose.yml --profile mail up -d
 #   full   — app + all of the above docker compose -f docker/docker-compose.yml --profile full up -d --build
+#   cluster— TWO app replicas behind an nginx proxy, on the same backends: the acceptance
+#            stand for roadmap Phase 3 item 3 (decision 38). `just cluster-up`.
 #
 # Every infra variable has a default (see .env.example), so a zero-config `up` works for
 # pg/s3/redis/mail. The ONE exception is the full profile's app: it runs in production
@@ -28,7 +30,7 @@ volumes:
 services:
   pg:
     image: postgres:17-alpine
-    profiles: [pg, full]
+    profiles: [pg, full, cluster]
     # Modest dev-box tuning; not production advice.
     command:
       - postgres
@@ -59,7 +61,7 @@ services:
   s3:
     # Consider pinning a RELEASE.* tag once the blob layer lands.
     image: minio/minio:latest
-    profiles: [s3, full]
+    profiles: [s3, full, cluster]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${PUB_S3_ACCESS_KEY:-pub-minio}
@@ -81,7 +83,7 @@ services:
   # makes re-runs a no-op.
   s3-init:
     image: minio/mc:latest
-    profiles: [s3, full]
+    profiles: [s3, full, cluster]
     depends_on:
       s3:
         condition: service_healthy
@@ -101,7 +103,7 @@ services:
 
   redis:
     image: valkey/valkey:8-alpine
-    profiles: [redis, full]
+    profiles: [redis, full, cluster]
     command: valkey-server --appendonly yes
     ports:
       - "${PUB_REDIS_PORT:-6379}:6379"
@@ -119,7 +121,7 @@ services:
   # notification mail land here: web UI + REST API on :8025 (GET /api/v1/messages).
   mail:
     image: axllent/mailpit:latest
-    profiles: [mail, full]
+    profiles: [mail, full, cluster]
     ports:
       - "${PUB_MAIL_SMTP_PORT:-1025}:1025" # SMTP sink
       - "${PUB_MAIL_UI_PORT:-8025}:8025"   # web UI + API
@@ -132,10 +134,10 @@ services:
 
   app:
     profiles: [full]
-    build:
+    build: &app-build
       context: ..                 # repo root — the Dockerfile copies server/ and web/
       dockerfile: docker/Dockerfile
-    depends_on:
+    depends_on: &app-depends
       pg:
         condition: service_healthy
       s3:
@@ -148,7 +150,7 @@ services:
         condition: service_healthy
     # PUB_* names follow the config contract: prefix PUB_, nested separator __, field
     # names from server/crates/config (e.g. database.kind → PUB_DATABASE__KIND).
-    environment:
+    environment: &app-environment
       PUB_SERVER__LISTEN: 0.0.0.0:8080
       # Production mode (S-25): the app refuses to boot until the PUB_AUTH__* values
       # below hold real secret material. Generate it once into docker/.env — the flow is
@@ -181,4 +183,71 @@ services:
       PUB_SMTP__SECURITY: none
     ports:
       - "${PUB_APP_PORT:-8080}:8080"
+    networks: [pub]
+
+  # --- the two-replica acceptance stand (profile `cluster`, decision 38) ---------------
+  #
+  # Two application containers on ONE set of backends, behind one nginx. This is the shape
+  # roadmap Phase 3 item 3 is about, and the shape `cluster.replicas > 1` has been telling
+  # operators is supported since decision 36 — so it is the shape that has to be run.
+  #
+  # Both replicas are published individually as well as through the proxy, which no real
+  # deployment should do: it is what makes "A revoked it and B refuses it" a sentence a test
+  # can write, instead of a claim about wherever round-robin happened to send the request.
+  #
+  # Start it with `just cluster-up` (which checks the secrets first and prints the addresses).
+  app-a:
+    profiles: [cluster]
+    image: pub-cluster:dev
+    build: *app-build
+    depends_on: *app-depends
+    environment: &cluster-environment
+      <<: *app-environment
+      # The address clients are handed back — the proxy, never this container. Every absolute
+      # URL the pub protocol returns is built from it (archive_url, upload, finalize), so a
+      # replica that answered with its own address would hand `dart pub` URLs that only work
+      # by accident. The acceptance run asserts this rather than trusting it.
+      PUB_SERVER__PUBLIC_URL: http://localhost:${PUB_CLUSTER_PROXY_PORT:-18080}
+      # S-24.b: a deployment terminating at a proxy MUST trust the proxy's X-Forwarded-For,
+      # or every per-IP budget in the instance is keyed on the proxy's own address.
+      PUB_SERVER__TRUST_PROXY_HEADERS: "true"
+      # Declared topology. Little reads it at runtime, but decision 36's validator refuses
+      # `> 1` without Postgres and Redis — so setting it is how the stand proves it is the
+      # deployment operators are told is supported, rather than one that merely works.
+      PUB_CLUSTER__REPLICAS: "2"
+    ports:
+      - "${PUB_CLUSTER_A_PORT:-18081}:8080"
+    networks: [pub]
+
+  # The second replica runs the image the first one builds, and declares no `build` of its own.
+  # Compose builds every service that declares one *before* it starts any of them, so the tag is
+  # there by the time this starts — and declaring the build twice runs the whole Rust release and
+  # frontend build twice, concurrently, for one image. That is not merely wasteful: the first
+  # attempt at this stand failed because the two `bun install`s raced each other at the registry.
+  app-b:
+    profiles: [cluster]
+    image: pub-cluster:dev
+    depends_on: *app-depends
+    environment: *cluster-environment
+    ports:
+      - "${PUB_CLUSTER_B_PORT:-18082}:8080"
+    networks: [pub]
+
+  proxy:
+    profiles: [cluster]
+    image: nginx:1.27-alpine
+    depends_on:
+      app-a:
+        condition: service_healthy
+      app-b:
+        condition: service_healthy
+    volumes:
+      - ./nginx-cluster.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${PUB_CLUSTER_PROXY_PORT:-18080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks: [pub]

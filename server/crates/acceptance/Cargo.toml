@@ -1,0 +1,24 @@
+[package]
+name = "pub-acceptance"
+description = "The two-replica acceptance run — claims about a deployment, made against a deployment."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `stream` is the SSE half: the cross-replica delivery claim reads a live response body.
+# `multipart` is the publish half: step 2 of the pub protocol is a multipart upload, and the
+# archive has to leave this process the way the `dart pub` client sends it.
+reqwest = { workspace = true, features = ["stream", "multipart"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# The publish flow needs a real archive, built the same way the wire tests build one.
+flate2 = { workspace = true }
+tar = { workspace = true }
+futures = { workspace = true }
+# The gate: decision 35's rule, one level up (PUB_TEST_CLUSTER_URL / PUB_TEST_NO_CLUSTER).
+pub-test-support = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

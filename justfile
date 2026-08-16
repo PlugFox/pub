@@ -34,6 +34,10 @@ server-check:
         export PUB_TEST_NO_S3=1
         skipped+=("s3 (just db-up s3; export PUB_TEST_S3_ENDPOINT=http://127.0.0.1:9000)")
     fi
+    if [ -z "${PUB_TEST_CLUSTER_URL:-}" ]; then
+        export PUB_TEST_NO_CLUSTER=1
+        skipped+=("cluster (just cluster-up; export PUB_TEST_CLUSTER_URL=http://localhost:18080)")
+    fi
     for leg in ${skipped[@]+"${skipped[@]}"}; do
         printf '  \033[33mSKIPPED BACKEND LEG\033[0m %s\n' "$leg"
     done
@@ -82,6 +86,53 @@ db-up profile='pg':
     docker compose -f docker/docker-compose.yml --profile {{profile}} up -d
     docker compose -f docker/docker-compose.yml ps
 
+# Builds the image, waits for health, prints the addresses (decision 38).
+# Start the two-replica acceptance stand: two app containers behind one nginx
+cluster-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f docker/.env ]; then
+        echo "docker/.env is missing." >&2
+        echo "The stand runs in production mode (S-25) and refuses to boot without real secret" >&2
+        echo "material. Generate it once — the file is gitignored and never leaves this machine:" >&2
+        echo >&2
+        echo "  cargo run -p pubd -- generate-secrets --format env --out docker/.env" >&2
+        echo >&2
+        exit 1
+    fi
+    docker compose -f docker/docker-compose.yml --profile cluster up -d --build --wait
+    echo
+    echo "  proxy     http://localhost:${PUB_CLUSTER_PROXY_PORT:-18080}   <- clients use this"
+    echo "  replica A http://localhost:${PUB_CLUSTER_A_PORT:-18081}"
+    echo "  replica B http://localhost:${PUB_CLUSTER_B_PORT:-18082}"
+    echo "  mail      http://localhost:${PUB_MAIL_UI_PORT:-8025}"
+    echo
+    echo "  run the acceptance claims:  just cluster-check"
+
+# Needs `just cluster-up` first: without the gate variables the suite panics naming both.
+# Run the four acceptance claims against the stand (roadmap Phase 3 item 3)
+cluster-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd server
+    export PUB_TEST_CLUSTER_URL="${PUB_TEST_CLUSTER_URL:-http://localhost:18080}"
+    cargo test -p pub-acceptance -- --test-threads=4 --nocapture
+
+# Stop the two-replica stand (volumes preserved; add `-v` by hand to drop the registry)
+cluster-down:
+    docker compose -f docker/docker-compose.yml --profile cluster down
+
+# Publishes through the proxy, then prints the ready-to-paste `oha` read profile.
+# Measure the stand (Phase 2's owed load test) — numbers go to docs/ops/capacity.md
+cluster-load total='24' concurrency='4' target='proxy':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd server
+    export PUB_TEST_CLUSTER_URL="${PUB_TEST_CLUSTER_URL:-http://localhost:18080}"
+    # Release, because a debug build measures the debug build. The read half is printed rather
+    # than run: it needs a token the driver mints, and `oha` is the better tool for one URL.
+    cargo run --release -p pub-acceptance --bin publish-load -- {{total}} {{concurrency}} {{target}}
+
 # Stop dev containers (volumes preserved)
 db-down:
     docker compose -f docker/docker-compose.yml --profile full down
@@ -94,7 +145,8 @@ docker-build:
 hooks:
     lefthook install
 
-# HTTP load smoke against a running instance (Phase 2 exit criteria live here)
+# The real measurement is `just cluster-load` (docs/ops/capacity.md); this is a smoke.
+# One-URL HTTP smoke against a running instance
 bench url='http://localhost:8080/healthz':
     oha -z 10s --no-tui {{url}}
 

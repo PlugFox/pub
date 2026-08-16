@@ -26,8 +26,10 @@ pub struct OptionalBackend {
     pub url_env: &'static str,
     /// Environment variable that turns this leg off, explicitly.
     pub skip_env: &'static str,
-    /// `just db-up <profile>` — the documented way to start it locally.
-    pub profile: &'static str,
+    /// The documented way to start it locally, as a command a reader can paste. Not a compose
+    /// profile name: the two-replica stand needs a build and a secrets check, so its command is
+    /// not `just db-up <profile>` and a message that said so would be wrong.
+    pub start: &'static str,
     /// An address that works against that profile's defaults, quoted in the failure message
     /// so nobody has to open `docker-compose.yml` to find out what to export.
     pub example: &'static str,
@@ -38,7 +40,7 @@ pub const POSTGRES: OptionalBackend = OptionalBackend {
     name: "postgres",
     url_env: "PUB_TEST_POSTGRES_URL",
     skip_env: "PUB_TEST_NO_POSTGRES",
-    profile: "pg",
+    start: "just db-up pg",
     example: "postgres://pub:pub@127.0.0.1:5432/pub",
 };
 
@@ -47,7 +49,7 @@ pub const REDIS: OptionalBackend = OptionalBackend {
     name: "redis",
     url_env: "PUB_TEST_REDIS_URL",
     skip_env: "PUB_TEST_NO_REDIS",
-    profile: "redis",
+    start: "just db-up redis",
     example: "redis://127.0.0.1:6379",
 };
 
@@ -60,8 +62,22 @@ pub const S3: OptionalBackend = OptionalBackend {
     name: "s3",
     url_env: "PUB_TEST_S3_ENDPOINT",
     skip_env: "PUB_TEST_NO_S3",
-    profile: "s3",
+    start: "just db-up s3",
     example: "http://127.0.0.1:9000",
+};
+
+/// The two-replica acceptance stand: two app containers on one set of backends, behind one
+/// nginx ([decision 38](../../../docs/decisions.md#38--two-replicas-behind-one-proxy-an-acceptance-stand-that-fails-closed-four-claims-proven-at-the-wire-and-a-measurement-that-is-a-number)).
+///
+/// The URL is the **proxy's**. The replicas' own addresses travel beside it in
+/// [`cluster_replicas`], defaulted to what the `cluster` profile publishes — a claim that names
+/// an instance cannot be written against a balancer.
+pub const CLUSTER: OptionalBackend = OptionalBackend {
+    name: "cluster",
+    url_env: "PUB_TEST_CLUSTER_URL",
+    skip_env: "PUB_TEST_NO_CLUSTER",
+    start: "just cluster-up",
+    example: "http://localhost:18080",
 };
 
 /// What a leg was told to do about its backend.
@@ -111,7 +127,7 @@ impl OptionalBackend {
         format!(
             "{test} needs the {name} backend and ${url_env} is not set.\n\
              \n\
-             Start it:  just db-up {profile}   then  export {url_env}={example}\n\
+             Start it:  {start}   then  export {url_env}={example}\n\
              Skip it:   export {skip_env}=1    (`just server-check` does this for you and says so)\n\
              \n\
              This is a panic rather than a skip on purpose (decision 35): `test result: ok` with the\n\
@@ -121,7 +137,7 @@ impl OptionalBackend {
             name = self.name,
             url_env = self.url_env,
             skip_env = self.skip_env,
-            profile = self.profile,
+            start = self.start,
             example = self.example,
         )
     }
@@ -131,6 +147,27 @@ impl fmt::Display for OptionalBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name)
     }
+}
+
+/// The two replicas' own addresses, defaulted to the ports the `cluster` compose profile
+/// publishes.
+///
+/// Going through the proxy answers what only the front door can answer; everything that names
+/// an instance — "A revoked it, B refuses it" — needs to reach that instance directly, which is
+/// why the stand publishes both and why this is a list rather than a URL.
+#[must_use]
+pub fn cluster_replicas() -> Vec<String> {
+    env_or("PUB_TEST_CLUSTER_REPLICAS", "http://localhost:18081,http://localhost:18082")
+        .split(',')
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty())
+        .collect()
+}
+
+/// The mail sink the stand runs, whose API is where "exactly once" is actually observable.
+#[must_use]
+pub fn cluster_mail_url() -> String {
+    env_or("PUB_TEST_CLUSTER_MAIL_URL", "http://localhost:8025").trim_end_matches('/').to_owned()
 }
 
 /// Access key, secret key and bucket for the [`S3`] leg, defaulted to the `s3` compose
@@ -169,8 +206,8 @@ mod tests {
     /// Every backend must be addressable and silenceable by *different* variables — a copied
     /// constant that reused another backend's `skip_env` would silence two legs at once.
     #[test]
-    fn the_three_backends_carry_distinct_variables() {
-        let all = [POSTGRES, REDIS, S3];
+    fn every_backend_carries_distinct_variables() {
+        let all = [POSTGRES, REDIS, S3, CLUSTER];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.url_env, b.url_env, "{a} and {b} share a url variable");

@@ -2541,6 +2541,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pub-acceptance"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "futures",
+ "pub-test-support",
+ "reqwest",
+ "serde_json",
+ "tar",
+ "tokio",
+]
+
+[[package]]
 name = "pub-admin"
 version = "0.1.0"
 dependencies = [
@@ -3185,6 +3198,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",

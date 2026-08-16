@@ -17,6 +17,7 @@ members = [
     "crates/events",
     "crates/admin",
     "crates/api",
+    "crates/acceptance",
     "crates/bin/pubd",
 ]
 
