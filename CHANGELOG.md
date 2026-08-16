@@ -2,6 +2,36 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-16 — Phase 3 wave 7a: a test stand that can fail, and the defect it found on its first run
+
+Roadmap Phase 3 item 2, taken before item 1 on purpose: Phase 3's claims are about what happens when two instances run at once, and every one of them will rest on tests. [Decision 35](docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race) was recorded before any code.
+
+Two blind spots, both demonstrated rather than argued. **A leg that did not run and a leg that passed were the same output** — with the Docker daemon down, `cargo test --workspace` answered `test result: ok. 31 passed; 0 failed; finished in 0.00s` for the Postgres contract suite with port 5432 closed ([D16](docs/roadmap.md)). And **the Redis and S3 backends had never been executed by any automated test**, while three comments in the tree claimed a "CI backend matrix (testcontainers)" that did not exist.
+
+> **`cargo test --workspace` with nothing running is now red.** That is the change, not a side effect. Use `just server-check` for the container-free loop: it sets the per-backend opt-outs for what you have not started and prints, every time, which legs it silenced.
+
+### Added
+
+- (server) **The `Kv` contract suite** (`crates/kv/tests/contract.rs`) — one set of properties run against `MemoryKv` and `RedisKv`: the atomic increment the S-03 attempt budget and every S-24 window decide on (64 concurrent increments must yield 64 distinct values), the TTL re-arm that forced the rate-limit window into the key, expiry, idempotent deletion, and the after-subscription delivery guarantee the event bus's peer bridge is built on. **`RedisKv` passed all seven properties on its first execution in the project's history.**
+- (server) **The `BlobStore` contract suite** (`crates/blob/tests/contract.rs`) — memory, filesystem and S3, including a presigned-URL round trip that is *dialled* rather than constructed: a `GET`-signed URL serves the bytes, a `HEAD`-signed URL answers the client's cache probe, and a `HEAD` against the `GET`-signed URL is refused **403**. That last one is wave 6's hand-run MinIO finding, made repeatable.
+- (server) **`TestOptions::database`** in the HTTP harness ([D51](docs/roadmap.md)): `MemorySqlite` (unchanged default) or `FileSqlite` — a temporary file with the configured pool, so a burst genuinely overlaps. `:memory:` pins the pool to one connection, which is why every wire-level race test in the suite was green by construction.
+- (server) **`session_rotation_is_single_winner`** in the repository contract suite — 25 barrier-released rounds of two concurrent rotations of one refresh token, run on file-backed SQLite and on live Postgres.
+- (infra) **`pub-test-support`**, a small crate holding the backend gate, and **Redis + MinIO in `server-ci.yml`** beside the existing Postgres service, with a bucket-init step. CI sets no opt-out, so a service that fails to start — or an `env:` line deleted from the workflow — is a red build.
+
+### Fixed
+
+- (server) **A lost refresh-rotation race answered 500 instead of 401 on SQLite** (S-08). Found by the new harness on its first run, and the reason it had never been seen is [D51](docs/roadmap.md) exactly: the test asserting this property had a single-connection pool underneath it, so its "concurrent" refreshes were sequential. `rotate` read the session row and then wrote it in a deferred transaction, so the second writer hit `SQLITE_BUSY_SNAPSHOT` — which the busy timeout deliberately does not wait out — and the loser got `database_error` on the endpoint every signed-in browser calls, where the auth layer can neither tell it apart from a store falling over nor act on it. The swap is now **one conditional statement** carrying every predicate that used to be checked in Rust, so a losing rotation matches zero rows and lands in the ordinary reuse-detection path. The Postgres sibling was already correct for a different reason (`SELECT … FOR UPDATE` plus READ COMMITTED re-evaluation) and is unchanged; both are now held to the same contract function.
+
+### Changed
+
+- (server) The Postgres contract leg **fails** when neither `PUB_TEST_POSTGRES_URL` nor `PUB_TEST_NO_POSTGRES` is set, and the same gate covers the new Redis and S3 legs. The failure message names the `just db-up <profile>` that starts the backend and the opt-out that silences it.
+- (docs) Three statements asserting a test matrix that did not exist are corrected in `architecture.md`, `rules/rust.md` and the `kv`/`db-tests` module headers; `rules/rust.md` gains the two rules this wave is about — a concurrency test sets the database knob, and a concurrency test is not kept until it has been seen red.
+
+### Notes
+
+- **The harness was one cause of the blind race tests, and now it is measured which.** S-08's was genuinely blind and failed the moment it got a real pool. The three KV-budget tests (S-03 parallel guesses, S-24.d token-auth failures and parallel uploads) were **not** blind for that reason: on a real pool they still pass against a deliberately reverted read-modify-write limiter, because the window between that read and that write is nanoseconds wide inside the KV and a handful of HTTP requests do not reliably land in it. They keep the real pool and each now says, beside its own assertions, what it proves and which test discriminates the defect it names — `hit_is_atomic_under_concurrency`, which admits 20 against a budget of 5 the moment `hit` stops being one increment. [D51](docs/roadmap.md)'s stated exit asked for the wire test to be demonstrated red; that turns out not to be reachable for this defect, and saying so is better than a test whose comment claims it.
+- **Testcontainers was considered and rejected.** It moves the backend requirement into the test process, so a machine without a Docker daemon goes straight back to skipping — the exact failure this wave exists to remove, relocated. Service containers in CI and the existing compose profiles locally are enough.
+
 ## 2026-08-16 — Phase 2 wave 6: presigned downloads, and the last item of Phase 2
 
 Roadmap Phase 2 item 5, the only one left. [Decision 34](docs/decisions.md#34--presigned-downloads-the-redirect-branch-becomes-reachable-off-by-default-and-honest-about-the-address-a-client-can-dial) and [S-18.a](docs/security.md#4-supply-chain--registry-integrity) were recorded before any code.

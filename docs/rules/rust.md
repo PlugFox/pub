@@ -35,6 +35,8 @@ Edition 2024, stable toolchain. `rustfmt` (max_width 120) + `clippy --all-target
 ## Tests
 
 - Unit tests inline (`#[cfg(test)]`), corner cases first-class: expired/garbage tokens, malformed cursors, boundary sizes, clock skew.
-- Integration tests in `crates/api/tests/` run the full stack on SQLite `:memory:` + in-memory blob + in-memory KV — no containers. The Postgres/MinIO/Redis matrix runs in CI.
+- Integration tests in `crates/api/tests/` run the full stack on SQLite `:memory:` + in-memory blob + in-memory KV — no containers. A test that asserts a property **under concurrency** must set `TestOptions::database = TestDatabase::FileSqlite`: `:memory:` pins the pool to one connection, so a burst is staggered and the race cannot happen ([decision 35](../decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)).
+- The Postgres, Redis and MinIO contract legs run in CI and are **gated, not optional**: with neither `PUB_TEST_<BACKEND>_URL` nor `PUB_TEST_NO_<BACKEND>` set they fail. Use `just server-check` for the container-free loop — it sets the opt-outs for the backends you have not started and prints which legs it silenced. A bare `cargo test --workspace` is the CI-shaped invocation and expects the backends.
+- A concurrency test is not kept until it has been seen **red**. Revert the mechanism, watch it fail, restore, and name the revert in the test's own comment — and if the wire-level test still passes against the reverted mechanism, say so there and point at the test that does discriminate.
 - Security-behavior tests name the requirement: `s14_forbidden_keeps_token_403()`.
 - Protocol conformance suite encodes `docs/protocol.md`; the real-`dart pub` E2E job is the final arbiter.
