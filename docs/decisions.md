@@ -41,6 +41,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 34 | Presigned S3 downloads: off by default, public endpoint, bounded TTL    | accepted |
 | 35 | Backend legs that fail when the backend is absent; a harness that races | accepted |
 | 36 | Leader election leaves the process: a lease table, and a topology gate  | accepted |
+| 37 | A grant that reaches the tables that do not exist yet, and a check      | accepted |
 
 ---
 
@@ -852,3 +853,63 @@ The second drain this wave creates is the door D45 named. `JobQueueRepo::complet
 - **The app role needs no new *kind* of grant** — unlike `audit_log`, this table has no revoke to survive — **but the shipped provisioning template does not reach it**, and that turns out to be true of every table added since a deployment was provisioned. `GRANT … ON ALL TABLES IN SCHEMA public` is a one-time grant over the tables that exist when it runs; a table created by a later migration is invisible to the app role. Verified live against Postgres 17 while writing this: with the role provisioned exactly as the template says, `has_table_privilege` answers `t` for a table created before and `f` for one created after. For `job_locks` the consequence is severe — every publish and every job tick acquires a lock — which is why it is recorded as [D64](roadmap.md) with a live demonstration rather than left as a sentence in a decision. This decision does not fix it: the fix changes the documented hardening recipe, which is normative in [S-22](security.md#5-audit--abuse) and [rules/migrations.md](rules/migrations.md), and that is a decision of its own.
 - **Two SQLite instances over one shared volume remain unsupported and are now the only unprotected shape**, since they would take the in-process lock. That configuration is already refused by the ops documentation for WAL reasons; this decision does not make it safe and does not pretend to.
 - **This decision does not close [D52](roadmap.md) or [D55](roadmap.md)**, and it does not deliver roadmap item 3 (the two-replica compose acceptance run). It closes D1 and D45, and it builds the harness that item 3's claims will be written against.
+## 37 — A grant that reaches the tables that do not exist yet: default privileges, a one-time repair, and an upgrade that says so
+
+> **Status: accepted.** Recorded 2026-08-16, after [decision 36](#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)'s wave found the defect in hardening it does not own (closes [D64](roadmap.md)).
+
+**Context.** Migration 0002 ships a documented, deliberately unexecuted template for provisioning the application role, and its table grant is `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pub_app`. In PostgreSQL `ON ALL TABLES` is shorthand for "on all tables that exist at this instant" — nothing carries it to an object created later unless `ALTER DEFAULT PRIVILEGES` says so, and the template never said so. Verified against Postgres 17 rather than reasoned about: with a role provisioned exactly as the template reads, `has_table_privilege` answers `t` for a table created before the grant and `f` for one created after.
+
+So a deployment that followed the S-22 hardening on an early release and has upgraded since holds **no privilege at all** on every table a later migration added. The list is fifteen tables, read from the schema rather than remembered: `packages`, `versions`, `package_tags`, `package_search`, `name_claims`, `upstream_packages`, `upstream_versions`, `upstream_quarantine`, `shadowing_alarms`, `download_stats`, `jobs`, `job_queue`, `notifications`, `notification_prefs`, and `job_locks`. (0014 and 0015 add columns and indexes, not tables — a table-level privilege covers every column the table later gains, which the S-22.a test has asserted since the quota wave.) The last of the fifteen is what turned a latent defect into an urgent one: decision 36's lock is taken on **every publish and every job tick**, so the release that added it takes publishing and all background work down together, on precisely the deployments that were careful enough to harden.
+
+Nothing in this repository would have noticed. `pub_app` appears nowhere in the tree but that comment; compose, CI, and every test connect as the database **owner**, which holds its privileges implicitly and can do anything to anything. This is the blind spot [D46](roadmap.md) named and closed for one table without noticing that it generalised — and the reason it survived thirteen migrations — 0004 through 0016 — is that the deployment shape it breaks is the one no test ever ran as.
+
+**Decision.**
+
+### The recipe grants twice: once for what exists, once for what will
+
+The corrected template — canonical text in [`0017_role_grants.sql`](../server/crates/db-postgres/migrations/0017_role_grants.sql), operator-facing copy in [ops/install.md](ops/install.md#hardening-the-postgres-role-optional) — keeps 0002's grants and adds the pair that reaches forward:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pub_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO pub_app;
+```
+
+Two properties of that statement decide the shape of everything else here.
+
+**Default privileges are keyed on the role that CREATEs the object**, never on the role being granted to. `<migration_role>` therefore has to be the role the migrations run as — the one `database.url` names. Naming the wrong role leaves the statement syntactically valid and semantically inert, which is the same failure moved one step later, so the template says so at the point of use rather than in prose elsewhere.
+
+**Default privileges are not retroactive.** They govern objects created after they are set, so they cannot repair a deployment that is already behind. An existing deployment needs the original `GRANT … ON ALL TABLES` run **once more** as well, and the two are documented together — the pair alone would leave every table between provisioning and today still unreachable, which is exactly today's outage with a fix applied to it.
+
+The `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log` stays last, and that ordering is load-bearing rather than cosmetic: the one-time repair re-grants `DELETE` on *every* table including `audit_log`, so a recipe that put the revoke first would fix this defect by undoing [S-22](security.md#5-audit--abuse). The test asserts the ordering.
+
+### Tables and sequences — deliberately not functions
+
+There is no `ALTER DEFAULT PRIVILEGES … ON FUNCTIONS` in the recipe. [Decision 30](#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature) revoked `EXECUTE` on `pub_audit_prune` from `PUBLIC` on purpose: a `SECURITY DEFINER` function is a capability, and a capability is granted one at a time by an operator who read what it does. A blanket default privilege over future functions would hand the application every such capability this schema ever grows — the precise trade decision 30 refused, re-made silently and by accident. Functions stay explicit; the operator's one-line grant for the prune stays in the recipe where they can see what it buys.
+
+### The correction travels in a new migration, and 0017 is where the template now lives
+
+0002 is not edited. Its checksum is applied on every deployment in existence, and a corrected template that made `sqlx` refuse to start would be a worse defect than the one it fixes. So migration 0017 carries the corrected text, adds no table and no column — one introspection function is the whole of what it puts in the database — and is the file the template's readers are pointed at from [S-22.a](security.md#5-audit--abuse), [rules/migrations.md](rules/migrations.md) and [ops/install.md](ops/install.md#hardening-the-postgres-role-optional). 0002's comment stays as it is — historically accurate for the release it shipped in, and superseded by a file that is easy to find.
+
+The SQLite set gains a `0017` too, whose whole content is a comment saying there is nothing to do and a `SELECT 1` so that this is a valid migration in any sqlx version rather than a file whose behaviour depends on how comment-only input parses. SQLite has no roles; the alternative was a permanent numbering skew between the two sets, which costs more than one comment forever after.
+
+### The upgrade says it out loud: `pub_role_grant_gaps()`
+
+A migration run is the exact moment the gap opens, so 0017 adds a `STABLE` catalogue query — which roles hold `INSERT` on `audit_log` but not on some other table in this schema — and a `DO` block that raises a `WARNING` naming each one and the tables it cannot reach. `INSERT` is the probe because it is the one privilege the template grants on every table and revokes on none, so "can append to `audit_log`" means "was provisioned against this schema" and "cannot append to X" means "was never granted X". Owners and superusers hold their privileges implicitly and never appear; neither does a role that was never granted anything.
+
+`sqlx` logs server notices, so the warning reaches the server log as well as the operator running `psql`. The difference it buys is one line during an upgrade instead of `permission denied for table job_locks` under the next publish. `SELECT * FROM pub_role_grant_gaps()` re-checks at any time, which is the form the ops documentation hands to an operator who wants to confirm a repair.
+
+**It reports rather than repairs.** The migration could find the roles that look provisioned and re-grant to them. It does not: inferring which role is meant to be the application from the privileges it happens to hold is a guess, and a wrong guess widens somebody's access to this database without anyone asking for it. A false positive in a report costs a sentence; a false positive in a `GRANT` costs a security boundary.
+
+### The test provisions at 0003 and then upgrades
+
+`s22_a_a_provisioned_role_reaches_a_table_added_after_it_d64` creates the throwaway database, stops the migrator at **0003** — the schema an operator's database had when they read the hardening — provisions a role from the shipped template there, and only then runs the rest of the migrations. That ordering is the whole test: provisioning against the current schema proves nothing, because every grant lands, which is why fresh installs and owner-connected suites are blind to this. It then asserts the refusal at the surface an operator meets (`locks.try_acquire` → `permission denied for table job_locks`), that the self-check's gap list is **exactly** the set of tables the upgrade added, that the corrected recipe repairs both halves, and that `audit_log` is still append-only afterwards.
+
+**Consequences.**
+
+- **Existing hardened deployments have to run the repair; nothing does it for them.** The upgrade warns, the upgrade guide names the two statements, and that is the whole of the mechanism. This is a deliberate refusal to auto-grant, not an oversight.
+- **The forward grant hands the application `SELECT/INSERT/UPDATE/DELETE` on every table this schema will ever gain.** A future table that must be restricted the way `audit_log` is now needs its own `REVOKE` in the template *and* a line in the upgrade guide telling existing deployments to run it — the cost of the alternative (a re-grant on every upgrade) is that skipping it fails silently, which is the defect being closed.
+- **A schema object joins the database for reporting only.** `pub_role_grant_gaps()` is `SECURITY INVOKER` over world-readable catalogues, so it exposes nothing a caller could not assemble by hand, and `EXECUTE` stays with `PUBLIC` for the same reason. A read-only reporting role that happens to hold `INSERT` on `audit_log` and nothing else would be listed as a gap — a false positive an operator can read and dismiss.
+- **The Postgres test harness can now stop the migrator at a version.** `TestDb::create_at_version` exists for this test and is the way any future claim about upgrading an old deployment gets written; `TestDb::create` is unchanged in behaviour.
+- **S-22 is unchanged.** This decision widens nothing: the app role's `audit_log` restriction, decision 30's prune capability, and the `EXECUTE` revoke from `PUBLIC` all stand exactly as they were. What changes is that the recipe now reaches the tables it always meant to.

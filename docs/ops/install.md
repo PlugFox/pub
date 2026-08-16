@@ -114,6 +114,48 @@ Bootstrap needs no console access ([decision 09 addendum](../decisions.md#09--al
 
 Instance administration is a plane orthogonal to org roles ([decision 19](../decisions.md#19--rbac-cumulative-role-levels-with-a-single-authorize-chokepoint)): an instance admin holds no org role they were not granted.
 
+## Hardening the Postgres role (optional)
+
+By default the application connects as the database owner, and nothing below is needed. If you want the audit log to be append-only *at the database* even if application code regresses ([S-22](../security.md#5-audit--abuse)), give the application a role of its own. Roles are cluster-global and environment-specific, so this is a deploy-time step the migrations deliberately do not perform; the canonical text lives in [`0017_role_grants.sql`](../../server/crates/db-postgres/migrations/0017_role_grants.sql).
+
+`<migration_role>` is the role the migrations run as — the one `database.url` names, which owns every table in the schema.
+
+```sql
+CREATE ROLE pub_app LOGIN PASSWORD :'app_password';
+GRANT CONNECT ON DATABASE pub TO pub_app;
+GRANT USAGE ON SCHEMA public TO pub_app;
+
+-- (1) The objects that exist now.
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pub_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pub_app;
+
+-- (2) And the objects a later migration will add. Without this pair, every table a future
+-- release adds is unreachable to the application — `ON ALL TABLES` grants only on the tables
+-- that exist when it runs.
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pub_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO pub_app;
+
+-- (3) The exceptions, last — (1) hands back exactly what they take away.
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM pub_app;
+GRANT EXECUTE ON FUNCTION pub_audit_prune(TIMESTAMPTZ, INT) TO pub_app;
+```
+
+Three things are worth reading rather than pasting ([decision 37](../decisions.md#37--a-grant-that-reaches-the-tables-that-do-not-exist-yet-default-privileges-a-one-time-repair-and-an-upgrade-that-says-so)):
+
+- **`FOR ROLE <migration_role>` must name the role that runs the migrations.** Default privileges belong to the role that *creates* the object, not to the role being granted to. Naming the wrong one is valid SQL that does nothing.
+- **Step (2) is not retroactive.** If you provisioned this role on an earlier release, run step (1) once more as well — that is the repair for the tables you are already locked out of, and step (2) is what stops it recurring. See [upgrade.md](upgrade.md#migrations-are-forward-only).
+- **Step (2) grants the application all four privileges on every table this schema ever gains.** If a future release adds a table that should be restricted the way `audit_log` is, the release notes will say so and you will need a `REVOKE` of your own.
+
+To check a role at any time — the same query the upgrade runs and warns about:
+
+```sql
+SELECT * FROM pub_role_grant_gaps();
+```
+
+Empty means every role provisioned against this schema can reach every table in it. A row names a role and the tables it cannot write, which is the shape of a role granted before a migration added them.
+
 ## Verifying an instance
 
 `GET /healthz` is unauthenticated and always on ([decision 23](../decisions.md#23--monitoring-is-optional)):

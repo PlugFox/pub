@@ -2,6 +2,33 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-16 — Phase 3 wave 7c: a grant that reaches the tables that do not exist yet
+
+The defect wave 7b found in hardening it did not own. [Decision 37](docs/decisions.md#37--a-grant-that-reaches-the-tables-that-do-not-exist-yet-default-privileges-a-one-time-repair-and-an-upgrade-that-says-so) was recorded before any code. **This closes [D64](docs/roadmap.md).**
+
+`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pub_app` — the last substantive line of the [S-22](docs/security.md#5-audit--abuse) provisioning template as it shipped through migration 0016 — grants on the tables that exist when it runs and on no others. PostgreSQL carries nothing forward to an object created later unless `ALTER DEFAULT PRIVILEGES` says so, and the template never said so. Any deployment that provisioned a hardened role on an early release and upgraded since therefore holds **no privilege at all** on the fifteen tables migrations 0004–0016 added, ending with `job_locks` — which wave 7b's lock takes on every publish and every job tick.
+
+> **If you provisioned a hardened `pub_app` role, run the repair once — it is two statements plus a re-grant, in [ops/upgrade.md](docs/ops/upgrade.md).** Without it, publishing and all background work fail with `permission denied for table job_locks`. Deployments connecting as the database owner (compose, and the default `docker run`) are unaffected and need nothing.
+
+### Added
+
+- (server) **Migration 0017 carries the corrected provisioning template** and adds no schema. The recipe grants twice: once for the objects that exist (`ON ALL TABLES`, which is also the one-time repair, because default privileges are **not** retroactive) and once for the ones that do not — `ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public GRANT … ON TABLES TO pub_app`, keyed on the role that *creates* the object rather than the role being granted to. The `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log` is documented **last**, because the re-grant hands back exactly what it takes away. 0002 is not edited: its checksum is applied on every deployment in existence.
+- (server) **`pub_role_grant_gaps()`, and an upgrade that says it out loud.** The migration raises a `WARNING` naming every role that can append to `audit_log` but not to some other table in the schema — the signature of a role granted before a migration added it — and the function re-checks at any time (`SELECT * FROM pub_role_grant_gaps();`). It **reports rather than repairs**, deliberately: inferring which role is meant to be the application from the privileges it happens to hold is a guess, and a wrong guess widens somebody's access without being asked.
+- (server) **The test that had been missing since 0004.** `s22_a_a_provisioned_role_reaches_a_table_added_after_it_d64` stops the migrator at **0003**, provisions a role from the shipped template there, and only then upgrades — a role provisioned against the current schema receives every grant and proves nothing, which is precisely why compose, CI and every owner-connected test were blind to this. It asserts the refusal through the real lock (`permission denied for table job_locks`), that the self-check's gap list is **exactly** the set of tables the upgrade added, that both halves of the corrected recipe are load-bearing, and that `audit_log` is still append-only afterwards.
+- (server) `TestDb::create_at_version` in the Postgres contract harness — the way any future claim about upgrading an older deployment gets written.
+
+### Changed
+
+- (docs) [ops/install.md](docs/ops/install.md#hardening-the-postgres-role-optional) gains the full role recipe (it had none — the template lived only in a migration comment), [ops/upgrade.md](docs/ops/upgrade.md) carries the repair, and [S-22.a](docs/security.md#5-audit--abuse), `architecture.md`, [rules/migrations.md](docs/rules/migrations.md) and `ops/monitoring.md` are reconciled with the corrected recipe.
+- (docs) The rule for whoever writes migration 0018: a new table is now reachable to a hardened app role without an operator action — and a new table that must be *restricted* the way `audit_log` is needs its own `REVOKE` in the template **and** a line in the upgrade guide, because the default privilege will already have granted all four privileges on it.
+
+### Notes
+
+- **Deliberately not extended to `ON FUNCTIONS`.** [Decision 30](docs/decisions.md#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature) revoked `EXECUTE` on `pub_audit_prune` from `PUBLIC` on purpose: a `SECURITY DEFINER` function is a capability, granted one at a time by an operator who read what it does. A blanket default privilege over future functions would have re-made that trade silently.
+- **SQLite gains a `0017` whose entire content is a comment and a `SELECT 1`.** It has no roles and nothing to correct; the file exists so the two migration sequences stay in lockstep rather than skewing permanently, and the no-op statement keeps it valid regardless of how comment-only input parses.
+- **Seen red three ways.** Without the `ALTER DEFAULT PRIVILEGES` pair the insert into a table created after the recipe is refused; without the one-time re-grant the lock acquire is refused with `permission denied for table job_locks`; and with the `REVOKE` moved to the head of the recipe instead of its foot, the direct `DELETE FROM audit_log` **succeeds** — a recipe in the wrong order repairs availability by giving S-22 away.
+- **One correction to D64's own text.** Migrations 0014 and 0015 add columns and indexes, not tables; the affected set is the fifteen tables from 0004 to 0016, read from the schema rather than remembered. A table-level privilege covers every column the table later gains, which the S-22.a suite has asserted since the quota wave.
+
 ## 2026-08-16 — Phase 3 wave 7b: leader election leaves the process
 
 Roadmap Phase 3 item 1, plus the harness half of item 2 that [decision 35](docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race) deferred to "the wave with HTTP-level claims only Postgres can answer". [Decision 36](docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check) was recorded before any code. **This closes [D1](docs/roadmap.md) — the last Critical debt — and [D45](docs/roadmap.md).**

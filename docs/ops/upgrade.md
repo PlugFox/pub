@@ -34,5 +34,17 @@ Consequences:
 
 - **Rollback = restore.** To return to version N−1 after upgrading to N, restore the pre-upgrade backup and start the N−1 image. Whatever happened on the instance between the upgrade and the rollback is lost — which is why step 1 is the procedure's load-bearing line, and why upgrading soon after a fresh backup beats upgrading long after one.
 - **Do not start an older binary against a newer schema.** It may boot (older migrations are all present), but it will run against tables whose newer invariants it does not know. Nothing checks for this today ([/healthz does not report migration state](install.md#verifying-an-instance), roadmap D25).
-- **If you provisioned a hardened `pub_app` role** per the [S-22 template](../security.md#5-audit--abuse), **re-run its table grant after every upgrade that adds a table** — `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pub_app;` followed by `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM pub_app;`. The template's grant covers the tables that existed when it ran and no others, so a migration that adds one leaves the app role locked out of it; the release that added `job_locks` makes that fatal, because the lock is taken on every publish and every job tick. The permanent fix — `ALTER DEFAULT PRIVILEGES` in the provisioning recipe — is roadmap **D64**. Deployments connecting as the database owner (compose, and the default `docker run`) are unaffected.
+- **If you provisioned a hardened `pub_app` role before the release that added `job_locks`, repair it once — now.** The template shipped through that release ended at `GRANT … ON ALL TABLES IN SCHEMA public`, which grants on the tables that existed when it ran and on no others, so the app role holds **nothing** on any table a later migration added. That is fatal rather than degrading as of `job_locks`: the lock is taken on every publish and every job tick, so publishing and all background work stop with `permission denied for table job_locks`. Run this once, as the role that owns the schema, and the upgrade is complete ([decision 37](../decisions.md#37--a-grant-that-reaches-the-tables-that-do-not-exist-yet-default-privileges-a-one-time-repair-and-an-upgrade-that-says-so), closes roadmap D64):
+
+  ```sql
+  GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pub_app;
+  GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pub_app;
+  ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+      GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pub_app;
+  ALTER DEFAULT PRIVILEGES FOR ROLE <migration_role> IN SCHEMA public
+      GRANT USAGE, SELECT ON SEQUENCES TO pub_app;
+  REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM pub_app;   -- last: the grant above re-granted it
+  ```
+
+  The `ALTER DEFAULT PRIVILEGES` pair is what stops this recurring on the next release, and `<migration_role>` must be the role the migrations run as — the one `database.url` names ([install.md](install.md#hardening-the-postgres-role-optional) explains why). Verify with `SELECT * FROM pub_role_grant_gaps();`: an empty result means every provisioned role can reach every table. The upgrade itself raises a `WARNING` naming any role that cannot, so a missed repair is a line in the log rather than a surprise under the next publish. Deployments connecting as the database owner (compose, and the default `docker run`) are unaffected.
 - Skipping versions is fine as far as migrations are concerned — they are a linear sequence and boot applies every missing step. Read the skipped releases' changelog sections anyway; config keys and defaults move between minor versions while the project is pre-1.0.

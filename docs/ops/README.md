@@ -4,11 +4,11 @@ Pub ships as **one binary, `pubd`**, with the web UI embedded ([decision 04](../
 
 | Page | Contents |
 |------|----------|
-| [install.md](install.md) | Docker run quickstart, compose profiles, building from source, dev vs production mode, data layout, first-admin bootstrap, connecting `dart pub` |
+| [install.md](install.md) | Docker run quickstart, compose profiles, building from source, dev vs production mode, data layout, first-admin bootstrap, the hardened Postgres role, connecting `dart pub` |
 | [configuration.md](configuration.md) | Reference of every configuration key — **generated from the config structs**, do not edit by hand |
 | [reverse-proxy.md](reverse-proxy.md) | nginx / Caddy / Traefik examples: TLS, `public_url` correctness, `trust_proxy_headers`, SSE, upload sizes and timeouts |
 | [backup-restore.md](backup-restore.md) | What to back up and in which order, per database and blob backend; restore and post-restore verification |
-| [upgrade.md](upgrade.md) | Upgrade procedure, automatic forward-only migrations, version verification, why rollback means restore |
+| [upgrade.md](upgrade.md) | Upgrade procedure, automatic forward-only migrations, the one-time grant repair a hardened role needs, version verification, why rollback means restore |
 | [security-runbook.md](security-runbook.md) | `require_auth_for_read` guidance (S-04.c), proxy-header trust (S-24.b), the key-rotation runbook (S-27), break-glass — including the mail-plane lockout and `pubd reset-smtp` — and responding to shadowing and quarantine alarms |
 | [monitoring.md](monitoring.md) | Turning the Prometheus exposition on, its separate listener, alert rules, a starting dashboard, and **how a dead mail plane surfaces** |
 | [metrics.md](metrics.md) | Every exported instrument — **generated from the exporter's catalogue**, do not edit by hand |
