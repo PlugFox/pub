@@ -40,6 +40,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 33 | Token model on the wire, supply-chain registers, errors users can read  | accepted |
 | 34 | Presigned S3 downloads: off by default, public endpoint, bounded TTL    | accepted |
 | 35 | Backend legs that fail when the backend is absent; a harness that races | accepted |
+| 36 | Leader election leaves the process: a lease table, and a topology gate  | accepted |
 
 ---
 
@@ -792,3 +793,62 @@ The roadmap sketched testcontainers for this item. It is refused for the reason 
 - **Three comments are corrected rather than left to drift.** The "CI backend matrix (testcontainers)" that never existed is replaced by what the file actually depends on.
 - **The default local loop is unchanged in cost and changed in honesty.** `just server-check` still needs no containers; it now tells you, every time, which legs did not run.
 - **This decision does not close [D52](roadmap.md)** (the plan tests EXPLAIN hand-copied SQL) or the mutation-testing gaps [D55](roadmap.md)/[D45](roadmap.md). It closes the two blind spots that would otherwise make Phase 3's own evidence unreadable, and D45 is answered by the wave that creates the second drain.
+
+## 36 — Leader election leaves the process: a lease table, a lock that outlives a pool connection, and a topology gate that replaces a KV check
+
+> **Status: accepted.** Recorded 2026-08-16 before implementation, as the Phase 3 wave-7b enabling decision for [roadmap item 1](roadmap.md#phase-3--make-multi-instance-real-closes-d1-d16) (closes [D1](roadmap.md) — the last Critical debt — and [D45](roadmap.md), which decision 35 assigned to "the wave that creates the second drain").
+
+**Context.** `build_registry` and `spawn_jobs` each construct an `InMemoryJobLock`, and `config/src/validate.rs` permits `cluster.replicas > 1` whenever the KV is Redis — with no check on a distributed lock and none on the database kind. So the one signal an operator has before scaling out says yes, and at two replicas the blob GC runs twice concurrently over bytes it deletes, mirror sweeps double-fetch, jobs race one durable cursor, and the per-name publish lock degrades to the database's unique index — a clean 409 becomes a constraint violation. The trait is already shaped for the fix: `try_acquire` returns a [`LockToken`](../server/crates/core/src/traits.rs) and `release` is ownership-checked, which is the contract decision 26's amendment needed and the one a distributed implementation has to satisfy.
+
+**Decision.**
+
+### The lock is a lease row in the application database — not a PG advisory lock, and not a Redis key
+
+Both alternatives were the roadmap's own sketch ("Redis and Postgres advisory-lock implementations"), and both are refused for reasons that are properties of this codebase rather than of the mechanisms in general.
+
+**A PostgreSQL advisory lock lives in a session, and this application has a pool.** `pg_try_advisory_lock` is held by the connection that took it, so an implementation over a pool must pin one `PoolConnection` per *held* lock for the whole life of the lock. The scheduler could afford that — six jobs. The per-name publish lock cannot: its name is the package (`publish:{format}:{name}`), so the number of simultaneously held locks is the number of simultaneous publishes, and a burst larger than the pool deadlocks the instance on its own database handles. A pooled implementation that does not pin is worse than none: two acquisitions that land on the same pooled session are re-entrant and both succeed. And the advisory lock has **no TTL**, so the `ttl` argument of a trait whose whole ownership model is built on expiry would have to be documented as ignored.
+
+**A Redis key can disappear without anybody being told.** `maxmemory-policy allkeys-lru` evicts it, a failover to a replica that never persisted it loses it, `FLUSHALL` clears it. Each of those is two leaders with no error anywhere — the failure mode that has no signal is exactly the one this decision exists to remove. The KV in this system is deliberately a cache whose loss is survivable ([decision 27](#27--rate-limit-identity-what-a-bucket-is-keyed-on-and-what-happens-when-the-kv-is-down) fails open on purpose); making leader election depend on it would quietly promote it to a correctness store while every document still calls it a cache.
+
+So: **migration 0016 adds `job_locks (name PRIMARY KEY, token, expires_at)` in both dialects**, and `JobLock` is implemented over it per dialect.
+
+- `try_acquire` is **one statement** — `INSERT … ON CONFLICT (name) DO UPDATE … WHERE job_locks.expires_at <= <db now> RETURNING token` — and that single statement is the whole of the atomicity: the conditional update either wins or matches nothing, with no read-then-write for two callers to interleave. `Some(token)` iff the returned token is the one this call minted.
+- `release` is `DELETE … WHERE name = ? AND token = ?`, which is the ownership check the trait already promises, expressed as a predicate rather than as a comparison in application memory.
+- **The clock is the database's, not the caller's.** This is a deliberate deviation from the convention that every repository method takes `now: DateTime<Utc>` from the caller, and it is recorded here rather than left to be discovered: leader election across replicas cannot rest on per-process clocks, because skew between two instances *is* the double-holder bug. One clock, at the one place both replicas already agree on.
+
+The SQLite implementation is not decoration: the contract functions run against both dialects, so the property "two acquisitions of one name cannot both win" is asserted on the everyday local backend as well as on the deployable one.
+
+### Which lock a deployment gets is decided by the database kind, not by `replicas`
+
+**`database.kind = postgres` → the lease lock, always.** Not "when `replicas > 1`". An operator who scales from one container to two without editing `cluster.replicas` is the likeliest way this failure actually happens, and a lock chosen by declared topology would be silently wrong exactly then. Chosen by the storage engine, the deployment is safe whether or not the operator told us what they did.
+
+**`database.kind = sqlite` → the in-process lock.** SQLite is single-instance by construction here and documented as such; the in-process lock is correct for it, a restart clears it, and the zero-container dev loop keeps the behaviour it has today.
+
+The boot log states which one is in use, because "which lock is this instance running" is not otherwise answerable from outside the process.
+
+### `cluster.replicas > 1` now requires Postgres **and** Redis
+
+The validator's KV check stays and gains its missing half. This is [D1](roadmap.md)'s exit: the acceptance an operator reads before scaling out now corresponds to a lock that leaves the process.
+
+### A leaked lease costs a stall, so shutdown gives it back
+
+With an in-process lock, a lock held at `SIGTERM` costs nothing — the table dies with the process. With a lease row it costs *up to the TTL* on whichever instance next wants that job, and for the queue drain (TTL ≥ 300 s) that is the sign-in mail plane stalling through a rolling restart. So the scheduler's loops become shutdown-aware: a job that is idle exits, a job that is running finishes its run, releases, and then exits, and `pubd` awaits that before it returns. The abort in `Drop` stays as the backstop, and the TTL remains what bounds a **crash** — which is what a TTL is for and all it can bound.
+
+### D45: `complete` carries the claim it is talking about
+
+The second drain this wave creates is the door D45 named. `JobQueueRepo::complete` transitions a row by id under `state = 'running'` and discards `rows_affected`, so a worker whose lease expired and was re-claimed by another instance can still mark the row `done`, NULL its lease, and erase the `last_error` an operator would have seen — mid-delivery, while the drain counts a delivery that belongs to a different attempt.
+
+`attempts` is the fencing value: it is incremented **when the lease is taken**, so the number a claim handed back names that claim and no later one. `complete` takes it, adds `AND attempts = ?` to the predicate, and **returns whether it matched**. The drain counts an outcome, increments `queue_jobs_total`, and publishes the item's follow-ups only when it did; when it did not, it logs and counts a `lost` — because the follow-up event is the record of *a* completion, and this worker's completion did not happen. The trait doc and both dialect module headers are corrected to the property that is now enforced, rather than the stronger one they claimed while the predicate delivered less.
+
+### The HTTP harness gets its Postgres variant, with the cleanup path decision 35 required first
+
+`TestDatabase::Postgres` creates a throwaway database per `TestApp`, migrates it, and **drops it on `Drop`** — a detached std thread with its own runtime, terminating the database's remaining backends first, so the ~250 tests that will never call a cleanup method do not have to. `TestApp::replica()` builds a second application over the **same** database with its own pool: that is the two-instance shape the claims of this wave need, and it is the shape item 3's compose acceptance run will assert again over a real network.
+
+**Consequences.**
+
+- **Every Postgres deployment now writes to the database on a schedule it did not before**: one conditional upsert per job per tick (the drain's tick is 5 s) and one per publish. That is the price of the lock being where the data is, and it is small — but it is not zero, and it is written here rather than discovered in a slow-query log.
+- **A crashed instance blocks its jobs for up to the lock TTL**, per job, on every other replica. This is new: with the in-process lock a crash cost nothing because nothing was shared. It is the standard cost of a lease and the reason `JobLockTtls` is per job rather than global.
+- **`complete` changes shape**, so every caller and both dialects move together; the queue report gains a `lost` counter that an operator can see. A non-zero `lost` means two drains overlapped — with this wave's lock that should be unreachable outside a crash window, which is precisely why it is counted rather than logged only.
+- **The app role needs no new *kind* of grant** — unlike `audit_log`, this table has no revoke to survive — **but the shipped provisioning template does not reach it**, and that turns out to be true of every table added since a deployment was provisioned. `GRANT … ON ALL TABLES IN SCHEMA public` is a one-time grant over the tables that exist when it runs; a table created by a later migration is invisible to the app role. Verified live against Postgres 17 while writing this: with the role provisioned exactly as the template says, `has_table_privilege` answers `t` for a table created before and `f` for one created after. For `job_locks` the consequence is severe — every publish and every job tick acquires a lock — which is why it is recorded as [D64](roadmap.md) with a live demonstration rather than left as a sentence in a decision. This decision does not fix it: the fix changes the documented hardening recipe, which is normative in [S-22](security.md#5-audit--abuse) and [rules/migrations.md](rules/migrations.md), and that is a decision of its own.
+- **Two SQLite instances over one shared volume remain unsupported and are now the only unprotected shape**, since they would take the in-process lock. That configuration is already refused by the ops documentation for WAL reasons; this decision does not make it safe and does not pretend to.
+- **This decision does not close [D52](roadmap.md) or [D55](roadmap.md)**, and it does not deliver roadmap item 3 (the two-replica compose acceptance run). It closes D1 and D45, and it builds the harness that item 3's claims will be written against.

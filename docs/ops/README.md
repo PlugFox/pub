@@ -15,7 +15,5 @@ Pub ships as **one binary, `pubd`**, with the web UI embedded ([decision 04](../
 | [token-scanning.md](token-scanning.md) | The published CLI-token format, regex, and offline checksum verification for secret scanners (S-15) |
 
 Not covered here because it does not exist yet (honesty over aspiration; each item is tracked):
-running more than one replica is unsafe despite the config validator accepting it with Redis (D1) — see [install.md](install.md#one-replica-for-now);
-the supply-chain registers (quarantine, shadowing) have no admin screens yet and are read through the audit log (D26) — the metrics and alert rules for them are in [monitoring.md](monitoring.md);
-nothing purges old sessions, audit rows, or notifications (D12);
+a **two-replica deployment** is not documented or tested yet (Phase 3 item 3) — leader election is a database lease as of [decision 36](../decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check) and the validator now refuses `replicas > 1` without Postgres and Redis, but no compose file runs two app containers behind a proxy; see [install.md](install.md#more-than-one-replica);
 trace export is not implemented — this build exports metrics and logs, and the `telemetry.otlp` flag that promised otherwise was removed rather than left in place ([decision 23](../decisions.md#23--monitoring-is-optional)).

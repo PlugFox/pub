@@ -24,7 +24,7 @@ Releases are cut by tagging `vX.Y.Z` ([decision 18](../decisions.md#18--ops-rele
    docker exec pub pubd --version   # version (git hash, build date)
    ```
 
-Expect a brief downtime window: this is a single-replica deployment shape (roadmap D1 — see [install.md](install.md#one-replica-for-now)), so there is no rolling upgrade today. The `dart pub` client retries transient failures, so a short restart is invisible to most CI.
+Expect a brief downtime window: no two-replica deployment shape is documented or tested yet (roadmap Phase 3 item 3 — see [install.md](install.md#more-than-one-replica) for what the validator now requires before it accepts more than one), so there is no rolling upgrade today. The `dart pub` client retries transient failures, so a short restart is invisible to most CI.
 
 ## Migrations are forward-only
 
@@ -34,4 +34,5 @@ Consequences:
 
 - **Rollback = restore.** To return to version N−1 after upgrading to N, restore the pre-upgrade backup and start the N−1 image. Whatever happened on the instance between the upgrade and the rollback is lost — which is why step 1 is the procedure's load-bearing line, and why upgrading soon after a fresh backup beats upgrading long after one.
 - **Do not start an older binary against a newer schema.** It may boot (older migrations are all present), but it will run against tables whose newer invariants it does not know. Nothing checks for this today ([/healthz does not report migration state](install.md#verifying-an-instance), roadmap D25).
+- **If you provisioned a hardened `pub_app` role** per the [S-22 template](../security.md#5-audit--abuse), **re-run its table grant after every upgrade that adds a table** — `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pub_app;` followed by `REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM pub_app;`. The template's grant covers the tables that existed when it ran and no others, so a migration that adds one leaves the app role locked out of it; the release that added `job_locks` makes that fatal, because the lock is taken on every publish and every job tick. The permanent fix — `ALTER DEFAULT PRIVILEGES` in the provisioning recipe — is roadmap **D64**. Deployments connecting as the database owner (compose, and the default `docker run`) are unaffected.
 - Skipping versions is fine as far as migrations are concerned — they are a linear sequence and boot applies every missing step. Read the skipped releases' changelog sections anyway; config keys and defaults move between minor versions while the project is pre-1.0.

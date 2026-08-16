@@ -26,7 +26,7 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 
 | File                   | Contents                                                        |
 | ---------------------- | --------------------------------------------------------------- |
-| `docs/decisions.md`    | 29 numbered decisions with rationale — normative                |
+| `docs/decisions.md`    | 36 numbered decisions with rationale — normative                |
 | `docs/product.md`      | Vision, feature triage v1/v1.1/later, screens list              |
 | `docs/architecture.md` | Crate/workspace layout, data model, pipelines, testing strategy |
 | `docs/security.md`     | S-01…S-33 normative security requirements                       |

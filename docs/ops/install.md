@@ -129,9 +129,16 @@ Instance administration is a plane orthogonal to org roles ([decision 19](../dec
 
 `status` is `ok` when every configured backend answers a **live ping** (these are real probes, not config echoes), `degraded` otherwise. Honest limits: `/healthz` does **not** report migration status, and there is no separate `/readyz` (roadmap D25) — a booted process has already applied its migrations, but a health probe cannot distinguish "migrating" from "down". `pubd --version` prints the same version plus git hash and build date.
 
-## One replica, for now
+## More than one replica
 
-The config validator accepts `cluster.replicas > 1` whenever the Redis KV backend is configured ([decision 03](../decisions.md#03--sessions-jwt-access--refresh-sessions-kv-backed-revocation)) — but the background-job leader lock is still per-process, so at two replicas the blob GC (a job that deletes bytes) can run twice concurrently and mirror sweeps race one durable cursor (roadmap D1, scheduled for Phase 3). **Run exactly one replica** until the distributed job lock lands; the validator's acceptance is currently a promise ahead of the code.
+Two backends are required before the validator accepts `cluster.replicas > 1`, and both are checked at boot:
+
+- **`kv.kind = redis`** ([decision 03](../decisions.md#03--sessions-jwt-access--refresh-sessions-kv-backed-revocation)) — session revocation, rate-limit windows and settings invalidation are shared through the KV, and the in-process one is shared with nobody.
+- **`database.kind = postgres`** ([decision 36](../decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)) — leader election is a lease row in `job_locks`, so background jobs run on one instance per tick and a package name being published on one instance is `busy` on the others. SQLite deployments are single-instance by construction and take an in-process lock; **do not run two of them over a shared volume.**
+
+The lock is chosen by the database kind rather than by `cluster.replicas`, so a Postgres deployment is safe whether or not it declared the second replica. Two costs are worth knowing before you scale out. A **crashed** instance holds its jobs' leases until they expire — per job, up to the lock TTL (300 s by default, longer for jobs whose budget is longer) — so a job can be blocked cluster-wide for that long; a **planned** stop gives its leases back, because `pubd` asks the scheduler to finish and release before it exits. And each replica counts rate-limit budgets alone whenever the KV is unreachable ([S-24.e](../security.md#5-audit--abuse)), so the aggregate budget during a KV outage is up to N times the configured limit.
+
+The two-replica deployment itself — compose with a proxy in front, and the acceptance run behind it — is Phase 3 item 3 and is not documented here yet.
 
 ## Connecting `dart pub`
 
