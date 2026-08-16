@@ -102,6 +102,22 @@ location ~ ^/registry/(o/[^/]+/)?pub/ {
 }
 ```
 
+### More than one replica
+
+Replace the single `proxy_pass` target with an upstream and change nothing else — every `location` above keeps its body:
+
+```nginx
+upstream pub_app {
+    server 10.0.0.11:8080;
+    server 10.0.0.12:8080;
+}
+# …then `proxy_pass http://pub_app;` in each location block above.
+```
+
+**Do not add `ip_hash` or a sticky cookie.** Nothing in this application is instance-local: sessions are JWTs with a shared-KV blocklist, the SSE stream receives peer instances' events through the KV broker, and background jobs are leader-locked in the database ([decision 36](../decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)). Stickiness would buy nothing and would hide a regression in any of the three until the day a replica restarts. `cluster.replicas > 1` additionally requires `database.kind = postgres` and `kv.kind = redis`, and the server refuses to start otherwise.
+
+The working two-replica configuration this is derived from is `docker/nginx-cluster.conf`, exercised by the acceptance run described in [install.md](install.md#the-two-replica-stand).
+
 ## Caddy
 
 ```caddyfile

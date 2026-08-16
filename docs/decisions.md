@@ -42,6 +42,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 35 | Backend legs that fail when the backend is absent; a harness that races | accepted |
 | 36 | Leader election leaves the process: a lease table, and a topology gate  | accepted |
 | 37 | A grant that reaches the tables that do not exist yet, and a check      | accepted |
+| 38 | Two replicas behind one proxy: a stand, four claims, and a number      | accepted |
 
 ---
 
@@ -913,3 +914,57 @@ A migration run is the exact moment the gap opens, so 0017 adds a `STABLE` catal
 - **A schema object joins the database for reporting only.** `pub_role_grant_gaps()` is `SECURITY INVOKER` over world-readable catalogues, so it exposes nothing a caller could not assemble by hand, and `EXECUTE` stays with `PUBLIC` for the same reason. A read-only reporting role that happens to hold `INSERT` on `audit_log` and nothing else would be listed as a gap — a false positive an operator can read and dismiss.
 - **The Postgres test harness can now stop the migrator at a version.** `TestDb::create_at_version` exists for this test and is the way any future claim about upgrading an old deployment gets written; `TestDb::create` is unchanged in behaviour.
 - **S-22 is unchanged.** This decision widens nothing: the app role's `audit_log` restriction, decision 30's prune capability, and the `EXECUTE` revoke from `PUBLIC` all stand exactly as they were. What changes is that the recipe now reaches the tables it always meant to.
+## 38 — Two replicas behind one proxy: an acceptance stand that fails closed, four claims proven at the wire, and a measurement that is a number
+
+> **Status: accepted.** Recorded 2026-08-16 before implementation, as the Phase 3 wave-7d enabling decision for [roadmap item 3](roadmap.md#phase-3--make-multi-instance-real-closes-d1-d16) — the last item of the phase — and for the load measurement [Phase 2's exit](roadmap.md) still owes.
+
+**Context.** After [decision 36](#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check) multi-instance is no longer *unsafe*: leader election is a lease two instances contend for and the validator refuses the configurations that have no lock. It is still not **documented and tested as a deployment**. Nothing in `docker/` runs two app containers behind a proxy, and item 3's four claims — session revocation propagates, jobs run exactly once, publishes serialize, SSE reaches a client on either replica — are proven today either at the level of two applications inside one test process over one database (publishes, jobs) or not at all (revocation and SSE, which need the shared Redis that harness deliberately does not have). The phase's exit sentence is "a documented, tested two-replica deployment", and a claim about two containers cannot be closed by a test that never starts one.
+
+**Decision.**
+
+### The stand is a profile of the compose file that already exists
+
+`docker/docker-compose.yml` gains a `cluster` profile — `proxy` (nginx), `app-a`, `app-b` — rather than a second compose file. The backing services are the same `pg`, `s3`, `redis` and `mail` the other profiles already define, which is the whole argument: a separate file would duplicate five service definitions and let the stand drift from the stack operators actually run. A YAML anchor holds the environment both replicas share.
+
+**Both replicas are published individually as well as behind the proxy** (`18081`, `18082`, proxy on `18080`). Without direct addresses, "instance A revoked it and instance B refuses it" is not a sentence a test can write — every request would go wherever the balancer sent it, and a claim about two instances would quietly be a claim about round-robin. The proxy is used for what only it can answer (that the front door is not sticky, that `public_url` survives the hop); the direct addresses are used for everything that names an instance.
+
+**The stand is the shape the validator demands, not merely a shape that works.** `cluster.replicas = 2` is set on both replicas even though little reads it at runtime: the point of the acceptance run is the deployment an operator is now told is supported, and that deployment is the one that passes decision 36's gate. `server.trust_proxy_headers = true` and `server.public_url` pointing at the proxy are set for the same reason — [S-24.b](security.md#5-audit--abuse) is MUST language for any deployment terminating at a proxy, and a stand that skipped it would measure per-IP budgets keyed on the proxy's own address.
+
+Secrets come from the documented `pubd generate-secrets` flow. The stand does **not** fall back to dev mode: production mode's refusal to boot without real key material (S-25) is part of what is being accepted.
+
+### Which instance answered is the proxy's business, not the application's
+
+Adding an instance identifier to `/healthz` was considered and refused. That endpoint is unauthenticated by [decision 23](#23--monitoring-is-optional), so an instance id there is a small information leak in every production deployment, added to serve a test. The stand's nginx config adds `X-Upstream: $upstream_addr` instead — the proxy already knows, it is the one component that cannot be wrong about it, and the header exists only in the stand's config rather than in anybody's production advice.
+
+### The four claims, and what each one is actually observing
+
+- **Session revocation propagates.** Revoke a session through replica A, then use its access token against replica B. The KV blocklist is the shared Redis, so B must answer `401` — the [S-08](security.md#1-authentication)/[S-09](security.md#1-authentication) fast path, tested across processes for the first time.
+- **Jobs run exactly once.** File *N* sign-in requests and assert Mailpit received exactly *N* messages with two live drains running. This is the end-to-end form of the claim: the durable queue's exclusive claim, the lease that keeps one scheduler ticking per job, and the enqueue-on-one-instance rule of the event bus, all observed at the only place a duplicate would be visible to a human — the mailbox.
+- **Publishes serialize.** Publish one package name concurrently through both replicas: one `200`, one clean `400 busy` per [sharp edge 2](protocol.md#sharp-edges-violate--break-clients), and exactly one version row afterwards. The wave-7b test proved this between two applications in one process; this proves it between two containers over a network, which is where the lock's cost is real.
+- **SSE reaches a client on either replica.** Open the stream on replica B, cause the event on replica A, assert it arrives within the heartbeat window. This is the one claim with no in-process proof at all: it exercises the KV broker topic that bridges a peer instance's stream, and a Redis pub/sub that silently dropped it would look exactly like a quiet registry today.
+
+Two more assertions belong to the stand rather than to the phase, and are kept because a stand that is wrong invalidates the four: the front door is **not** sticky (both upstreams are observed across a burst), and `archive_url` names the **proxy** rather than the replica that served the listing — a `public_url` misconfiguration is the single most likely way this stand would produce four green lies.
+
+### The gate is decision 35's, one level up
+
+A new `crates/acceptance` holds the run: no library, only tests, and `PUB_TEST_CLUSTER_URL` gates it with `PUB_TEST_NO_CLUSTER` as the explicit opt-out, failing closed with both named. No `#[ignore]`. The replica and mail addresses default to the ports the shipped profile publishes, because the stand that starts them is in this repository — a default that is wrong is a default the same run detects immediately.
+
+The acceptance run is **opt-in and manual for now**: no CI leg. That is a deliberate deferral rather than an omission — the stand builds an image and boots five containers, and a leg that flakes on a cold runner would teach the team to ignore it. The gate makes adding the leg a one-line change when the run has a history.
+
+### The measurement is two profiles and a recorded number, not a threshold
+
+[Phase 2's exit](roadmap.md) owes a load test and has owed one since the phase closed; `just bench` today hits `/healthz`, which measures the router and nothing behind it.
+
+- **Read profile: `oha`**, already installed and already in the justfile — driving the two requests `dart pub get` actually makes (the org-scoped version listing, and an archive download).
+- **Write profile: a small Rust driver** in the acceptance crate, because a publish is three authenticated steps and no single-URL tool can express it.
+- **The numbers are recorded in [ops/capacity.md](ops/capacity.md) with the machine and the method**, and they are *not* a CI threshold. A latency gate measured on whatever host happened to run it is noise with a version number; a recorded measurement with its conditions is something the next measurement can be compared against.
+
+**What the stand found on its first run.** Recorded here because it is the argument for the stand rather than a footnote to it. Restarting replica B onto a *different* Redis logical database — one line, nothing else changed — turned three of the five claims red at once: revocation, the event bridge, and the concurrent publishes, the last with *"this upload has expired or was already finalized"*, because a **staged upload's session record lives in the KV as well**. Nobody predicted the third. The exactly-once claim stayed green, correctly, since the queue is in Postgres. Two smaller findings came out of the same day: the SSE audience filter reads `claims.orgs`, so an owner who creates an org and keeps the token they signed in with sees nothing on the stream until the pair rotates (the harness rotates; the behaviour is by design and now written down), and a name generator keyed only on the system clock returned **identical** names inside one tight loop, which the load driver then read as a defect in the publish lock.
+
+**Consequences.**
+
+- **A new crate that ships nothing.** `pub-acceptance` is a thin harness library plus one test target and one binary, and nothing in it reaches `pubd`. That is the cost of the run being written in Rust rather than in `curl`, and it buys real assertions for "the event arrived on the other replica" and "exactly N messages, not 2N".
+- **`cargo test --workspace` now includes a leg that needs containers**, so `just server-check` sets `PUB_TEST_NO_CLUSTER` when no stand is addressed and says which leg it silenced, and CI sets it explicitly beside the three backend opt-outs. Deleting that line in CI turns the suite red rather than quietly skipping it, which is how it should read the day somebody decides the leg is worth running there.
+- **The stand is not a production deployment recipe.** It publishes both replicas directly, which no real deployment should do, and it terminates no TLS. [ops/install.md](ops/install.md#more-than-one-replica) gains the two-replica section it lacks and says so; the nginx configuration in [ops/reverse-proxy.md](ops/reverse-proxy.md) gains the multi-upstream variant, which is the part an operator actually copies.
+- **Four claims proven at the wire do not make every claim true.** Nothing here proves behaviour under a *rolling* restart, under partition, or with more than two replicas; the acceptance run is the shape this project documents and nothing wider. What it does close is the phase's exit sentence and the audit's "multi-instance is permitted and unsafe", which is already false in its second half and becomes false in its first.
+- **A measurement dates.** The recorded numbers are a snapshot on one machine; they answer "is a publish milliseconds or seconds" and "does the second replica change throughput", not "what will your hardware do".

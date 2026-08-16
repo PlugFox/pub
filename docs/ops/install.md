@@ -180,7 +180,27 @@ Two backends are required before the validator accepts `cluster.replicas > 1`, a
 
 The lock is chosen by the database kind rather than by `cluster.replicas`, so a Postgres deployment is safe whether or not it declared the second replica. Two costs are worth knowing before you scale out. A **crashed** instance holds its jobs' leases until they expire — per job, up to the lock TTL (300 s by default, longer for jobs whose budget is longer) — so a job can be blocked cluster-wide for that long; a **planned** stop gives its leases back, because `pubd` asks the scheduler to finish and release before it exits. And each replica counts rate-limit budgets alone whenever the KV is unreachable ([S-24.e](../security.md#5-audit--abuse)), so the aggregate budget during a KV outage is up to N times the configured limit.
 
-The two-replica deployment itself — compose with a proxy in front, and the acceptance run behind it — is Phase 3 item 3 and is not documented here yet.
+### The two-replica stand
+
+`docker/docker-compose.yml` carries a `cluster` profile: two app containers on one Postgres, one Valkey, one MinIO and one mail sink, behind one nginx ([decision 38](../decisions.md#38--two-replicas-behind-one-proxy-an-acceptance-stand-that-fails-closed-four-claims-proven-at-the-wire-and-a-measurement-that-is-a-number)).
+
+```sh
+cargo run -p pubd -- generate-secrets --format env --out docker/.env   # once
+just cluster-up        # builds the image, waits for health, prints the addresses
+just cluster-check     # the four claims below, against those containers
+just cluster-down
+```
+
+What the acceptance run asserts, and therefore what "supported" means here:
+
+- a session revoked through one replica is refused by the other, immediately and without a restart (S-09, through the shared Redis blocklist);
+- queued work runs **exactly once** with both replicas draining — four sign-in requests produce four messages in the mail sink, not eight;
+- concurrent publishes of one package name serialize across replicas, and the losers get the retryable `400 busy` rather than a database error;
+- an event emitted on one replica reaches an SSE client attached to the other, through the KV broker topic.
+
+**This stand is not a deployment recipe.** It publishes both replicas directly (`18081`, `18082`) so that a test can address one instance rather than whichever the balancer chose, and those ports run with `trust_proxy_headers = true` — meaning anything that can reach them can claim any client address. A real deployment publishes the proxy and nothing else. It also terminates no TLS, and its `public_url` is `http://localhost:18080`.
+
+What is still not proven anywhere: behaviour under a **rolling** restart, under partition, or above two replicas.
 
 ## Connecting `dart pub`
 

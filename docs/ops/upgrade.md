@@ -24,7 +24,7 @@ Releases are cut by tagging `vX.Y.Z` ([decision 18](../decisions.md#18--ops-rele
    docker exec pub pubd --version   # version (git hash, build date)
    ```
 
-Expect a brief downtime window: no two-replica deployment shape is documented or tested yet (roadmap Phase 3 item 3 — see [install.md](install.md#more-than-one-replica) for what the validator now requires before it accepts more than one), so there is no rolling upgrade today. The `dart pub` client retries transient failures, so a short restart is invisible to most CI.
+Expect a brief downtime window. A two-replica deployment is documented and tested as of [decision 38](../decisions.md#38--two-replicas-behind-one-proxy-an-acceptance-stand-that-fails-closed-four-claims-proven-at-the-wire-and-a-measurement-that-is-a-number) ([install.md](install.md#the-two-replica-stand)), but **a rolling upgrade is not**: what the acceptance run proves is two instances running together, not one being replaced while the other serves — and migrations are forward-only, so a replica on the old binary is briefly running against the new schema. Until that shape is tested, upgrade by stopping both. The `dart pub` client retries transient failures, so a short restart is invisible to most CI.
 
 ## Migrations are forward-only
 

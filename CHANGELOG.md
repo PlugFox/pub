@@ -2,6 +2,29 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-16 — Phase 3 wave 7d: two replicas behind one proxy, and the number Phase 2 owed
+
+Roadmap Phase 3 item 3 — the last item of the phase — plus the load test [Phase 2's exit](docs/roadmap.md) has owed since that phase closed. [Decision 38](docs/decisions.md#38--two-replicas-behind-one-proxy-an-acceptance-stand-that-fails-closed-four-claims-proven-at-the-wire-and-a-measurement-that-is-a-number) was recorded before any code. **Phase 3 is closed.**
+
+Since [decision 36](docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check) multi-instance has been *safe*; it has not been *tested as a deployment*. Nothing in `docker/` ran two app containers behind a proxy, and two of the phase's four claims — session revocation propagating and SSE crossing replicas — had no test anywhere, because the in-process harness gives its two applications a private KV each.
+
+### Added
+
+- (infra) **A `cluster` compose profile**: two app containers on one Postgres, one Valkey, one MinIO and one Mailpit, behind one nginx (`docker/nginx-cluster.conf`, the multi-upstream form of the configuration in [ops/reverse-proxy.md](docs/ops/reverse-proxy.md)). `just cluster-up` builds, waits for health and prints the addresses; `just cluster-down` stops it. Both replicas are published individually **as well as** behind the proxy, which no real deployment should do — it is what lets a test name an instance instead of asking a balancer.
+- (server) **`crates/acceptance`**, gated by `PUB_TEST_CLUSTER_URL` with the same fail-closed rule as the backend matrix ([decision 35](docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)). Five tests: a session revoked through one replica refused by the other; four queued sign-ins producing exactly four messages in the mail sink with both drains live; six concurrent finalizes of one package name answering only `200` or `400 busy`, with the listing agreeing on the count and `archive_url` naming the proxy; an event emitted on one replica arriving on an SSE stream held by the other; and the front door proven non-sticky, because four green claims about two instances mean nothing if every request landed on one.
+- (server) **A publish-load driver** (`cargo run -p pub-acceptance --bin publish-load`) and [ops/capacity.md](docs/ops/capacity.md), which records what one measurement on one machine actually said — with the method, the machine, and the list of what has never been measured. `oha` covers the read path; a publish is three authenticated round trips and needs a driver.
+- (docs) [ops/install.md](docs/ops/install.md) gains the two-replica stand and what it deliberately does not prove; [ops/reverse-proxy.md](docs/ops/reverse-proxy.md) gains the multi-upstream nginx form and the reason **not** to add stickiness.
+
+### Changed
+
+- (infra) `just server-check` now silences the cluster leg (and says so) when no stand is addressed, and `server-ci.yml` sets `PUB_TEST_NO_CLUSTER` explicitly beside the three backend opt-outs. The acceptance run is **not** a CI leg: it builds an image and boots five containers, and a leg that flakes on a cold runner teaches people to ignore it. Deleting that one line is how it gets turned on.
+
+### Notes
+
+- **The stand earned its keep on the first run.** Restarting one replica onto a different Redis logical database — one line, nothing else changed — turned three of the five claims red: revocation, the event bridge, and, unpredicted, the concurrent publishes, which failed with *"this upload has expired or was already finalized"* because **a staged upload's session record lives in the KV too**. The exactly-once claim stayed green, correctly: the queue is in Postgres.
+- **Two of the first run's failures were the harness, not the product**, and both are worth knowing. The SSE audience filter authorizes from `claims.orgs`, a snapshot taken when the access token was minted — so an owner who creates an org and keeps signing-in token sees nothing on the stream until the pair rotates. And a unique-name helper keyed only on the system clock returned **identical** names inside one tight loop, which the load driver reported as a `busy` refusal from the publish lock until it was investigated rather than believed.
+- **The second replica does not add publish throughput.** At concurrency 12 the proxy and a single replica are within 1.5 % of each other, because what saturates first is the shared Postgres and blob store. Sizing for publish volume means sizing the database, not the app tier. The read path is single-digit milliseconds inside its budget, and one *identified* caller gets 3 000 reads a minute — a CI fleet sharing one token meets that wall long before it meets the server.
+
 ## 2026-08-16 — Phase 3 wave 7c: a grant that reaches the tables that do not exist yet
 
 The defect wave 7b found in hardening it did not own. [Decision 37](docs/decisions.md#37--a-grant-that-reaches-the-tables-that-do-not-exist-yet-default-privileges-a-one-time-repair-and-an-upgrade-that-says-so) was recorded before any code. **This closes [D64](docs/roadmap.md).**

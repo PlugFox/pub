@@ -41,6 +41,7 @@ operator docs live in [docs/ops/](../docs/ops/README.md): [install](../docs/ops/
 | `redis` | Valkey 8 | test the Redis KV backend / multi-instance gate |
 | `mail`  | Mailpit (SMTP :1025, UI/API :8025) | catch OTP + notification mail in dev |
 | `full`  | app (built from `docker/Dockerfile`) + pg + s3 + redis + mail | run the whole stack in containers |
+| `cluster` | **two** app replicas + nginx + pg + s3 + redis + mail | the two-replica acceptance stand ([decision 38](../docs/decisions.md#38--two-replicas-behind-one-proxy-an-acceptance-stand-that-fails-closed-four-claims-proven-at-the-wire-and-a-measurement-that-is-a-number)) |
 
 ## One-liners
 
@@ -50,6 +51,9 @@ docker compose -f docker/docker-compose.yml --profile pg up -d      # just Postg
 docker compose -f docker/docker-compose.yml --profile pg --profile redis up -d
 docker compose -f docker/docker-compose.yml --profile full up -d --build
 docker compose -f docker/docker-compose.yml --profile full down     # add -v to drop data
+
+# two replicas behind nginx — build, wait for health, then run the four acceptance claims
+just cluster-up && just cluster-check && just cluster-down
 
 # production-shaped image alone (build from the repo root)
 docker build -f docker/Dockerfile -t pub .

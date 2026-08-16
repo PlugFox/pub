@@ -26,7 +26,7 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 
 | File                   | Contents                                                        |
 | ---------------------- | --------------------------------------------------------------- |
-| `docs/decisions.md`    | 37 numbered decisions with rationale — normative                |
+| `docs/decisions.md`    | 38 numbered decisions with rationale — normative                |
 | `docs/product.md`      | Vision, feature triage v1/v1.1/later, screens list              |
 | `docs/architecture.md` | Crate/workspace layout, data model, pipelines, testing strategy |
 | `docs/security.md`     | S-01…S-33 normative security requirements                       |
@@ -49,7 +49,8 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 | `taplo` | pre-commit hook + `just fmt` | Cargo.toml formatting/lint |
 | `actionlint` (+shellcheck) | pre-commit hook + `just lint-ci` | workflow linting after any `.github/` edit |
 | `cargo audit` / `cargo deny` / `cargo machete` | `just audit` | dependency and supply-chain hygiene |
-| `oha` (`just bench [url]`) | justfile | HTTP load smoke; Phase 2 latency exit criteria |
+| `oha` (`just bench [url]`, `just cluster-load`) | justfile | HTTP load: the read half of the measurement in [ops/capacity.md](docs/ops/capacity.md) |
+| `just cluster-up` / `cluster-check` / `cluster-down` | justfile → `docker compose --profile cluster` | the two-replica acceptance stand and its four claims (decision 38); gated by `PUB_TEST_CLUSTER_URL` |
 | `dive` (`just image-dive`) | justfile | image layer/size analysis when touching docker/ |
 | `hyperfine` | manual | benchmark claims instead of asserting them |
 | `sqlx-cli` 0.9 | manual | migration ops against a live DB (rare; migrations apply at startup) |
