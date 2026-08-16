@@ -47,6 +47,26 @@ Two sections cannot be expressed through the env layer because they are **arrays
 
 Validation is fail-fast and semantic: `postgres` without a URL, `s3` without a bucket, `redis` without a URL, a malformed KEK, a heartbeat that would break the SSE revocation bound — each is a named startup error, not a runtime surprise.
 
+### S3 archive downloads: streamed or presigned
+
+On the `s3` backend, archive bytes are read by this process and streamed to the client. `blob.presign = true` changes that to a **`307` redirect to a presigned URL**, so the bytes go straight from the object store ([decision 34](../decisions.md#34--presigned-downloads-the-redirect-branch-becomes-reachable-off-by-default-and-honest-about-the-address-a-client-can-dial)). It is **off by default**, because turning it on is an assertion no validator can check: that the address inside the signed URL is one your clients can dial. Once the redirect has been sent there is no fallback left.
+
+| Key | Default | What it is |
+|---|---|---|
+| `blob.presign` | `false` | Answer archive downloads with a presigned redirect (`s3` only) |
+| `blob.public_endpoint` | unset | The endpoint address **clients** reach, when it differs from `blob.endpoint` |
+| `blob.presign_ttl_secs` | `1800` | Lifetime of a signed URL; must be `1500..=604800` |
+
+`blob.endpoint` is the address *this process* dials. Behind a container network or a private link that is not the address a developer's laptop resolves — `docker/docker-compose.yml` uses `http://s3:9000` — and the signature covers the host, so the URL cannot be rewritten after the fact. Set `blob.public_endpoint` and the server builds a second, signing-only client for it. Real AWS S3 (no `blob.endpoint` at all) needs neither key.
+
+Three combinations are refused at boot rather than warned about, each naming its own way out:
+
+- `blob.presign` with `blob.kind` other than `s3` — only that backend can sign.
+- `blob.presign` with a `blob.endpoint` and no `blob.public_endpoint` — see above.
+- a signing origin equal to `server.public_url`'s origin. The pub client keeps its `Authorization` header across a **same-origin** redirect, and S3 refuses a request that carries both a header credential and a query signature (`400 InvalidArgument`), which breaks every authenticated download. Give the object store an origin of its own.
+
+What to weigh before turning it on: a signed URL is a bearer capability for its TTL — anyone holding it reads that archive with no token, and **revoking that token does not reach a URL already issued** (the shortest achievable window is the 25-minute floor) — the read rate limit is spent at the redirect rather than at the bytes, the URL publishes your `blob.access_key` (the key *id*, by SigV4's design; the secret never leaves the process), and intermediary caching of archives goes away (the redirect is `no-store` and cannot carry the `immutable` tier a streamed archive does). None of that affects integrity: what a client verifies is the `archive_sha256` in the version listing, and the blob key *is* that hash. See [S-18.a](../security.md#4-supply-chain--registry-integrity) and [monitoring.md](monitoring.md#who-serves-the-archive-bytes).
+
 ## Data layout (image)
 
 The container runs as non-root **uid 1000** with `WORKDIR /data`, declared as a `VOLUME`. The config defaults are relative paths, so everything durable lands under the volume:

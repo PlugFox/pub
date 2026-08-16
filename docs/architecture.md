@@ -40,7 +40,7 @@ server/
 │   ├── db-postgres/            # sqlx 0.9 impls + migrations/ (tsvector, pg_trgm,
 │   │                           #   advisory locks, partial indexes, TIMESTAMPTZ/INET)
 │   ├── db-sqlite/              # sqlx 0.9 impls + migrations/ (FTS5, single-writer locks)
-│   ├── blob/                   # object_store: LocalFileSystem | AmazonS3(+MinIO) | InMemory
+│   ├── blob/                   # object_store: LocalFileSystem | AmazonS3(+MinIO, presigning) | InMemory
 │   │                           #   DownloadPlan::Redirect(presigned) | Stream(bytes)
 │   ├── kv/                     # Kv impls: in-process (moka) | redis (deadpool-redis);
 │   │                           #   blocklists, rate counters, locks, settings pub/sub
@@ -130,7 +130,7 @@ Endpoints per virtual registry base `B = /o/{org}/pub` (plus the public root `B 
 
 - `GET B/api/packages/{name}` — version listing (hot path; includes `archive_sha256`, `retracted`, `isDiscontinued`, `replacedBy`, later `advisoriesUpdated`).
 - `GET B/api/packages/versions/new` → `POST` multipart upload → `GET` finalize — 3-step publish, all under `B` so bearer auth flows automatically; validation happens at finalize (400 + `{"error":…}`).
-- `GET B/api/archives/{name}-{version}.tar.gz` — `DownloadPlan`: 307 to presigned URL (S3) or streamed bytes (fs/memory). Legacy routes `B/api/packages/{name}/versions/{v}` and `B/packages/{name}/versions/{v}.tar.gz` kept for old clients.
+- `GET B/api/archives/{name}-{version}.tar.gz` — `DownloadPlan`: streamed bytes, or a 307 to a presigned URL on S3 when `blob.presign` is on ([decision 34](decisions.md#34--presigned-downloads-the-redirect-branch-becomes-reachable-off-by-default-and-honest-about-the-address-a-client-can-dial), off by default). The plan is chosen per request **and per method**: SigV4 signs the method, so the `HEAD` the client sends before every fetch is signed as a `HEAD` — a `GET`-signed URL answers 403 to it, verified against live MinIO. Legacy routes `B/api/packages/{name}/versions/{v}` and `B/packages/{name}/versions/{v}.tar.gz` kept for old clients.
 
 Both bases are served by **one** handler set (`api/src/protocol/pub_v2.rs`) mounted twice; the base arrives as a typed extractor that yields the resolution scope and the URL prefix, so no handler can be correct on one mount and wrong on the other. Resolution itself is `PackageRepo::resolve_in_base` — a provided trait method, so the ordering exists once, above both SQL dialects, and runs through `authorize()`.
 

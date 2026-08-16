@@ -161,6 +161,21 @@ groups:
             (S-24.e), so the effective budget is up to N x the limit on N replicas. Sign-in keeps
             working; fix the KV.
 
+      # --- presigned downloads (decision 34) ----------------------------------------------
+      - alert: PubPresignFailing
+        expr: >-
+          sum(rate(archive_presign_total{outcome="failed"}[10m]))
+            / sum(rate(archive_presign_total[10m])) > 0.01
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Pub cannot presign archive URLs and is streaming them instead"
+          description: >-
+            `blob.presign` is on, but the object store's credential path is failing to sign, so
+            every archive is being proxied through the app process. Downloads still work — this
+            is latency and egress, not an outage — and without this alert it presents only as S3
+            egress disappearing while the app tier gets busy.
+
       # --- the basics ---------------------------------------------------------------------
       - alert: PubHighErrorRate
         expr: >-
@@ -229,6 +244,18 @@ Two jobs delete objects from the blob store, and they ship with **opposite defau
 **Reading a `blob-gc` pass.** It walks the key space one shard at a time from a durable cursor and stops when `jobs.blob_gc.budget_secs` is spent, so `phase` reads either `swept` (or `dry-run`) when the pass reached the end, or `swept, resumes at pub:3f` when it did not. That is normal on a large bucket — coverage rotates across passes — but it should not be *every* pass: `blob_gc_sweep_converged` sitting at 0 means no rotation ever completes, and the fix is a larger budget or a shorter interval. `staging-sweep` has no cursor because everything it collects leaves the namespace, so each pass makes the next one smaller.
 
 **One safety property worth knowing about**, because it explains a non-zero `contested` count in a report: both jobs re-read an object's age immediately before deleting it. `put` on a content-addressed key is an idempotent overwrite, so republishing byte-identical content refreshes an object that a listing already called old and unreferenced; the re-read sees that and skips. A steady trickle of `contested` is a busy registry, not a fault.
+
+## Who serves the archive bytes
+
+By default, this process does: an archive download is read from the blob store and streamed to the client. With `blob.presign = true` on the `s3` backend the same request answers **`307` to a presigned URL** and the bytes never enter the app tier ([decision 34](../decisions.md#34--presigned-downloads-the-redirect-branch-becomes-reachable-off-by-default-and-honest-about-the-address-a-client-can-dial), [S-18.a](../security.md#4-supply-chain--registry-integrity)). Three things change for whoever is watching the instance, and none of them is visible in an error rate:
+
+- **`http_request_duration_seconds` on the archive route collapses**, because the route stopped doing the work. Egress moves to the object store's own bill and its own dashboard. A latency graph that improves the day this is turned on is the feature, not an anomaly.
+- **`downloads_total` counts redirects issued, not bytes delivered.** It was always an upper bound — a streamed download can be aborted mid-body — and it becomes a slightly looser one, because we no longer see whether the client followed the URL.
+- **`archive_presign_total{outcome="failed"}` is the one signal that needs an alert** (rule above). Signing runs offline against the store's credentials; when it fails the request falls back to streaming, so nothing 5xxs and nothing 404s. The instance simply, silently, starts doing the work again.
+
+**What a signed URL is.** A bearer capability for `blob.presign_ttl_secs` (default 30 minutes): whoever holds it reads that archive with no token and no session. The authorization decision is made once, when the redirect is issued, which is why the redirect carries `Cache-Control: no-store` and why the S-24.f read bucket is spent at the redirect rather than at the bytes. **During an incident this is the sentence that matters**: revoking a token or a session does not reach a URL already handed out, so the containment step for leaked archive bytes is the object store's own — rotate `blob.access_key`, or turn `blob.presign` off and restart, which makes every outstanding URL useless at once. An instance that cannot accept the second property leaves the flag off, which is the default.
+
+**If downloads break the moment you turn it on**, the address is almost always the cause: `blob.endpoint` is what *this process* dials, and behind a container network or a private link it is not what a client can reach. Set `blob.public_endpoint` to the client-facing address — boot refuses the combination rather than letting you find out from a support ticket, and it refuses two more: a signing origin equal to `server.public_url` (the client keeps its `Authorization` across a same-origin redirect and S3 answers 400 to a request carrying two credentials), and a TTL outside `1500..=604800`.
 
 ## What deletes rows, and what it needs
 

@@ -277,6 +277,24 @@ string (optional) · `PUB_BLOB__ENDPOINT` · default: none
 
 Custom endpoint URL for S3-compatible stores (MinIO); AWS default when unset.
 
+### `blob.public_endpoint`
+
+string (optional) · `PUB_BLOB__PUBLIC_ENDPOINT` · default: none
+
+Endpoint URL clients can reach, when it differs from `blob.endpoint` — required to presign behind a private endpoint.
+
+### `blob.presign`
+
+boolean · `PUB_BLOB__PRESIGN` · default: `false`
+
+Serve archive downloads as presigned redirects instead of streaming them through this process (`s3` only).
+
+### `blob.presign_ttl_secs`
+
+integer · `PUB_BLOB__PRESIGN_TTL_SECS` · default: `1800`
+
+Lifetime of a presigned download URL, in seconds; must be between 1500 and 604800.
+
 ### `blob.region`
 
 string (optional) · `PUB_BLOB__REGION` · default: none

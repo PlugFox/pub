@@ -2,6 +2,41 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-16 — Phase 2 wave 6: presigned downloads, and the last item of Phase 2
+
+Roadmap Phase 2 item 5, the only one left. [Decision 34](docs/decisions.md#34--presigned-downloads-the-redirect-branch-becomes-reachable-off-by-default-and-honest-about-the-address-a-client-can-dial) and [S-18.a](docs/security.md#4-supply-chain--registry-integrity) were recorded before any code.
+
+`DownloadPlan::Redirect` has been in `core` since the first slice, the archive handler has implemented both arms since then, and nothing ever constructed the redirect ([D11](docs/roadmap.md)). On an S3 deployment every archive byte therefore crossed the app process twice — S3 → app → client — while [decision 10](docs/decisions.md#10--blob-storage-via-object_store) claimed presigned downloads were "designed in from day one".
+
+> **Nothing changes unless you turn it on.** `blob.presign` defaults to `false`, including on `s3`. The roadmap's sketch said "on by default for s3" and this wave takes the opposite default, with the counter-example in this repository: `docker/docker-compose.yml` signs against `http://s3:9000`, an address no client outside that network resolves — and once a redirect has been sent there is no fallback left. Turning it on is an assertion no validator can make for you.
+
+### Added
+
+- (server) **Presigned archive downloads on the S3 backend** ([decision 34](docs/decisions.md#34--presigned-downloads-the-redirect-branch-becomes-reachable-off-by-default-and-honest-about-the-address-a-client-can-dial), [S-18.a](docs/security.md#4-supply-chain--registry-integrity), closes [D11](docs/roadmap.md)). With `blob.presign = true`, `GET`/`HEAD` of an archive answer **307** to a presigned URL and the bytes never enter this process. Verified end to end against real MinIO and Dart 3.12.2: publish, resolve, run — with the archive existing only in the bucket.
+- (server) **`blob.public_endpoint`** — the endpoint address *clients* reach, when it differs from the one this process dials. SigV4 signs the `host` header, so an already-signed URL cannot have its origin patched afterwards; the server builds a second, signing-only S3 client for this address instead. Real AWS (no custom endpoint) needs neither key.
+- (server) **`blob.presign_ttl_secs`**, default **1800**, bounded to `1500..=604800`. Neither bound is a preference: the floor is [sharp edge 4](docs/protocol.md#sharp-edges-violate--break-clients)'s retry-and-clock-drift allowance, the ceiling is SigV4's own maximum, above which signing fails at the library rather than at boot.
+- (server) **`archive_presign_total{outcome}`** in the [metrics catalogue](docs/ops/metrics.md), with an alert rule in [monitoring.md](docs/ops/monitoring.md). A signing failure falls back to streaming, so it costs latency and egress and never a 5xx — which means without this counter it presents only as S3 egress disappearing while the app tier gets busy.
+
+### Changed
+
+- (server) **`BlobStore::download` takes the request's method.** A presigned URL is signed *for one method*: SigV4 covers it, so a `GET`-signed URL is answered **403 SignatureDoesNotMatch** to the `HEAD` the pub client sends before every archive fetch — demonstrated against live MinIO, not inferred. The new `DownloadMethod` is a two-variant enum in `core` rather than an `http::Method`, because `core` takes no infrastructure dependency and the archive routes accept nothing else. Every backend that only streams ignores it.
+- (server) **Four presign misconfigurations are refused at boot rather than warned about**, each naming its own way out: a `blob.kind` that cannot sign; a custom `blob.endpoint` with no `blob.public_endpoint`; a signing origin equal to `server.public_url`'s origin (the client keeps its `Authorization` across a same-origin redirect, and S3 answers `400 InvalidArgument` to a request carrying two credentials, which breaks every authenticated download); and a TTL outside the bounds above. A warning was rejected deliberately — a knob set to `true` that quietly does nothing is the failure mode this project keeps finding.
+- (server) The startup summary and the boot log now state whether archive bytes leave through this process or through the object store, and at which address.
+
+### Notes
+
+- **Two properties an operator must decide about before enabling it.** A signed URL **outlives revocation**: revoking a token, suspending a user or making a package private does not reach a URL already issued, and the 1500-second floor means the shortest achievable window is 25 minutes. And SigV4 puts the **access key id** in every URL, so `blob.access_key` — typed `Secret` and masked in the startup summary — becomes public once presigning is on (`blob.secret_key` never leaves the process). Both are written into [S-18.a](docs/security.md#4-supply-chain--registry-integrity) rather than left to be discovered.
+- **Two costs are recorded rather than absorbed.** A signed URL is a **bearer capability** for its TTL — whoever holds it reads that archive with no token — so the S-24.f read bucket is spent at the redirect and the bytes themselves leave outside our rate limit, and intermediary caching of archives goes away (the redirect is `no-store`; it cannot carry the `immutable` tier a streamed archive does). Neither touches integrity: what a client verifies is `archive_sha256` from the listing, and the blob key *is* that hash, so S-19's serve-time check stays structural.
+- **Existence is deliberately not checked before signing.** Signing is offline; a `head` first would add a round trip to every archive `GET` *and* every client cache probe to improve the diagnosis of a store that has lost bytes. On the S3 backend a missing object is now the store's own 404 at the client rather than ours.
+- A counted download is now a **redirect issued** rather than bytes served. It was already an upper bound — a streamed download can be aborted mid-body — and it becomes a slightly looser one.
+
+### Tests
+
+- (server) `pub-blob`: the URL is signed for the method that asked for it (same instant, different signature), the configured TTL reaches `X-Amz-Expires`, the public endpoint is what gets signed and the private address never appears in a client URL, a broken signer streams the bytes instead of failing the download, and presigning is wired only where it is asked for.
+- (server) `pub-config`: the default does not presign, a presigning config with a public endpoint validates (as does real AWS with no endpoint at all), and each of the four refusals is asserted with the key its message must name — including that the bounds bind only when presigning is on.
+- (server) `protocol.rs`: the 307 carries the signed URL and no `ETag`, the plan is signed for the method the client used (`[Head, Get]`), and **no URL is signed for a caller who cannot read the package** — the visibility ladder runs in front of the plan, asserted by the blob double having been asked nothing.
+- (server) Every one of those was demonstrated **red** against a mutant before being kept. One mutation changed the wave: the wire assertion that the redirect carries `Cache-Control: no-store` stayed green against a handler that dropped it, because the S-28 response pass supplies that header for the whole pub family. The guarantee now has a unit test beside `redirect_to` that fails when the line goes, and the wire test says in its own comment which of the two proves what.
+
 ## 2026-08-15 — Phase 2 wave 5: reaching three mechanisms that were already built
 
 Roadmap Phase 2 items 8, 9 and 10. [Decision 33](docs/decisions.md#33--reaching-the-mechanisms-that-already-exist-the-token-model-on-the-wire-an-operator-surface-for-the-supply-chain-registers-and-errors-that-say-what-the-server-said) was recorded before any code, and [decision 16](docs/decisions.md#16--error-handling) moves from *proposed* to accepted with the client half it never had.

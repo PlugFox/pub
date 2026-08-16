@@ -167,6 +167,14 @@ No labels.
 
 Age of the last completed mirror sweep, in seconds. The number to alert on for a mirror-mode deployment: it grows without bound when the sweep stops.
 
+## `archive_presign_total`
+
+*counter*
+
+Labels: `outcome`
+
+Archive downloads planned by the S3 backend while `blob.presign` is on, by outcome: `signed` was answered with a 307 to a presigned URL, `failed` could not be signed and was streamed through this process instead (decision 34). A rising `failed` share is the object store's credential path failing, and it presents otherwise as S3 egress disappearing while the app tier gets busy.
+
 ## `blob_gc_scanned_total`
 
 *counter*
