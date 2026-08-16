@@ -20,7 +20,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 13 | CLI tokens: opaque `<prefix>_<base62x30><crc32x6>`, SHA-256 at rest     | accepted |
 | 14 | Frontend: Astro SSG + single Solid app island, Kobalte, hand-rolled SW  | accepted |
 | 15 | i18n: YAML + codegen (foxic-style), no i18n framework dependency        | accepted |
-| 16 | Errors: `thiserror` domain enums, RFC-ish envelope; no anyhow matching  | proposed |
+| 16 | Errors: `thiserror` domain enums, RFC-ish envelope; no anyhow matching  | accepted |
 | 17 | Branding: default name "Pub", token prefix `pub_`, white-label          | accepted |
 | 18 | Ops: release model, image registry, reference orchestrator             | accepted |
 | 19 | RBAC: cumulative role levels (0/50/100/200/250), one authorize() gate   | accepted |
@@ -34,6 +34,11 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 27 | Rate-limit identity model; read-path buckets; in-process outage fallback | accepted |
 | 28 | The observability plane: own listener, bounded labels, opt-in timing    | accepted |
 | 29 | A mail plane that cannot hide, and an offline way back in               | accepted |
+| 30 | Retention: one window per table, bounded deletes, privilege preserved   | accepted |
+| 31 | Blob lifecycle: staged sweep on by default, resumable archive GC        | accepted |
+| 32 | Quotas and limits: org storage, write buckets, one identity per request | accepted |
+| 33 | Token model on the wire, supply-chain registers, errors users can read  | accepted |
+| 34 | Presigned S3 downloads: off by default, public endpoint, bounded TTL    | accepted |
 
 ---
 
@@ -660,7 +665,7 @@ Two corrections belong at the top, because the roadmap asserts the opposite of t
   - a shadowing alarm ages from `acknowledged_at`, and an **active alarm is undeletable at every setting**, exactly as a pending invitation is ([decision 30](#30--retention-one-window-per-table-a-delete-that-stays-bounded-and-a-privilege-that-survives-the-feature)). Deleting an active alarm would be worse than pointless: the mirror sweep re-raises it on the next pass with a *fresh* `first_seen_at`, so retention would quietly rewrite the incident's start date.
   Both deletes are batched, looped and budgeted like every other one, and both are reported per table by the same `RetentionReport`.
 
-### Errors that reach the user — [decision 16](#16--error-handling-proposed) accepted
+### Errors that reach the user — [decision 16](#16--error-handling) accepted
 
 The server half of decision 16 has been true since the first slice: `thiserror` domain variants, a stable `code()`, one envelope, no `anyhow` string matching. Its client half was never written down, and what shipped throws the envelope away. The rule is **one function, three tiers, keyed on the code and never on the message**:
 
@@ -678,3 +683,53 @@ The server half of decision 16 has been true since the first slice: `thiserror` 
 - **A pattern typo is now a 400 instead of a token that authorizes nothing** — but a pattern that is *well-formed and wrong* (`acme-*` is refused, `acme_x*` for packages named `acme_y*` is not) still mints happily. The mint validates the grammar, never the intent, and the token list showing the patterns is what closes the loop.
 - **Users start seeing English fragments inside a localized UI** on tier-2 refusals. That is a visible product change, deliberate, and the reason it is recorded in a decision rather than left to a screen.
 - **Migration 0015 carries five index changes** — three created, two dropped — in both dialects, forward-only, per [rules/migrations.md](rules/migrations.md).
+
+---
+
+## 34 — Presigned downloads: the redirect branch becomes reachable, off by default, and honest about the address a client can dial
+
+> **Status: accepted.** Recorded 2026-08-16 before implementation, as the Phase 2 wave-6 enabling decision for roadmap item 5 (closes [D11](roadmap.md)).
+
+**Context.** [Decision 10](#10--blob-storage-via-object_store) says downloads "return `DownloadPlan::Redirect(presigned_url)` where the backend supports signing (S3) … designed in from day one". The type exists (`core/src/traits.rs:64`), the handler implements both arms (`api/src/protocol/pub_v2.rs:737-739`), and **nothing ever constructs the redirect**: `ObjectStoreBlob::download` (`blob/src/lib.rs:94`) always answers `Stream`. So on an S3 deployment every archive byte crosses the app process twice — S3 → app → client — while a `Redirect` arm sits in the router as dead code and a `DownloadPlan` enum with one reachable variant sits in `core`. This is the same shape as wave 5's three items: a mechanism built, tested, and reachable from nothing.
+
+One correction belongs at the top, because the roadmap asserts a default this decision does not take. [Roadmap Part III item 5](roadmap.md#phase-2--make-the-claims-true-closes-d2-d3-d9d12-d14-d19d23-d26-d31-d18-d20) records the sketch as "on by default for `s3`, 30-minute TTL, fall back to streaming when signing fails". The TTL and the fallback stand. **The default does not**, and the counter-example is in this repository: `docker/docker-compose.yml:165` sets `PUB_BLOB__ENDPOINT: http://s3:9000`, a container-network address. A URL signed for that host is unreachable from the laptop running `dart pub get`, and the redirect has already been sent — there is no fallback left. On by default would have shipped a change that breaks downloads outright on the commonest self-hosted S3 shape, and on our own `s3`/`full` compose profiles.
+
+### What is signed, and for which method
+
+- **The plan needs the request's method, so `download` takes one.** SigV4 puts the HTTP method inside the signature, so a URL signed for `GET` answers `SignatureDoesNotMatch` to a `HEAD`. The pub client issues a `HEAD` before every archive `GET` (the same behaviour `count_download` already exists to compensate for), and axum routes both to one handler — so a plan that could not distinguish them would make every cache probe fail on the S3 backend. `BlobStore::download` therefore becomes `download(&self, key: &str, method: DownloadMethod)`, with `DownloadMethod` a two-variant enum in `core` (`Get`, `Head`) rather than an `http::Method`, because `core` takes no infrastructure dependency and because those are the only two methods the archive routes accept. The default `BlobStore::get` — the in-process read used by the publish finalizer and the S-19 re-verification — passes `Get` and is unchanged in meaning: it drains a stream and refuses a redirect, exactly as before.
+- **A signed URL is signed by a store that knows the public address, not by rewriting one afterwards.** SigV4 signs the `host` header, so patching the origin of an already-signed URL invalidates it. When `blob.public_endpoint` is set, the S3 backend builds a **second `AmazonS3` from the same credentials and bucket with that endpoint**, used only for signing and never for I/O. The data path keeps using `blob.endpoint`. This is what lets the app reach MinIO at `http://s3:9000` while handing clients `https://blobs.example.com/...`.
+
+### Off by default, and every misconfiguration is a refusal rather than a warning
+
+`blob.presign` defaults to **`false`**. Turning it on is the operator asserting that the address in the signed URL is one their clients can dial, which is a fact no validator can check — so everything adjacent to it that *is* checkable is checked, and each check is a boot refusal naming the key and the way out. A warning was rejected for the reason wave 3a's review recorded: a configuration that says one thing and does another is the failure mode this project keeps finding, and a knob set to `true` that quietly does nothing is exactly that.
+
+With `blob.presign = true`, boot fails when:
+
+- **`blob.kind` is not `s3`.** Only that backend can sign. There is no reading of this flag under `fs` or `memory` that does anything, so accepting it would be storing an intention.
+- **`blob.endpoint` is set and `blob.public_endpoint` is not.** A custom endpoint is by construction a private one until an operator says otherwise; the error names `blob.public_endpoint` and says what it is for. Unset `blob.endpoint` means real AWS S3, whose endpoint is public by construction — that deployment needs nothing extra.
+- **The signing origin equals `server.public_url`'s origin** (scheme, host and port). [Sharp edge 4](protocol.md#sharp-edges-violate--break-clients) and the measurement behind it: `dart:io` drops `Authorization` across a **cross-origin** redirect and keeps it same-origin (verified on Dart 3.12.2). A kept `Authorization` arriving at S3 beside `X-Amz-Signature` is two auth mechanisms in one request, which S3 answers `400 InvalidArgument` — so this shape is broken for every authenticated download, which on a private registry is all of them. It is *not* broken for a fully anonymous instance, which is why the refusal is scoped to `presign = true` and the escape hatch (`presign = false`) is in the message rather than the check being softened.
+- **`blob.presign_ttl_secs` is outside `1500..=604800`.** Neither bound is chosen: the floor is [sharp edge 4](protocol.md#sharp-edges-violate--break-clients)'s "expiry ≥25 min — retries + clock drift", and the ceiling is SigV4's own seven-day limit, above which signing fails at the library. The default is **1800** (30 minutes).
+
+### Failure, and what is deliberately not checked
+
+- **Signing failure falls back to streaming, once, per request.** A credential provider that cannot answer is an outage of the signing path and not of the download path; the request re-plans as a `Stream` and the bytes still arrive, more slowly. It is counted (`archive_presign_total{outcome="failed"}`) and logged at `warn`, and [ops/monitoring.md](ops/monitoring.md) gains an alert on the ratio — a silent fallback would present as "S3 egress disappeared and the app tier got busy", which is not a page anybody can read.
+- **Existence is deliberately not checked before signing.** Signing is offline; adding a `head` would put a round trip to S3 in front of every archive `GET` *and* every client cache probe — two per download — to improve an outcome that means the blob store has lost bytes a live version row still references. The accepted cost, recorded here so it is not discovered: on the S3 backend a missing object is S3's own XML `NoSuchKey` at the client instead of our 404, and the `archive bytes missing for a live version` error log does not fire. The signal for that condition stays where it belongs — the archive collector's reference check and its dry-run default ([decision 31](#31--blob-lifecycle-staged-uploads-swept-by-default-and-an-archive-gc-that-streams-batches-and-resumes)).
+
+### What the redirect response is, and what it stops being
+
+- **`307`, with `Cache-Control: no-store`, set by the handler and not by the middleware.** 307 is unchanged from the dead branch and for the same reason (the method must not change). `no-store` is new and is the point: a presigned URL is a **bearer capability** with a bounded life, and a shared cache holding one hands the archive to whoever asks next. The header is set at the site rather than left to the S-28 pass, so it cannot be lost by a future change to the no-store family.
+- **The archive stops being cacheable by intermediaries on this path.** The streamed response carries `private, max-age=31536000, immutable` — everything content addressing buys — and a 307 to a URL that expires in thirty minutes can carry none of it. S3's own response has no `immutable` either. The client's `PUB_CACHE` is unaffected (it is keyed on name+version locally), so what is lost is CDN/proxy caching of archive bytes, which is what an operator choosing S3 is generally buying elsewhere.
+- **The `ETag` a client sees changes on this path**, from our `"<sha256>"` to S3's own entity tag. The integrity contract does not move: `archive_sha256` in the version listing is what the client verifies and what lands in `pubspec.lock` ([sharp edge 3](protocol.md#sharp-edges-violate--break-clients)). The consequence is confined to conditional-request behaviour, and it is consistent per deployment.
+- **S-19's serve-time re-verification stays structural and unweakened.** It never was a hash computed at serve time: the blob key *is* the content hash, so "serve the bytes for this sha256" is the only thing the serve path can express, and a presigned URL for that key expresses exactly the same thing. What a redirect removes is our ability to *observe* the bytes leaving, which we did not do either.
+
+### Two costs on the abuse surface, taken deliberately
+
+- **A download's rate limit is spent at the redirect, not at the bytes.** The S-24.f read bucket is charged by the middleware before the handler runs, so a caller can collect signed URLs at the bucket's rate and then fetch them from S3 in parallel, outside our budget, for the life of the TTL. This is inherent to handing out capabilities and is the same trade every registry using presigned downloads makes; what bounds it is the TTL and S3's own limits, not us. Recorded rather than mitigated, because the mitigation is "do not presign".
+- **A counted download is now a redirect issued, not bytes served.** `download_stats` counts at the same place it always did (GET only, never HEAD), but on this path we no longer observe whether the client followed the redirect. The figure was already an upper bound — a streamed download can be aborted mid-body — and it becomes a slightly looser one.
+
+**Consequences.**
+
+- **A trait signature changes across the workspace.** `BlobStore::download` gains a parameter; the seven test doubles in `registry`, `jobs` and `api` follow it. This is the honest cost of a plan that has to know what it is planning for, and it is the compiler enforcing that a signing backend can never be asked a question it cannot answer.
+- **`blob` gains three keys** — `presign`, `presign_ttl_secs`, `public_endpoint` — which the generated [configuration reference](ops/configuration.md) picks up from the struct docs, and one new instrument in the [metrics catalogue](ops/metrics.md).
+- **The compose `s3` and `full` profiles document the split rather than enabling it.** They keep `presign` off and carry the two keys commented with the address a laptop can reach, because a profile that silently worked only from inside the network would teach the wrong shape.
+- **A new normative requirement records what a signed URL is** — [S-18.a](security.md#4-supply-chain--registry-integrity): the bearer-capability property, the TTL floor and its origin, the `Authorization` interplay, and the fact that the integrity claim is the listing's `archive_sha256` and never the transport.
