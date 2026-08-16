@@ -1,7 +1,11 @@
-//! Runs the shared repository contract suite against PostgreSQL — the CI backend matrix leg
-//! (docs/architecture.md). Gated **at runtime** by the `PUB_TEST_POSTGRES_URL` environment
-//! variable: when it is unset every test returns early after a skip note on stderr. No
-//! `#[ignore]` attributes — CI enables the suite purely by exporting the variable.
+//! Runs the shared repository contract suite against PostgreSQL — one leg of the backend
+//! matrix ([decision 35](../../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)).
+//!
+//! Gated **at runtime** by `PUB_TEST_POSTGRES_URL`, and the gate fails closed: with neither
+//! that variable nor `PUB_TEST_NO_POSTGRES` set, every test here panics naming both. Before
+//! decision 35 the unset case returned early and reported `ok`, so a dead database and a
+//! passing suite printed the same thing — 31 tests, 0.00 s, port 5432 closed. No `#[ignore]`
+//! attributes: CI enables the suite purely by exporting the URL, and sets no opt-out.
 //!
 //! Each test creates a throwaway, uniquely named database on the target server, migrates it,
 //! runs one contract function, and drops the database again. On a failed assertion the
@@ -14,9 +18,6 @@ use pub_core::traits::Repositories;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Connection as _, PgConnection, PgPool};
 
-/// Environment variable carrying the admin connection URL of the test server.
-const URL_ENV: &str = "PUB_TEST_POSTGRES_URL";
-
 /// One throwaway database on the configured server.
 struct TestDb {
     admin_url: String,
@@ -25,12 +26,17 @@ struct TestDb {
 }
 
 impl TestDb {
-    /// Creates and migrates a fresh uniquely named database; `None` (after a skip note on
-    /// stderr) when [`URL_ENV`] is not set.
+    /// Creates and migrates a fresh uniquely named database; `None` only when the operator
+    /// explicitly opted out of the Postgres leg.
+    ///
+    /// # Panics
+    ///
+    /// When neither `PUB_TEST_POSTGRES_URL` nor `PUB_TEST_NO_POSTGRES` is set — see
+    /// [`pub_test_support::OptionalBackend::gate`].
     async fn create(test: &str) -> Option<Self> {
-        let Ok(admin_url) = std::env::var(URL_ENV) else {
-            eprintln!("skipping {test}: {URL_ENV} is not set (the postgres contract suite runs in CI)");
-            return None;
+        let admin_url = match pub_test_support::POSTGRES.gate(test) {
+            pub_test_support::Gate::Run(url) => url,
+            pub_test_support::Gate::Skipped => return None,
         };
         // Unique and SQL-safe by construction: a dash-stripped UUID v7 is `[0-9a-f]{32}`.
         let name = format!("pub_contract_{}", pub_core::UserId::new().to_string().replace('-', ""));
@@ -105,6 +111,16 @@ async fn invitations_contract() {
 async fn session_repo_contract_s08_s09_s10() {
     let Some(db) = TestDb::create("session_repo_contract_s08_s09_s10").await else { return };
     pub_db_tests::contract::session_repo(&db.repos()).await;
+    db.cleanup().await;
+}
+
+/// **S-08 under real concurrency.** The throwaway database's pool holds five connections, so
+/// this leg races for real — and it is the leg that answers what the *production* backend
+/// does, which the SQLite one cannot: the two dialects fail a lost race in different ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_rotation_is_single_winner_s08() {
+    let Some(db) = TestDb::create("session_rotation_is_single_winner_s08").await else { return };
+    pub_db_tests::contract::session_rotation_is_single_winner(&db.repos()).await;
     db.cleanup().await;
 }
 
@@ -558,8 +574,9 @@ async fn s22_a_the_hardened_app_role_prunes_audit_without_holding_delete() {
     let admin_pool = db.pool.clone();
     db.cleanup().await;
     let _ = admin_pool;
-    let mut admin =
-        PgConnection::connect(&std::env::var(URL_ENV).expect("url")).await.expect("connect to postgres admin");
+    let mut admin = PgConnection::connect(&std::env::var(pub_test_support::POSTGRES.url_env).expect("url"))
+        .await
+        .expect("connect to postgres admin");
     sqlx::query(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
         .execute(&mut admin)
         .await

@@ -23,7 +23,7 @@ use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::{StatusCode, header};
-use common::{TestApp, TestOptions, package_archive};
+use common::{TestApp, TestDatabase, TestOptions, package_archive};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pub_core::token::TokenScope;
 use pub_core::{Format, OrgId, RoleLevel, UserId};
@@ -380,11 +380,22 @@ async fn s24_parallel_uploads_cannot_exceed_the_org_publish_budget() {
     // bounds one *burst* rather than one upload — and staged blobs are the thing it exists to
     // bound, since nothing sweeps abandoned ones yet.
     //
-    // A wire-level guard, not the race proof: the token and org lookups ahead of the budget hit
-    // the single-connection `:memory:` pool, which staggers the burst enough that the old
-    // read-modify-write also passed this. `ratelimit::hit_is_atomic_under_concurrency` is where
-    // the defect is actually caught.
-    let app = Arc::new(TestApp::with_options(TestOptions { publish_per_hour_org: 2, ..TestOptions::default() }).await);
+    // A wire-level guard, not the race proof — and the reason is now measured rather than
+    // assumed. The harness no longer staggers the burst: `FileSqlite` gives the token and org
+    // lookups a real pool, closing the half of this that was [D51](../../../../docs/roadmap.md).
+    // What remains is the window itself: `hit`'s read and write are a few nanoseconds apart
+    // inside the KV, and eight HTTP uploads do not reliably land between them — a deliberately
+    // reverted read-modify-write limiter still passes this test.
+    // `ratelimit::hit_is_atomic_under_concurrency` is where the defect is actually caught, at
+    // 64 tasks on one key.
+    let app = Arc::new(
+        TestApp::with_options(TestOptions {
+            publish_per_hour_org: 2,
+            database: TestDatabase::FileSqlite,
+            ..TestOptions::default()
+        })
+        .await,
+    );
     let acme = publisher(&app, "dev@acme.test", "acme").await;
     let upload_url = format!("{}/api/packages/versions/newUpload", acme.base());
     let archive = Arc::new(package_archive("acme_core", "1.0.0"));

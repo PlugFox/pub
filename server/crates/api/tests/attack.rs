@@ -11,7 +11,9 @@ use std::time::Duration as StdDuration;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use chrono::Duration;
-use common::{ApiResponse, DEFAULT_IP, FailingKv, INSTANCE_ORIGIN, TestApp, TestOptions, token_body, wrong_code};
+use common::{
+    ApiResponse, DEFAULT_IP, FailingKv, INSTANCE_ORIGIN, TestApp, TestDatabase, TestOptions, token_body, wrong_code,
+};
 use pub_auth::jwt::{Claims, Keyring};
 use pub_auth::otp;
 use pub_auth::token as cli_token;
@@ -24,9 +26,25 @@ const EMAIL: &str = "dev@corp.com";
 /// Two parallel wrong codes must cost two attempts. Under a get-modify-set counter both
 /// requests read the same value and write the same increment, so a burst of guesses costs one
 /// attempt and the ≤5 budget stops bounding anything.
+///
+/// **What this test proves, and what it does not.** It runs on a pool that admits real
+/// concurrency (`FileSqlite`), so the two requests genuinely overlap — which the `:memory:`
+/// default prevented. It still does **not** discriminate the defect in its own first
+/// paragraph: measured during [decision 35](../../../../docs/decisions.md)'s wave, this test
+/// and its bulk sibling passed five runs out of five against a deliberately reverted
+/// read-modify-write budget, because the window between that read and that write is a few
+/// nanoseconds inside the KV and two HTTP requests do not reliably land inside it. The
+/// property is proven where the window is the whole test: `Kv::incr`'s atomicity, asserted at
+/// 64 concurrent increments per backend by the contract suite in `pub-kv`, is the single
+/// operation this budget is built from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s03_parallel_wrong_codes_each_spend_an_attempt() {
-    let app = TestApp::with_options(TestOptions { login_per_ip_minute: 100, ..TestOptions::default() }).await;
+    let app = TestApp::with_options(TestOptions {
+        login_per_ip_minute: 100,
+        database: TestDatabase::FileSqlite,
+        ..TestOptions::default()
+    })
+    .await;
     let (pending_id, code) = app.request_otp(EMAIL).await;
     let bad = wrong_code(&code);
 
@@ -48,7 +66,12 @@ async fn s03_parallel_wrong_codes_each_spend_an_attempt() {
 /// dead afterwards — the attacker bought nothing by parallelising.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s03_concurrent_burst_exhausts_the_budget_and_kills_the_code() {
-    let app = TestApp::with_options(TestOptions { login_per_ip_minute: 100, ..TestOptions::default() }).await;
+    let app = TestApp::with_options(TestOptions {
+        login_per_ip_minute: 100,
+        database: TestDatabase::FileSqlite,
+        ..TestOptions::default()
+    })
+    .await;
     let (pending_id, code) = app.request_otp(EMAIL).await;
     let bad = wrong_code(&code);
 
@@ -258,9 +281,22 @@ async fn s24_kv_outage_fails_closed_on_the_otp_endpoint() {
 
 /// Two concurrent refreshes of the same token: exactly one may win, and the loser must fail
 /// loudly. A silent second success would mean two live refresh chains from one theft.
+///
+/// **Demonstrated red before it was kept**, which is what makes it a guard rather than a
+/// hopeful assertion: on `TestDatabase::FileSqlite` the loser used to answer **500
+/// `database_error`**, because the SQLite `rotate` read the row and then wrote it in a
+/// deferred transaction and the second writer hit `SQLITE_BUSY_SNAPSHOT`. The test passed for
+/// years on the `:memory:` harness, whose single connection turned the race into two
+/// sequential calls ([D51](../../../../docs/roadmap.md)). Leave the database knob out and it
+/// goes back to proving nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s08_concurrent_refresh_has_exactly_one_winner() {
-    let app = TestApp::with_options(TestOptions { login_per_ip_minute: 100, ..TestOptions::default() }).await;
+    let app = TestApp::with_options(TestOptions {
+        login_per_ip_minute: 100,
+        database: TestDatabase::FileSqlite,
+        ..TestOptions::default()
+    })
+    .await;
     let login = app.login(EMAIL).await;
     let refresh_token = login["refresh_token"].as_str().unwrap().to_owned();
 
@@ -276,7 +312,12 @@ async fn s08_concurrent_refresh_has_exactly_one_winner() {
     assert_eq!(winners.len(), 1, "exactly one rotation may succeed");
     let losers: Vec<&ApiResponse> = responses.iter().filter(|r| r.status != StatusCode::OK).collect();
     assert_eq!(losers.len(), 1);
-    assert_eq!(losers[0].status, StatusCode::UNAUTHORIZED, "the loser must be rejected, never silently accepted");
+    assert_eq!(
+        losers[0].status,
+        StatusCode::UNAUTHORIZED,
+        "the loser must be rejected, never silently accepted and never with a 5xx: {:?}",
+        losers[0].json
+    );
     assert!(
         matches!(losers[0].error_code(), "refresh_reused" | "unauthorized"),
         "unexpected loser code: {}",

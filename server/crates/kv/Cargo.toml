@@ -17,4 +17,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 
 [dev-dependencies]
+# The Kv contract suite (decision 35) runs the same properties against MemoryKv and RedisKv;
+# the Redis leg is gated by PUB_TEST_REDIS_URL through the shared backend gate.
+pub-test-support = { workspace = true }
 tokio = { workspace = true }

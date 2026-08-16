@@ -100,6 +100,30 @@ impl SessionRepo for SqliteSessionRepo {
         row.map(TryInto::try_into).transpose()
     }
 
+    /// **The swap is one conditional statement, and that is what decides the race (S-08).**
+    ///
+    /// It used to be `SELECT` the row, check it in Rust, then `UPDATE … WHERE id = ?`, inside a
+    /// transaction — with a comment calling the result an atomic swap. It was not one. SQLite's
+    /// transactions are deferred: the `SELECT` takes a read snapshot without a write lock, so
+    /// two rotations of the same token both read the live row, and the second one's `UPDATE`
+    /// finds another writer has committed since its snapshot. That is `SQLITE_BUSY_SNAPSHOT`,
+    /// which the busy timeout deliberately does **not** wait out (waiting cannot resolve a
+    /// conflict that has already happened), so the loser of the race got `database is locked` —
+    /// a 500 on the endpoint every signed-in browser calls, where the auth layer can neither
+    /// tell it apart from a store that fell over nor act on it: no family revocation, no
+    /// cleared session, and a client that retries.
+    ///
+    /// Making the predicate part of the write removes the read that created the conflict. A
+    /// statement whose transaction has not read anything simply waits for the write lock —
+    /// which is what the busy timeout is for — and then matches zero rows, because the hash it
+    /// is looking for is no longer the current one. The loser lands in the ordinary
+    /// reuse-detection path below and gets the answer S-08 asks for.
+    ///
+    /// The Postgres sibling reaches the same property differently and correctly:
+    /// `SELECT … FOR UPDATE` blocks the second reader until the first commits, and under READ
+    /// COMMITTED the predicate is then re-evaluated against the updated row, which no longer
+    /// matches. Both dialects are held to `session_rotation_is_single_winner` in the contract
+    /// suite, which races 25 rounds behind a barrier — one attempt does not reliably overlap.
     async fn rotate(
         &self,
         old_hash: &str,
@@ -107,52 +131,64 @@ impl SessionRepo for SqliteSessionRepo {
         limits: &SessionLimits,
         now: DateTime<Utc>,
     ) -> Result<Session> {
-        let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let current: Option<SessionRow> = sqlx::query_as(q!("SELECT {COLS} FROM sessions WHERE refresh_hash = ?"))
-            .bind(old_hash)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-
-        let Some(current) = current else {
-            // Not the current hash of any session — was it rotated out? (S-08 reuse detection)
-            let reused: Option<SqliteRow> = sqlx::query("SELECT id FROM sessions WHERE prev_refresh_hash = ?")
-                .bind(old_hash)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            return match reused {
-                Some(row) => {
-                    let sid: String = row.get("id");
-                    Err(Error::RefreshReused { session: parse_col(&sid)? })
-                }
-                None => Err(Error::NotFound { what: "session".to_owned() }),
-            };
-        };
-
-        if current.revoked_at.is_some() {
-            // Revoked sessions behave as unknown — no oracle for stolen hashes.
-            return Err(Error::NotFound { what: "session".to_owned() });
-        }
-        if parse_ts(&current.last_seen_at)? < cutoff(now, limits.idle_timeout)
-            || parse_ts(&current.created_at)? < cutoff(now, limits.absolute_cap)
-        {
-            return Err(Error::Expired { what: "session".to_owned() });
-        }
-
-        // Atomic swap: the old hash moves to the reuse-detection slot, activity slides.
-        let row: SessionRow = sqlx::query_as(q!(
+        // Every condition the old code checked in Rust, moved into the statement: the hash must
+        // still be the current one, the session must be live, and both windows must hold.
+        let swapped: Option<SessionRow> = sqlx::query_as(q!(
             "UPDATE sessions SET prev_refresh_hash = refresh_hash, refresh_hash = ?, last_seen_at = ? \
-             WHERE id = ? RETURNING {COLS}"
+             WHERE refresh_hash = ? AND revoked_at IS NULL AND last_seen_at >= ? AND created_at >= ? \
+             RETURNING {COLS}"
         ))
         .bind(new_hash)
         .bind(super::ts(now))
-        .bind(&current.id)
-        .fetch_one(&mut *tx)
+        .bind(old_hash)
+        .bind(super::ts(cutoff(now, limits.idle_timeout)))
+        .bind(super::ts(cutoff(now, limits.absolute_cap)))
+        .fetch_optional(&self.pool)
         .await
         .map_err(|err| write_err(err, "refresh hash already exists", "session"))?;
-        tx.commit().await.map_err(db_err)?;
-        row.try_into()
+        if let Some(row) = swapped {
+            return row.try_into();
+        }
+
+        // Nothing matched, so this call is refused; the reads below only decide *which* refusal,
+        // in the same order the pre-conditional code used — current hash first, reuse slot
+        // second. They run outside any transaction because they change nothing: the refusal has
+        // already happened, and the worst a concurrent rotation can do to them is pick a
+        // different one of two refusals.
+        let current: Option<SessionRow> = sqlx::query_as(q!("SELECT {COLS} FROM sessions WHERE refresh_hash = ?"))
+            .bind(old_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        if let Some(current) = current {
+            // Revoked sessions behave as unknown — no oracle for stolen hashes.
+            if current.revoked_at.is_some() {
+                return Err(Error::NotFound { what: "session".to_owned() });
+            }
+            if parse_ts(&current.last_seen_at)? < cutoff(now, limits.idle_timeout)
+                || parse_ts(&current.created_at)? < cutoff(now, limits.absolute_cap)
+            {
+                return Err(Error::Expired { what: "session".to_owned() });
+            }
+            // The row is live and still carries this hash, yet the swap matched nothing: the
+            // only way there is a rotation that committed and moved it on between the two
+            // statements. Answering "unknown" is the safe read of a hash we cannot claim.
+            return Err(Error::NotFound { what: "session".to_owned() });
+        }
+
+        // Not the current hash of any session — was it rotated out? (S-08 reuse detection)
+        let reused: Option<SqliteRow> = sqlx::query("SELECT id FROM sessions WHERE prev_refresh_hash = ?")
+            .bind(old_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        match reused {
+            Some(row) => {
+                let sid: String = row.get("id");
+                Err(Error::RefreshReused { session: parse_col(&sid)? })
+            }
+            None => Err(Error::NotFound { what: "session".to_owned() }),
+        }
     }
 
     async fn touch(&self, id: SessionId, throttle: Duration, now: DateTime<Utc>) -> Result<bool> {

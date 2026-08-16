@@ -10,12 +10,18 @@ publish.workspace = true
 chrono = { workspace = true }
 pub-core = { workspace = true }
 serde_json = { workspace = true }
+# The S-08 rotation contract spawns two callers at once: a race is a property of the
+# statement, and asserting it needs two tasks rather than two sequential calls.
+tokio = { workspace = true }
 
 [dev-dependencies]
 pub-config = { workspace = true }
 pub-db-postgres = { workspace = true }
 pub-db-sqlite = { workspace = true }
+pub-test-support = { workspace = true }
 # postgres: the env-gated contract run creates/drops throwaway databases on a live server.
 # sqlite: the query-plan assertions that keep the drain's per-tick statements off a full scan.
 sqlx = { workspace = true, features = ["postgres", "sqlite"] }
+# The file-backed SQLite leg: a pool of more than one connection needs a database on disk.
+tempfile = { workspace = true }
 tokio = { workspace = true }

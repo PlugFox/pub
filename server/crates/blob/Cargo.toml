@@ -19,6 +19,11 @@ pub-core = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+pub-test-support = { workspace = true }
+# The S3 leg of the BlobStore contract suite (decision 35) *dials* the presigned URL: whether
+# S3 refuses a method the signature does not cover is S3's behaviour, and no offline assertion
+# can reach it.
+reqwest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }

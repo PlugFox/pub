@@ -70,9 +70,10 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Postgres leg of the backend matrix: the shared repository contract suite
-    # (crates/db-tests/tests/postgres.rs) is gated at runtime by PUB_TEST_POSTGRES_URL —
-    # exported below, so it runs here and skips cleanly on machines without the variable.
+    # The backend matrix (decision 35). Each optional backend is addressed by one PUB_TEST_*
+    # variable, exported below beside the service that serves it; **no opt-out is set here**,
+    # so a service that fails to start — or an env line deleted from this file — fails the
+    # build instead of skipping green. That is the whole of D16's exit.
     services:
       postgres:
         image: postgres:17-alpine
@@ -87,8 +88,26 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Valkey, matching docker/docker-compose.yml's redis profile: the Kv contract suite's
+      # Redis leg is the first automated execution RedisKv has ever had.
+      redis:
+        image: valkey/valkey:8-alpine
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      # MinIO is deliberately NOT a service container: the image needs `server /data` as its
+      # command and the `services:` block cannot set one, so it is started as a step below.
     env:
       PUB_TEST_POSTGRES_URL: postgres://pub:pub@127.0.0.1:5432/pub
+      PUB_TEST_REDIS_URL: redis://127.0.0.1:6379
+      PUB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      PUB_TEST_S3_ACCESS_KEY: pub-minio
+      PUB_TEST_S3_SECRET_KEY: pub_dev_password
+      PUB_TEST_S3_BUCKET: pub
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08
@@ -97,5 +116,28 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: server -> target
+      # MinIO, and then the bucket. The bucket is not the server: an S3 leg that fails because
+      # nobody created a bucket is a different failure from one whose endpoint is down, and the
+      # suite says which — creating it here is what keeps the second message out of CI.
+      - name: Start MinIO and create the test bucket
+        run: |
+          docker run -d --name pub-minio --network host \
+            -e "MINIO_ROOT_USER=$PUB_TEST_S3_ACCESS_KEY" \
+            -e "MINIO_ROOT_PASSWORD=$PUB_TEST_S3_SECRET_KEY" \
+            minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            curl -sf "$PUB_TEST_S3_ENDPOINT/minio/health/live" && break
+            sleep 2
+          done
+          curl -sf "$PUB_TEST_S3_ENDPOINT/minio/health/live"
+          docker run --rm --network host --entrypoint sh \
+            -e "ENDPOINT=$PUB_TEST_S3_ENDPOINT" \
+            -e "ACCESS_KEY=$PUB_TEST_S3_ACCESS_KEY" \
+            -e "SECRET_KEY=$PUB_TEST_S3_SECRET_KEY" \
+            -e "BUCKET=$PUB_TEST_S3_BUCKET" \
+            minio/mc:latest -ceu '
+              mc alias set pub "$ENDPOINT" "$ACCESS_KEY" "$SECRET_KEY"
+              mc mb --ignore-existing "pub/$BUCKET"
+            '
       # --locked: CI must build exactly the committed Cargo.lock (S-30).
       - run: cargo test --workspace --locked

@@ -9,10 +9,35 @@ default:
 # --- validation ------------------------------------------------------------
 
 # Full server validation pipeline (fmt, clippy, tests)
+#
+# The optional backend legs (postgres, redis, s3) run when their PUB_TEST_*_URL / _ENDPOINT is
+# exported and are skipped **out loud** otherwise — decision 35: a leg that did not run and a
+# leg that passed used to be the same green. `just db-up full` plus the three exports below
+# turns every leg on; CI exports them beside its service containers and sets no opt-out, so a
+# backend that fails to start is a red build there.
 server-check:
-    cd server && cargo fmt --check
-    cd server && cargo clippy --all-targets -- -D warnings
-    cd server && cargo test --workspace
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd server
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+    skipped=()
+    if [ -z "${PUB_TEST_POSTGRES_URL:-}" ]; then
+        export PUB_TEST_NO_POSTGRES=1
+        skipped+=("postgres (just db-up pg; export PUB_TEST_POSTGRES_URL=postgres://pub:pub_dev_password@127.0.0.1:5432/pub)")
+    fi
+    if [ -z "${PUB_TEST_REDIS_URL:-}" ]; then
+        export PUB_TEST_NO_REDIS=1
+        skipped+=("redis (just db-up redis; export PUB_TEST_REDIS_URL=redis://127.0.0.1:6379)")
+    fi
+    if [ -z "${PUB_TEST_S3_ENDPOINT:-}" ]; then
+        export PUB_TEST_NO_S3=1
+        skipped+=("s3 (just db-up s3; export PUB_TEST_S3_ENDPOINT=http://127.0.0.1:9000)")
+    fi
+    for leg in ${skipped[@]+"${skipped[@]}"}; do
+        printf '  \033[33mSKIPPED BACKEND LEG\033[0m %s\n' "$leg"
+    done
+    cargo test --workspace
 
 # Full web validation pipeline (typecheck+lint+contrast, build, tests)
 web-check:

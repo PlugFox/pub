@@ -38,6 +38,12 @@ const MAX_NOTIFICATION_BATCH: usize = 500;
 /// the predicate; the bound has its own scenarios.
 const PURGE_BATCH: u32 = 1_000;
 
+/// Rounds the S-08 rotation race runs. The window between a rotation's read and its write is
+/// narrow, so one attempt that happens not to overlap proves nothing; every round asserts the
+/// same deterministic property, and once the swap is a single conditional statement the count
+/// only costs time.
+const ROTATION_RACE_ROUNDS: u32 = 25;
+
 /// Deterministic base instant for every scenario (no wall clock in tests).
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap()
@@ -638,6 +644,101 @@ pub async fn session_repo(repos: &Repositories) {
     assert_eq!(repos.sessions.revoke_all_for_user(alice.id, t0() + days(1)).await.expect("revoke all"), 2);
     assert!(repos.sessions.list_for_user(alice.id).await.expect("list empty").is_empty());
     assert_eq!(repos.sessions.revoke_all_for_user(alice.id, t0() + days(1)).await.expect("nothing left"), 0);
+}
+
+/// **S-08.** Two concurrent rotations of one refresh token: exactly **one** may win, and the
+/// loser must be refused with an answer the auth layer can act on.
+///
+/// This is a separate contract function because it is the one session property a
+/// single-connection pool cannot express, and until [decision 35](../../../../docs/decisions.md)
+/// every leg of this suite had one: the `:memory:` SQLite database is pinned to a single
+/// connection, so two "concurrent" rotations were two sequential ones and the second took the
+/// ordinary reuse-detection path. Run this against a pool that admits real concurrency —
+/// file-backed SQLite, or the Postgres leg — or it proves nothing.
+///
+/// The property is stated as *loser gets a decision*, not merely as "one winner": a rotation
+/// that loses the race and reports a database error is a 500 on the endpoint every signed-in
+/// browser calls, and the auth layer cannot tell it apart from a store that fell over, so it
+/// neither revokes the family (which reuse would demand) nor clears the client's session.
+pub async fn session_rotation_is_single_winner(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let limits = SessionLimits::DEFAULT;
+
+    // Rounds, with both callers released by a barrier, because the window is narrow and a
+    // single attempt that happens not to overlap would pass for the wrong reason — the exact
+    // failure this function exists to stop being possible. The assertion inside a round is
+    // deterministic: no round may produce two winners, and none may fail with a store error.
+    for round in 0..ROTATION_RACE_ROUNDS {
+        let current = format!("race-{round}-current");
+        let (next_a, next_b) = (format!("race-{round}-a"), format!("race-{round}-b"));
+        let session = repos
+            .sessions
+            .create(NewSession { user_id: alice.id, refresh_hash: current.clone(), user_agent: None, ip: None }, t0())
+            .await
+            .expect("seed session");
+
+        // Both callers present the *same* current hash — one client retrying, two browser tabs,
+        // or an attacker replaying a stolen token beside its owner. They differ only in what
+        // they ask to rotate to, which is what makes "who won" observable afterwards.
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let at = t0() + minutes(1);
+        let mut racers = Vec::new();
+        for next in [next_a.clone(), next_b.clone()] {
+            let (sessions, gate, current) =
+                (std::sync::Arc::clone(&repos.sessions), std::sync::Arc::clone(&gate), current.clone());
+            racers.push(tokio::spawn(async move {
+                gate.wait().await;
+                sessions.rotate(&current, &next, &SessionLimits::DEFAULT, at).await
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for racer in racers {
+            outcomes.push(racer.await.expect("join"));
+        }
+
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "round {round}: exactly one rotation may succeed — two winners are two live refresh chains from one \
+             stolen token (S-08): {outcomes:?}"
+        );
+        let loser = outcomes.iter().find_map(|outcome| outcome.as_ref().err()).expect("one loser");
+        assert!(
+            matches!(loser.code(), "refresh_reused" | "not_found"),
+            "round {round}: the loser must be told it lost, not that the database failed: {loser}"
+        );
+
+        // The winner's hash is the session's current one, the loser's hash does not exist, and
+        // the raced hash has landed in the reuse-detection slot rather than vanishing.
+        let winner_hash = if outcomes[0].is_ok() { &next_a } else { &next_b };
+        let loser_hash = if outcomes[0].is_ok() { &next_b } else { &next_a };
+        let live = repos
+            .sessions
+            .find_by_refresh_hash(winner_hash, &limits, t0() + minutes(2))
+            .await
+            .expect("look up the winner's hash")
+            .expect("the winning rotation's new hash must be the session's current one");
+        assert_eq!(live.id, session.id, "round {round}: a rotation must stay on its own session row");
+        assert!(
+            repos
+                .sessions
+                .find_by_refresh_hash(loser_hash, &limits, t0() + minutes(2))
+                .await
+                .expect("look up")
+                .is_none(),
+            "round {round}: the losing rotation must not have left a usable hash behind"
+        );
+        let reused = repos
+            .sessions
+            .rotate(&current, &format!("race-{round}-c"), &limits, t0() + minutes(3))
+            .await
+            .expect_err("the old hash is spent");
+        assert_eq!(
+            reused.code(),
+            "refresh_reused",
+            "round {round}: the raced hash must land in the reuse-detection slot, not vanish"
+        );
+    }
 }
 
 /// `TokenRepo`: active-by-hash semantics (expiry, revocation, the D37 holder-status gate),

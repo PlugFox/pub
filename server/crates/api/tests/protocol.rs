@@ -28,7 +28,7 @@ mod common;
 
 use axum::http::{Method, StatusCode, header};
 use chrono::Duration;
-use common::{ApiResponse, PUB_ACCEPT, PUB_MEDIA_TYPE, TestApp, TestOptions, package_archive};
+use common::{ApiResponse, PUB_ACCEPT, PUB_MEDIA_TYPE, TestApp, TestDatabase, TestOptions, package_archive};
 use pub_api::protocol::pub_v2::MAX_LISTED_VERSIONS;
 use pub_blob::ObjectStoreBlob;
 use pub_core::package::{PackageOptions, Visibility};
@@ -277,7 +277,18 @@ async fn s24_parallel_token_auth_failures_each_spend_the_budget() {
     // buys nothing. A `get` → decide → `set` counter lets a whole burst share one unit, which
     // hands an attacker unlimited 401s — and every one of those costs a co-located client its
     // stored credential (S-14.a).
-    let app = TestApp::with_options(TestOptions { token_auth_fail_per_ip_minute: 5, ..TestOptions::default() }).await;
+    //
+    // The pool is file-backed so the burst really overlaps (D51), but this is a wire-shape
+    // guard, not the atomicity proof: measured against a reverted read-modify-write limiter it
+    // still passes, because the racing window lives inside the KV and is nanoseconds wide.
+    // `pub_auth::ratelimit::tests::hit_is_atomic_under_concurrency` is the discriminator — it
+    // admits 20 against a budget of 5 the moment `hit` stops being one increment.
+    let app = TestApp::with_options(TestOptions {
+        token_auth_fail_per_ip_minute: 5,
+        database: TestDatabase::FileSqlite,
+        ..TestOptions::default()
+    })
+    .await;
     let acme = publisher(&app, "dev@acme.test", "acme").await;
     publish_ok(&app, &acme, "acme_core", "1.0.0").await;
     let path = format!("{}/api/packages/acme_core", acme.base());

@@ -58,8 +58,40 @@ pub const TEST_PEPPER: &[u8] = b"integration-test-pepper";
 /// The KEK of the test policy (S-05 sealing); tests unseal stored blobs with it.
 pub const TEST_KEK: [u8; 32] = [7u8; 32];
 
+/// What the harness boots its database on.
+///
+/// This exists because the default was silently deciding the outcome of every concurrency
+/// test in the suite ([D51](../../../../../docs/roadmap.md),
+/// [decision 35](../../../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)):
+/// a `:memory:` database dies with its sole connection, so `SqliteDb::connect` pins the pool
+/// to **one** connection, and every lookup ahead of a contended write queues on it. That
+/// staggers a burst until the race under test cannot happen.
+///
+/// Switching the four wire-level race tests onto [`Self::FileSqlite`] separated two things
+/// that had been one claim. **S-08's concurrent refresh was genuinely blind**: on a real pool
+/// it failed immediately, and the defect it had never seen was a lost rotation answering 500
+/// rather than 401. **The three KV-budget tests were not blind for that reason** — a real pool
+/// lets them overlap, and they still pass against a reverted non-atomic limiter, because the
+/// window between that read and that write is nanoseconds wide inside the KV. Their proofs are
+/// the unit and contract tests where the window *is* the whole test, and each test now says so
+/// beside its own assertions rather than leaving a reader to assume the wire proves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TestDatabase {
+    /// `:memory:`, one connection. The default, and correct for the ~250 tests that assert
+    /// behaviour rather than concurrency: fastest, and isolated by construction.
+    #[default]
+    MemorySqlite,
+    /// A file in a temporary directory with the configured pool, so more than one request is
+    /// genuinely in flight at once. Slower, and the only setting under which a wire-level
+    /// race test proves anything.
+    FileSqlite,
+}
+
 /// Policy knobs a scenario can override.
 pub struct TestOptions {
+    /// The database the app boots on — see [`TestDatabase`]. A concurrency test that leaves
+    /// this at the default is testing the harness.
+    pub database: TestDatabase,
     /// Whether first-login registration is allowed.
     pub allow_registration: bool,
     /// S-31 domain allowlist; empty = allow all.
@@ -157,6 +189,7 @@ pub struct TestOptions {
 impl Default for TestOptions {
     fn default() -> Self {
         Self {
+            database: TestDatabase::default(),
             allow_registration: true,
             allowed_email_domains: Vec::new(),
             login_per_ip_minute: 10,
@@ -415,6 +448,10 @@ pub struct TestApp {
     /// The real queue drain, run by [`TestApp::drain_jobs`] (decision 26).
     pub queue_worker: Arc<QueueWorker>,
     clock: Arc<Mutex<DateTime<Utc>>>,
+    /// The directory holding a [`TestDatabase::FileSqlite`] file. Shared with anything
+    /// [`TestApp::restart`] produces — a restart is a new process over the *same* database,
+    /// and dropping this deletes it.
+    _db_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl TestApp {
@@ -426,13 +463,18 @@ impl TestApp {
     /// App with scenario-specific policy knobs.
     pub async fn with_options(mut options: TestOptions) -> Self {
         let job_factory = options.jobs.take();
+        // Held for the app's lifetime: dropping it deletes the directory the database file
+        // lives in, so it belongs to `TestApp` and not to this scope.
+        let db_dir = match options.database {
+            TestDatabase::MemorySqlite => None,
+            TestDatabase::FileSqlite => Some(tempfile::tempdir().expect("tempdir for the file-backed database")),
+        };
+        let db_path = match &db_dir {
+            None => ":memory:".to_owned(),
+            Some(dir) => dir.path().join("pub.db").to_string_lossy().into_owned(),
+        };
         let mut settings = Settings {
-            database: DatabaseConfig {
-                kind: DatabaseKind::Sqlite,
-                url: None,
-                path: ":memory:".to_owned(),
-                ..Default::default()
-            },
+            database: DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: db_path, ..Default::default() },
             ..Settings::default()
         };
         settings.blob.kind = BlobKind::Memory;
@@ -458,7 +500,7 @@ impl TestApp {
         settings.smtp.password = options.smtp_password.clone().map(pub_config::Secret::new);
         settings.smtp.security = options.smtp_security;
 
-        let db = SqliteDb::connect(&settings.database).await.expect("connect :memory:");
+        let db = SqliteDb::connect(&settings.database).await.expect("connect the test database");
         db.run_migrations().await.expect("migrate");
         let repos = db.repositories();
 
@@ -605,6 +647,7 @@ impl TestApp {
             events,
             queue_worker,
             clock,
+            _db_dir: db_dir.map(Arc::new),
         }
     }
 
@@ -658,6 +701,7 @@ impl TestApp {
             events: Arc::clone(&self.state.events),
             queue_worker: Arc::clone(&self.queue_worker),
             clock: Arc::clone(&self.clock),
+            _db_dir: self._db_dir.clone(),
         }
     }
 

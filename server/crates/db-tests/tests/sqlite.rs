@@ -1,6 +1,12 @@
 //! Runs the shared repository contract suite against SQLite `:memory:` — the everyday local
 //! backend (docs/rules/rust.md: no containers locally). Each test gets a fresh migrated
 //! database, so scenarios can never bleed into one another.
+//!
+//! One contract function does **not** run on `:memory:`, and the reason is the point of
+//! [decision 35](../../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race):
+//! an in-memory database dies with its sole connection, so `SqliteDb::connect` pins the pool
+//! to one, and anything asserting a property *under concurrency* is testing the pool rather
+//! than the code. Those use [`file_backed_repos`].
 
 use pub_config::{DatabaseConfig, DatabaseKind};
 use pub_core::traits::Repositories;
@@ -12,6 +18,23 @@ async fn fresh_repos() -> Repositories {
     let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
     db.run_migrations().await.expect("migrate");
     db.repositories()
+}
+
+/// A migrated database in a temporary directory, with the configured pool rather than a pinned
+/// single connection — so two callers are genuinely in flight at once.
+///
+/// The returned directory must outlive the repositories: dropping it deletes the file.
+async fn file_backed_repos() -> (tempfile::TempDir, Repositories) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = DatabaseConfig {
+        kind: DatabaseKind::Sqlite,
+        url: None,
+        path: dir.path().join("pub.db").to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let db = SqliteDb::connect(&cfg).await.expect("connect the file-backed database");
+    db.run_migrations().await.expect("migrate");
+    (dir, db.repositories())
 }
 
 #[tokio::test]
@@ -42,6 +65,15 @@ async fn invitations_contract() {
 #[tokio::test]
 async fn session_repo_contract_s08_s09_s10() {
     pub_db_tests::contract::session_repo(&fresh_repos().await).await;
+}
+
+/// **S-08, on a pool that can actually race.** Deliberately the one contract function in this
+/// file that does not take `fresh_repos()`: on `:memory:` the two rotations would be two
+/// sequential calls through one connection and the assertion would hold for the wrong reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_rotation_is_single_winner_s08() {
+    let (_dir, repos) = file_backed_repos().await;
+    pub_db_tests::contract::session_rotation_is_single_winner(&repos).await;
 }
 
 #[tokio::test]

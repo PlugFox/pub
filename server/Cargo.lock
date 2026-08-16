@@ -2646,6 +2646,8 @@ dependencies = [
  "object_store",
  "pub-config",
  "pub-core",
+ "pub-test-support",
+ "reqwest",
  "tempfile",
  "tokio",
  "tracing",
@@ -2723,8 +2725,10 @@ dependencies = [
  "pub-core",
  "pub-db-postgres",
  "pub-db-sqlite",
+ "pub-test-support",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
 ]
 
@@ -2781,6 +2785,7 @@ dependencies = [
  "moka",
  "pub-config",
  "pub-core",
+ "pub-test-support",
  "tokio",
  "tokio-stream",
 ]
@@ -2840,6 +2845,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "pub-test-support"
+version = "0.1.0"
 
 [[package]]
 name = "pubd"

@@ -1,8 +1,10 @@
 //! Redis-backed [`Kv`] implementation (decision 03) — the mandatory backend for
 //! `cluster.replicas > 1`.
 //!
-//! Skeleton status: constructor + full method set implemented, exercised by the CI backend
-//! matrix (testcontainers) rather than local unit tests.
+//! The unit tests below cover construction only (no I/O). Every behavioural property is in
+//! the shared contract suite at `tests/contract.rs`, which runs the same functions against
+//! this backend and against [`crate::MemoryKv`]; the leg is gated by `PUB_TEST_REDIS_URL`
+//! ([decision 35](../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)).
 
 use std::time::Duration;
 

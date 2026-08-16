@@ -6,6 +6,7 @@ members = [
     "crates/db-sqlite",
     "crates/db-postgres",
     "crates/db-tests",
+    "crates/test-support",
     "crates/blob",
     "crates/kv",
     "crates/telemetry",
@@ -32,6 +33,7 @@ pub-config = { path = "crates/config" }
 pub-db-sqlite = { path = "crates/db-sqlite" }
 pub-db-postgres = { path = "crates/db-postgres" }
 pub-db-tests = { path = "crates/db-tests" }
+pub-test-support = { path = "crates/test-support" }
 pub-blob = { path = "crates/blob" }
 pub-kv = { path = "crates/kv" }
 pub-telemetry = { path = "crates/telemetry" }
