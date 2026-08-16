@@ -39,6 +39,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 32 | Quotas and limits: org storage, write buckets, one identity per request | accepted |
 | 33 | Token model on the wire, supply-chain registers, errors users can read  | accepted |
 | 34 | Presigned S3 downloads: off by default, public endpoint, bounded TTL    | accepted |
+| 35 | Backend legs that fail when the backend is absent; a harness that races | accepted |
 
 ---
 
@@ -739,3 +740,55 @@ With `blob.presign = true`, boot fails when:
 - **The compose `s3` and `full` profiles document the split rather than enabling it.** They keep `presign` off and carry the two keys commented with the address a laptop can reach, because a profile that silently worked only from inside the network would teach the wrong shape.
 - **The endpoint keys are parsed only under presigning.** Outside it, `blob.endpoint` is a string handed to `object_store` and never interpreted here, so this change refuses no boot it would previously have accepted; the same value is refused the moment `presign` turns it into an origin to compare and a URL to hand out.
 - **A new normative requirement records what a signed URL is** — [S-18.a](security.md#4-supply-chain--registry-integrity): the bearer-capability property, the TTL floor and its origin, the `Authorization` interplay, and the fact that the integrity claim is the listing's `archive_sha256` and never the transport.
+
+## 35 — Backend legs that fail when the backend is absent, and a harness that admits a race
+
+> **Status: accepted.** Recorded 2026-08-16 before implementation, as the Phase 3 wave-7a enabling decision for [roadmap item 2](roadmap.md#phase-3--make-multi-instance-real-closes-d1-d16) (closes [D16](roadmap.md), the harness half of [D51](roadmap.md)).
+
+**Context.** Phase 3 is where this codebase claims a second replica is safe. Every claim it will make rests on tests, and two properties of the current suite mean those tests cannot carry it.
+
+**A leg that does not run and a leg that passes are the same output.** Demonstrated during wave 3a rather than argued: the Docker daemon died, and `cargo test --workspace` answered `test result: ok. 31 passed; 0 failed; finished in 0.00s` for `db-tests/tests/postgres.rs` with port 5432 closed. Every test took the `TestDb::create → None` early return; the skip note goes to stderr, which cargo prints only for *failing* tests. The tell is the duration, and nothing reads durations.
+
+**Three backends have never been executed by any automated test.** The Redis `Kv` and the S3 `BlobStore` are compiled, wired, documented, and reachable by configuration — `RedisKv` has been in the tree since the first slice — and no test in this workspace has ever opened a socket to either. Wave 6 narrowed the S3 gap by hand (a live MinIO round found that a `GET`-signed URL is answered 403 to a `HEAD`, which every test in this repository was blind to) and did not close it. Worse than the gap is what the tree *says* about it: `kv/src/redis_kv.rs` claims the module is "exercised by the CI backend matrix (testcontainers)", `db-tests/src/lib.rs` and `db-tests/tests/postgres.rs` both name that matrix, and **there is no matrix and no testcontainers anywhere in the repository** — CI runs one Postgres service container. Three comments asserting infrastructure that does not exist, which is the wave-3a rule (a comment is an unasserted claim) applied to the test plane itself.
+
+**And every wire-level concurrency test in the suite is green by construction** ([D51](roadmap.md)). `TestApp::with_options` hardcodes `database.path = ":memory:"`, and `SqliteDb::connect` deliberately pins in-memory databases to `max_connections(1)` because a `:memory:` database dies with its sole connection. So the lookups ahead of any contended write queue on that one connection and stagger the burst before the race can happen. Four tests assert properties they cannot prove: the S-24.d parallel publish budget (whose own comment says so), the S-08 one-winner refresh rotation, the S-03 parallel OTP burst, and decision 07's single-flight collapse. A Phase 3 built on this harness would prove leader election the same way.
+
+**Decision.**
+
+### A backend leg fails when its backend is missing; skipping is something a human types
+
+Each optional backend is addressed by one environment variable — `PUB_TEST_POSTGRES_URL`, `PUB_TEST_REDIS_URL`, `PUB_TEST_S3_ENDPOINT` (with its credentials) — and when it is unset the leg **panics** with a message naming the `just db-up <profile>` that starts the backend and the opt-out that silences it. The opt-out is per backend and explicit (`PUB_TEST_NO_POSTGRES=1`, `PUB_TEST_NO_REDIS=1`, `PUB_TEST_NO_S3=1`), and taking it prints one line per leg saying that leg did not run.
+
+The opt-out exists because [CLAUDE.md](../CLAUDE.md) promises a dev loop that needs no containers, and that promise is worth keeping. What is not worth keeping is the *silence*: today "I have no Postgres" and "Postgres passed" are the same green. So the skip stops being a default and becomes a sentence somebody wrote down.
+
+- **`just server-check` sets the opt-out only for the backends whose URL is absent, and says which ones it silenced.** The ergonomic path stays container-free and loud; `just db-up full` plus the exported URLs turns every leg on with no other change.
+- **CI sets no opt-out at all.** A service that fails to start, or an `env:` line deleted from a workflow, is now a red build rather than a fast green one. This is the whole of D16's exit: "the leg did not run" and "the leg passed" stop being the same output.
+- **A bare `cargo test --workspace` on a machine with nothing running is therefore red.** That is a deliberate change to a documented command, and the documentation moves with it: `just server-check` is the container-free path.
+
+### The harness gets a database knob, and a concurrency test is not kept until it has been seen red
+
+`TestOptions::database` selects what the integration app boots on:
+
+- **`MemorySqlite`** — the default, unchanged, for the ~250 tests that assert behaviour rather than concurrency. Fast and isolated, and its single connection is a feature there.
+- **`FileSqlite`** — a temporary file with the configured pool, so more than one connection is real and a burst actually overlaps. This is what the four race tests move to.
+A `Postgres` variant — the same app over a throwaway database on `PUB_TEST_POSTGRES_URL` — is deliberately **not** part of this wave, and the reason is worth recording rather than leaving as an omission: a throwaway database needs a drop, `TestApp` is constructed by ~250 tests that will never call one, and a harness that leaks a database per test is a worse default than no variant at all. It lands with the wave that has HTTP-level claims only Postgres can answer (the distributed lock), together with the cleanup path those tests will actually exercise.
+
+**A concurrency guard is not evidence until it has failed.** Every test moved onto a racing pool is demonstrated red against a reverted mechanism before it is kept, and the revert it was proven against is named in the test's own comment. A test that has only ever been green proves that it is green.
+
+### `Kv` and `BlobStore` get contract suites, in the shape `db-tests` already has
+
+One set of backend-agnostic functions per trait, run against every implementation — `MemoryKv` and `RedisKv`; the memory, filesystem and S3 blob stores — exactly as the repository contract suite runs against both dialects. The properties are the ones the traits state normatively and that other subsystems depend on rather than a survey of the API: `Kv::incr` is atomic under concurrency and re-arms its TTL (S-03/S-24.d depend on it in that order), `set_ttl` expires, `subscribe` sees only messages published after it was established (the bus's peer bridge is built on that), `del` on an absent key is not an error. For blobs: a round trip is byte-identical through both read paths, a missing key is `NotFound` rather than an empty read, deletion is idempotent, and both listing shapes the byte collectors need report an age. The S3 leg adds the one assertion no offline test can make — the presigned URL is **dialled**, and the method it was signed for is the only method the server answers.
+
+**Expect these to be red on their first run against Redis and S3.** That is the reason to write them, and a defect found there is a defect that has been shipped since the first slice, not a defect this wave introduced.
+
+### Testcontainers is rejected
+
+The roadmap sketched testcontainers for this item. It is refused for the reason this decision exists: it moves the backend requirement *into the test process*, so a machine without a running Docker daemon goes straight back to skipping — the exact failure D16 is about, relocated. The two mechanisms this repository already has are enough and are already understood by everyone reading it: service containers in CI (Postgres is already one) and the `docker/docker-compose.yml` profiles locally (`pg`, `s3`, `redis`, `full` — already wired, including MinIO bucket init).
+
+**Consequences.**
+
+- **CI grows two service containers** (Redis, MinIO) and the environment that addresses them; `server-ci` gains an S3 bucket-init step, because a bucket that does not exist is not a backend that is absent and the two must not present the same way.
+- **The first execution of `RedisKv` and of the S3 `BlobStore` is a CI leg rather than a production deployment.** Any behaviour that differs from the in-memory backends surfaces as a failing contract function naming the property, which is what the dual-dialect repository suite has done four times already.
+- **Three comments are corrected rather than left to drift.** The "CI backend matrix (testcontainers)" that never existed is replaced by what the file actually depends on.
+- **The default local loop is unchanged in cost and changed in honesty.** `just server-check` still needs no containers; it now tells you, every time, which legs did not run.
+- **This decision does not close [D52](roadmap.md)** (the plan tests EXPLAIN hand-copied SQL) or the mutation-testing gaps [D55](roadmap.md)/[D45](roadmap.md). It closes the two blind spots that would otherwise make Phase 3's own evidence unreadable, and D45 is answered by the wave that creates the second drain.

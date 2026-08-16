@@ -108,6 +108,24 @@ Corporate-grade posture. Self-assessment framework: **OWASP ASVS L2**; authentic
 
 **S-07** Access JWT: TTL ≤15 min; Ed25519 with `kid`; claims limited to `sub`, `sid`, org role levels, timestamps. No other PII in claims. Verification pins the algorithm to EdDSA, resolves keys strictly by `kid` from the boot keyring, rejects `none`/unknown algorithms and retired kids, and enforces `exp`/`iat` with small skew.
 **S-08** Refresh token: opaque ≥128-bit CSPRNG, stored hashed (SHA-256), rotated on every refresh; reuse of a rotated-out token revokes the session family. The refresh endpoint validates the durable session row in the DB on **every** call: not revoked (`revoked_at`), within idle timeout (default 30 d sliding) and absolute cap (default 90 d). Client-side the refresh token lives in localStorage; its theft-bound is rotation + reuse detection + these caps (decision 03 consequences).
+> **S-08.a — what the loser of a rotation race is told** (added 2026-08-16 with [decision 35](decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race), after the new test stand found the answer was a 500).
+>
+> Two refreshes of one token can be in flight at once, and this is ordinary rather than exotic: two
+> browser tabs, a client retrying a slow request, or a stolen token presented beside its owner's. The
+> requirement "exactly one may win" was already implied by rotation; what was never written down is
+> that **the loser must be told it lost**. A rotation refused by the store — a lock conflict, a
+> serialization failure — is indistinguishable from the store being down: the auth layer cannot revoke
+> the family, cannot clear the client's session, and answers 5xx on the endpoint every signed-in
+> browser calls, so the client retries into the same race.
+>
+> Normative: a rotation that loses the race answers as **reuse** (`RefreshReused`, which revokes the
+> family) or as **unknown** (`NotFound`), never as a store error, and the decision is made by the write
+> itself rather than by a read the write then trusts — SQLite makes the swap one conditional statement,
+> Postgres holds the row with `SELECT … FOR UPDATE`. Both dialects are held to
+> `session_rotation_is_single_winner` in the shared contract suite, which races 25 barrier-released
+> rounds; a single attempt does not reliably overlap, and a pool with one connection cannot overlap at
+> all, which is why this requirement was satisfiable and unsatisfied for as long as it was.
+
 **S-09** Revocation: durable truth is `sessions.revoked_at` in the DB. The revoked-`sid` set (TTL = access TTL) in KV is only the fast path for access-JWT checks on every authenticated request; its keyspace must not evict early (`noeviction` or a dedicated non-evicting store), and when the KV check is unavailable it **fails closed** (reject or force refresh, which hits the DB). Logout revokes the current session (`sid`); the explicit revoke-all action and **any permission or role change** revoke all the user's sessions. Multi-instance coherence is guaranteed by the Redis requirement ([decision 03](decisions.md#03--sessions-jwt-access--refresh-sessions-kv-backed-revocation)); with the in-memory KV a restart clears the blocklist for up to one access TTL — accepted, documented single-node risk.
 > **S-09.a — which changes revoke, and where the rule lives** (added 2026-08-07 with the management surface).
 >
