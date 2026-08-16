@@ -252,7 +252,21 @@ async fn build_database(settings: &Settings) -> anyhow::Result<Repositories> {
 fn build_blob(settings: &Settings) -> anyhow::Result<Arc<dyn BlobStore>> {
     let blob: Arc<dyn BlobStore> = match settings.blob.kind {
         BlobKind::Fs => Arc::new(ObjectStoreBlob::fs(&settings.blob).context("failed to open fs blob store")?),
-        BlobKind::S3 => Arc::new(ObjectStoreBlob::s3(&settings.blob).context("failed to configure s3 blob store")?),
+        BlobKind::S3 => {
+            let store = ObjectStoreBlob::s3(&settings.blob).context("failed to configure s3 blob store")?;
+            // Presigning changes who serves the bytes, which is the kind of thing an operator
+            // should be able to confirm from the boot log rather than by watching egress. The
+            // address is the one clients will be handed (decision 34).
+            if store.presigns() {
+                tracing::info!(
+                    signing_endpoint =
+                        settings.blob.public_endpoint.as_deref().or(settings.blob.endpoint.as_deref()).unwrap_or("aws"),
+                    ttl_secs = settings.blob.presign_ttl_secs,
+                    "archive downloads answer a presigned redirect; bytes do not traverse this process"
+                );
+            }
+            Arc::new(store)
+        }
         BlobKind::Memory => Arc::new(ObjectStoreBlob::memory()),
     };
     Ok(blob)

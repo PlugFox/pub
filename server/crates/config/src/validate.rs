@@ -21,12 +21,7 @@ impl Settings {
         }
         self.validate_database_pool()?;
 
-        if self.blob.kind == BlobKind::S3 && self.blob.bucket.is_none() {
-            return Err(invalid("blob.kind = s3 requires blob.bucket"));
-        }
-        if self.blob.kind == BlobKind::Fs && self.blob.path.is_empty() {
-            return Err(invalid("blob.kind = fs requires a non-empty blob.path"));
-        }
+        self.validate_blob()?;
 
         if self.kv.kind == KvKind::Redis && self.kv.url.is_none() {
             return Err(invalid("kv.kind = redis requires kv.url"));
@@ -143,6 +138,83 @@ impl Settings {
             // upload/finalize URLs) and would only ever be a typo.
             return Err(invalid("server.public_url must not carry a query or fragment"));
         }
+        Ok(())
+    }
+
+    /// Blob backend invariants, including everything about presigning that is checkable
+    /// ([decision 34](../../../../docs/decisions.md), [S-18.a](../../../../docs/security.md)).
+    ///
+    /// The one thing no validator can check is the thing `blob.presign` actually asserts — that
+    /// the address in the signed URL is one this instance's clients can dial. Because the
+    /// redirect has already left by the time that is disproved, everything *adjacent* to it that
+    /// can be checked is a refusal rather than a warning.
+    fn validate_blob(&self) -> Result<(), ConfigError> {
+        let blob = &self.blob;
+        if blob.kind == BlobKind::S3 && blob.bucket.is_none() {
+            return Err(invalid("blob.kind = s3 requires blob.bucket"));
+        }
+        if blob.kind == BlobKind::Fs && blob.path.is_empty() {
+            return Err(invalid("blob.kind = fs requires a non-empty blob.path"));
+        }
+
+        // Deliberately scoped to presigning. Outside it, `blob.endpoint` is a string this
+        // process hands to `object_store` and never interprets, and refusing a boot that worked
+        // yesterday over a key we do not otherwise read would be this change widening its own
+        // blast radius. Under presigning the same string becomes an origin we compare and a URL
+        // we hand to clients, so it has to be one.
+        if !blob.presign {
+            return Ok(());
+        }
+        let endpoint = parse_endpoint("blob.endpoint", blob.endpoint.as_deref())?;
+        let public_endpoint = parse_endpoint("blob.public_endpoint", blob.public_endpoint.as_deref())?;
+
+        if blob.kind != BlobKind::S3 {
+            return Err(invalid(format!(
+                "blob.presign requires blob.kind = s3 (this instance is '{}'): only the S3 backend can sign a URL",
+                blob.kind.as_str()
+            )));
+        }
+        // Sharp edge 4 floor (retries + clock drift) and SigV4's own seven-day ceiling; neither
+        // number is ours to pick, which is why neither is a round one.
+        if !(PRESIGN_TTL_MIN..=PRESIGN_TTL_MAX).contains(&blob.presign_ttl_secs) {
+            return Err(invalid(format!(
+                "blob.presign_ttl_secs = {} must be between {PRESIGN_TTL_MIN} and {PRESIGN_TTL_MAX}: the floor is \
+                 the pub client's retry and clock-drift allowance (docs/protocol.md sharp edge 4), the ceiling is \
+                 SigV4's maximum presigned lifetime",
+                blob.presign_ttl_secs
+            )));
+        }
+
+        // A custom endpoint is a private address until an operator says otherwise — ours is
+        // `http://s3:9000` in docker-compose, which no client outside that network resolves.
+        let signing = match (&public_endpoint, &endpoint) {
+            (Some(public), _) => Some(public),
+            (None, Some(_)) => {
+                return Err(invalid(
+                    "blob.presign with a custom blob.endpoint requires blob.public_endpoint: the signed URL is \
+                     handed to the client, and blob.endpoint is the address this process dials, which behind a \
+                     container network or a private link is not the same one. Set blob.public_endpoint to the \
+                     address clients reach, or leave blob.presign off",
+                ));
+            }
+            // No endpoint at all is real AWS S3, whose endpoint is public by construction.
+            (None, None) => None,
+        };
+
+        if let Some(signing) = signing {
+            let public_url = url::Url::parse(&self.server.public_url)
+                .map_err(|err| invalid(format!("server.public_url is not a valid URL: {err}")))?;
+            if signing.origin() == public_url.origin() {
+                return Err(invalid(format!(
+                    "the presigning origin '{}' is the same origin as server.public_url: the pub client keeps its \
+                     Authorization header across a same-origin redirect, and S3 refuses a request carrying both a \
+                     header credential and a query signature (400 InvalidArgument). Give the object store an \
+                     origin of its own, or set blob.presign = false",
+                    origin_of(signing)
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -798,18 +870,179 @@ fn validate_seed(field: &str, value: &Secret) -> Result<(), ConfigError> {
     }
 }
 
+/// Shortest presigned lifetime the pub client can be given: 25 minutes, from
+/// [`docs/protocol.md`](../../../../docs/protocol.md) sharp edge 4 — its retry ladder plus
+/// clock drift. Not a preference; a URL that expires inside a retry is a download that fails
+/// on the attempt that would have succeeded.
+const PRESIGN_TTL_MIN: u64 = 1500;
+
+/// Longest presigned lifetime AWS SigV4 will produce at all (7 days). Above it the library
+/// refuses to sign, so this bound turns a request-time failure into a boot-time one.
+const PRESIGN_TTL_MAX: u64 = 604_800;
+
+/// Parses an optional endpoint URL, refusing anything that cannot carry an origin.
+///
+/// Both endpoints reach `AmazonS3Builder::with_endpoint`, and the public one is additionally
+/// compared against `server.public_url`'s origin — a value without a host has an *opaque*
+/// origin, which compares equal to nothing including itself, so an unparseable endpoint would
+/// silently pass the same-origin check rather than fail it.
+fn parse_endpoint(field: &str, raw: Option<&str>) -> Result<Option<url::Url>, ConfigError> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let url = url::Url::parse(raw).map_err(|err| invalid(format!("{field} is not a valid URL: {err}")))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(invalid(format!("{field} scheme '{other}' must be http or https"))),
+    }
+    if url.host_str().is_none() {
+        return Err(invalid(format!("{field} must have a host")));
+    }
+    Ok(Some(url))
+}
+
+/// `scheme://host[:port]` of a URL, for an error message that names what collided.
+fn origin_of(url: &url::Url) -> String {
+    url.origin().ascii_serialization()
+}
+
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{QueueConfig, Settings};
+    use crate::{BlobConfig, BlobKind, QueueConfig, Settings};
 
     fn with_queue(queue: QueueConfig) -> Settings {
         let mut settings = Settings::default();
         settings.jobs.queue = queue;
         settings
+    }
+
+    /// A presigning S3 config that validates, so every case below can change one thing.
+    fn with_blob(blob: BlobConfig) -> Settings {
+        Settings { blob, ..Settings::default() }
+    }
+
+    fn presigning_blob() -> BlobConfig {
+        BlobConfig {
+            kind: BlobKind::S3,
+            bucket: Some("pub-blobs".to_owned()),
+            endpoint: Some("http://s3:9000".to_owned()),
+            public_endpoint: Some("https://blobs.example.com".to_owned()),
+            presign: true,
+            ..BlobConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_default_blob_section_does_not_presign() {
+        // Decision 34: `blob.presign` asserts something no validator can check — that the
+        // address in the signed URL is one this instance's clients can dial. Off is the only
+        // default that is true without an operator saying so.
+        assert!(!BlobConfig::default().presign);
+        assert!(with_blob(BlobConfig::default()).validate().is_ok());
+    }
+
+    #[test]
+    fn a_presigning_s3_config_with_a_public_endpoint_validates() {
+        assert!(with_blob(presigning_blob()).validate().is_ok());
+        // Real AWS: no endpoint at all, so the endpoint is public by construction.
+        let aws = BlobConfig { endpoint: None, public_endpoint: None, ..presigning_blob() };
+        assert!(with_blob(aws).validate().is_ok());
+    }
+
+    #[test]
+    fn presigning_behind_a_private_endpoint_is_a_startup_error() {
+        // The exact shape of this repository's own compose file: the process dials
+        // `http://s3:9000`, and a URL signed for that host is unreachable from the laptop
+        // running `dart pub get` — with the redirect already sent, there is no fallback left.
+        let private = BlobConfig { public_endpoint: None, ..presigning_blob() };
+        let err = with_blob(private).validate().expect_err("a private endpoint must not presign");
+        assert!(err.to_string().contains("blob.public_endpoint"), "the error must name the key: {err}");
+    }
+
+    #[test]
+    fn presigning_from_the_instance_origin_is_a_startup_error() {
+        // Sharp edge 4 and `dart:io`: the client keeps its Authorization across a *same-origin*
+        // redirect, and S3 answers 400 to a request carrying both a header credential and a
+        // query signature. Broken for every authenticated download, which on a private
+        // registry is all of them.
+        let mut settings =
+            with_blob(BlobConfig { public_endpoint: Some("https://pub.example.com".to_owned()), ..presigning_blob() });
+        settings.server.public_url = "https://pub.example.com/".to_owned();
+        let err = settings.validate().expect_err("same origin must not presign");
+        assert!(err.to_string().contains("same origin"), "{err}");
+
+        // A different port is a different origin, and is fine.
+        let mut ok = with_blob(BlobConfig {
+            public_endpoint: Some("https://pub.example.com:9000".to_owned()),
+            ..presigning_blob()
+        });
+        ok.server.public_url = "https://pub.example.com/".to_owned();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn the_origin_check_also_covers_a_bare_endpoint_and_an_unparseable_one() {
+        // Without `public_endpoint` the signing address *is* `blob.endpoint`, and it is checked
+        // the same way — otherwise the one deployment shape that reaches this branch (a public
+        // S3 endpoint named directly) would skip the check entirely.
+        let mut same = with_blob(BlobConfig {
+            endpoint: Some("https://pub.example.com".to_owned()),
+            public_endpoint: Some("https://pub.example.com".to_owned()),
+            ..presigning_blob()
+        });
+        same.server.public_url = "https://pub.example.com".to_owned();
+        assert!(same.validate().is_err());
+
+        // An endpoint that cannot carry a *tuple* origin has to be refused before the
+        // comparison rather than by it: `url::Origin::Opaque` compares equal to nothing,
+        // including itself, so `https://pub.example.com` would sail past the same-origin check
+        // on a value that is not a usable endpoint in the first place. `s3:9000` is the shape
+        // that matters — it parses cleanly, as a URL with scheme `s3` and an opaque origin.
+        for junk in ["s3:9000", "not a url", "https://"] {
+            let cfg = BlobConfig { endpoint: Some(junk.to_owned()), ..presigning_blob() };
+            let err = with_blob(cfg).validate().expect_err("{junk} is not a usable endpoint");
+            assert!(err.to_string().contains("blob.endpoint"), "{junk}: {err}");
+            // Why each of these must be caught *before* the origin comparison and not by it.
+            if let Ok(parsed) = url::Url::parse(junk) {
+                assert!(!parsed.origin().is_tuple(), "{junk} would compare equal to nothing, including itself");
+            }
+        }
+    }
+
+    #[test]
+    fn presigning_needs_the_backend_that_can_sign_and_a_lifetime_the_client_can_use() {
+        let wrong_backend = BlobConfig { kind: BlobKind::Fs, presign: true, ..BlobConfig::default() };
+        assert!(with_blob(wrong_backend).validate().is_err(), "only s3 can sign a URL");
+
+        // The floor is the pub client's retry ladder plus clock drift (sharp edge 4); the
+        // ceiling is SigV4's own, above which signing fails at the library instead of at boot.
+        for ttl in [0, 60, 1499, 604_801, u64::MAX] {
+            let cfg = BlobConfig { presign_ttl_secs: ttl, ..presigning_blob() };
+            assert!(with_blob(cfg).validate().is_err(), "presign_ttl_secs = {ttl} must be refused");
+        }
+        for ttl in [1500, 1800, 604_800] {
+            let cfg = BlobConfig { presign_ttl_secs: ttl, ..presigning_blob() };
+            assert!(with_blob(cfg).validate().is_ok(), "presign_ttl_secs = {ttl} must be accepted");
+        }
+        // The bounds bind only when presigning: an untouched TTL beside `presign = false` is
+        // not a reason to refuse a boot.
+        let off = BlobConfig { presign: false, presign_ttl_secs: 0, ..presigning_blob() };
+        assert!(with_blob(off).validate().is_ok());
+    }
+
+    #[test]
+    fn an_endpoint_is_only_parsed_when_something_reads_it_as_a_url() {
+        // This wave must not refuse a boot it would have accepted yesterday. Outside presigning
+        // `blob.endpoint` is a string handed to `object_store` and never interpreted here, so a
+        // value this validator would call malformed is still none of its business — the same
+        // value is refused the moment `presign` makes it an origin and a client-facing URL.
+        let odd = BlobConfig { presign: false, endpoint: Some("s3:9000".to_owned()), ..presigning_blob() };
+        assert!(with_blob(odd.clone()).validate().is_ok(), "an unused endpoint must not gate a boot");
+        assert!(with_blob(BlobConfig { presign: true, ..odd }).validate().is_err());
     }
 
     #[test]

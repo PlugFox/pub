@@ -34,7 +34,7 @@ use pub_core::audit::{AuditActor, AuditResult, NewAuditEvent};
 use pub_core::authorize::{Action, Resource, authorize};
 use pub_core::package::{Package, Resolution, Version, Visibility};
 use pub_core::token::TokenScope;
-use pub_core::traits::{ByteStream, DownloadPlan};
+use pub_core::traits::{ByteStream, DownloadMethod, DownloadPlan};
 use pub_core::{Format, OrgId, PackageId, SemVer, TokenId, UserId};
 use pub_registry::{ActorMeta, PublishRequest, RegistryService, latest_index, validate_package_name};
 use serde::{Deserialize, Serialize};
@@ -734,7 +734,11 @@ async fn serve_archive(
     };
 
     let key = RegistryService::blob_key(FORMAT, &sha256);
-    match state.blob.download(&key).await {
+    // The plan is method-specific because a presigned URL is (decision 34): the client's cache
+    // probe is a HEAD, and a GET-signed URL refuses it. `get` is the right answer for every
+    // other method because the archive routes accept no others.
+    let plan = if method == Method::HEAD { DownloadMethod::Head } else { DownloadMethod::Get };
+    match state.blob.download(&key, plan).await {
         Ok(DownloadPlan::Redirect(url)) => redirect_to(&url),
         Ok(DownloadPlan::Stream(stream)) => Ok(stream_archive(name, version, &sha256, size, stream)),
         // Metadata without bytes is a broken store, not a missing package — but answering
@@ -767,13 +771,21 @@ fn count_download(state: &AppState, method: &Method, package: PackageId, version
     state.downloads.record(package, version, (state.clock)());
 }
 
-/// 307 to a presigned URL (decision 10). 307 rather than 302: the method must not change,
-/// and the client follows it without dropping its `Accept`.
+/// 307 to a presigned URL (decisions 10 and 34). 307 rather than 302: the method must not
+/// change, and the client follows it without dropping its `Accept`.
+///
+/// `no-store` is set **here** rather than left to the S-28 response pass, which only fills in a
+/// tier the handler left empty: a presigned URL is a bearer capability for the length of its
+/// TTL ([S-18.a](../../../../../docs/security.md#4-supply-chain--registry-integrity)), so a
+/// shared cache holding this response would hand the archive to whoever asks next. Setting it
+/// at the site means a future change to the no-store path families cannot silently drop it.
 fn redirect_to(url: &url::Url) -> Result<Response, ProtocolError> {
     let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
     let value = HeaderValue::from_str(url.as_str())
         .map_err(|_| pub_core::Error::Blob { message: "presigned url is not header-safe".into() })?;
-    response.headers_mut().insert(header::LOCATION, value);
+    let headers = response.headers_mut();
+    headers.insert(header::LOCATION, value);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
 }
 
@@ -1129,6 +1141,22 @@ mod tests {
     use pub_core::{PackageId, UserId, VersionId};
 
     use super::*;
+
+    #[test]
+    fn a_presigned_redirect_carries_no_store_without_help_from_the_middleware() {
+        // The wire test in `tests/protocol.rs` cannot prove this: the S-28 response pass puts
+        // `no-store` on the whole pub family anyway, so deleting the line below leaves that
+        // test green. What it would break is the day archives leave that family — which the
+        // hygiene module's own comment already contemplates, because a *streamed* archive is
+        // `immutable` and belongs nowhere near `no-store`. A presigned URL is a bearer
+        // capability (S-18.a) and must not be storable whichever tier the family carries, so
+        // the guarantee lives at the site and is asserted at the site.
+        let url: url::Url = "https://blobs.example.test/pub-blobs/a?X-Amz-Signature=abc".parse().unwrap();
+        let response = redirect_to(&url).expect("header-safe url");
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], url.as_str());
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
 
     /// Projects versions onto the `(retracted, pre_release)` pairs `latest_index` reads.
     fn ladder(versions: &[Version]) -> Vec<(bool, bool)> {

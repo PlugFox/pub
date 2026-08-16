@@ -14,7 +14,7 @@
 //! | 1 | 401 destroys credentials; 401/403 carry the challenge; unreadable ⇒ 404 | [`unauthenticated_private_package_is_404_not_401`], [`insufficient_scope_gets_403_with_www_authenticate`], [`invalid_token_gets_401_with_www_authenticate`], [`require_auth_for_read_makes_anonymous_reads_401`] |
 //! | 2 | Permanent failures are 4xx | [`finalize_rejects_duplicate_version_with_400_not_500`], [`finalize_rejects_a_corrupt_archive_with_400`] |
 //! | 3 | Archives are byte-stable, `archive_url` is ours | [`archive_bytes_are_identical_across_restarts_and_backends`], [`listing_archive_urls_point_at_our_own_base`] |
-//! | 4 | `archive_url` lives under the credential prefix | [`listing_archive_urls_point_at_our_own_base`], [`publish_urls_stay_under_the_base`] |
+//! | 4 | `archive_url` lives under the credential prefix; presigned URLs need no auth | [`listing_archive_urls_point_at_our_own_base`], [`publish_urls_stay_under_the_base`], [`a_presigned_archive_is_a_307_that_no_cache_may_keep`], [`a_presigned_archive_is_signed_for_the_method_the_client_used`], [`a_presigned_archive_is_still_behind_the_visibility_ladder`] |
 //! | 5 | Validate at finalize, not upload | [`upload_accepts_junk_and_finalize_rejects_it`] |
 //! | 6 | Absent `Accept` ⇒ v2; 406 only for version mismatch | [`accept_header_absent_defaults_to_v2`], [`unsupported_api_version_gets_406`] |
 //! | 7 | Full pubspec per version; a capped listing keeps its newest end | [`listing_field_types_match_the_client_parser`], [`a_listing_at_the_safety_cap_drops_the_oldest_versions_not_the_newest`] |
@@ -668,6 +668,157 @@ async fn a_private_archive_is_404_without_a_token_and_served_with_one() {
 
     assert_eq!(app.pub_get_raw(&path, None).await.status, StatusCode::NOT_FOUND);
     assert_eq!(app.pub_get_raw(&path, Some(&acme.token)).await.status, StatusCode::OK);
+}
+
+// ------------------------- sharp edge 4: presigned downloads (decision 34, S-18.a, roadmap D11)
+
+/// A blob store that plans every download as a redirect, recording the method it was asked to
+/// sign for.
+///
+/// It stands in for the S3 backend deliberately: the signing itself is offline and unit-tested
+/// in `pub-blob` (`presigning_signs_the_method_the_caller_will_use` and friends), while what
+/// belongs *here* is what the wire does with a `Redirect` plan — the status, the headers a
+/// capability URL must and must not carry, and the fact that the visibility ladder still runs
+/// in front of it. Its inner store is real, so a test that expects bytes still gets bytes.
+#[derive(Debug)]
+struct RedirectingBlob {
+    inner: ObjectStoreBlob,
+    signed_for: std::sync::Mutex<Vec<pub_core::traits::DownloadMethod>>,
+}
+
+impl RedirectingBlob {
+    /// The URL every plan points at — a distinct origin, as decision 34's validator requires.
+    const SIGNED: &'static str = "https://blobs.example.test/pub-blobs/archive?X-Amz-Signature=deadbeef";
+
+    fn new() -> Self {
+        Self { inner: ObjectStoreBlob::memory(), signed_for: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    fn methods(&self) -> Vec<pub_core::traits::DownloadMethod> {
+        self.signed_for.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl pub_core::traits::BlobStore for RedirectingBlob {
+    async fn ping(&self) -> pub_core::Result<()> {
+        self.inner.ping().await
+    }
+
+    async fn put(&self, key: &str, bytes: bytes::Bytes) -> pub_core::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn download(
+        &self,
+        key: &str,
+        method: pub_core::traits::DownloadMethod,
+    ) -> pub_core::Result<pub_core::traits::DownloadPlan> {
+        // A signing backend does not look before it signs (decision 34), but the key must still
+        // be the one the caller asked for — otherwise this double would hide a steering bug.
+        assert!(key.starts_with("pub/"), "unexpected blob key {key}");
+        self.signed_for.lock().expect("lock").push(method);
+        Ok(pub_core::traits::DownloadPlan::Redirect(Self::SIGNED.parse().expect("url")))
+    }
+
+    async fn get(&self, key: &str) -> pub_core::Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+
+    async fn delete(&self, key: &str) -> pub_core::Result<()> {
+        self.inner.delete(key).await
+    }
+
+    fn list_stream<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> futures::stream::BoxStream<'a, pub_core::Result<pub_core::traits::BlobObject>> {
+        self.inner.list_stream(prefix)
+    }
+
+    async fn list_prefixes(&self, prefix: &str) -> pub_core::Result<pub_core::traits::PrefixListing> {
+        self.inner.list_prefixes(prefix).await
+    }
+
+    async fn head(&self, key: &str) -> pub_core::Result<Option<pub_core::traits::BlobObject>> {
+        self.inner.head(key).await
+    }
+}
+
+#[tokio::test]
+async fn a_presigned_archive_is_a_307_that_no_cache_may_keep() {
+    // S-18.a: the URL is a bearer capability for the length of its TTL, so the one response
+    // that carries it must not be storable. The streamed path's `immutable` tier is the exact
+    // opposite header, which is why this asserts what is absent as well as what is present.
+    //
+    // The `no-store` assertion here is the *observable* contract and nothing more: the S-28
+    // response pass would supply that header for the whole pub family even if the handler set
+    // nothing, so this test stays green against a handler that dropped it. What proves the
+    // handler owns the guarantee is the unit test beside `redirect_to`
+    // (`a_presigned_redirect_carries_no_store_without_help_from_the_middleware`).
+    let blob = Arc::new(RedirectingBlob::new());
+    let app = TestApp::with_options(TestOptions {
+        blob: Some(Arc::clone(&blob) as Arc<dyn pub_core::traits::BlobStore>),
+        ..TestOptions::default()
+    })
+    .await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    publish_ok(&app, &acme, "acme_core", "1.0.0").await;
+    let path = format!("{}/api/archives/acme_core-1.0.0.tar.gz", acme.base());
+
+    let response = app.pub_get_raw(&path, Some(&acme.token)).await;
+    assert_eq!(response.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(response.headers[header::LOCATION], RedirectingBlob::SIGNED);
+    assert_eq!(response.headers[header::CACHE_CONTROL], "no-store");
+    assert!(response.body.is_empty(), "the bytes come from the object store, not from us");
+    assert!(!response.headers.contains_key(header::ETAG), "an ETag here would describe a body we did not send");
+}
+
+#[tokio::test]
+async fn a_presigned_archive_is_signed_for_the_method_the_client_used() {
+    // The pub client HEADs an archive before it GETs it, and SigV4 covers the method: a
+    // GET-signed URL handed to that HEAD is refused by S3. This is the wire half of
+    // `DownloadMethod` — that the request's own method reaches the plan.
+    let blob = Arc::new(RedirectingBlob::new());
+    let app = TestApp::with_options(TestOptions {
+        blob: Some(Arc::clone(&blob) as Arc<dyn pub_core::traits::BlobStore>),
+        ..TestOptions::default()
+    })
+    .await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    publish_ok(&app, &acme, "acme_core", "1.0.0").await;
+    let path = format!("{}/api/archives/acme_core-1.0.0.tar.gz", acme.base());
+
+    let head = app.send_raw(app.pub_request(Method::HEAD, &path, Some(&acme.token), None)).await;
+    assert_eq!(head.status, StatusCode::TEMPORARY_REDIRECT, "HEAD must be answered like GET (sharp edge 7)");
+    assert_eq!(head.headers[header::LOCATION], RedirectingBlob::SIGNED);
+    let get = app.pub_get_raw(&path, Some(&acme.token)).await;
+    assert_eq!(get.status, StatusCode::TEMPORARY_REDIRECT);
+
+    use pub_core::traits::DownloadMethod::{Get, Head};
+    assert_eq!(blob.methods(), vec![Head, Get], "the plan must be signed for the method that asked for it");
+}
+
+#[tokio::test]
+async fn a_presigned_archive_is_still_behind_the_visibility_ladder() {
+    // A redirect is an authorization decision made once and then handed out, so the check that
+    // precedes it is the only one there is. Anonymous and cross-org callers must never reach
+    // the plan at all — asserted by the double having been asked nothing.
+    let blob = Arc::new(RedirectingBlob::new());
+    let app = TestApp::with_options(TestOptions {
+        blob: Some(Arc::clone(&blob) as Arc<dyn pub_core::traits::BlobStore>),
+        ..TestOptions::default()
+    })
+    .await;
+    let acme = publisher(&app, "dev@acme.test", "acme").await;
+    let other = publisher(&app, "dev@other.test", "other").await;
+    publish_ok(&app, &acme, "acme_core", "1.0.0").await;
+    let path = format!("{}/api/archives/acme_core-1.0.0.tar.gz", acme.base());
+
+    assert_eq!(app.pub_get_raw(&path, None).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(app.pub_get_raw(&path, Some(&other.token)).await.status, StatusCode::NOT_FOUND);
+    assert!(blob.methods().is_empty(), "no URL may be signed for a caller who cannot read the package");
+    assert_eq!(app.pub_get_raw(&path, Some(&acme.token)).await.status, StatusCode::TEMPORARY_REDIRECT);
 }
 
 // ------------------------------------------------------------- sharp edge 6: API versioning

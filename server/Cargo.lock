@@ -2641,11 +2641,15 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "http",
+ "metrics",
  "object_store",
  "pub-config",
  "pub-core",
  "tempfile",
  "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

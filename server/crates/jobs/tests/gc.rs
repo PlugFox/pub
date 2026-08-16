@@ -30,7 +30,7 @@ use pub_blob::ObjectStoreBlob;
 use pub_core::jobs::JobProgress;
 use pub_core::org::NewOrg;
 use pub_core::package::{NewUpstreamVersion, NewVersion, Publisher, UpstreamSnapshot, Visibility};
-use pub_core::traits::{BlobObject, BlobStore, DownloadPlan, PrefixListing, Repositories};
+use pub_core::traits::{BlobObject, BlobStore, DownloadMethod, DownloadPlan, PrefixListing, Repositories};
 use pub_core::user::NewUser;
 use pub_core::{Format, OrgId, SemVer, UserId};
 use pub_db_sqlite::SqliteDb;
@@ -454,7 +454,7 @@ async fn a_backend_that_cannot_enumerate_fails_the_job_rather_than_deleting() {
             Ok(())
         }
 
-        async fn download(&self, key: &str) -> pub_core::Result<DownloadPlan> {
+        async fn download(&self, key: &str, _method: DownloadMethod) -> pub_core::Result<DownloadPlan> {
             Err(pub_core::Error::NotFound { what: key.to_owned() })
         }
 
@@ -486,8 +486,8 @@ impl BlobStore for RewrittenOnHead {
         self.inner.put(key, bytes).await
     }
 
-    async fn download(&self, key: &str) -> pub_core::Result<DownloadPlan> {
-        self.inner.download(key).await
+    async fn download(&self, key: &str, method: DownloadMethod) -> pub_core::Result<DownloadPlan> {
+        self.inner.download(key, method).await
     }
 
     async fn delete(&self, _key: &str) -> pub_core::Result<()> {
@@ -524,8 +524,8 @@ impl BlobStore for SlowListing {
         self.inner.put(key, bytes).await
     }
 
-    async fn download(&self, key: &str) -> pub_core::Result<DownloadPlan> {
-        self.inner.download(key).await
+    async fn download(&self, key: &str, method: DownloadMethod) -> pub_core::Result<DownloadPlan> {
+        self.inner.download(key, method).await
     }
 
     async fn delete(&self, _key: &str) -> pub_core::Result<()> {

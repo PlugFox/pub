@@ -201,6 +201,16 @@ pub const INSTRUMENTS: &[Instrument] = &[
     },
     // --- blob lifecycle ---
     Instrument {
+        name: "archive_presign_total",
+        kind: InstrumentKind::Counter,
+        labels: &["outcome"],
+        help: "Archive downloads planned by the S3 backend while `blob.presign` is on, by \
+               outcome: `signed` was answered with a 307 to a presigned URL, `failed` could not \
+               be signed and was streamed through this process instead (decision 34). A rising \
+               `failed` share is the object store's credential path failing, and it presents \
+               otherwise as S3 egress disappearing while the app tier gets busy.",
+    },
+    Instrument {
         name: "blob_gc_scanned_total",
         kind: InstrumentKind::Counter,
         labels: &[],

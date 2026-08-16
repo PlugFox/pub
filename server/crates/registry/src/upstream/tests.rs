@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use chrono::TimeZone as _;
 use pub_core::audit::AuditFilter;
-use pub_core::traits::{BlobStore, DownloadPlan, Repositories};
+use pub_core::traits::{BlobStore, DownloadMethod, DownloadPlan, Repositories};
 use pub_db_sqlite::SqliteDb;
 use serde_json::json;
 
@@ -48,7 +48,7 @@ impl BlobStore for MemoryBlob {
         Ok(())
     }
 
-    async fn download(&self, key: &str) -> Result<DownloadPlan> {
+    async fn download(&self, key: &str, _method: DownloadMethod) -> Result<DownloadPlan> {
         let bytes = self
             .objects
             .lock()

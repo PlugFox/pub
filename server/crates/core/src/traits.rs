@@ -60,6 +60,21 @@ pub type ByteStream = BoxStream<'static, Result<Bytes>>;
 /// Stream of broker messages delivered to a [`Kv`] subscriber.
 pub type MessageStream = BoxStream<'static, KvMessage>;
 
+/// The HTTP method a planned download will be fetched with.
+///
+/// A plan needs this because a presigned URL is signed *for one method*: SigV4 puts the method
+/// inside the signature, so a URL signed for `GET` answers `SignatureDoesNotMatch` to the
+/// `HEAD` the pub client sends before every archive fetch ([decision 34](../../../docs/decisions.md)).
+/// Two variants and not [`http::Method`], because `core` takes no infrastructure dependency and
+/// because the archive routes accept nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadMethod {
+    /// The bytes are wanted.
+    Get,
+    /// Only the headers are wanted — the pub client's cache probe.
+    Head,
+}
+
 /// How a blob download is served (decision 10) — decided per request.
 pub enum DownloadPlan {
     /// Redirect (HTTP 307) to a presigned URL; used by backends that support signing (S3).
@@ -1251,9 +1266,18 @@ pub trait BlobStore: Send + Sync {
     /// overwrites idempotent).
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()>;
 
-    /// Plans a download for `key`: presigned redirect where supported, streamed bytes
-    /// otherwise. [`crate::Error::NotFound`] when the key does not exist.
-    async fn download(&self, key: &str) -> Result<DownloadPlan>;
+    /// Plans a download for `key`: presigned redirect where supported and enabled, streamed
+    /// bytes otherwise. [`crate::Error::NotFound`] when the key does not exist.
+    ///
+    /// `method` is the method the planned response will be fetched with, and it is load-bearing
+    /// only on the redirect path — a presigned URL is signed for one method and refuses the
+    /// others ([`DownloadMethod`]). A backend that only ever streams may ignore it.
+    ///
+    /// **A redirect is not a proof that the bytes exist.** A signing backend signs offline, so
+    /// [`crate::Error::NotFound`] is reported only by the streaming path; a redirect to a key
+    /// the store has lost is answered by the store, at the client
+    /// ([S-18.a](../../../docs/security.md#4-supply-chain--registry-integrity)).
+    async fn download(&self, key: &str, method: DownloadMethod) -> Result<DownloadPlan>;
 
     /// Reads a blob's bytes into this process.
     ///
@@ -1265,7 +1289,7 @@ pub trait BlobStore: Send + Sync {
     /// The default drains a streamed plan, which is correct for every backend that never
     /// redirects; a signing backend must override it with a direct read.
     async fn get(&self, key: &str) -> Result<Bytes> {
-        match self.download(key).await? {
+        match self.download(key, DownloadMethod::Get).await? {
             DownloadPlan::Stream(mut stream) => {
                 use futures::StreamExt as _;
 

@@ -19,7 +19,7 @@ use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use pub_blob::ObjectStoreBlob;
-use pub_core::traits::{BlobObject, BlobStore, DownloadPlan, PrefixListing, Repositories};
+use pub_core::traits::{BlobObject, BlobStore, DownloadMethod, DownloadPlan, PrefixListing, Repositories};
 use pub_core::{Format, Result};
 use pub_db_sqlite::SqliteDb;
 use pub_jobs::{STAGING_SWEEP_JOB, StagingPolicy, StagingSweeper};
@@ -216,7 +216,7 @@ async fn a_backend_that_cannot_enumerate_fails_the_job_rather_than_deleting() {
             Ok(())
         }
 
-        async fn download(&self, key: &str) -> Result<DownloadPlan> {
+        async fn download(&self, key: &str, _method: DownloadMethod) -> Result<DownloadPlan> {
             Err(pub_core::Error::NotFound { what: key.to_owned() })
         }
 
@@ -248,8 +248,8 @@ impl BlobStore for SlowListing {
         self.inner.put(key, bytes).await
     }
 
-    async fn download(&self, key: &str) -> Result<DownloadPlan> {
-        self.inner.download(key).await
+    async fn download(&self, key: &str, method: DownloadMethod) -> Result<DownloadPlan> {
+        self.inner.download(key, method).await
     }
 
     async fn delete(&self, _key: &str) -> Result<()> {
@@ -291,8 +291,8 @@ impl BlobStore for RewrittenOnHead {
         self.inner.put(key, bytes).await
     }
 
-    async fn download(&self, key: &str) -> Result<DownloadPlan> {
-        self.inner.download(key).await
+    async fn download(&self, key: &str, method: DownloadMethod) -> Result<DownloadPlan> {
+        self.inner.download(key, method).await
     }
 
     async fn delete(&self, _key: &str) -> Result<()> {

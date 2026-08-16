@@ -10,10 +10,15 @@ publish.workspace = true
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+# http: the method a presigned URL is signed for — object_store's Signer takes `http::Method`.
+http = { workspace = true }
+metrics = { workspace = true }
 object_store = { workspace = true }
 pub-config = { workspace = true }
 pub-core = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+url = { workspace = true }

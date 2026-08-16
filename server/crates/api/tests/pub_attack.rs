@@ -123,8 +123,12 @@ impl pub_core::traits::BlobStore for RecordingBlob {
         self.inner.put(key, bytes).await
     }
 
-    async fn download(&self, key: &str) -> pub_core::Result<pub_core::traits::DownloadPlan> {
-        self.inner.download(key).await
+    async fn download(
+        &self,
+        key: &str,
+        method: pub_core::traits::DownloadMethod,
+    ) -> pub_core::Result<pub_core::traits::DownloadPlan> {
+        self.inner.download(key, method).await
     }
 
     async fn delete(&self, key: &str) -> pub_core::Result<()> {

@@ -22,7 +22,7 @@ use pub_core::package::{
     NameClaim, NewPackage, NewVersion, Package, PackageOptions, PublishedVersion, Publisher, RegistryStats, Version,
     Visibility,
 };
-use pub_core::traits::{BlobStore, DownloadPlan, PackageRepo, Repositories};
+use pub_core::traits::{BlobStore, DownloadMethod, DownloadPlan, PackageRepo, Repositories};
 use pub_core::user::NewUser;
 use pub_core::{Error, Format, OrgId, PackageId, Page, Result, SemVer, UserId, VersionId};
 use pub_db_sqlite::SqliteDb;
@@ -59,7 +59,7 @@ impl BlobStore for MemoryBlob {
         Ok(())
     }
 
-    async fn download(&self, key: &str) -> Result<DownloadPlan> {
+    async fn download(&self, key: &str, _method: DownloadMethod) -> Result<DownloadPlan> {
         let bytes = self
             .objects
             .lock()
@@ -411,7 +411,7 @@ impl Harness {
     }
 
     async fn blob_bytes(&self, key: &str) -> Vec<u8> {
-        match self.blob.download(key).await.expect("download") {
+        match self.blob.download(key, DownloadMethod::Get).await.expect("download") {
             DownloadPlan::Stream(stream) => {
                 let chunks: Vec<Bytes> = stream.map(|chunk| chunk.expect("chunk")).collect().await;
                 chunks.concat()

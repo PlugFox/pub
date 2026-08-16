@@ -717,6 +717,12 @@ pub struct BlobConfig {
     pub bucket: Option<String>,
     /// Custom endpoint URL for S3-compatible stores (MinIO); AWS default when unset.
     pub endpoint: Option<String>,
+    /// Endpoint URL clients can reach, when it differs from `blob.endpoint` — required to presign behind a private endpoint.
+    pub public_endpoint: Option<String>,
+    /// Serve archive downloads as presigned redirects instead of streaming them through this process (`s3` only).
+    pub presign: bool,
+    /// Lifetime of a presigned download URL, in seconds; must be between 1500 and 604800.
+    pub presign_ttl_secs: u64,
     /// S3 region; defaults to `us-east-1` when unset.
     pub region: Option<String>,
     /// S3 access key id; falls back to the ambient AWS credential chain when unset.
@@ -732,6 +738,9 @@ impl Default for BlobConfig {
             path: "data/blobs".to_owned(),
             bucket: None,
             endpoint: None,
+            public_endpoint: None,
+            presign: false,
+            presign_ttl_secs: 1800,
             region: None,
             access_key: None,
             secret_key: None,
@@ -1688,6 +1697,13 @@ impl Settings {
             BlobKind::S3 => {
                 let _ = writeln!(out, "  blob.bucket          = {}", opt(&self.blob.bucket));
                 let _ = writeln!(out, "  blob.endpoint        = {}", opt(&self.blob.endpoint));
+                // Who serves the archive bytes is not a detail an operator should have to infer
+                // from egress graphs (decision 34), so both lines print even when off.
+                let _ = writeln!(out, "  blob.presign         = {}", self.blob.presign);
+                if self.blob.presign {
+                    let _ = writeln!(out, "  blob.public_endpoint = {}", opt(&self.blob.public_endpoint));
+                    let _ = writeln!(out, "  blob.presign_ttl     = {}s", self.blob.presign_ttl_secs);
+                }
                 let _ = writeln!(out, "  blob.region          = {}", opt(&self.blob.region));
                 let _ = writeln!(out, "  blob.access_key      = {}", mask_opt(&self.blob.access_key));
                 let _ = writeln!(out, "  blob.secret_key      = {}", mask_opt(&self.blob.secret_key));
