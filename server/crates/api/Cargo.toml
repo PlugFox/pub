@@ -62,6 +62,11 @@ hmac = { workspace = true }
 http-body-util = { workspace = true }
 pub-blob = { workspace = true }
 pub-db-sqlite = { workspace = true }
+# The cluster suite boots two applications over one throwaway Postgres database — the only
+# backend that can arbitrate a lease between them (decision 36).
+pub-db-postgres = { workspace = true }
+pub-test-support = { workspace = true }
+sqlx = { workspace = true }
 pub-events = { workspace = true }
 pub-jobs = { workspace = true }
 pub-kv = { workspace = true }

@@ -136,6 +136,6 @@ mod tests {
     #[test]
     fn migrator_contains_the_expected_migrations() {
         let versions: Vec<i64> = MIGRATOR.migrations.iter().map(|m| m.version).collect();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     }
 }

@@ -199,12 +199,38 @@ fn replicas_above_one_with_memory_kv_is_rejected() {
 }
 
 #[test]
-fn replicas_above_one_with_redis_kv_is_accepted() {
+fn replicas_above_one_with_sqlite_is_rejected() {
+    // Decision 36, closing D1: the Redis KV alone used to be the whole gate, so this exact
+    // configuration was *accepted* while leader election still lived in one process. The lock is
+    // a lease row in the database, and a SQLite file is not a place two instances may meet.
+    let cli = CliArgs { replicas: Some(2), ..CliArgs::default() };
+    let err = load_from(&cli, env(&[("PUB_KV__KIND", "redis"), ("PUB_KV__URL", "redis://localhost:6379")]))
+        .expect_err("redis alone is not a distributed lock");
+    match err {
+        ConfigError::Invalid(message) => {
+            assert!(message.contains("postgres"), "message must point at the fix: {message}");
+            assert!(message.contains("decision 36"), "message must cite the decision: {message}");
+        }
+        other => panic!("expected Invalid, got: {other}"),
+    }
+}
+
+#[test]
+fn replicas_above_one_with_redis_kv_and_postgres_is_accepted() {
     let cli = CliArgs { replicas: Some(3), ..CliArgs::default() };
-    let settings =
-        load_from(&cli, env(&[("PUB_KV__KIND", "redis"), ("PUB_KV__URL", "redis://localhost:6379")])).unwrap();
+    let settings = load_from(
+        &cli,
+        env(&[
+            ("PUB_KV__KIND", "redis"),
+            ("PUB_KV__URL", "redis://localhost:6379"),
+            ("PUB_DATABASE__KIND", "postgres"),
+            ("PUB_DATABASE__URL", "postgres://pub:pub@localhost:5432/pub"),
+        ]),
+    )
+    .unwrap();
     assert_eq!(settings.cluster.replicas, 3);
     assert_eq!(settings.kv.kind, KvKind::Redis);
+    assert_eq!(settings.database.kind, DatabaseKind::Postgres);
 }
 
 #[test]

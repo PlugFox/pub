@@ -762,11 +762,12 @@ async fn d2_a_fanout_that_hangs_is_bounded_by_the_deadline_its_budget_prices_it_
         async fn complete(
             &self,
             id: QueuedJobId,
+            attempts: i64,
             outcome: QueueOutcome,
             backoff: StdDuration,
             now: DateTime<Utc>,
-        ) -> Result<()> {
-            self.inner.complete(id, outcome, backoff, now).await
+        ) -> Result<bool> {
+            self.inner.complete(id, attempts, outcome, backoff, now).await
         }
 
         async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64> {
@@ -944,11 +945,12 @@ async fn d44_a_notification_email_that_cannot_be_queued_is_not_lost_in_silence()
         async fn complete(
             &self,
             id: QueuedJobId,
+            attempts: i64,
             outcome: QueueOutcome,
             backoff: StdDuration,
             now: DateTime<Utc>,
-        ) -> Result<()> {
-            self.inner.complete(id, outcome, backoff, now).await
+        ) -> Result<bool> {
+            self.inner.complete(id, attempts, outcome, backoff, now).await
         }
 
         async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64> {

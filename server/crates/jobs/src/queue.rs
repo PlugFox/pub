@@ -155,12 +155,35 @@ pub struct QueueReport {
     pub dead: u64,
     /// Leases returned to the queue because their worker never reported back.
     pub reaped: u64,
+    /// Completions that **did not apply** — the item had been reaped and re-claimed by another
+    /// drain before this one reported back ([D45](../../../../docs/roadmap.md),
+    /// [decision 36](../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)).
+    ///
+    /// Counted rather than only logged, because a non-zero value is a *diagnosis*: two drains
+    /// overlapped on one item, which with the leader lease in place should only be reachable
+    /// inside a crash window. The work itself already happened — for `mail.send` that means a
+    /// message this instance sent and another instance is sending again.
+    pub lost: u64,
     /// Items sitting in `dead` **right now**.
     ///
     /// A per-run count is not what an operator needs: a dead-lettered sign-in message is an
     /// account lockout with no other visible cause, and it stays invisible until somebody looks
     /// at the standing total. This is that total, reported on every tick.
     pub dead_pending: i64,
+}
+
+/// What one item's run produced — and whether the queue actually recorded it.
+///
+/// The second half is why this is not a bare [`QueueOutcome`]: since [D45](../../../../docs/roadmap.md)
+/// was closed, a completion carries the claim it belongs to, so a worker whose lease expired and
+/// whose item was re-claimed elsewhere writes nothing. The drain has to tell the two apart —
+/// counting a lost completion as a delivery is reporting another attempt's work as this one's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ItemResult {
+    /// The completion matched the claim and the row moved.
+    Applied(QueueOutcome),
+    /// The item had moved on; nothing was written.
+    Lost,
 }
 
 /// One kind's handler.
@@ -313,16 +336,20 @@ impl QueueWorker {
             // used to gate every message behind it, including the sign-in code (decision 26's
             // amendment). Each item still completes before its own follow-ups are published —
             // that ordering is per item and is preserved inside `run_item`.
-            let outcomes: Vec<Result<QueueOutcome>> = futures::stream::iter(batch)
+            let outcomes: Vec<Result<ItemResult>> = futures::stream::iter(batch)
                 .map(|job| async move { self.run_item(&job, started, now).await })
                 .buffer_unordered(self.policy.concurrency.max(1) as usize)
                 .collect()
                 .await;
             for outcome in outcomes {
+                // A completion that did not apply is not an outcome this drain produced: the row
+                // belongs to a later claim, and counting it here would report a delivery that
+                // another attempt owns (D45).
                 match outcome? {
-                    QueueOutcome::Done => report.delivered += 1,
-                    QueueOutcome::Retry(_) => report.retried += 1,
-                    QueueOutcome::Dead(_) => report.dead += 1,
+                    ItemResult::Lost => report.lost += 1,
+                    ItemResult::Applied(QueueOutcome::Done) => report.delivered += 1,
+                    ItemResult::Applied(QueueOutcome::Retry(_)) => report.retried += 1,
+                    ItemResult::Applied(QueueOutcome::Dead(_)) => report.dead += 1,
                 }
             }
         }
@@ -341,15 +368,16 @@ impl QueueWorker {
     /// tick's instant a lease minted after two minutes of drain is already expired when it is
     /// written, and every retry's backoff — the ten-second-to-an-hour ladder that exists for
     /// exactly this outage — collapses to "runnable immediately".
-    async fn run_item(&self, job: &QueuedJob, started: Instant, now: DateTime<Utc>) -> Result<QueueOutcome> {
+    async fn run_item(&self, job: &QueuedJob, started: Instant, now: DateTime<Utc>) -> Result<ItemResult> {
         let at = now + chrono::Duration::from_std(started.elapsed()).unwrap_or_else(|_| Duration::zero());
         let Some(handler) = self.handlers.get(&job.kind) else {
             // Unreachable while `claim` is given exactly the registered kinds; recorded rather
             // than `expect`ed because a panic here would take the whole drain down with it.
             tracing::error!(kind = %job.kind, "claimed an item with no registered handler");
             let outcome = QueueOutcome::Dead("no handler registered".to_owned());
-            self.repos.queue.complete(job.id, outcome.clone(), StdDuration::ZERO, at).await?;
-            return Ok(outcome);
+            let applied =
+                self.repos.queue.complete(job.id, job.attempts, outcome.clone(), StdDuration::ZERO, at).await?;
+            return Ok(if applied { ItemResult::Applied(outcome) } else { ItemResult::Lost });
         };
 
         let handled = handler.run(job, at).await;
@@ -361,21 +389,42 @@ impl QueueWorker {
             }
             other => other,
         };
-        if let QueueOutcome::Dead(message) = &outcome {
-            tracing::error!(kind = %job.kind, id = %job.id, attempts = job.attempts, %message, "queue item dead-lettered");
-        }
-        metrics::counter!("queue_jobs_total", "kind" => job.kind.as_str(), "outcome" => outcome.as_str()).increment(1);
 
         // The clock again, not `at`: the handler is where the wall-clock goes, so a completion
         // dated from before it is a lease and a backoff measured from the wrong end of a send.
         let done_at = now + chrono::Duration::from_std(started.elapsed()).unwrap_or_else(|_| Duration::zero());
         // Completion first, follow-ups second, always: publishing from before the completion is
         // committed is how a client learns about a notification it cannot yet read.
-        self.repos.queue.complete(job.id, outcome.clone(), self.policy.backoff_for(job), done_at).await?;
+        let applied = self
+            .repos
+            .queue
+            .complete(job.id, job.attempts, outcome.clone(), self.policy.backoff_for(job), done_at)
+            .await?;
+        if !applied {
+            // The item was reaped and re-claimed while this handler was running, so the row now
+            // belongs to another attempt (D45). Neither the metric nor the follow-ups are ours to
+            // emit: the follow-up event is the record of *a* completion, and this one did not
+            // happen. The work did — for `mail.send` that is a message sent twice, which is what
+            // at-least-once delivery has always meant and is why this is logged at warn.
+            tracing::warn!(
+                kind = %job.kind,
+                id = %job.id,
+                attempts = job.attempts,
+                "completion did not apply: the item was re-claimed by another drain"
+            );
+            return Ok(ItemResult::Lost);
+        }
+        // Logged **after** the write, not before it: a dead letter that did not apply is another
+        // worker's row, and an error line for a transition that never happened is the class of
+        // claim the wave-3a rule is about.
+        if let QueueOutcome::Dead(message) = &outcome {
+            tracing::error!(kind = %job.kind, id = %job.id, attempts = job.attempts, %message, "queue item dead-lettered");
+        }
+        metrics::counter!("queue_jobs_total", "kind" => job.kind.as_str(), "outcome" => outcome.as_str()).increment(1);
         for followup in handled.followups {
             self.events.publish_followup(followup).await;
         }
-        Ok(outcome)
+        Ok(ItemResult::Applied(outcome))
     }
 
     /// Publishes the per-`(kind, state)` gauges and reads the standing dead-letter total.

@@ -11,6 +11,11 @@
 //! Every write carries a state predicate: `complete` touches only a row that is still
 //! `running`, which is what keeps a `suppressed` row (S-04.a/S-31) from being resurrected into
 //! something deliverable by a late `Retry`.
+//!
+//! On this dialect that guard was never enough on its own, and the header said otherwise
+//! ([D45](../../../../docs/roadmap.md)): with concurrent drains a running row may be running
+//! under *another* worker's lease. Since [decision 36](../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)
+//! the claim's `attempts` fences the completion, and the statement reports whether it applied.
 
 use std::time::Duration;
 
@@ -224,10 +229,11 @@ impl JobQueueRepo for PgJobQueueRepo {
     async fn complete(
         &self,
         id: QueuedJobId,
+        attempts: i64,
         outcome: QueueOutcome,
         backoff: Duration,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // A success clears the previous error for the same reason `JobRepo::finish_run` does:
         // leaving it would show the admin surface a failure that has been recovered from.
         let (state, run_after) = match &outcome {
@@ -235,19 +241,24 @@ impl JobQueueRepo for PgJobQueueRepo {
             QueueOutcome::Retry(_) => (QueueState::Pending, Some(deadline(now, backoff))),
             QueueOutcome::Dead(_) => (QueueState::Dead, None),
         };
-        sqlx::query(
+        // `attempts` fences the claim (D45, decision 36). This is the dialect where two drains
+        // are a real shape: a worker whose lease expired, was reaped, and whose item was
+        // re-claimed by another instance would otherwise mark that row `done` mid-delivery,
+        // clear the lease and erase the `last_error` the operator would have seen.
+        let result = sqlx::query(
             "UPDATE job_queue SET state = $1, run_after = COALESCE($2::timestamptz, run_after), locked_until = NULL, \
-             last_error = $3, updated_at = $4 WHERE id = $5 AND state = 'running'",
+             last_error = $3, updated_at = $4 WHERE id = $5 AND state = 'running' AND attempts = $6",
         )
         .bind(state.as_str())
         .bind(run_after)
         .bind(outcome.message())
         .bind(now)
         .bind(*id.as_uuid())
+        .bind(attempts)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64> {

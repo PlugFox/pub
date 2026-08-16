@@ -10,6 +10,12 @@
 //! Every write here also carries a state predicate, because the states are not interchangeable:
 //! `complete` touches only a row that is still `running`, which is what keeps a `suppressed`
 //! row (S-04.a/S-31) from being resurrected into something deliverable by a late `Retry`.
+//!
+//! That predicate used to be the *whole* of `complete`'s guard, and this header claimed more
+//! than it delivered ([D45](../../../../docs/roadmap.md)): a running row is not necessarily
+//! *this* worker's running row. Since [decision 36](../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)
+//! the claim's `attempts` fences it, so a completion that arrives after the item was reaped and
+//! re-claimed matches nothing and says so.
 
 use std::time::Duration;
 
@@ -231,10 +237,11 @@ impl JobQueueRepo for SqliteJobQueueRepo {
     async fn complete(
         &self,
         id: QueuedJobId,
+        attempts: i64,
         outcome: QueueOutcome,
         backoff: Duration,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // A success clears the previous error for the same reason `JobRepo::finish_run` does:
         // leaving it would show the admin surface a failure that has been recovered from.
         let (state, run_after) = match &outcome {
@@ -242,19 +249,26 @@ impl JobQueueRepo for SqliteJobQueueRepo {
             QueueOutcome::Retry(_) => (QueueState::Pending, Some(super::ts(deadline(now, backoff)))),
             QueueOutcome::Dead(_) => (QueueState::Dead, None),
         };
-        sqlx::query(
+        // `attempts` fences the claim (D45, decision 36): the count is incremented when the
+        // lease is taken, so a row that was reaped and re-claimed elsewhere no longer matches
+        // this worker's number and its late completion writes nothing at all. Without it the
+        // `state = 'running'` predicate alone would let that worker mark the row `done`
+        // mid-delivery under somebody else's lease, and `rows_affected` is what turns "did not
+        // apply" into something the caller can count.
+        let result = sqlx::query(
             "UPDATE job_queue SET state = ?, run_after = COALESCE(?, run_after), locked_until = NULL, \
-             last_error = ?, updated_at = ? WHERE id = ? AND state = 'running'",
+             last_error = ?, updated_at = ? WHERE id = ? AND state = 'running' AND attempts = ?",
         )
         .bind(state.as_str())
         .bind(run_after)
         .bind(outcome.message())
         .bind(super::ts(now))
         .bind(id.to_string())
+        .bind(attempts)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn reap_expired_leases(&self, now: DateTime<Utc>) -> Result<u64> {

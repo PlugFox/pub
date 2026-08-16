@@ -30,12 +30,26 @@ impl Settings {
         if self.cluster.replicas == 0 {
             return Err(invalid("cluster.replicas must be at least 1"));
         }
-        // Decision 03: the in-memory KV cannot share revocations, locks, or invalidations
+        // Decision 03: the in-memory KV cannot share revocations, sessions or invalidations
         // across instances — a Redis-compatible store + broker gates any scale-out.
         if self.cluster.replicas > 1 && self.kv.kind == KvKind::Memory {
             return Err(invalid(format!(
                 "cluster.replicas = {} requires kv.kind = redis (decision 03): \
                  the in-memory KV backend is only correct for a single instance",
+                self.cluster.replicas
+            )));
+        }
+        // Decision 36, closing D1: this check used to be the KV one alone, which let an operator
+        // scale out with leader election still living in one process — at two replicas the blob
+        // GC runs twice over bytes it deletes and every job races one durable cursor. The
+        // distributed lock is a lease table in the database, so a SQLite deployment cannot have
+        // one: SQLite is single-instance by construction here, and its file is not a place two
+        // instances may meet.
+        if self.cluster.replicas > 1 && self.database.kind != DatabaseKind::Postgres {
+            return Err(invalid(format!(
+                "cluster.replicas = {} requires database.kind = postgres (decision 36): \
+                 leader election is a lease in the database, and the sqlite backend is \
+                 single-instance by construction",
                 self.cluster.replicas
             )));
         }

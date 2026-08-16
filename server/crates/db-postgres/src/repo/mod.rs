@@ -35,6 +35,7 @@ use sqlx::PgPool;
 mod audit;
 mod credentials;
 mod jobs;
+mod locks;
 mod notifications;
 mod orgs;
 mod packages;
@@ -49,6 +50,7 @@ mod users;
 pub use audit::PgAuditRepo;
 pub use credentials::PgCredentialRepo;
 pub use jobs::PgJobRepo;
+pub use locks::PgJobLock;
 pub use notifications::PgNotificationRepo;
 pub use orgs::PgOrgRepo;
 pub use packages::PgPackageRepo;
@@ -83,6 +85,7 @@ pub fn repositories(pool: PgPool) -> Repositories {
         audit: Arc::new(PgAuditRepo::new(pool.clone())),
         settings: Arc::new(PgSettingsRepo::new(pool.clone())),
         jobs: Arc::new(PgJobRepo::new(pool.clone())),
+        locks: Arc::new(PgJobLock::new(pool.clone())),
         queue: Arc::new(PgJobQueueRepo::new(pool.clone())),
         search: Arc::new(PgPackageSearch::new(pool.clone())),
         stats: Arc::new(PgStatsRepo::new(pool.clone())),

@@ -526,10 +526,11 @@ pub trait UpstreamRepo: Send + Sync {
 
 /// Durable background-job state (decision 03 leader-locked scheduler; see [`crate::jobs`]).
 ///
-/// Separate from [`JobLock`] on purpose: the lock answers "may I run right now" and lives
-/// wherever leader election does (KV, PG advisory locks), while this answers "where did I get
-/// to" and has to be durable across every restart and every leader change. One instance
-/// acquiring the lock must resume the cursor the *previous* leader wrote.
+/// Separate from [`JobLock`] on purpose: the lock answers "may I run right now" and holds a
+/// lease that expires, while this answers "where did I get to" and has to be durable across
+/// every restart and every leader change. Since decision 36 both live in the same database,
+/// which makes the distinction easy to lose — the lock's rows are disposable and the cursor's
+/// are not. One instance acquiring the lock must resume the cursor the *previous* leader wrote.
 #[async_trait]
 pub trait JobRepo: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.
@@ -623,20 +624,31 @@ pub trait JobQueueRepo: Send + Sync {
     async fn claim(&self, kinds: &[JobKind], limit: u32, lease: Duration, now: DateTime<Utc>)
     -> Result<Vec<QueuedJob>>;
 
-    /// Records how one claimed item ended (see [`QueueOutcome`]). `backoff` is consumed only
-    /// by [`QueueOutcome::Retry`], which re-arms `run_after = now + backoff`.
+    /// Records how one claimed item ended (see [`QueueOutcome`]), and reports whether the
+    /// transition **applied**. `backoff` is consumed only by [`QueueOutcome::Retry`], which
+    /// re-arms `run_after = now + backoff`.
     ///
-    /// Applies **only to a row that is still `running`**. A worker whose lease already expired
-    /// and was reaped therefore reports into the void rather than clobbering the state of
-    /// whoever holds the item now — and, decisively, a `Retry` can never resurrect a
-    /// suppressed or dead-lettered row into something claimable.
+    /// `attempts` is the claim this call is talking about — the value
+    /// [`JobQueueRepo::claim`] handed back for this item. Attempts are incremented when the
+    /// lease is taken, so that number names one acquisition and no later one, and the row moves
+    /// only when it is still `running` **and** still on that attempt.
+    ///
+    /// Both halves are load-bearing, and before [decision 36](../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)
+    /// only the first existed ([D45](../../../docs/roadmap.md)). `state = 'running'` alone stops
+    /// a `Retry` from resurrecting a suppressed or dead-lettered row — but it does **not** stop
+    /// a worker whose lease expired, was reaped, and was re-claimed elsewhere from marking that
+    /// row `done` mid-delivery, clearing the lease and the `last_error` an operator would have
+    /// seen. With the attempt in the predicate, a completion that arrives after the item moved
+    /// on returns `false` and writes nothing; the caller counts it as lost rather than as a
+    /// delivery, and does not publish the item's follow-ups.
     async fn complete(
         &self,
         id: QueuedJobId,
+        attempts: i64,
         outcome: QueueOutcome,
         backoff: Duration,
         now: DateTime<Utc>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Returns every item whose lease expired — a worker died mid-run — to `pending`, and
     /// reports how many. The attempt those items already spent is **not** given back.
@@ -1606,6 +1618,14 @@ pub struct Repositories {
     pub settings: Arc<dyn SettingsRepo>,
     /// Durable background-job state (decision 03, decision 07 mirror).
     pub jobs: Arc<dyn JobRepo>,
+    /// Leader-election leases over the `job_locks` table ([decision 36](../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)).
+    ///
+    /// A [`JobLock`] rather than a repository of its own: the trait already states exactly what
+    /// this table has to provide, and bundling it here is what runs the same contract functions
+    /// against both dialects. Which implementation a *deployment* takes is decided in `pubd` by
+    /// the database kind — Postgres takes this one, SQLite takes the in-process lock — so this
+    /// field is always populated and never the answer to "what is this instance using".
+    pub locks: Arc<dyn JobLock>,
     /// The durable work queue behind asynchronous fan-out and outbound mail (decision 26).
     pub queue: Arc<dyn JobQueueRepo>,
     /// Package search index and the read model over it (decision 11).
@@ -1669,6 +1689,14 @@ impl LockToken {
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
     }
+
+    /// The underlying UUID — for an implementation that stores the token in a typed column.
+    ///
+    /// Only a [`JobLock`] implementation has any business with this: the token is opaque to
+    /// holders, which compare it by handing it back to [`JobLock::release`].
+    pub const fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
 }
 
 impl Default for LockToken {
@@ -1683,8 +1711,18 @@ impl fmt::Display for LockToken {
     }
 }
 
-/// Leader-election lock guarding single-instance background jobs (PG advisory lock / Redis
-/// lock / trivial in-process lock for a single node).
+/// Leader-election lock guarding single-instance background jobs.
+///
+/// Two implementations ship ([decision 36](../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)):
+/// the in-process one, correct for a single instance and what a SQLite deployment takes, and a
+/// **lease row in the application database**, which is what every Postgres deployment takes
+/// whether or not it declared more than one replica. It is deliberately neither a PG advisory
+/// lock (session-scoped, so a pooled implementation must pin a connection per held lock — and
+/// the per-name publish lock is keyed on the package) nor a Redis key (evictable, and lost by a
+/// failover that never persisted it, which is two leaders with no signal).
+///
+/// An implementation whose state is shared between instances must derive expiry from **one**
+/// clock — the store's — because skew between two callers is the double-holder bug itself.
 #[async_trait]
 pub trait JobLock: Send + Sync {
     /// Cheap connectivity probe used by `/healthz`.

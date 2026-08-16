@@ -466,7 +466,6 @@ async fn finalize_keeps_the_staged_upload_across_a_publish_lock_conflict() {
     // into "publish again from scratch" — so the session must survive it, unlike every
     // permanent 400 (duplicate version, corrupt archive), whose discard behavior is pinned by
     // the surrounding tests.
-    use pub_core::traits::JobLock as _;
 
     let app = TestApp::new().await;
     let acme = publisher(&app, "dev@acme.test", "acme").await;

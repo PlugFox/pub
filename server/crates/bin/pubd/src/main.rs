@@ -136,7 +136,11 @@ async fn main() -> anyhow::Result<()> {
     events.spawn_broker_subscription();
     let sink: Arc<dyn EventSink> = Arc::clone(&events) as Arc<dyn EventSink>;
 
-    let registry = build_registry(&settings, repos.clone(), Arc::clone(&blob), Arc::clone(&sink));
+    // One lock plane for the whole process: the per-name publish lock and every job's leader
+    // lock take their names out of the same table (decision 36), which is also what makes
+    // "which lock is this instance running" a single answer rather than two.
+    let lock = build_job_lock(&settings, &repos);
+    let registry = build_registry(&settings, repos.clone(), Arc::clone(&blob), Arc::clone(&sink), Arc::clone(&lock));
     let upstream = build_upstream(&settings, repos.clone(), Arc::clone(&blob), Arc::clone(&sink))?;
 
     // One buffer, shared by the download handler that fills it and the rollup job that drains
@@ -147,8 +151,9 @@ async fn main() -> anyhow::Result<()> {
     // `serve` — a mirror sweep that stops the moment the binding is dropped would be a very
     // confusing bug. The registry it hands back is the same job set, reachable on demand from
     // the admin surface under the same leader lock.
-    let (_jobs, triggers) = spawn_jobs(
+    let (jobs, triggers) = spawn_jobs(
         &settings,
+        Arc::clone(&lock),
         repos.clone(),
         Arc::clone(&blob),
         upstream.clone(),
@@ -222,6 +227,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("server error")?;
 
+    // The jobs stop *after* the listener drains, and they stop by asking rather than by abort:
+    // since decision 36 a lock held at exit is a row another replica has to wait out, so a
+    // planned stop gives its leases back instead of paying the TTL that exists for crashes.
+    if let Some(jobs) = jobs {
+        jobs.stop_and_release().await;
+    }
+
     tracing::info!("pubd stopped");
     drop(telemetry);
     Ok(())
@@ -272,18 +284,51 @@ fn build_blob(settings: &Settings) -> anyhow::Result<Arc<dyn BlobStore>> {
     Ok(blob)
 }
 
+/// Chooses this instance's leader-election lock
+/// ([decision 36](../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check),
+/// closing D1).
+///
+/// **By the database kind, deliberately not by `cluster.replicas`.** A lock chosen from the
+/// declared topology would be wrong in exactly the case that actually happens — an operator
+/// scaling one container to two without editing the config — and being wrong there means the
+/// blob GC running twice over bytes it deletes. Chosen by the storage engine, a Postgres
+/// deployment is safe whether or not it told us what it did.
+///
+/// SQLite takes the in-process lock: it is single-instance by construction here, that lock is
+/// correct for it, and a restart clears it rather than leaving a lease behind for the next boot
+/// to wait out.
+fn build_job_lock(settings: &Settings, repos: &Repositories) -> Arc<dyn JobLock> {
+    match settings.database.kind {
+        DatabaseKind::Postgres => {
+            tracing::info!(
+                lock = "database",
+                "background jobs and the publish lock elect a leader through the job_locks table"
+            );
+            Arc::clone(&repos.locks)
+        }
+        DatabaseKind::Sqlite => {
+            tracing::info!(
+                lock = "in-process",
+                "leader election is in-process: the sqlite backend is a single-instance deployment"
+            );
+            Arc::new(InMemoryJobLock::new())
+        }
+    }
+}
+
 /// Builds the registry services from the `[registry]` config section (S-20 limits,
 /// decision 06 restore window).
 ///
-/// The publish lock is the in-process [`JobLock`] for now; the Redis-backed implementation
-/// arrives with the multi-instance tier (decision 03). The event sink is the process-wide bus
-/// (decision 22), so a publish reaches the SSE stream and the notification center through the
-/// same seam the audit log already uses.
+/// The publish lock is handed in rather than built here: it is the same lock the scheduler
+/// takes, so that a name being published and a job running are decided by one mechanism
+/// (decision 36). The event sink is the process-wide bus (decision 22), so a publish reaches the
+/// SSE stream and the notification center through the same seam the audit log already uses.
 fn build_registry(
     settings: &Settings,
     repos: Repositories,
     blob: Arc<dyn BlobStore>,
     events: Arc<dyn EventSink>,
+    lock: Arc<dyn JobLock>,
 ) -> Arc<RegistryService> {
     let cfg = &settings.registry;
     let policy = RegistryPolicy {
@@ -297,7 +342,6 @@ fn build_registry(
         unretract_window: chrono::Duration::days(cfg.unretract_window_days),
         ..RegistryPolicy::default()
     };
-    let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
     Arc::new(RegistryService::new(repos, blob, lock, events, policy))
 }
 
@@ -368,14 +412,14 @@ fn window(days: i64) -> Option<chrono::Duration> {
 /// The **work queue's drain is the exception with no switch at all** (decision 26): it carries
 /// the sign-in mail, so an operator who could turn it off could not sign in to turn it back on.
 ///
-/// The lock is the in-process one for now (single instance); the Redis-backed implementation
-/// arrives with the multi-instance tier, and it is a one-line change here because the scheduler
-/// only ever sees `Arc<dyn JobLock>`. Note the interaction with D1 for the queue specifically:
-/// with the in-process lock two replicas would both drain, which the Postgres claim's
-/// `FOR UPDATE SKIP LOCKED` already makes safe, and SQLite is single-instance by construction.
+/// The lock comes from [`build_job_lock`] — the same handle the publish path holds. On Postgres
+/// it is a lease in `job_locks`, so two replicas contend for real and only one drains
+/// (decision 36, closing D1); on SQLite it is the in-process lock, which is what a
+/// single-instance deployment needs and all a single file can offer.
 #[allow(clippy::too_many_arguments)]
 fn spawn_jobs(
     settings: &Settings,
+    lock: Arc<dyn JobLock>,
     repos: Repositories,
     blob: Arc<dyn BlobStore>,
     upstream: Option<Arc<pub_registry::UpstreamService>>,
@@ -385,7 +429,6 @@ fn spawn_jobs(
     kek: Vec<u8>,
     runtime: Arc<SettingsCache>,
 ) -> (Option<SchedulerHandle>, Arc<dyn JobTrigger>) {
-    let lock: Arc<dyn JobLock> = Arc::new(InMemoryJobLock::new());
     // The work queue's drain (decision 26). Unconditional and first in the list: it carries the
     // sign-in mail, so there is no configuration under which this instance runs without it.
     // The mailer handed in is the *same* `Arc` the request path holds, so an administrator's

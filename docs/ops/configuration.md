@@ -328,7 +328,7 @@ Which KV backend to use: `memory` | `redis`.
 Allowed values:
 
 - `memory` — In-process store + broker — valid for a single replica only.
-- `redis` — Redis-compatible store + pub/sub broker — mandatory for `replicas > 1`.
+- `redis` — Redis-compatible store + pub/sub broker — mandatory for `replicas > 1` (which also requires `database.kind = postgres`, decision 36).
 
 ### `kv.url`
 
@@ -395,7 +395,9 @@ Multi-instance topology.
 
 integer · `PUB_CLUSTER__REPLICAS` · default: `1`
 
-Number of app replicas sharing the same backends. `> 1` requires the Redis KV backend.
+Number of app replicas sharing the same backends. `> 1` requires the Redis KV backend
+**and** the Postgres database backend — leader election is a lease row in the database
+(decision 36), and the SQLite backend is single-instance by construction.
 
 ## `[auth]`
 

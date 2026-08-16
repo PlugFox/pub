@@ -120,13 +120,17 @@ impl Harness {
                     .expect("enqueue")
                     .expect("row")
                     .id;
-                self.repos.queue.claim(&[job], 10, StdDuration::from_secs(60), at).await.expect("claim");
+                let claimed = self.repos.queue.claim(&[job], 10, StdDuration::from_secs(60), at).await.expect("claim");
                 let outcome = if state == QueueState::Done {
                     QueueOutcome::Done
                 } else {
                     QueueOutcome::Dead("undeliverable".to_owned())
                 };
-                self.repos.queue.complete(id, outcome, StdDuration::ZERO, at).await.expect("complete");
+                self.repos
+                    .queue
+                    .complete(id, claimed[0].attempts, outcome, StdDuration::ZERO, at)
+                    .await
+                    .expect("complete");
             }
             QueueState::Pending | QueueState::Running => panic!("not a settled state"),
         }

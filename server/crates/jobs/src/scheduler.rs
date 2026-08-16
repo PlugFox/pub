@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use pub_core::traits::JobLock;
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
 use crate::lock::JobLockTtls;
@@ -58,27 +59,37 @@ impl Scheduler {
         self.ttls.get(job)
     }
 
-    /// Spawns one tokio task per registered job and returns a handle that aborts them all
-    /// on [`SchedulerHandle::shutdown`] or drop.
+    /// Spawns one tokio task per registered job and returns a handle that stops them —
+    /// gracefully through [`SchedulerHandle::stop_and_release`], by abort on
+    /// [`SchedulerHandle::shutdown`] or drop.
     pub fn spawn(self) -> SchedulerHandle {
+        let (stop, _) = watch::channel(false);
         let handles = self
             .jobs
             .into_iter()
             .map(|job| {
                 let lock = Arc::clone(&self.lock);
                 let lock_ttl = self.ttls.get(job.name);
-                tokio::spawn(run_job_loop(job, lock, lock_ttl))
+                tokio::spawn(run_job_loop(job, lock, lock_ttl, stop.subscribe()))
             })
             .collect();
-        SchedulerHandle { handles }
+        SchedulerHandle { stop, handles }
     }
 }
 
-async fn run_job_loop(job: Job, lock: Arc<dyn JobLock>, lock_ttl: Duration) {
+async fn run_job_loop(job: Job, lock: Arc<dyn JobLock>, lock_ttl: Duration, mut stop: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(job.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        interval.tick().await;
+        // Waiting on the stop signal *beside* the tick is what keeps a shutdown from costing a
+        // lease. Since decision 36 a Postgres deployment's locks live in a table, so a loop
+        // aborted while holding one blocks that job on every replica until the TTL expires —
+        // for the queue drain, the sign-in mail plane through a rolling restart.
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            _ = interval.tick() => {}
+        }
         match lock.try_acquire(job.name, lock_ttl).await {
             Ok(Some(token)) => {
                 if let Err(error) = (job.run)().await {
@@ -88,6 +99,11 @@ async fn run_job_loop(job: Job, lock: Arc<dyn JobLock>, lock_ttl: Duration) {
                 // somebody else now holds, and the implementation is what refuses that.
                 if let Err(error) = lock.release(job.name, token).await {
                     tracing::warn!(job = job.name, %error, "failed to release job lock; TTL will expire it");
+                }
+                // A stop that arrived mid-run: the run finished, the lease is back, and this is
+                // the point at which leaving costs nothing.
+                if *stop.borrow() {
+                    return;
                 }
             }
             Ok(None) => {
@@ -102,14 +118,55 @@ async fn run_job_loop(job: Job, lock: Arc<dyn JobLock>, lock_ttl: Duration) {
 
 /// Owns the spawned job tasks; aborts them when shut down or dropped.
 pub struct SchedulerHandle {
+    stop: watch::Sender<bool>,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl SchedulerHandle {
-    /// Stops all job loops.
+    /// How long [`SchedulerHandle::stop_and_release`] waits for the loops before aborting them.
+    ///
+    /// A bound rather than "however long the longest job takes": a shutdown that hangs on a job
+    /// is a container the orchestrator kills anyway, and then the lease is leaked *and* the stop
+    /// took the grace period with it. Long enough for a drain to finish its current item.
+    pub const STOP_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// Stops all job loops **immediately**, by abort.
+    ///
+    /// A loop aborted while it holds its lock leaves that lock to expire on its TTL, which is
+    /// free for the in-process implementation and costs a stall for the database one — see
+    /// [`Self::stop_and_release`], which is what `pubd` calls.
     pub fn shutdown(&self) {
         for handle in &self.handles {
             handle.abort();
+        }
+    }
+
+    /// Asks every loop to finish what it is doing, release its lock, and exit; waits up to
+    /// [`Self::STOP_TIMEOUT`] and then aborts whatever is left.
+    ///
+    /// This is the half of leader election that only matters once the lock outlives the process
+    /// ([decision 36](../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)):
+    /// the TTL is what bounds a *crash*, and a planned stop should not have to be paid for at
+    /// the same price.
+    pub async fn stop_and_release(mut self) {
+        // A send with no receivers is not a failure here — it means every loop has already
+        // exited, which is the state this method is trying to reach.
+        let _ = self.stop.send(true);
+        let handles = &mut self.handles;
+        let waited = tokio::time::timeout(Self::STOP_TIMEOUT, async move {
+            for handle in handles.iter_mut() {
+                // The loops return rather than fail; a join error is an abort or a panic, and
+                // either way there is nothing left to wait for.
+                let _ = handle.await;
+            }
+        })
+        .await;
+        if waited.is_err() {
+            tracing::warn!(
+                timeout_secs = Self::STOP_TIMEOUT.as_secs(),
+                "background jobs did not stop in time; aborting — their locks will expire on their TTL"
+            );
+            self.shutdown();
         }
     }
 }
@@ -176,6 +233,44 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         handle.shutdown();
         assert!(runs.load(Ordering::SeqCst) >= 1, "job must run after the lock is released");
+    }
+
+    /// The pair that shows what the graceful stop buys, against the abort that does not buy it.
+    ///
+    /// With the in-process lock a leaked lease costs nothing, so this asserts the mechanism
+    /// rather than the damage — but the mechanism is the one a Postgres deployment's `job_locks`
+    /// row depends on: a loop aborted mid-run leaves that row until its TTL, on every replica
+    /// (decision 36).
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_stop_returns_the_lock_and_an_abort_does_not() {
+        async fn spawn_slow_job(lock: &Arc<InMemoryJobLock>) -> SchedulerHandle {
+            let mut scheduler =
+                Scheduler::new(Arc::clone(lock) as Arc<dyn JobLock>, JobLockTtls::with_default(Duration::from_secs(1)));
+            scheduler.add("slow", Duration::from_millis(50), || async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            });
+            let handle = scheduler.spawn();
+            // Long enough for the first tick to take the lock and be inside the run.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            handle
+        }
+
+        let aborted = Arc::new(InMemoryJobLock::new());
+        let handle = spawn_slow_job(&aborted).await;
+        handle.shutdown();
+        assert!(
+            aborted.try_acquire("slow", Duration::from_secs(3600)).await.unwrap().is_none(),
+            "an abort mid-run leaves the lock to its TTL — this is the cost the graceful path avoids"
+        );
+
+        let released = Arc::new(InMemoryJobLock::new());
+        let handle = spawn_slow_job(&released).await;
+        handle.stop_and_release().await;
+        assert!(
+            released.try_acquire("slow", Duration::from_secs(3600)).await.unwrap().is_some(),
+            "a graceful stop finishes the run in flight and hands the lock back"
+        );
     }
 
     #[tokio::test(start_paused = true)]

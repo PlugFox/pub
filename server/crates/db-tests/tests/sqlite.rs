@@ -192,6 +192,25 @@ async fn job_queue_contract_s04_s31() {
 }
 
 #[tokio::test]
+async fn queue_completion_is_fenced_by_its_claim_d45() {
+    pub_db_tests::contract::queue_completion_is_fenced_by_its_claim(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn job_lock_contract_decision36() {
+    pub_db_tests::contract::job_lock(&fresh_repos().await).await;
+}
+
+/// **D1's property, on a pool that can actually race.** Like the S-08 rotation above, this one
+/// does not take `fresh_repos()`: two acquisitions through one pinned connection are two
+/// sequential statements, and "exactly one winner" would hold for the wrong reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_lock_is_single_winner_decision36() {
+    let (_dir, repos) = file_backed_repos().await;
+    pub_db_tests::contract::job_lock_is_single_winner(&repos).await;
+}
+
+#[tokio::test]
 async fn retention_contract_s23_s22a() {
     pub_db_tests::contract::retention(&fresh_repos().await).await;
 }

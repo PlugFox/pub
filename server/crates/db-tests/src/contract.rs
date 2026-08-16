@@ -3569,11 +3569,14 @@ pub async fn job_queue(repos: &Repositories) {
     assert!(repos.queue.claim(&JobKind::ALL, 0, lease, t0()).await.expect("no room").is_empty());
 
     // A retry re-arms run_after, records why, and does not refund the attempt.
-    repos
-        .queue
-        .complete(mail.id, QueueOutcome::Retry("smtp unreachable".to_owned()), backoff, t0() + seconds(5))
-        .await
-        .expect("retry");
+    assert!(
+        repos
+            .queue
+            .complete(mail.id, 1, QueueOutcome::Retry("smtp unreachable".to_owned()), backoff, t0() + seconds(5))
+            .await
+            .expect("retry"),
+        "the worker holding the claim it names is the one that moves the row"
+    );
     let stored = repos.queue.get(mail.id).await.expect("get").expect("row");
     assert_eq!(stored.state, QueueState::Pending);
     assert_eq!(stored.run_after, t0() + seconds(35), "now + backoff, measured from the completion");
@@ -3604,11 +3607,13 @@ pub async fn job_queue(repos: &Repositories) {
     // the dead letter is final, and it is the operator's record of mail that never arrived.
     let claimed = repos.queue.claim(&[JobKind::MailSend], 10, lease, t0() + minutes(2)).await.expect("claim");
     assert_eq!(claimed[0].attempts, 3);
-    repos
-        .queue
-        .complete(mail.id, QueueOutcome::Dead("mailbox does not exist".to_owned()), backoff, t0() + minutes(3))
-        .await
-        .expect("dead letter");
+    assert!(
+        repos
+            .queue
+            .complete(mail.id, 3, QueueOutcome::Dead("mailbox does not exist".to_owned()), backoff, t0() + minutes(3))
+            .await
+            .expect("dead letter")
+    );
     let dead = repos.queue.get(mail.id).await.expect("get").expect("row");
     assert_eq!(dead.state, QueueState::Dead);
     assert_eq!(dead.last_error.as_deref(), Some("mailbox does not exist"));
@@ -3629,37 +3634,47 @@ pub async fn job_queue(repos: &Repositories) {
         vec![queued.id],
         "neither the dead letter nor the suppressed row is claimable, whatever the clock says"
     );
-    repos
-        .queue
-        .complete(suppressed.id, QueueOutcome::Retry("deliver me".to_owned()), backoff, t0() + days(1))
-        .await
-        .expect("complete");
+    assert!(
+        !repos
+            .queue
+            .complete(suppressed.id, 0, QueueOutcome::Retry("deliver me".to_owned()), backoff, t0() + days(1))
+            .await
+            .expect("complete"),
+        "a completion for a row nobody leased applies to nothing, and says so"
+    );
     assert_eq!(
         repos.queue.get(suppressed.id).await.expect("get"),
         Some(suppressed.clone()),
         "a completion for a row nobody leased leaves it exactly as it was"
     );
-    repos
-        .queue
-        .complete(mail.id, QueueOutcome::Retry("too late".to_owned()), backoff, t0() + days(1))
-        .await
-        .expect("complete");
+    assert!(
+        !repos
+            .queue
+            .complete(mail.id, 3, QueueOutcome::Retry("too late".to_owned()), backoff, t0() + days(1))
+            .await
+            .expect("complete")
+    );
     assert_eq!(
         repos.queue.get(mail.id).await.expect("get").expect("row").state,
         QueueState::Dead,
         "and a dead letter cannot be resurrected by a worker whose lease was already reaped"
     );
-    repos.queue.complete(QueuedJobId::new(), QueueOutcome::Done, backoff, t0()).await.expect("unknown id");
+    assert!(
+        !repos.queue.complete(QueuedJobId::new(), 1, QueueOutcome::Done, backoff, t0()).await.expect("unknown id"),
+        "an id nothing carries is not a transition that happened"
+    );
 
     // A success clears the failure the admin surface was showing.
-    repos
-        .queue
-        .complete(queued.id, QueueOutcome::Retry("boom".to_owned()), backoff, t0() + days(1))
-        .await
-        .expect("retry");
+    assert!(
+        repos
+            .queue
+            .complete(queued.id, 1, QueueOutcome::Retry("boom".to_owned()), backoff, t0() + days(1))
+            .await
+            .expect("retry")
+    );
     let claimed = repos.queue.claim(&[JobKind::NotificationFanout], 10, lease, t0() + days(2)).await.expect("claim");
     assert_eq!(claimed[0].last_error.as_deref(), Some("boom"), "the failure survives while the item is retried");
-    repos.queue.complete(queued.id, QueueOutcome::Done, backoff, t0() + days(2)).await.expect("done");
+    assert!(repos.queue.complete(queued.id, 2, QueueOutcome::Done, backoff, t0() + days(2)).await.expect("done"));
     let done = repos.queue.get(queued.id).await.expect("get").expect("row");
     assert_eq!(done.state, QueueState::Done);
     assert_eq!(done.last_error, None);
@@ -3735,7 +3750,7 @@ pub async fn job_queue(repos: &Repositories) {
         "the newest interactive row precedes every older bulk row, and bulk stays in arrival order"
     );
     for job in &claimed {
-        repos.queue.complete(job.id, QueueOutcome::Done, backoff, fair + minutes(2)).await.expect("done");
+        repos.queue.complete(job.id, job.attempts, QueueOutcome::Done, backoff, fair + minutes(2)).await.expect("done");
     }
     assert_eq!(
         repos.queue.purge(&retention_at(fair + days(2)), PURGE_BATCH).await.expect("purge"),
@@ -3784,7 +3799,11 @@ pub async fn job_queue(repos: &Repositories) {
     for _ in 0..2 {
         let claimed = repos.queue.claim(&[JobKind::MailSend], 1, lease, ladder + minutes(6)).await.expect("claim");
         assert_eq!(claimed.len(), 1);
-        repos.queue.complete(claimed[0].id, QueueOutcome::Done, backoff, ladder + minutes(6)).await.expect("done");
+        repos
+            .queue
+            .complete(claimed[0].id, claimed[0].attempts, QueueOutcome::Done, backoff, ladder + minutes(6))
+            .await
+            .expect("done");
         order.push(claimed[0].id);
     }
     assert_eq!(order, vec![fresh.id, retried.id], "the row that became runnable first is claimed first");
@@ -3813,6 +3832,156 @@ pub async fn job_queue(repos: &Repositories) {
     taken.dedup();
     filed.sort_unstable();
     assert_eq!(taken, filed, "and no item was leased twice");
+}
+
+/// A completion belongs to the claim that produced it ([D45](../../../docs/roadmap.md),
+/// [decision 36](../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)).
+///
+/// This is the scenario the suite did not have while `complete` matched on `state = 'running'`
+/// alone: not "a settled row cannot be resurrected" — which it did test — but a row that was
+/// leased, reaped, and **re-claimed by somebody else**, arriving at a late completion from the
+/// first lease. That worker's `Done` used to match, mark the row done, NULL the successor's
+/// lease and erase the `last_error` an operator was reading, while its own drain counted a
+/// delivery that belonged to a different attempt. With one instance it was unreachable; the
+/// distributed lock is the second drain that makes it a real shape, which is why it lands with
+/// the same wave.
+pub async fn queue_completion_is_fenced_by_its_claim(repos: &Repositories) {
+    let lease = Duration::from_secs(60);
+    let backoff = Duration::from_secs(30);
+    let job = repos
+        .queue
+        .enqueue(&NewQueuedJob::pending(MailJob::KIND, mail_payload("fenced@corp.com")), t0())
+        .await
+        .expect("enqueue")
+        .expect("stored");
+
+    // A first attempt fails, so the row carries the error an operator would be looking at.
+    let first = repos.queue.claim(&[JobKind::MailSend], 1, lease, t0()).await.expect("claim");
+    assert_eq!(first[0].attempts, 1);
+    assert!(
+        repos
+            .queue
+            .complete(job.id, 1, QueueOutcome::Retry("relay refused".to_owned()), backoff, t0() + seconds(1))
+            .await
+            .expect("retry")
+    );
+
+    // Worker A takes the item and then stalls past its own lease.
+    let worker_a = repos.queue.claim(&[JobKind::MailSend], 1, lease, t0() + minutes(1)).await.expect("claim A");
+    assert_eq!(worker_a[0].attempts, 2, "the claim A is talking about");
+    assert_eq!(repos.queue.reap_expired_leases(t0() + minutes(3)).await.expect("reap"), 1);
+
+    // Worker B — on the other instance — picks the reaped item up.
+    let worker_b = repos.queue.claim(&[JobKind::MailSend], 1, lease, t0() + minutes(3)).await.expect("claim B");
+    assert_eq!(worker_b[0].id, job.id, "the same item, now on a later attempt");
+    assert_eq!(worker_b[0].attempts, 3);
+
+    // A finally reports. It is talking about attempt 2, and attempt 2 is over.
+    assert!(
+        !repos.queue.complete(job.id, 2, QueueOutcome::Done, backoff, t0() + minutes(4)).await.expect("late done"),
+        "a completion from a reaped lease applies to nothing"
+    );
+    let mid_flight = repos.queue.get(job.id).await.expect("get").expect("row");
+    assert_eq!(mid_flight.state, QueueState::Running, "B is still delivering it");
+    assert_eq!(mid_flight.attempts, 3);
+    assert_eq!(mid_flight.locked_until, worker_b[0].locked_until, "B's lease is untouched");
+    assert_eq!(
+        mid_flight.last_error.as_deref(),
+        Some("relay refused"),
+        "and the failure an operator is reading was not erased by a stale success"
+    );
+
+    // A stale `Retry` is refused for the same reason — otherwise the loser of the race could
+    // hand the item back to the queue while the winner is still sending it.
+    assert!(
+        !repos
+            .queue
+            .complete(job.id, 2, QueueOutcome::Retry("give it back".to_owned()), backoff, t0() + minutes(4))
+            .await
+            .expect("late retry")
+    );
+    assert_eq!(repos.queue.get(job.id).await.expect("get").expect("row").state, QueueState::Running);
+
+    // The holder of the current claim still completes it, exactly as before.
+    assert!(repos.queue.complete(job.id, 3, QueueOutcome::Done, backoff, t0() + minutes(5)).await.expect("done"));
+    let done = repos.queue.get(job.id).await.expect("get").expect("row");
+    assert_eq!(done.state, QueueState::Done);
+    assert_eq!(done.last_error, None, "a success clears the error it recovered from");
+}
+
+/// The leader-election lease behind [`pub_core::traits::JobLock`]
+/// ([decision 36](../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)).
+///
+/// Runs against both dialects for the reason every contract function does — the SQLite
+/// implementation is not the one a deployment takes, and it is the one this property is cheap to
+/// assert on. Expiry is asserted with a millisecond TTL and a real sleep rather than an injected
+/// clock, because the clock under test is deliberately the **database's**: an implementation
+/// that took `now` from the caller would pass an injected-clock test and still let two replicas
+/// with skewed clocks hold one name.
+///
+/// **Seen red** twice, on both dialects: against a `try_acquire` whose conflict branch drops
+/// `WHERE expires_at <= <db now>` (an upsert that always wins), and against a `release` that
+/// deletes by name without comparing the token.
+pub async fn job_lock(repos: &Repositories) {
+    let locks = &repos.locks;
+    locks.ping().await.expect("ping");
+
+    let ttl = Duration::from_secs(60);
+    let held = locks.try_acquire("blob-gc", ttl).await.expect("acquire").expect("a free name");
+    assert!(locks.try_acquire("blob-gc", ttl).await.expect("second").is_none(), "one holder per name");
+    assert!(locks.try_acquire("reindex", ttl).await.expect("other name").is_some(), "names do not contend");
+
+    // Releasing with somebody else's token is a no-op, not an error: the loser of a race must
+    // not be able to free the winner's lock on its way out.
+    locks.release("blob-gc", pub_core::traits::LockToken::new()).await.expect("foreign release");
+    assert!(locks.try_acquire("blob-gc", ttl).await.expect("still held").is_none());
+    locks.release("blob-gc", held).await.expect("release");
+    let reacquired = locks.try_acquire("blob-gc", ttl).await.expect("acquire").expect("released");
+    assert_ne!(reacquired, held, "a second acquisition is a second token");
+    locks.release("blob-gc", reacquired).await.expect("release");
+
+    // Releasing a name nobody holds is not an error either.
+    locks.release("never-held", pub_core::traits::LockToken::new()).await.expect("unheld release");
+
+    // A crashed holder is bounded by the TTL, and the successor's lock is its own.
+    let crashed = locks.try_acquire("job-queue", Duration::from_millis(50)).await.expect("acquire").expect("free");
+    assert!(locks.try_acquire("job-queue", ttl).await.expect("live lease").is_none());
+    // A blocking sleep on purpose: this crate carries no runtime (see `interleave`), and there
+    // is nothing else in flight on this task to starve.
+    std::thread::sleep(Duration::from_millis(120));
+    let successor = locks.try_acquire("job-queue", ttl).await.expect("acquire").expect("the TTL expired");
+    assert_ne!(successor, crashed);
+
+    // The overrunning holder's release must not free the lock its successor now holds — the
+    // property `LockToken` exists for, here across a shared table rather than a process's map.
+    locks.release("job-queue", crashed).await.expect("stale release");
+    assert!(
+        locks.try_acquire("job-queue", ttl).await.expect("still held").is_none(),
+        "a stale holder's release must not hand the lock to a third worker"
+    );
+    locks.release("job-queue", successor).await.expect("release");
+    assert!(locks.try_acquire("job-queue", ttl).await.expect("free").is_some());
+}
+
+/// Concurrent acquisition of one name: exactly one caller wins.
+///
+/// Separate from [`job_lock`] because it needs a pool that can actually overlap — on SQLite the
+/// `:memory:` harness pins one connection, which is the whole of [decision 35](../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race).
+/// The claim under test is the one D1 rests on: a lock is not leader election if two instances
+/// can both be told they hold it.
+///
+/// **Seen red** against the unconditional upsert described above, on file-backed SQLite and on
+/// live Postgres. A token-blind `release` does *not* fail this one — that defect is the
+/// successor property in [`job_lock`], which is why the two are separate functions.
+pub async fn job_lock_is_single_winner(repos: &Repositories) {
+    let ttl = Duration::from_secs(60);
+    for round in 0..25 {
+        let name = format!("mirror-sync-{round}");
+        let (left, right) = interleave(repos.locks.try_acquire(&name, ttl), repos.locks.try_acquire(&name, ttl)).await;
+        let winners = [left.expect("left"), right.expect("right")].into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1, "exactly one of two concurrent acquisitions may win round {round}");
+        repos.locks.release(&name, winners[0]).await.expect("release");
+    }
 }
 
 /// S-23 retention across every table that has a window (decision 30).

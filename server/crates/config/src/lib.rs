@@ -754,7 +754,8 @@ impl Default for BlobConfig {
 pub enum KvKind {
     /// In-process store + broker — valid for a single replica only.
     Memory,
-    /// Redis-compatible store + pub/sub broker — mandatory for `replicas > 1`.
+    /// Redis-compatible store + pub/sub broker — mandatory for `replicas > 1` (which also
+    /// requires `database.kind = postgres`, decision 36).
     Redis,
 }
 
@@ -1499,7 +1500,9 @@ impl Default for UpstreamConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
-    /// Number of app replicas sharing the same backends. `> 1` requires the Redis KV backend.
+    /// Number of app replicas sharing the same backends. `> 1` requires the Redis KV backend
+    /// **and** the Postgres database backend — leader election is a lease row in the database
+    /// (decision 36), and the SQLite backend is single-instance by construction.
     pub replicas: u32,
 }
 

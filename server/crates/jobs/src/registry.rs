@@ -177,6 +177,11 @@ impl JobRegistry {
     /// The report carries `dead_pending` — the standing dead-letter count, not just this run's
     /// — because a dead-lettered sign-in message is an account lockout with no other visible
     /// cause, and a per-run number would read as zero on every tick after the one that failed.
+    ///
+    /// It also carries `lost`: completions that applied to nothing because the item had been
+    /// reaped and re-claimed by another drain ([D45](../../../../docs/roadmap.md), decision 36).
+    /// With the leader lease in place that should be unreachable outside a crash window, which is
+    /// why a non-zero value is worth an operator's attention rather than a log line nobody reads.
     #[must_use]
     pub fn with_queue(mut self, worker: Arc<QueueWorker>) -> Self {
         self.runners.insert(
@@ -191,6 +196,7 @@ impl JobRegistry {
                         "retried": report.retried,
                         "dead": report.dead,
                         "reaped": report.reaped,
+                        "lost": report.lost,
                         "dead_pending": report.dead_pending,
                     }))
                 }

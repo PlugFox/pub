@@ -284,6 +284,30 @@ async fn job_queue_contract_s04_s31() {
     db.cleanup().await;
 }
 
+#[tokio::test]
+async fn queue_completion_is_fenced_by_its_claim_d45() {
+    let Some(db) = TestDb::create("queue_completion_is_fenced_by_its_claim_d45").await else { return };
+    pub_db_tests::contract::queue_completion_is_fenced_by_its_claim(&db.repos()).await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn job_lock_contract_decision36() {
+    let Some(db) = TestDb::create("job_lock_contract_decision36").await else { return };
+    pub_db_tests::contract::job_lock(&db.repos()).await;
+    db.cleanup().await;
+}
+
+/// **The claim D1 rests on, against the server that will actually arbitrate it.** Two
+/// acquisitions of one name in flight on a real pool: exactly one may win, and the loser must be
+/// told it lost rather than handed the same lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_lock_is_single_winner_decision36() {
+    let Some(db) = TestDb::create("job_lock_is_single_winner_decision36").await else { return };
+    pub_db_tests::contract::job_lock_is_single_winner(&db.repos()).await;
+    db.cleanup().await;
+}
+
 /// S-23 retention, and the one contract function that exercises a **stored procedure**.
 ///
 /// On this dialect the audit prune goes through `pub_audit_prune` (migration 0012) rather than

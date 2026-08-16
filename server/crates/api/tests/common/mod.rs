@@ -29,6 +29,7 @@ use pub_core::settings::SettingsCache;
 use pub_core::token::{NewToken, TokenScope};
 use pub_core::traits::{BlobStore, JobLock, JobTrigger, Kv, Mailer, NoJobs, Repositories};
 use pub_core::{OrgId, UserId};
+use pub_db_postgres::PostgresDb;
 use pub_db_sqlite::SqliteDb;
 use pub_events::{
     EventBus, EventBusPolicy, EventConsumer, NotificationCenter, NotificationEnqueuer, NotificationPolicy,
@@ -85,6 +86,160 @@ pub enum TestDatabase {
     /// genuinely in flight at once. Slower, and the only setting under which a wire-level
     /// race test proves anything.
     FileSqlite,
+    /// A throwaway database on `PUB_TEST_POSTGRES_URL`, created and migrated per app and
+    /// **dropped when the app is** — the cleanup path [decision 35](../../../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)
+    /// said this variant could not ship without, since ~250 tests will never call one.
+    ///
+    /// The reason it exists is the reason it arrives with [decision 36](../../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check):
+    /// leader election between two instances is a claim about a shared store, and this is the
+    /// only backend in the harness that two applications can share. Use it with
+    /// [`TestApp::try_with_options`] plus [`TestApp::replica`], and expect a gate panic when
+    /// nobody has said anything about Postgres.
+    Postgres,
+}
+
+/// A throwaway Postgres database, dropped when the last application over it is.
+///
+/// The drop is the part that had to exist before this variant could ship
+/// ([decision 35](../../../../../docs/decisions.md#35--backend-legs-that-fail-when-the-backend-is-absent-and-a-harness-that-admits-a-race)):
+/// a harness that leaks a database per test is worse than no harness at all. It runs in `Drop`
+/// rather than in a method the test calls, on a std thread with its own runtime — `Drop` cannot
+/// await, and a detached task on the test's runtime would race the runtime's own shutdown.
+/// `WITH (FORCE)` terminates whatever connections the app pools still hold.
+struct PostgresScratch {
+    admin_url: String,
+    name: String,
+    url: String,
+}
+
+impl PostgresScratch {
+    /// Creates and migrates a fresh database; `None` only when the operator explicitly opted
+    /// out of the Postgres leg.
+    ///
+    /// # Panics
+    ///
+    /// When neither `PUB_TEST_POSTGRES_URL` nor `PUB_TEST_NO_POSTGRES` is set — the gate fails
+    /// closed, so "nobody said anything about Postgres" is not a silent pass.
+    async fn create() -> Option<Self> {
+        let admin_url = match pub_test_support::POSTGRES.gate("the Postgres HTTP harness") {
+            pub_test_support::Gate::Run(url) => url,
+            pub_test_support::Gate::Skipped => return None,
+        };
+        // Unique and SQL-safe by construction: a dash-stripped UUID v7 is `[0-9a-f]{32}`.
+        let name = format!("pub_http_{}", UserId::new().to_string().replace('-', ""));
+        let mut admin =
+            <sqlx::PgConnection as sqlx::Connection>::connect(&admin_url).await.expect("connect to postgres admin");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+            .execute(&mut admin)
+            .await
+            .expect("create throwaway database");
+        <sqlx::PgConnection as sqlx::Connection>::close(admin).await.expect("close admin connection");
+        let url = replace_database(&admin_url, &name);
+        Some(Self { admin_url, name, url })
+    }
+}
+
+impl Drop for PostgresScratch {
+    fn drop(&mut self) {
+        let admin_url = self.admin_url.clone();
+        let name = self.name.clone();
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime for dropping the throwaway database");
+            runtime.block_on(async move {
+                let mut admin = <sqlx::PgConnection as sqlx::Connection>::connect(&admin_url)
+                    .await
+                    .expect("connect to postgres admin");
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")))
+                    .execute(&mut admin)
+                    .await
+                    .expect("drop throwaway database");
+                <sqlx::PgConnection as sqlx::Connection>::close(admin).await.expect("close admin connection");
+            });
+        })
+        .join();
+        // A panic here would be swallowed inside another unwind; the leak is worth a line.
+        if dropped.is_err() {
+            eprintln!("failed to drop throwaway database {}", self.name);
+        }
+    }
+}
+
+/// Points a Postgres URL at another database on the same server, keeping the query string.
+fn replace_database(url: &str, database: &str) -> String {
+    let (base, query) = url.split_once('?').map_or((url, None), |(base, query)| (base, Some(query)));
+    let authority_start = base.find("://").map_or(0, |at| at + 3);
+    let mut rebuilt = match base[authority_start..].find('/') {
+        Some(offset) => format!("{}/{database}", &base[..authority_start + offset]),
+        None => format!("{base}/{database}"),
+    };
+    if let Some(query) = query {
+        rebuilt.push('?');
+        rebuilt.push_str(query);
+    }
+    rebuilt
+}
+
+/// What an app's database is, and what has to go when the app does.
+///
+/// Cloneable because a replica boots on the *same* store: the clone shares the temporary
+/// directory or the throwaway database, and the last handle to drop cleans it up.
+#[derive(Clone)]
+enum TestStore {
+    /// `:memory:` or a file in a temporary directory (held so the file outlives the app).
+    Sqlite { dir: Option<Arc<tempfile::TempDir>>, path: String },
+    /// A throwaway database on the configured server.
+    Postgres(Arc<PostgresScratch>),
+}
+
+impl TestStore {
+    /// Prepares the store for `kind`; `None` when the Postgres leg is opted out.
+    async fn create(kind: TestDatabase) -> Option<Self> {
+        match kind {
+            TestDatabase::MemorySqlite => Some(Self::Sqlite { dir: None, path: ":memory:".to_owned() }),
+            TestDatabase::FileSqlite => {
+                let dir = tempfile::tempdir().expect("tempdir for the file-backed database");
+                let path = dir.path().join("pub.db").to_string_lossy().into_owned();
+                Some(Self::Sqlite { dir: Some(Arc::new(dir)), path })
+            }
+            TestDatabase::Postgres => PostgresScratch::create().await.map(|scratch| Self::Postgres(Arc::new(scratch))),
+        }
+    }
+
+    /// The `[database]` section an app over this store boots with.
+    fn config(&self) -> DatabaseConfig {
+        match self {
+            Self::Sqlite { path, .. } => {
+                DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: path.clone(), ..Default::default() }
+            }
+            Self::Postgres(scratch) => DatabaseConfig {
+                kind: DatabaseKind::Postgres,
+                url: Some(scratch.url.clone()),
+                path: String::new(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Connects **its own pool** and migrates. Called once per application, so two apps over one
+    /// store are two pools — which is what makes them two instances rather than one with two
+    /// routers.
+    async fn connect(&self) -> Repositories {
+        match self {
+            Self::Sqlite { .. } => {
+                let db = SqliteDb::connect(&self.config()).await.expect("connect the test database");
+                db.run_migrations().await.expect("migrate");
+                db.repositories()
+            }
+            Self::Postgres(_) => {
+                let db = PostgresDb::connect_lazy(&self.config()).expect("configure the throwaway database");
+                db.run_migrations().await.expect("migrate");
+                db.repositories()
+            }
+        }
+    }
 }
 
 /// Policy knobs a scenario can override.
@@ -440,7 +595,11 @@ pub struct TestApp {
     pub upstream: Option<Arc<MockUpstream>>,
     /// The registry's per-name publish lock — tests hold it to simulate a concurrent publish
     /// (e.g. this client's own timed-out first finalize attempt).
-    pub lock: Arc<InMemoryJobLock>,
+    ///
+    /// `dyn` rather than the in-process type because it is not always the in-process one: on
+    /// [`TestDatabase::Postgres`] this is the `job_locks` lease, shared with every other
+    /// instance over the same store (decision 36).
+    pub lock: Arc<dyn JobLock>,
     /// The runtime-settings cache this app serves from (decision 09).
     pub runtime: Arc<SettingsCache>,
     /// The domain event bus every service in this app emits into (decision 22).
@@ -448,10 +607,10 @@ pub struct TestApp {
     /// The real queue drain, run by [`TestApp::drain_jobs`] (decision 26).
     pub queue_worker: Arc<QueueWorker>,
     clock: Arc<Mutex<DateTime<Utc>>>,
-    /// The directory holding a [`TestDatabase::FileSqlite`] file. Shared with anything
-    /// [`TestApp::restart`] produces — a restart is a new process over the *same* database,
-    /// and dropping this deletes it.
-    _db_dir: Option<Arc<tempfile::TempDir>>,
+    /// What this app's database *is* — the temporary directory or the throwaway database, held
+    /// so it outlives the app. Shared with anything [`TestApp::restart`] or [`TestApp::replica`]
+    /// produces: both are other processes over the *same* store, and the last handle cleans up.
+    store: TestStore,
 }
 
 impl TestApp {
@@ -461,22 +620,27 @@ impl TestApp {
     }
 
     /// App with scenario-specific policy knobs.
-    pub async fn with_options(mut options: TestOptions) -> Self {
+    ///
+    /// Panics if the scenario asked for [`TestDatabase::Postgres`] and the operator opted that
+    /// backend out — a test that needs two instances cannot quietly run on one. Use
+    /// [`Self::try_with_options`] there, which is what makes the opt-out a skip.
+    pub async fn with_options(options: TestOptions) -> Self {
+        let database = options.database;
+        Self::try_with_options(options)
+            .await
+            .unwrap_or_else(|| panic!("{database:?} is opted out; call try_with_options to skip instead"))
+    }
+
+    /// App with scenario-specific policy knobs; `None` when its backend was opted out.
+    pub async fn try_with_options(mut options: TestOptions) -> Option<Self> {
+        let store = TestStore::create(options.database).await?;
+        Some(Self::over(store, &mut options).await)
+    }
+
+    /// Boots one application over an existing store.
+    async fn over(store: TestStore, options: &mut TestOptions) -> Self {
         let job_factory = options.jobs.take();
-        // Held for the app's lifetime: dropping it deletes the directory the database file
-        // lives in, so it belongs to `TestApp` and not to this scope.
-        let db_dir = match options.database {
-            TestDatabase::MemorySqlite => None,
-            TestDatabase::FileSqlite => Some(tempfile::tempdir().expect("tempdir for the file-backed database")),
-        };
-        let db_path = match &db_dir {
-            None => ":memory:".to_owned(),
-            Some(dir) => dir.path().join("pub.db").to_string_lossy().into_owned(),
-        };
-        let mut settings = Settings {
-            database: DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: db_path, ..Default::default() },
-            ..Settings::default()
-        };
+        let mut settings = Settings { database: store.config(), ..Settings::default() };
         settings.blob.kind = BlobKind::Memory;
         settings.kv.kind = KvKind::Memory;
         settings.server.trust_proxy_headers = options.trust_proxy_headers;
@@ -500,9 +664,7 @@ impl TestApp {
         settings.smtp.password = options.smtp_password.clone().map(pub_config::Secret::new);
         settings.smtp.security = options.smtp_security;
 
-        let db = SqliteDb::connect(&settings.database).await.expect("connect the test database");
-        db.run_migrations().await.expect("migrate");
-        let repos = db.repositories();
+        let repos = store.connect().await;
 
         settings.auth.allow_registration = options.allow_registration;
         settings.auth.allowed_email_domains = options.allowed_email_domains.clone();
@@ -551,7 +713,7 @@ impl TestApp {
             Arc::clone(&mailer) as Arc<dyn Mailer>,
         ));
 
-        let oidc = OidcClient::new(options.oidc_providers, INSTANCE_ORIGIN).expect("oidc client");
+        let oidc = OidcClient::new(options.oidc_providers.clone(), INSTANCE_ORIGIN).expect("oidc client");
         let auth = Arc::new(AuthService::new(
             repos.clone(),
             Arc::clone(&kv_handle),
@@ -580,11 +742,17 @@ impl TestApp {
             Arc::clone(&runtime),
         );
 
-        let lock = Arc::new(InMemoryJobLock::new());
+        // The lock `pubd` would build for this database (decision 36): the in-process one on
+        // SQLite, the `job_locks` lease on Postgres — which is the only setting in which two
+        // instances of this harness contend for anything.
+        let lock: Arc<dyn JobLock> = match store {
+            TestStore::Sqlite { .. } => Arc::new(InMemoryJobLock::new()),
+            TestStore::Postgres(_) => Arc::clone(&repos.locks),
+        };
         let registry = Arc::new(RegistryService::new(
             repos.clone(),
             Arc::clone(&blob),
-            Arc::clone(&lock) as Arc<dyn JobLock>,
+            Arc::clone(&lock),
             Arc::clone(&sink),
             RegistryPolicy::default(),
         ));
@@ -647,7 +815,7 @@ impl TestApp {
             events,
             queue_worker,
             clock,
-            _db_dir: db_dir.map(Arc::new),
+            store: store.clone(),
         }
     }
 
@@ -665,11 +833,16 @@ impl TestApp {
         let settings = (*self.state.settings).clone();
         let runtime = Arc::clone(&self.state.runtime);
         // A restart throws in-process locks away — exactly what a real process restart does.
-        let lock = Arc::new(InMemoryJobLock::new());
+        // A database lease is not in-process and deliberately survives, which is the whole point
+        // of the row: the successor has to wait it out or find it expired (decision 36).
+        let lock: Arc<dyn JobLock> = match &self.store {
+            TestStore::Sqlite { .. } => Arc::new(InMemoryJobLock::new()),
+            TestStore::Postgres(_) => Arc::clone(&self.state.repos.locks),
+        };
         let registry = Arc::new(RegistryService::new(
             self.state.repos.clone(),
             Arc::clone(&self.state.blob),
-            Arc::clone(&lock) as Arc<dyn JobLock>,
+            Arc::clone(&lock),
             Arc::clone(&self.state.events) as Arc<dyn EventSink>,
             RegistryPolicy::default(),
         ));
@@ -701,8 +874,39 @@ impl TestApp {
             events: Arc::clone(&self.state.events),
             queue_worker: Arc::clone(&self.queue_worker),
             clock: Arc::clone(&self.clock),
-            _db_dir: self._db_dir.clone(),
+            store: self.store.clone(),
         }
+    }
+
+    /// A **second instance** over the same store: its own pool, its own router, its own caches,
+    /// its own event bus — sharing only what two replicas actually share.
+    ///
+    /// This is what [`Self::restart`] cannot be, and the difference matters
+    /// ([decision 36](../../../../../docs/decisions.md#36--leader-election-leaves-the-process-a-lease-table-a-lock-that-outlives-a-pool-connection-and-a-topology-gate-that-replaces-a-kv-check)):
+    /// a restart reuses the repositories, so both apps would take the same pool and the same
+    /// in-process objects, and a lock test over that pair proves nothing about two processes.
+    ///
+    /// Only meaningful on [`TestDatabase::Postgres`] — a `:memory:` database is not shareable at
+    /// all, and two writers over one SQLite file is a configuration this project refuses.
+    ///
+    /// The KV is **not** shared here on purpose: this harness's KV is in-process, so two
+    /// instances have two of them, which is exactly the state a deployment without Redis is in.
+    /// A claim that needs shared revocation belongs to the two-replica acceptance run, not here.
+    pub async fn replica(&self, mut options: TestOptions) -> Self {
+        assert!(
+            matches!(self.store, TestStore::Postgres(_)),
+            "a second instance needs a store two instances can share — boot the first one on TestDatabase::Postgres"
+        );
+        options.database = TestDatabase::Postgres;
+        let mut replica = Self::over(self.store.clone(), &mut options).await;
+        // One clock across the pair: two instances of a deployment do not disagree about the
+        // date, and a test that advanced only one of them would be testing the harness.
+        replica.clock = Arc::clone(&self.clock);
+        let clock_handle = Arc::clone(&self.clock);
+        let state = replica.state.clone().with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
+        replica.router = pub_api::router(state.clone());
+        replica.state = state;
+        replica
     }
 
     /// The injected current time.
