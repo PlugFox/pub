@@ -2,7 +2,7 @@
   "name": "Pub",
   "short_name": "Pub",
   "description": "Self-hosted package registry for Dart and Flutter",
-  "start_url": "/app",
+  "start_url": "/app/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#fbfbfa",

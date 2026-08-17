@@ -49,6 +49,13 @@ web-check:
     cd web && bun run build
     cd web && bun test
 
+# Offline PWA end-to-end run against a real browser (decision 41).
+# Opt-in like `cluster-check`, not part of `web-check`: it needs Playwright's
+# browser binaries and serves the production build over `astro preview`.
+web-e2e:
+    cd web && bun run build
+    cd web && bun run test:e2e
+
 # Everything — both sides
 check: server-check web-check
 

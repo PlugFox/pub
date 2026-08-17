@@ -1,8 +1,9 @@
 import { Route, Router } from "@solidjs/router";
-import { type Component, type JSX, lazy } from "solid-js";
+import { type Component, createSignal, type JSX, lazy, Show } from "solid-js";
 import { AppBoundary } from "./shell/app-boundary";
 import { AppShell } from "./shell/app-shell";
 import { RequireAuth, ScreenBoundary } from "./shell/require-auth";
+import { bootLocale } from "./state/locale";
 
 /*
  * The single client:only SolidJS island (decision 14), routed by
@@ -73,7 +74,36 @@ function Guarded(props: { readonly children: JSX.Element }): JSX.Element {
   );
 }
 
+/**
+ * The locale boot, started once per island (decision 41).
+ *
+ * Module-level so a re-render cannot start a second one, and started from the
+ * first render rather than from `onMount` so the fetch is in flight as early as
+ * possible. English resolves synchronously — the dictionaries are bundled — so
+ * the gate below costs an English reader nothing.
+ */
+let localeBoot: Promise<unknown> | null = null;
+
 export function App(): JSX.Element {
+  // The dictionaries must be registered BEFORE the tree that reads them
+  // mounts: `t()` is not reactive, so a locale that arrives late would render
+  // English and repaint. `Show` keeps the children unevaluated until then, and
+  // a failed fetch resolves to English rather than holding the gate shut.
+  const [localeReady, setLocaleReady] = createSignal(false);
+  localeBoot ??= bootLocale();
+  void localeBoot.then(
+    () => setLocaleReady(true),
+    () => setLocaleReady(true),
+  );
+
+  return (
+    <Show when={localeReady()}>
+      <AppRoutes />
+    </Show>
+  );
+}
+
+function AppRoutes(): JSX.Element {
   return (
     <Router
       base="/app"

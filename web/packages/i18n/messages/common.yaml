@@ -105,6 +105,21 @@ packagesCount:
     other: "{count} пакета"
   desc: How many packages a listing contains. `{count}` is the number, already formatted.
 
+offlineTitle:
+  en: You are offline
+  ru: Нет подключения
+  desc: Heading of the offline fallback page the service worker serves when a navigation fails and there is no network.
+
+offlineBody:
+  en: This page needs a connection, and there is none right now. Pages you have already opened are still available, and the app keeps working with whatever it has cached.
+  ru: Этой странице нужно подключение, а его сейчас нет. Уже открытые страницы по-прежнему доступны, а приложение продолжает работать с тем, что успело сохранить.
+  desc: Body paragraph of the offline fallback page; explains what still works rather than only what failed.
+
+offlineRetry:
+  en: Try again
+  ru: Повторить
+  desc: Button on the offline page that reloads the document the reader was trying to reach.
+
 securityPageTitle:
   en: Security
   ru: Безопасность

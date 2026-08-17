@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "build": "astro build && bun scripts/build-sw.ts",
     "preview": "astro preview",
     "typecheck": "tsc --noEmit"
   },

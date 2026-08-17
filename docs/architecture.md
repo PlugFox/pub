@@ -195,7 +195,8 @@ web/
 │   ├── src/pages/app/[...rest].astro   # static shell → <App client:only="solid-js"/>
 │   ├── src/app/                # Solid SPA: solid-router 1.0, createAsync/query/action,
 │   │                           #   feature folders (auth, orgs, packages, tokens, admin)
-│   └── public/manifest.webmanifest, sw.js (hand-rolled)
+│   ├── src/sw/                 # hand-rolled service worker (TS) → dist/sw.js at build
+│   └── public/manifest.webmanifest
 ├── packages/tokens/            # OKLCH design tokens, @theme, data-theme + anti-FOUC
 ├── packages/ui/                # Kobalte-based components + ui-kit showcase page
 ├── packages/i18n/              # YAML messages (mandatory desc per key) + Bun codegen
@@ -204,7 +205,7 @@ web/
                                 #   network-vs-denial discrimination) — ported from foxic
 ```
 
-Service worker policy: precache app shell + hashed assets; SWR for metadata/search API; cache-first for immutable per-version artifacts (rendered READMEs, docs); network-only for auth; never cache mutations. README/markdown is rendered and sanitized on the backend — the client injects HTML into a styled container under strict CSP.
+Service worker policy ([decision 41](decisions.md#41--a-service-worker-that-honours-no-store-a-precache-generated-from-the-build-a-version-that-waits-its-turn-and-locales-that-finally-load)): authored in TypeScript under `apps/site/src/sw/` and built into `dist/sw.js` with a precache manifest generated from the emitted build — the app shell, the landing page and `/offline`, each with its eager asset closure, in one cache per build whose name carries the manifest hash. `_astro/*` is cache-first (content-addressed, `immutable` on the wire); locales, icons and the manifest are stale-while-revalidate; navigations are network-first, falling back to the shell under `/app` and to `/offline` elsewhere. **The API and pub planes are passed through untouched** — every app-API response is `no-store` (S-28), those responses are personalized, and the SSE stream must never be wrapped in `respondWith`; decision 14's SWR-for-metadata and cache-first-for-per-version-artifacts clauses are withdrawn for those reasons. A new worker waits for the last old tab rather than calling `skipWaiting`, so a deploy cannot delete a chunk a live tab has yet to fetch. README/markdown is rendered and sanitized on the backend — the client injects HTML into a styled container under strict CSP.
 
 ## Configuration & secrets
 

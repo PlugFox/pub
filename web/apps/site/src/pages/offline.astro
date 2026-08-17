@@ -1,0 +1,43 @@
+---
+import { t } from "@pub/i18n";
+import { common } from "@pub/i18n/generated/common";
+import { buttonVariants } from "@pub/ui/button";
+import BaseLayout from "../layouts/base-layout.astro";
+
+/*
+ * The offline fallback (decision 41), and the document `docs/product.md` has
+ * been promising since the first slice.
+ *
+ * The service worker serves this page from its precache when a navigation
+ * fails outside `/app` — inside `/app` the fallback is the shell, which boots
+ * the island and reports the failure with the app's own chrome. It goes
+ * through the same layout as every other page precisely so that the offline
+ * state is styled, translated and themed rather than a browser error screen.
+ *
+ * Nothing here may assume the network: no island, no API call, and the only
+ * script is a bundled one-liner behind the retry button.
+ */
+---
+
+<BaseLayout title={`${t(common.offlineTitle)} — ${t(common.siteTitle)}`}>
+  <main class="mx-auto flex w-full max-w-2xl flex-col items-center gap-6 px-6 py-24 text-center">
+    <h1 class="text-2xl font-semibold text-ink">{t(common.offlineTitle)}</h1>
+    <p class="text-ink-muted">{t(common.offlineBody)}</p>
+    <div class="flex flex-wrap items-center justify-center gap-3">
+      <button id="offline-retry" type="button" class={buttonVariants({ size: "sm" })}>
+        {t(common.offlineRetry)}
+      </button>
+      <a href="/app/" class={buttonVariants({ intent: "ghost", size: "sm" })}>
+        {t(common.navApp)}
+      </a>
+    </div>
+  </main>
+</BaseLayout>
+
+<script>
+  // Bundled, never inline: the anti-FOUC theme script in the base layout is the
+  // only inline script the document CSP carries a hash for (decisions 03/14).
+  document.getElementById("offline-retry")?.addEventListener("click", () => {
+    window.location.reload();
+  });
+</script>

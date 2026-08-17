@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // The service worker runs in a WorkerGlobalScope, not a document: `caches`,
+    // `FetchEvent` and `ServiceWorkerGlobalScope` are declared by lib.webworker
+    // and DOM is deliberately absent, so a `document.` typo in the worker is a
+    // typecheck error rather than a runtime one. The two libs cannot share a
+    // program (they redeclare the same globals), which is why this is its own
+    // project and why `src/sw` is excluded from the site's tsconfig.
+    "lib": ["ES2023", "WebWorker"],
+    "types": []
+  },
+  "include": ["src/sw/**/*.ts"]
+}

@@ -13,7 +13,7 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 - **Virtual registry URLs**: `PUB_HOSTED_URL = /o/{org}/pub` (format segment reserved: `/npm`, `/cargo` later); public root `/pub`. Resolution: org-owned → instance-public → upstream proxy iff name unclaimed (local always wins). Status ladder: unreadable → 404, missing/invalid creds → 401 + `WWW-Authenticate`, insufficient-but-visible → 403.
 - **Proxy**: read-through cache + mirror-mode sync worker share one ingest pipeline; archives byte-stable forever, `archive_url` rewritten to our host, sha256 verified at ingest.
 - **Events**: one domain event bus fans out to SSE (`/api/v1/events`), notification center, audit log, outbound webhooks.
-- **Frontend** (`web/`): Bun workspaces — Astro 7 SSG (landing/docs, 10 locales, light/dark OKLCH tokens) + one `client:only` SolidJS island under `/app` (solid-router); Kobalte + Tailwind 4; homegrown YAML+codegen i18n; hand-rolled service worker; API types generated from utoipa OpenAPI. Frontend embeds into the server binary (`server/crates/api/embedded/`).
+- **Frontend** (`web/`): Bun workspaces — Astro 7 SSG (landing/docs, 10 locales, light/dark OKLCH tokens) + one `client:only` SolidJS island under `/app` (solid-router); Kobalte + Tailwind 4; homegrown YAML+codegen i18n; hand-rolled service worker (TypeScript in `apps/site/src/sw/`, bundled to `dist/sw.js` with a build-generated precache manifest); API types generated from utoipa OpenAPI. Frontend embeds into the server binary (`server/crates/api/embedded/`).
 
 ## Domain concepts
 
@@ -26,7 +26,7 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 
 | File                   | Contents                                                        |
 | ---------------------- | --------------------------------------------------------------- |
-| `docs/decisions.md`    | 40 numbered decisions with rationale — normative                |
+| `docs/decisions.md`    | 41 numbered decisions with rationale — normative                |
 | `docs/product.md`      | Vision, feature triage v1/v1.1/later, screens list              |
 | `docs/architecture.md` | Crate/workspace layout, data model, pipelines, testing strategy |
 | `docs/security.md`     | S-01…S-33 normative security requirements                       |
@@ -55,6 +55,7 @@ Tool-agnostic deep guide for AI agents and new contributors. The short router li
 | `hyperfine` | manual | benchmark claims instead of asserting them |
 | `sqlx-cli` 0.9 | manual | migration ops against a live DB (rare; migrations apply at startup) |
 | vitest browser mode | `packages/ui` `test:browser` | component tests in real Chromium (naming: `*.vitest.tsx`, never `*.test.*`) |
+| Playwright (`just web-e2e`) | justfile → `astro preview` over `dist` | the offline PWA run (decision 41); specs are `apps/site/test/e2e/*.e2e.ts`, never `*.spec.ts`; opt-in, not a CI leg |
 
 ## Mandatory rules
 

@@ -5,5 +5,10 @@
     "jsxImportSource": "solid-js",
     "types": ["astro/client", "bun"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "scripts/**/*.ts", "test/**/*.ts"],
+  // The worker entry is typechecked by tsconfig.sw.json against lib.webworker;
+  // DOM and WebWorker cannot coexist in one program. `src/sw/policy.ts` stays
+  // in BOTH — it is a pure function over plain values, which is exactly what
+  // lets the tests in this project import it.
+  "exclude": ["src/sw/sw.ts"]
 }

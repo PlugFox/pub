@@ -1,5 +1,5 @@
 {
-  "__todo__": "TODO: translate from English: siteTitle, tagline, navHome, navApp, themePicker, themeSystem, themeLight, themeDark, themeAmoled, language, close, copy, copied, loading, notFound, appDashboard, appAbout, packagesCount, securityPageTitle, securityPageIntro, securityPageContactTitle, securityPageContactBody, securityPageScopeTitle, securityPageScopeBody, securityPageOperatorTitle, securityPageOperatorBody",
+  "__todo__": "TODO: translate from English: siteTitle, tagline, navHome, navApp, themePicker, themeSystem, themeLight, themeDark, themeAmoled, language, close, copy, copied, loading, notFound, appDashboard, appAbout, packagesCount, offlineTitle, offlineBody, offlineRetry, securityPageTitle, securityPageIntro, securityPageContactTitle, securityPageContactBody, securityPageScopeTitle, securityPageScopeBody, securityPageOperatorTitle, securityPageOperatorBody",
   "common.siteTitle": "Pub",
   "common.tagline": "Self-hosted package registry for Dart and Flutter",
   "common.navHome": "Home",
@@ -21,6 +21,9 @@
     "one": "{count} package",
     "other": "{count} packages"
   },
+  "common.offlineTitle": "You are offline",
+  "common.offlineBody": "This page needs a connection, and there is none right now. Pages you have already opened are still available, and the app keeps working with whatever it has cached.",
+  "common.offlineRetry": "Try again",
   "common.securityPageTitle": "Security",
   "common.securityPageIntro": "We want to hear about security problems in this registry, and we would rather hear about them early than read about them later.",
   "common.securityPageContactTitle": "How to report",

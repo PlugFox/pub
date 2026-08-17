@@ -38,6 +38,12 @@ export const common = {
   appAbout: { id: "common.appAbout", en: "About" },
   /** How many packages a listing contains. `{count}` is the number, already formatted. */
   packagesCount: { id: "common.packagesCount", en: {"one":"{count} package","other":"{count} packages"} },
+  /** Heading of the offline fallback page the service worker serves when a navigation fails and there is no network. */
+  offlineTitle: { id: "common.offlineTitle", en: "You are offline" },
+  /** Body paragraph of the offline fallback page; explains what still works rather than only what failed. */
+  offlineBody: { id: "common.offlineBody", en: "This page needs a connection, and there is none right now. Pages you have already opened are still available, and the app keeps working with whatever it has cached." },
+  /** Button on the offline page that reloads the document the reader was trying to reach. */
+  offlineRetry: { id: "common.offlineRetry", en: "Try again" },
   /** Title of the vulnerability-disclosure page linked from /.well-known/security.txt. */
   securityPageTitle: { id: "common.securityPageTitle", en: "Security" },
   /** Opening paragraph of the disclosure page. */
