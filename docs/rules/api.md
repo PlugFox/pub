@@ -13,6 +13,7 @@ Two API families with different contracts — never mix them:
 - Cursor pagination only: `{items, cursor, has_more}`.
 - SSE stream at `/api/v1/events` (S-32): heartbeats re-check revocation; auth via `Authorization` header (fetch-streaming client).
 - State-changing endpoints require JSON content type and the custom header (S-12); CORS is locked to the instance origin.
+- **A response body that is not the envelope needs a reason.** Two have one: the S-23 audit export and the S-29.b account export stream NDJSON with an explicit `{"done":true}` terminator, because a cursor walk cannot be one JSON document and a truncated file must be detectable. Everything else answers the envelope, including the errors these two return before their first row.
 
 ## Both
 

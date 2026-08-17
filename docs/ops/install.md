@@ -171,6 +171,20 @@ Empty means every role provisioned against this schema can reach every table in 
 
 `status` is `ok` when every configured backend answers a **live ping** (these are real probes, not config echoes), `degraded` otherwise. Honest limits: `/healthz` does **not** report migration status, and there is no separate `/readyz` (roadmap D25) — a booted process has already applied its migrations, but a health probe cannot distinguish "migrating" from "down". `pubd --version` prints the same version plus git hash and build date.
 
+## Publishing a security contact (optional)
+
+An instance serves `/.well-known/security.txt` (RFC 9116) only when it has somebody to name, and the shipped default names nobody — the route answers **404** ([S-29.c](../security.md#7-platform)):
+
+```toml
+[disclosure]
+contact    = "mailto:security@example.com"   # or an https: form, or tel:
+policy_url = "https://pub.example.com/security"   # optional; the shipped page lives at /security
+```
+
+Both are validated **at boot**, like every other address in the configuration: a contact that is not a `mailto:`, `https:` or `tel:` URI, or a policy URL that is not `https:`, refuses to start rather than publishing something a reporter cannot use. A `policy_url` without a `contact` is likewise refused — the file it would appear in is never served.
+
+`Expires` is generated (today plus a year, recomputed daily), so the published file cannot quietly go stale the way a hand-maintained one does. Nothing else in the instance changes: this is a text file and a page, and the reports still arrive in a human's mailbox.
+
 ## More than one replica
 
 Two backends are required before the validator accepts `cluster.replicas > 1`, and both are checked at boot:

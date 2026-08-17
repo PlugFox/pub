@@ -1505,3 +1505,33 @@ Largest audience one event's notification fan-out may reach.
 boolean · `PUB_REALTIME__NOTIFICATION_EMAIL` · default: `true`
 
 Whether high-importance notification categories are emailed.
+
+## `[disclosure]`
+
+Vulnerability disclosure: who to contact, and where the policy is published (S-29.c).
+
+Vulnerability-disclosure contact, published as `/.well-known/security.txt`
+([S-29.c](../security.md#7-platform), RFC 9116).
+
+Boot configuration rather than a runtime settings section, deliberately: this is set once per
+deployment by whoever owns the mailbox, it is not per-tenant, and the runtime cache exists for
+values that change while an instance is under load.
+
+**Empty `contact` means the route answers 404.** `Contact` is mandatory in the RFC, so an
+instance with nothing to say says nothing rather than publishing a file naming nobody — and a
+default install does not advertise a reporting channel its operator never agreed to monitor.
+
+### `disclosure.contact`
+
+string · `PUB_DISCLOSURE__CONTACT` · default: `""`
+
+Where to report a vulnerability: a `mailto:`, `https:` or `tel:` URI. Empty = no file.
+
+Validated at boot rather than at the first request, like every other address in this
+configuration: a security contact that is wrong is discovered by the person who needed it.
+
+### `disclosure.policy_url`
+
+string · `PUB_DISCLOSURE__POLICY_URL` · default: `""`
+
+Absolute `https:` URL of the disclosure policy page; empty = the file omits `Policy`.

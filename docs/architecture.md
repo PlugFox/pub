@@ -115,7 +115,9 @@ Two cost rules the read model enforces rather than assumes, both added by the 20
 
 ## Management & administration surface (app API)
 
-Two planes, deliberately orthogonal ([decision 19](decisions.md#19--rbac-cumulative-role-levels-with-a-single-authorize-chokepoint)).
+Three planes, deliberately orthogonal ([decision 19](decisions.md#19--rbac-cumulative-role-levels-with-a-single-authorize-chokepoint)) — org management, instance administration, and (since [decision 39](decisions.md#39--the-account-surface-one-me-the-client-can-trust-an-email-change-that-proves-both-addresses-an-export-that-streams-and-a-deletion-that-keeps-the-attribution-and-nothing-else)) the caller's own account.
+
+**The account surface** (`pub-admin::AccountService`) answers what a person may do to *themselves*: `GET /me` (the profile plus `totp_enabled`, a fact the access token deliberately cannot carry — S-07), `PATCH /me`, the two-step email change ([S-03.b](security.md#1-authentication), whose OTP machinery stays in `AuthService`), the NDJSON export, and deletion. It is a service rather than a handler for the same reason `OrgService` is: deletion touches six repositories in an order where two steps are load-bearing — every credential row goes, or a surviving OIDC link binds that identity to a tombstone permanently; memberships go through `OrgService`, so each removal is audited and each org's members are told. Two refusals precede the first destructive step (last org Owner, last instance administrator), and what survives is exactly the attribution: `versions.published_by` still names the id ([S-29.a](security.md#7-platform)).
 
 **Org and package management** (`pub-admin::OrgService`, `pub-registry::RegistryService`) is org-role-gated through the same `authorize()` chokepoint the read paths use: `PATCH /orgs/{slug}` and the members/invitations routes at Admin, package options at Write, hard delete at Admin, transfer and org deletion at Owner. Two rules live at the service layer rather than in a handler, because a handler can forget them:
 
