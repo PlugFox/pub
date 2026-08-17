@@ -44,6 +44,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 37 | A grant that reaches the tables that do not exist yet, and a check      | accepted |
 | 38 | Two replicas behind one proxy: a stand, four claims, and a number      | accepted |
 | 39 | The account surface: `/me`, an email change, an export, and a tombstone | accepted |
+| 40 | A 429 stream is a delay not a death; a boundary around the chrome; pages | accepted |
 
 ---
 
@@ -1055,3 +1056,68 @@ What survives is exactly the supply-chain claim S-29 makes: `versions.published_
 - **A burst of personal exports can make an audit export wait**, since they share one permit pool; the per-account hourly budget is what keeps that bounded.
 - **One more index on the append-only table.** `audit_log` goes from three indexes to four, so every audited action pays a little more on write. It is bought back by the admin viewer's actor filter, which stops being a full scan on the same day.
 - **The account surface adds seven routes to the app API**, and `/me` becomes the first route a client is expected to call on every load. That is a deliberate coupling: the alternative was more claims in the token, and S-07 exists to refuse that.
+
+## 40 — A refused stream is a delay, not a death: the client half of the S-32 cap, one boundary around the chrome, and pages where footnotes stood
+
+> **Status: accepted.** Recorded 2026-08-17 before implementation, as the Phase 4 wave-9 enabling decision for [roadmap item 2](roadmap.md#phase-4--finish-the-product-surface-closes-d17-d19-d26-d32d36-and-the-account-gaps). It closes the two open clauses of [D32](roadmap.md) and the paginator half of item 2. Three owner-decided forks shaped it: the refused stream retries **automatically** rather than waiting for a human, a hidden tab **releases** its slot rather than holding it, and **all four** truncated lists become paginated rather than two of them.
+
+**Context.** Three defects share one property — the client knows something and throws it away.
+
+`GET /api/v1/events` answers `429` with `Retry-After: 30` when the account is over the [S-32](security.md#6-realtime--notifications) per-user connection cap (`events/src/bus.rs`, five streams by default), and [S-32.a](security.md#6-realtime--notifications) already states why that refusal is temporary: the slot is RAII, released on every exit path, so "the condition clears by itself". The client reads none of it. `createEventStream` treats a 429 exactly like a 401 — `stopFor("rate_limited")`, the stream object is dropped, and `app-shell.tsx` only ever restarts on a change of authentication. So a sixth tab loses live updates permanently, and closing the other five does not bring them back; only a reload does.
+
+`ScreenBoundary` wraps the router's children, which is every screen and nothing else. The shell around them — the branding prime, the org switcher's `createAsync`, the user menu — throws into no boundary at all, and Solid's default for an uncaught render error is an empty document. The one surface that is on screen for every route has the weakest failure mode in the app.
+
+And four lists carry `has_more` from a keyset-paginated endpoint and render a sentence, or nothing: package versions ("Only the most recent versions are listed"), the notification feed ("Older notifications are not shown"), an organization's packages ("Use search to see the rest"), and the dependents tab, which fetches fifty rows and says nothing at all. A working forward-only paginator has existed since the admin tables landed — `CursorNav`, in `screens/admin-people.tsx`, imported from there by two other screens.
+
+**Decision.**
+
+### A 429 is answered at the time the server named, and the 401 rule does not move
+
+The transport parses `Retry-After` from the refusal (the same `parseRetryAfter` the REST client has used for S-24 since it was written) and **schedules a reconnect** instead of stopping. Consecutive refusals double the delay to a five-minute ceiling; the jitter is additive rather than subtractive here, so the delay is never *below* the number the server named, and the ceiling is `max(5 min, Retry-After)` so a server asking for longer is obeyed rather than clamped. It never gives up: the condition is another connection of the same account ending, and nothing about waiting longer makes that less likely.
+
+**A 401 stays terminal, and the difference is not a matter of degree.** An unauthorized stream means the credential presented is wrong — retrying cannot repair it, the repair belongs to the API client's refresh, and a loop against a revoked session is the self-inflicted denial of service the transport's own header comment describes. A 429 names a time. One is "this will never work", the other is "not yet, come back at T".
+
+**The toast fires once per capped episode.** `eventStreamCapped` explains a symptom that is otherwise indistinguishable from a quiet instance; repeating it every five minutes turns the one alarm this stream raises into noise. It rearms when the stream next reaches `open`.
+
+### The 401 half, which this wave's own review found rather than designed
+
+Keeping the 401 rule intact exposed what was missing beside it, and it is worse than the defect this item was filed for. **The server ends every stream at the access token's `exp`** (S-32), the transport reconnects, and it presents whatever is in storage — but the proactive refresh rides on outgoing REST requests, and a tab nobody is typing in makes none. So the reconnect carries the expired token, is answered 401, and the transport stops. **Every idle tab therefore loses live updates one access TTL after it stops being used, permanently**, and no reload-free path brings it back. That is not the cap, it is not new, and it is reachable without doing anything unusual.
+
+The repair is the second half of the sentence the transport's comment has always carried — "the access token is repaired by the API client's refresh". The refresh lives in the api client, `state/sse.ts` may not import it (the cycle its own header describes), so the repair belongs to the shell, which already owns the lifecycle: on an unauthorized stop it calls `renewAuth` **once** and reopens the stream if it succeeded. Once, because a session the server keeps refusing must not become a refresh loop — that is the same self-inflicted denial of service the 401 rule exists to prevent, one level up. The attempt rearms when a connection reaches `open`, so a healthy stream restores the budget and a refused one does not.
+
+A repaired stream starts **blind rather than replaying**: the resume point was minted under a credential the server just refused, so the badge is re-read from the API instead.
+
+### A hidden tab releases its slot instead of competing for it
+
+The way an ordinary person reaches a five-stream cap is tabs, so the client stops holding streams it cannot use. When the document has been hidden for sixty seconds the shell **pauses** the stream; when it becomes visible again it resumes. The grace period is the point: a glance at another tab must not churn a connection whose slot lingers for up to one heartbeat after the client is gone ([S-32.a](security.md#6-realtime--notifications)'s second residue), and a pause-per-tab-switch would spend more slots than it frees.
+
+**A pause remembers the last event id; a sign-out forgets it.** That is the whole difference between `pauseEventStream` and `stopEventStream`, and it is why the resume replays the gap through `Last-Event-ID` rather than starting blind. Replay is bounded by the instance's ring buffer and filtered identically to live delivery, so a long pause loses frames — which is why the resume also re-seeds the unread badge from the API. Decision 20's rule is unchanged and is what makes this safe: the stream is a hint channel, and every screen still reads REST.
+
+The listener lives in the shell rather than in the transport. `state/sse.ts` must not import `state/api.ts` (the cycle its header comment describes), and the shell is already the one place that sees every lifecycle transition.
+
+### One boundary around the chrome, rendering without the chrome
+
+A root `ErrorBoundary` sits outside the router root in `App.tsx`, so it catches what `ScreenBoundary` structurally cannot: a throw from the shell itself. Its fallback is a **standalone** page — no header, no navigation — because the component that failed is the one that draws them, and a fallback that re-renders the failing subtree is not a fallback. It offers two actions with different guarantees: a retry that drops the query cache and re-renders (which fixes a failed prime or a refused org list), and a document reload (which fixes everything else). Nested boundaries mean a screen error is still handled by the screen's own boundary; this one only sees what escapes.
+
+What it cannot catch is stated rather than implied: a failure before the island mounts, or inside an event handler, is not a render error, and Solid's boundary sees neither.
+
+### Footnotes become pages, and a cursor belongs to the slice that issued it
+
+`CursorNav` moves out of the admin screen it happens to live in and becomes the app's one paginator, used by all four lists. The cursor is **URL state** (`?cursor=`), like search and the admin tables: a page a reader reached is a page they can link to, and it survives a reload.
+
+The one rule that cannot be got wrong is the one search already enforces for `sort`: **a cursor is only valid under the slice that minted it**. Changing the package tab drops it (tab links carry no query string), and toggling the notification feed's `unread` filter resets it explicitly.
+
+**This reverses an argument written in the code**, and deliberately. `package.tsx` currently declines a versions paginator because "the full listing is the pub protocol's job" — but that listing is for a resolver, and a person looking for the version they published last Tuesday is not going to read `/api/packages/{name}`. The protocol listing keeps its own bounds ([decision 32](#32--quotas-and-limits-what-an-org-may-store-what-a-caller-may-write-and-one-identity-per-request)'s window and `MAX_LISTED_VERSIONS`) and is untouched by this.
+
+**A cursor in the URL is a trap the retry has to know about**, and this wave's review found that too. A cursor the server refuses — malformed, or minted for a different slice — is refused identically every time it is presented, so `ScreenBoundary`'s retry button would rerun the same 400 forever and a reader who followed a stale link would be stuck on a screen with no way out but the address bar. The retry therefore drops `?cursor=` before it revalidates. That is exactly what the search screen's own boundary has always done for its `sort`-bound cursor; making `cursor` the app-wide name for "the page within a list" is what lets the generic boundary do it once instead of four screens doing it each.
+
+**Consequences.**
+
+- **A capped tab now costs one request per five minutes, forever.** Each refused attempt is not free: the handler reads the account row *before* it asks for a slot, and the SSE route is exempt from the S-24.f read bucket ("one request per session rather than a rate"), so nothing else meters these. The ceiling is what bounds it, and it is why the ladder grows rather than repeating the server's thirty seconds.
+- **A hidden tab is not live.** Anything that happens during a pause arrives as replay if the ring buffer still holds it and as a badge number if it does not. This is a deliberate trade of freshness in a tab nobody is looking at for a slot in the one they are.
+- **`pauseEventStream` is a second stop path**, and a wrong call site is a stream that never resumes. It is reachable from the shell only, and the sign-out path keeps calling `stopEventStream`.
+- **Three message keys are deleted** (`pkgVersionsTruncated`, `orgPackagesTruncated`, `notifTruncated`) — the i18n coverage test refuses a generated key nobody references, so the sentences cannot be left behind as dead weight in ten locales.
+- **Paging an organization's packages refetches its profile.** The cursor paginates the package list *inside* `GET /orgs/{slug}`, so a page turn carries the profile document with it. Accepted over adding a second endpoint for a list that is thirty rows a page; the alternative is a route whose only reason to exist is saving a small payload.
+- **The root boundary changes what a shell defect looks like in the wild**: a blank page becomes a page with a retry, which is better for the reader and worse for the bug report, since a reader who retries successfully has nothing to report.
+- **An idle tab now costs one refresh per lost stream** instead of losing the stream for good. The budget is one attempt per healthy connection, so a genuinely dead session spends exactly one refresh and then stops — and a tab whose session died stays silent rather than announcing it, because a stream that never opens is not a sign-out.
+- **Every screen's retry now clears `?cursor=`.** On the four paginated screens that is the fix; everywhere else it is a parameter that does not exist. The cost is that a retry after an unrelated failure also returns a paginated screen to its first page, which is a page turn rather than lost work.
