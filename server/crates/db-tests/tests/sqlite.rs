@@ -9,6 +9,8 @@
 //! than the code. Those use [`file_backed_repos`].
 
 use pub_config::{DatabaseConfig, DatabaseKind};
+use pub_core::UserId;
+use pub_core::audit::{AuditActor, AuditFilter};
 use pub_core::traits::Repositories;
 use pub_db_sqlite::SqliteDb;
 
@@ -213,6 +215,64 @@ async fn job_lock_is_single_winner_decision36() {
 #[tokio::test]
 async fn retention_contract_s23_s22a() {
     pub_db_tests::contract::retention(&fresh_repos().await).await;
+}
+
+#[tokio::test]
+async fn account_lifecycle_contract_s29a() {
+    pub_db_tests::contract::account_lifecycle(&fresh_repos().await).await;
+}
+
+/// **S-29.b.** An actor-filtered audit page is a seek, not a scan of the largest table.
+///
+/// `AuditFilter::actor` has been reachable from the admin viewer since the admin surface landed
+/// and was never index-backed; the personal export walks that same predicate page after page,
+/// which is what turned a slow query into a slow query in a loop and bought migration 0018.
+///
+/// The SQL is read from the repository (`audit_page_sql`), never copied here — [D52](../../../../docs/roadmap.md)'s
+/// exit shape applied to new code — and the assertion names the seek rather than an index name
+/// alone, per the working agreement: an index test that asserts a name passes while the statement
+/// scans. The cursor form is checked as well as the first page, because a walk spends all but its
+/// first round trip in the cursor form.
+#[tokio::test]
+async fn s29b_the_actor_filtered_audit_page_seeks() {
+    let cfg =
+        DatabaseConfig { kind: DatabaseKind::Sqlite, url: None, path: ":memory:".to_owned(), ..Default::default() };
+    let db = SqliteDb::connect(&cfg).await.expect("connect :memory:");
+    db.run_migrations().await.expect("migrate");
+
+    // `AssertSqlSafe`: the text comes from the repository crate, and every value in it is a bind.
+    let plan = async |sql: &str| -> String {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                .fetch_all(db.pool())
+                .await
+                .expect("explain");
+        rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | ")
+    };
+
+    let by_user = AuditFilter { actor: Some(AuditActor::User(UserId::new())), ..AuditFilter::default() };
+    for (with_cursor, usable) in
+        [(false, "(actor_type=? AND actor_id=?)"), (true, "(actor_type=? AND actor_id=? AND id<?)")]
+    {
+        let sql = pub_db_sqlite::repo::audit_page_sql(&by_user, with_cursor);
+        let rendered = plan(&sql).await;
+        assert!(!rendered.contains("SCAN audit_log"), "an actor page (cursor: {with_cursor}) scans: {rendered}");
+        // The columns, not the name: SQLite prints the seek's usable prefix, so this fails if a
+        // future column order leaves `id` as a post-filter and the walk sorts each page.
+        assert!(
+            rendered.contains(&format!("audit_actor_idx {usable}")),
+            "an actor page (cursor: {with_cursor}) does not seek on {usable}: {rendered}"
+        );
+    }
+
+    // The control, and the reason the assertion above is about the actor rather than about
+    // pagination: with no actor filter the page is an ordered walk of the primary key, which is
+    // correct and is not what the new index is for.
+    let unfiltered = plan(&pub_db_sqlite::repo::audit_page_sql(&AuditFilter::default(), true)).await;
+    assert!(
+        !unfiltered.contains("audit_actor_idx"),
+        "the unfiltered page must not be planned through the actor index: {unfiltered}"
+    );
 }
 
 /// Every statement the drain emits on **every tick** must be an index lookup (SF2).

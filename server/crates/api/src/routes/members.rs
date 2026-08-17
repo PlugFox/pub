@@ -214,6 +214,46 @@ pub async fn remove(
     })))
 }
 
+/// Leaves an organization — the caller removes **themselves**, at any role
+/// ([D40](../../../../docs/roadmap.md), decision 39).
+///
+/// The route every other member-management endpoint on this module could not be: those all take
+/// `Action::ManageMembers`, which a Read or Write member does not hold, so below Admin there was
+/// no way out of an org through the API at all. Authorization here is membership itself —
+/// `Action::ReadPackages`, the level every member holds — and the D39 self-reduction carve-out is
+/// what lets the service accept it without a ceiling check.
+///
+/// The ≥1-Owner invariant still applies and is still the repository's: a sole Owner leaving is
+/// `409 last_owner`, not an org without an owner.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/orgs/{slug}/membership",
+    tag = "orgs",
+    security(("bearer_auth" = [])),
+    params(("slug" = String, Path, description = "Org slug")),
+    responses(
+        (status = OK, description = "The caller is no longer a member; their sessions were revoked (S-09)", body = OkEnvelope<MembershipChangedDto>),
+        (status = CONFLICT, description = "last_owner — transfer ownership first", body = ErrorEnvelope),
+        (status = NOT_FOUND, description = "Unknown org, or the caller is not a member", body = ErrorEnvelope),
+    )
+)]
+pub async fn leave(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    RequestMeta(meta): RequestMeta,
+    Path(slug): Path<String>,
+) -> Result<Json<OkEnvelope<MembershipChangedDto>>, ApiError> {
+    let org = org_for(&state, &auth, &slug, Action::ReadPackages).await?;
+    let now = (state.clock)();
+    let acting_role = auth.actor.role_in(org.id);
+    let revoked = state.orgs.remove_member(&org, auth.claims.sub, acting_role, &actor_meta(&auth, &meta), now).await?;
+    Ok(Json(OkEnvelope::new(MembershipChangedDto {
+        role: None,
+        sessions_revoked: revoked.sessions,
+        tokens_revoked: revoked.tokens,
+    })))
+}
+
 /// The org's invitations, newest first (Admin+).
 #[utoipa::path(
     get,

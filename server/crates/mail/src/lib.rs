@@ -594,6 +594,24 @@ struct OtpHtml<'a> {
     expiry_minutes: i64,
 }
 
+#[derive(Template)]
+#[template(path = "email_change.txt")]
+struct EmailChangeText<'a> {
+    code: &'a str,
+    instance: &'a str,
+    requester_ip: &'a str,
+    expiry_minutes: i64,
+}
+
+#[derive(Template)]
+#[template(path = "email_change.html")]
+struct EmailChangeHtml<'a> {
+    code: &'a str,
+    instance: &'a str,
+    requester_ip: &'a str,
+    expiry_minutes: i64,
+}
+
 /// A rendered OTP email, ready for [`Mailer::send_multipart`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderedEmail {
@@ -622,6 +640,29 @@ pub fn render_otp_email(code: &str, requester_ip: Option<&str>, expiry_minutes: 
         .render()
         .map_err(|err| Error::Internal { message: format!("otp html template failed: {err}") })?;
     Ok(RenderedEmail { subject: "Your sign-in code".to_owned(), text, html })
+}
+
+/// Renders the address-confirmation email for an account email change
+/// ([S-03.b](../../../docs/security.md#1-authentication)).
+///
+/// The same subject rule as the sign-in code and for the same reason: **the code never enters the
+/// subject**, because a queued subject is an unsealed column. The body says the account keeps its
+/// current address until the code is entered — the recipient of a mistyped change needs to know
+/// that ignoring the message is a complete answer, not a hopeful one.
+pub fn render_email_change_email(
+    code: &str,
+    instance: &str,
+    requester_ip: Option<&str>,
+    expiry_minutes: i64,
+) -> Result<RenderedEmail> {
+    let ip = requester_ip.unwrap_or("unknown");
+    let text = EmailChangeText { code, instance, requester_ip: ip, expiry_minutes }
+        .render()
+        .map_err(|err| Error::Internal { message: format!("email-change text template failed: {err}") })?;
+    let html = EmailChangeHtml { code, instance, requester_ip: ip, expiry_minutes }
+        .render()
+        .map_err(|err| Error::Internal { message: format!("email-change html template failed: {err}") })?;
+    Ok(RenderedEmail { subject: "Confirm your new email address".to_owned(), text, html })
 }
 
 #[cfg(test)]

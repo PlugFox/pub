@@ -63,6 +63,44 @@ impl Settings {
         self.validate_jobs()?;
         self.validate_realtime()?;
         self.validate_telemetry()?;
+        self.validate_disclosure()?;
+        Ok(())
+    }
+
+    /// The security-contact invariants ([S-29.c](../../../docs/security.md#7-platform), RFC 9116).
+    ///
+    /// Checked at boot rather than when the file is first requested, for the reason every other
+    /// address in this file is: a wrong disclosure contact is discovered by the person who needed
+    /// it, at the moment they needed it. An unset contact is not an error — it means the instance
+    /// publishes no file at all.
+    fn validate_disclosure(&self) -> Result<(), ConfigError> {
+        let contact = self.disclosure.contact.trim();
+        if !contact.is_empty() {
+            let uri = url::Url::parse(contact)
+                .map_err(|err| invalid(format!("disclosure.contact is not a valid URI: {err}")))?;
+            // RFC 9116 allows any URI; these three are the ones a reporter can actually act on,
+            // and refusing the rest keeps a `http:` contact — which is a plaintext report channel
+            // — from being published as the instance's security posture.
+            if !matches!(uri.scheme(), "mailto" | "https" | "tel") {
+                return Err(invalid(format!(
+                    "disclosure.contact '{contact}' must be a mailto:, https: or tel: URI (RFC 9116)"
+                )));
+            }
+        }
+        let policy = self.disclosure.policy_url.trim();
+        if !policy.is_empty() {
+            let url = url::Url::parse(policy)
+                .map_err(|err| invalid(format!("disclosure.policy_url is not a valid URL: {err}")))?;
+            if url.scheme() != "https" {
+                return Err(invalid(format!("disclosure.policy_url '{policy}' must be an https: URL")));
+            }
+        }
+        if contact.is_empty() && !policy.is_empty() {
+            return Err(invalid(
+                "disclosure.policy_url is set without disclosure.contact: security.txt is only served when a \
+                 contact exists (RFC 9116 makes Contact mandatory), so the policy would never be published",
+            ));
+        }
         Ok(())
     }
 

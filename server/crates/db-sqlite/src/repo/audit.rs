@@ -14,7 +14,7 @@ use pub_core::audit::{AuditActor, AuditEvent, AuditFilter, AuditId, AuditResult,
 use pub_core::retention::RetentionPolicy;
 use pub_core::traits::AuditRepo;
 use pub_core::{Error, Page, Result};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::SqlitePool;
 
 use super::{db_err, parse_col, parse_ts, q};
 
@@ -85,6 +85,45 @@ impl TryFrom<AuditRow> for AuditEvent {
     }
 }
 
+/// The audit page statement for one filter shape, with or without its keyset predicate.
+///
+/// **Exported so the plan test can EXPLAIN the statement production emits instead of a copy of
+/// it** — the drift roadmap [D52](../../../../docs/roadmap.md) describes, avoided here rather
+/// than repeated. No caller-supplied value enters the text: the filter decides only which
+/// predicates are present, and every value travels as a bind.
+///
+/// Binds, in this order: `org`, the `action` prefix pattern, the actor kind, the actor id (only
+/// when the actor carries one — `AuditActor::System` renders `IS NULL` and binds nothing), `from`,
+/// `until`, the cursor id when `with_cursor`, and finally the row limit.
+///
+/// The actor predicate is written as two equalities in the order `audit_actor_idx` (0018) carries
+/// them, with the `id` keyset third — so an actor page is a range scan inside one actor rather
+/// than a filter over the whole log.
+pub fn audit_page_sql(filter: &AuditFilter, with_cursor: bool) -> String {
+    let mut sql = format!("SELECT {COLS} FROM audit_log WHERE 1 = 1");
+    if filter.org.is_some() {
+        sql.push_str(" AND org_id = ?");
+    }
+    if filter.action_prefix.is_some() {
+        sql.push_str(" AND action LIKE ? ESCAPE '\\'");
+    }
+    if let Some(actor) = &filter.actor {
+        sql.push_str(" AND actor_type = ?");
+        sql.push_str(if actor.id_string().is_some() { " AND actor_id = ?" } else { " AND actor_id IS NULL" });
+    }
+    if filter.from.is_some() {
+        sql.push_str(" AND created_at >= ?");
+    }
+    if filter.until.is_some() {
+        sql.push_str(" AND created_at < ?");
+    }
+    if with_cursor {
+        sql.push_str(" AND id < ?");
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT ?");
+    sql
+}
+
 /// Escapes `%`, `_`, and the escape char itself for a `LIKE … ESCAPE '\'` prefix match.
 fn like_prefix(prefix: &str) -> String {
     let mut escaped = String::with_capacity(prefix.len() + 1);
@@ -135,41 +174,39 @@ impl AuditRepo for SqliteAuditRepo {
 
     async fn list(&self, filter: &AuditFilter, cursor: Option<&str>, limit: u32) -> Result<Page<AuditEvent>> {
         let limit = limit.clamp(1, MAX_PAGE) as i64;
-        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!("SELECT {COLS} FROM audit_log WHERE 1 = 1"));
+        // Keyset pagination over the ULID id: strictly older than the last-seen id. The id is
+        // unique, so pages are stable even when timestamps collide. Parsed before the statement
+        // is built, so a malformed cursor is a 400 rather than a query that returns nothing.
+        let cursor: Option<AuditId> = cursor
+            .map(|raw| raw.parse().map_err(|_| Error::Invalid { message: format!("malformed cursor: {raw}") }))
+            .transpose()?;
 
+        // The text comes from [`audit_page_sql`] and the binds follow in the order it documents.
+        let mut query = sqlx::query_as::<_, AuditRow>(sqlx::AssertSqlSafe(audit_page_sql(filter, cursor.is_some())));
         if let Some(org) = filter.org {
-            query.push(" AND org_id = ").push_bind(org.to_string());
+            query = query.bind(org.to_string());
         }
         if let Some(prefix) = &filter.action_prefix {
-            query.push(" AND action LIKE ").push_bind(like_prefix(prefix)).push(" ESCAPE '\\'");
+            query = query.bind(like_prefix(prefix));
         }
         if let Some(actor) = &filter.actor {
-            query.push(" AND actor_type = ").push_bind(actor.kind());
-            match actor.id_string() {
-                Some(id) => {
-                    query.push(" AND actor_id = ").push_bind(id);
-                }
-                None => {
-                    query.push(" AND actor_id IS NULL");
-                }
+            query = query.bind(actor.kind());
+            if let Some(id) = actor.id_string() {
+                query = query.bind(id);
             }
         }
         if let Some(from) = filter.from {
-            query.push(" AND created_at >= ").push_bind(super::ts(from));
+            query = query.bind(super::ts(from));
         }
         if let Some(until) = filter.until {
-            query.push(" AND created_at < ").push_bind(super::ts(until));
+            query = query.bind(super::ts(until));
         }
         if let Some(cursor) = cursor {
-            // Keyset pagination over the ULID id: strictly older than the last-seen id. The
-            // id is unique, so pages are stable even when timestamps collide.
-            let cursor: AuditId =
-                cursor.parse().map_err(|_| Error::Invalid { message: format!("malformed cursor: {cursor}") })?;
-            query.push(" AND id < ").push_bind(cursor.to_string());
+            query = query.bind(cursor.to_string());
         }
-        query.push(" ORDER BY id DESC LIMIT ").push_bind(limit + 1);
+        query = query.bind(limit + 1);
 
-        let rows: Vec<AuditRow> = query.build_query_as().fetch_all(&self.pool).await.map_err(db_err)?;
+        let rows: Vec<AuditRow> = query.fetch_all(&self.pool).await.map_err(db_err)?;
         let has_more = rows.len() as i64 > limit;
         let items: Vec<AuditEvent> =
             rows.into_iter().take(limit as usize).map(TryInto::try_into).collect::<Result<_>>()?;

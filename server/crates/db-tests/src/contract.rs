@@ -3984,6 +3984,131 @@ pub async fn job_lock_is_single_winner(repos: &Repositories) {
     }
 }
 
+/// The account surface's four writes ([S-29.a](../../../../docs/security.md#7-platform),
+/// [S-03.b](../../../../docs/security.md#1-authentication), decision 39).
+///
+/// Every property here is one a single-dialect test cannot see. `change_email` is two statements
+/// in one transaction and each dialect spells the case-insensitive uniqueness differently
+/// (`COLLATE NOCASE` versus a `lower()` index), so "an address held by somebody else conflicts"
+/// and "the credential row moved with the user row" are exactly the pair that drifts. The two
+/// account-wide deletes are the only methods on their traits that erase by identity rather than by
+/// age. And the anonymization asserts what deletion is *for*: the row survives, the address does
+/// not, and the instance-admin flag goes with the profile.
+pub async fn account_lifecycle(repos: &Repositories) {
+    let alice = seed_user(repos, "alice@corp.com", "Alice").await;
+    let bob = seed_user(repos, "bob@corp.com", "Bob").await;
+    repos.credentials.create_email_identity(alice.id, "alice@corp.com", t0()).await.expect("email identity");
+    repos.credentials.upsert_oidc(alice.id, "https://accounts.google.com", "sub-alice", t0()).await.expect("oidc");
+
+    // --- profile edit -----------------------------------------------------------------
+    let renamed = repos.users.update_profile(alice.id, "Alice Cooper", t0() + hours(1)).await.expect("rename");
+    assert_eq!(renamed.display_name, "Alice Cooper");
+    assert_eq!(renamed.email.as_deref(), Some("alice@corp.com"), "a rename touches nothing else");
+    assert_eq!(renamed.updated_at, t0() + hours(1));
+    assert_eq!(renamed.created_at, t0());
+    let err = repos.users.update_profile(UserId::new(), "Nobody", t0()).await.expect_err("unknown user");
+    assert_eq!(err.code(), "not_found");
+
+    // --- email change -----------------------------------------------------------------
+    // An address another *live* account holds is refused by the index, not by a prior read.
+    let err = repos.users.change_email(alice.id, "BOB@corp.com", t0() + hours(2)).await.expect_err("taken address");
+    assert_eq!(err.code(), "conflict", "case-insensitive uniqueness holds on both dialects");
+    assert_eq!(
+        repos.users.get(alice.id).await.expect("reread").and_then(|user| user.email),
+        Some("alice@corp.com".to_owned()),
+        "a refused change leaves the account exactly as it was"
+    );
+
+    let moved = repos.users.change_email(alice.id, "alice@new.example", t0() + hours(3)).await.expect("change email");
+    assert_eq!(moved.email.as_deref(), Some("alice@new.example"));
+    assert!(moved.email_verified, "the caller proved the address before this call");
+    assert_eq!(repos.users.find_by_email("ALICE@NEW.example").await.expect("find"), Some(moved.clone()));
+    assert_eq!(repos.users.find_by_email("alice@corp.com").await.expect("old address"), None);
+    // The credential row moved with the user row: otherwise the account's own inventory names an
+    // address that no longer signs in (S-03.b).
+    let creds = repos.credentials.list_for_user(alice.id).await.expect("credentials");
+    let email_identity = creds.iter().find(|c| c.credential_type == CredentialType::Email).expect("email identity");
+    assert_eq!(email_identity.email.as_deref(), Some("alice@new.example"));
+    // The address it vacated is free for anybody, including a brand-new account.
+    seed_user(repos, "alice@corp.com", "Someone Else").await;
+    let err = repos.users.change_email(UserId::new(), "ghost@corp.com", t0()).await.expect_err("unknown user");
+    assert_eq!(err.code(), "not_found");
+
+    // --- the two account-wide deletes -------------------------------------------------
+    repos
+        .notifications
+        .create(
+            NewNotification {
+                user_id: alice.id,
+                category: NotificationCategory::Package,
+                event_id: None,
+                event: "package.publish".to_owned(),
+                title: "something".to_owned(),
+                org_id: None,
+                payload: serde_json::json!({ "type": "package_published" }),
+            },
+            t0() + hours(4),
+        )
+        .await
+        .expect("notification");
+    repos
+        .notifications
+        .set_preferences(
+            alice.id,
+            &[NotificationPreference { category: NotificationCategory::Package, in_app: false, email: false }],
+            t0() + hours(4),
+        )
+        .await
+        .expect("preferences");
+    // Bob's rows are the control: an account-wide delete that took a neighbour's feed with it
+    // would still pass every assertion about Alice.
+    repos
+        .notifications
+        .create(
+            NewNotification {
+                user_id: bob.id,
+                category: NotificationCategory::Package,
+                event_id: None,
+                event: "package.publish".to_owned(),
+                title: "bob's".to_owned(),
+                org_id: None,
+                payload: serde_json::json!({ "type": "package_published" }),
+            },
+            t0() + hours(4),
+        )
+        .await
+        .expect("bob's notification");
+
+    let erased = repos.notifications.delete_for_user(alice.id).await.expect("delete feed");
+    assert_eq!(erased, 2, "one feed row and one stored preference");
+    assert_eq!(repos.notifications.unread_count(alice.id).await.expect("count"), 0);
+    assert!(repos.notifications.preferences(alice.id).await.expect("prefs").is_empty());
+    assert_eq!(repos.notifications.unread_count(bob.id).await.expect("bob"), 1, "a neighbour's feed is untouched");
+
+    let credentials_gone = repos.credentials.delete_all_for_user(alice.id).await.expect("delete credentials");
+    assert_eq!(credentials_gone, 2, "the email identity and the OIDC link");
+    assert!(repos.credentials.list_for_user(alice.id).await.expect("credentials").is_empty());
+    // The reason the step exists: a surviving OIDC row would bind this identity to a tombstone
+    // forever, and the person behind it could never register again through that provider.
+    assert_eq!(repos.credentials.find_oidc("https://accounts.google.com", "sub-alice").await.expect("oidc"), None);
+
+    // --- anonymization ----------------------------------------------------------------
+    // The flag is set first, because clearing a flag nobody set proves nothing.
+    repos.users.set_instance_admin(alice.id, true, t0() + hours(5)).await.expect("promote");
+    let tombstone = repos.users.update_status(alice.id, UserStatus::Deleted, t0() + hours(6)).await.expect("delete");
+    assert_eq!(tombstone.status, UserStatus::Deleted);
+    assert_eq!(tombstone.email, None);
+    assert!(!tombstone.email_verified);
+    assert_ne!(tombstone.display_name, "Alice Cooper");
+    assert!(!tombstone.is_instance_admin, "a tombstone is not an administrator");
+    assert!(repos.users.get(alice.id).await.expect("row").is_some(), "the attribution row survives");
+    let counts = repos.users.counts().await.expect("counts");
+    assert_eq!(counts.admins, 0, "`counts` must not report tombstones as administrators");
+    // The clincher for the flag: `claim_first_admin` asks whether *any* account holds it, so a
+    // deleted admin left flagged would block the bootstrap promotion permanently.
+    assert!(repos.users.claim_first_admin(bob.id, t0() + hours(7)).await.expect("claim"), "the instance has no admin");
+}
+
 /// S-23 retention across every table that has a window (decision 30).
 ///
 /// The properties worth a cross-dialect contract are the ones a single-backend test cannot see:

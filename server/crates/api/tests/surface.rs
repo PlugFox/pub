@@ -19,6 +19,7 @@ const SURFACE: &[(&str, &str, bool)] = &[
     // system
     ("get", "/healthz", false),
     ("get", "/api/v1/ping", false),
+    ("get", "/.well-known/security.txt", false),
     // auth
     ("post", "/api/v1/auth/otp/request", false),
     ("post", "/api/v1/auth/otp/verify", false),
@@ -32,6 +33,13 @@ const SURFACE: &[(&str, &str, bool)] = &[
     ("delete", "/api/v1/auth/totp", true),
     ("post", "/api/v1/auth/totp/verify", false),
     ("post", "/api/v1/auth/step-up", true),
+    // account (decision 39, S-29)
+    ("get", "/api/v1/me", true),
+    ("patch", "/api/v1/me", true),
+    ("delete", "/api/v1/me", true),
+    ("post", "/api/v1/me/email", true),
+    ("post", "/api/v1/me/email/verify", true),
+    ("get", "/api/v1/me/export", true),
     // sessions & tokens
     ("get", "/api/v1/sessions", true),
     ("delete", "/api/v1/sessions/{sid}", true),
@@ -52,6 +60,7 @@ const SURFACE: &[(&str, &str, bool)] = &[
     ("get", "/api/v1/orgs/{slug}/invitations", true),
     ("post", "/api/v1/orgs/{slug}/invitations", true),
     ("delete", "/api/v1/orgs/{slug}/invitations/{id}", true),
+    ("delete", "/api/v1/orgs/{slug}/membership", true),
     ("post", "/api/v1/invitations/accept", true),
     // packages: read model
     ("get", "/api/v1/packages", false),
@@ -231,6 +240,8 @@ async fn no_response_schema_carries_a_credential_field() {
         ("TokenCreatedDto", "token"),
         // A count of credentials the D37 sweep revoked, not a credential (decision 13).
         ("MembershipChangedDto", "tokens_revoked"),
+        // The same shape one layer up: what an account deletion revoked, as numbers (S-29.a).
+        ("AccountDeletedDto", "tokens_revoked"),
     ];
 
     const SUSPICIOUS: &[&str] = &["secret", "token", "password", "hash", "pepper", "kek", "private_key"];
@@ -266,6 +277,14 @@ fn mutations() -> Vec<(axum::http::Method, String, Option<serde_json::Value>)> {
         (Method::POST, "/api/v1/auth/totp/confirm".to_owned(), json(serde_json::json!({ "code": "000000" }))),
         (Method::DELETE, "/api/v1/auth/totp".to_owned(), None),
         (Method::POST, "/api/v1/auth/step-up".to_owned(), json(serde_json::json!({ "code": "000000" }))),
+        (Method::PATCH, "/api/v1/me".to_owned(), json(serde_json::json!({ "display_name": "X" }))),
+        (Method::DELETE, "/api/v1/me".to_owned(), json(serde_json::json!({ "confirm": "x@corp.com" }))),
+        (Method::POST, "/api/v1/me/email".to_owned(), json(serde_json::json!({ "email": "x@corp.com" }))),
+        (
+            Method::POST,
+            "/api/v1/me/email/verify".to_owned(),
+            json(serde_json::json!({ "pending_id": "x", "code": "00000000" })),
+        ),
         (Method::DELETE, "/api/v1/sessions/00000000-0000-7000-8000-000000000000".to_owned(), None),
         (Method::POST, "/api/v1/sessions/revoke-all".to_owned(), None),
         (
@@ -286,6 +305,7 @@ fn mutations() -> Vec<(axum::http::Method, String, Option<serde_json::Value>)> {
         (Method::DELETE, "/api/v1/orgs/acme/members/00000000-0000-7000-8000-000000000000".to_owned(), None),
         (Method::POST, "/api/v1/orgs/acme/invitations".to_owned(), json(serde_json::json!({ "email": "x@corp.com" }))),
         (Method::DELETE, "/api/v1/orgs/acme/invitations/00000000-0000-7000-8000-000000000000".to_owned(), None),
+        (Method::DELETE, "/api/v1/orgs/acme/membership".to_owned(), None),
         (Method::POST, "/api/v1/invitations/accept".to_owned(), json(serde_json::json!({ "token": "x" }))),
         (Method::PATCH, "/api/v1/packages/acme_core/options".to_owned(), json(serde_json::json!({ "unlisted": true }))),
         (Method::POST, "/api/v1/packages/acme_core/versions/1.0.0/retract".to_owned(), None),

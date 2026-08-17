@@ -393,4 +393,26 @@ impl NotificationRepo for PgNotificationRepo {
         .map_err(db_err)?;
         Ok(result.rows_affected())
     }
+
+    async fn delete_for_user(&self, user: UserId) -> Result<u64> {
+        // Unbatched deliberately, unlike `purge_before`: this is bounded by one account's feed
+        // rather than by an instance-wide backlog crossing a cutoff, and it runs once per
+        // deletion. Retention is what keeps that feed from being unbounded in the first place.
+        let key = *user.as_uuid();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let feed = sqlx::query("DELETE FROM notifications WHERE user_id = $1")
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+        let prefs = sqlx::query("DELETE FROM notification_prefs WHERE user_id = $1")
+            .bind(key)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+        tx.commit().await.map_err(db_err)?;
+        Ok(feed + prefs)
+    }
 }

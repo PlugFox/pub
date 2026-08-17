@@ -19,9 +19,11 @@
 //! called by the API layer before it reaches a service method, because only the API layer knows
 //! how a denial has to look on the wire (403 vs the S-04 404).
 
+pub mod account;
 pub mod instance;
 pub mod orgs;
 
+pub use account::{AccountDeletion, AccountProfile, AccountService, AccountSnapshot};
 pub use instance::{AdminService, InstanceStats, SettingsPatch, SettingsView};
 pub use orgs::{AuthorityChange, AuthorityRevocations, InvitationCreated, OrgDeletion, OrgPolicy, OrgService};
 

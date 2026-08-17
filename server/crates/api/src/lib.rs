@@ -72,6 +72,7 @@ impl Modify for SecurityAddon {
         (name = "system", description = "Health and system endpoints"),
         (name = "auth", description = "Sign-in (email OTP, OIDC), TOTP second factor, step-up, refresh, logout"),
         (name = "sessions", description = "Web session management"),
+        (name = "account", description = "The caller's own account: profile, email change, export, deletion (S-29)"),
         (name = "tokens", description = "CLI/API tokens"),
         (name = "orgs", description = "Organizations: profile, members, invitations, danger zone"),
         (name = "packages", description = "Package read model and management: search, pages, options, retraction, transfer"),
@@ -90,6 +91,7 @@ pub fn router(state: AppState) -> Router {
     let (api_router, openapi) = OpenApiRouter::<AppState>::with_openapi(ApiDoc::openapi())
         .routes(routes!(routes::system::healthz))
         .routes(routes!(routes::system::ping))
+        .routes(routes!(routes::system::security_txt))
         .routes(routes!(routes::auth::otp_request))
         .routes(routes!(routes::auth::otp_verify))
         .routes(routes!(routes::auth::refresh))
@@ -102,6 +104,12 @@ pub fn router(state: AppState) -> Router {
         .routes(routes!(routes::mfa::totp_verify))
         .routes(routes!(routes::mfa::totp_disable))
         .routes(routes!(routes::mfa::step_up))
+        // The account surface (decision 39). `me` and `update_profile` share a path, so utoipa
+        // merges their methods onto one path item; `delete_account` joins them for the same reason.
+        .routes(routes!(routes::account::me, routes::account::update_profile, routes::account::delete_account))
+        .routes(routes!(routes::account::request_email_change))
+        .routes(routes!(routes::account::verify_email_change))
+        .routes(routes!(routes::account::export))
         .routes(routes!(routes::sessions::list))
         .routes(routes!(routes::sessions::revoke))
         .routes(routes!(routes::sessions::revoke_all))
@@ -112,6 +120,7 @@ pub fn router(state: AppState) -> Router {
         // Org management (decision 19; S-06 step-up gates, S-09 session revocation).
         .routes(routes!(routes::members::list, routes::members::add))
         .routes(routes!(routes::members::update_role, routes::members::remove))
+        .routes(routes!(routes::members::leave))
         .routes(routes!(routes::members::list_invitations, routes::members::invite))
         .routes(routes!(routes::members::revoke_invitation))
         .routes(routes!(routes::members::accept))

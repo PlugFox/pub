@@ -708,9 +708,31 @@ pub trait UserRepo: Send + Sync {
     /// Updates the lifecycle status.
     ///
     /// Transitioning to [`UserStatus::Deleted`] anonymizes the row (S-29): email is cleared
-    /// (freeing it for re-registration) and the display name is blanked; the row itself
-    /// survives as the attribution tombstone for published versions.
+    /// (freeing it for re-registration), the display name is blanked, **and the instance-admin
+    /// flag is dropped** — the row itself survives as the attribution tombstone for published
+    /// versions. Clearing the flag is not tidiness: [`UserRepo::counts`] would otherwise report
+    /// tombstones as administrators, and [`UserRepo::claim_first_admin`] asks whether the
+    /// instance has *any* admin, so a deleted one would block the bootstrap promotion forever on
+    /// an instance that has nobody left to promote by hand.
     async fn update_status(&self, id: UserId, status: UserStatus, now: DateTime<Utc>) -> Result<User>;
+
+    /// Replaces the account's display name (S-29 profile edit). Unknown id → `NotFound`.
+    ///
+    /// Deliberately narrow, for [`UserRepo::set_instance_admin`]'s reason: a general "update
+    /// user" call is how a privilege change rides along with a cosmetic one.
+    async fn update_profile(&self, id: UserId, display_name: &str, now: DateTime<Utc>) -> Result<User>;
+
+    /// Moves the account to `email`, which the caller has **already proven** the holder controls,
+    /// and marks it verified ([S-03.b](../../../docs/security.md#1-authentication)).
+    ///
+    /// The address is unique case-insensitively across every account, so an address held by
+    /// another row is [`crate::Error::Conflict`] — the check is the index, not a prior read, and
+    /// therefore cannot be raced through. Unknown id → `NotFound`.
+    ///
+    /// The repository moves the `email` **credential** row with the user row in the same call:
+    /// the two disagreeing would leave the account's own credential inventory naming an address
+    /// that no longer signs in.
+    async fn change_email(&self, id: UserId, email: &str, now: DateTime<Utc>) -> Result<User>;
 
     /// The admin user listing, **newest account first**, keyset-paginated over the UUID v7 id
     /// (which is time-ordered, so the id alone is the cursor). Filters combine with AND.
@@ -802,6 +824,18 @@ pub trait CredentialRepo: Send + Sync {
     /// Removes the user's whole second factor: the TOTP enrollment plus every remaining
     /// recovery code. Returns how many rows were deleted (0 = nothing was enrolled).
     async fn delete_second_factor(&self, user: UserId) -> Result<u64>;
+
+    /// Deletes **every** credential of the user — OIDC links, the email identity, the TOTP seed,
+    /// the recovery hashes — and returns how many rows went. Account deletion
+    /// ([S-29.a](../../../docs/security.md#7-platform)) is its only caller.
+    ///
+    /// This is the step that separates the identity plane from the attribution one, and skipping
+    /// it is expensive in a way that is invisible for months: the sign-in paths resolve a known
+    /// `(iss, sub)` to its user and then require `status == Active`, so an OIDC credential left
+    /// on a tombstone binds that identity to a dead account **permanently** — the same person
+    /// signing up again with the same provider is refused, and no surface in the product can
+    /// explain why.
+    async fn delete_all_for_user(&self, user: UserId) -> Result<u64>;
 }
 
 /// Organization, membership, and invitation persistence (decision 19).
@@ -1240,6 +1274,16 @@ pub trait NotificationRepo: Send + Sync {
     /// months ago is not a message somebody is about to act on, and a window that depends on read
     /// state is a table whose growth depends on user behaviour.
     async fn purge_before(&self, cutoff: DateTime<Utc>, batch: u32) -> Result<u64>;
+
+    /// Deletes everything this trait stores for one account — the feed rows **and** the stored
+    /// preferences — and returns how many rows went. Account deletion
+    /// ([S-29.a](../../../docs/security.md#7-platform)) is its only caller.
+    ///
+    /// The second method here that is not a feed operation, and the counterpart of
+    /// [`NotificationRepo::purge_before`]: that one is instance-wide by age, this one is
+    /// account-wide by identity. A feed is not attribution — nothing downstream needs a deleted
+    /// account's unread badge — so unlike the version rows it is erased rather than kept.
+    async fn delete_for_user(&self, user: UserId) -> Result<u64>;
 
     /// The user's stored preference rows — categories they never touched are absent, and
     /// [`crate::notification::NotificationPreferences::from_rows`] fills them in.

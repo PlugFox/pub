@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use base64::Engine as _;
 use clap::{CommandFactory as _, FromArgMatches as _};
-use pub_admin::{AdminService, OrgPolicy, OrgService};
+use pub_admin::{AccountService, AdminService, OrgPolicy, OrgService};
 use pub_api::AppState;
 use pub_auth::flows::{AuthPolicy, AuthService};
 use pub_auth::jwt::Keyring;
@@ -184,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&mailer),
         settings.smtp.password.is_some(),
     ));
+    let accounts = Arc::new(AccountService::new(repos.clone(), Arc::clone(&auth), Arc::clone(&orgs)));
 
     // Cross-instance settings invalidation: the broker subscription is the fast path and the
     // version poll is the reconciliation fallback for messages lost across a reconnect
@@ -212,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let state = AppState::new(settings, runtime, repos, blob, kv, auth, registry, orgs, admin)
+    let state = AppState::new(settings, runtime, repos, blob, kv, auth, registry, orgs, admin, accounts)
         .with_upstream(upstream)
         .with_downloads(downloads)
         .with_events(events);

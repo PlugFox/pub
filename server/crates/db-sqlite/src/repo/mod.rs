@@ -37,7 +37,7 @@ mod tokens;
 mod upstream;
 mod users;
 
-pub use audit::SqliteAuditRepo;
+pub use audit::{SqliteAuditRepo, audit_page_sql};
 pub use credentials::SqliteCredentialRepo;
 pub use jobs::SqliteJobRepo;
 pub use locks::SqliteJobLock;

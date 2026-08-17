@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use pub_admin::{AdminService, OrgService};
+use pub_admin::{AccountService, AdminService, OrgService};
 use pub_auth::flows::AuthService;
 use pub_config::Settings;
 use pub_core::settings::SettingsCache;
@@ -41,6 +41,10 @@ pub struct AppState {
     pub orgs: Arc<OrgService>,
     /// Instance administration: settings, users, orgs, audit, stats, manual job runs.
     pub admin: Arc<AdminService>,
+    /// The caller's own account (decision 39): profile, export, deletion. Separate from
+    /// [`AppState::admin`] because the question is different — that one is "what may an
+    /// administrator do to somebody", this one is "what may a person do to themselves".
+    pub accounts: Arc<AccountService>,
     /// Upstream read-through proxy (decision 07); `None` when `[upstream].enabled = false`.
     ///
     /// An `Option` rather than a no-op implementation on purpose: "the proxy is off" and "the
@@ -88,6 +92,7 @@ impl AppState {
         registry: Arc<RegistryService>,
         orgs: Arc<OrgService>,
         admin: Arc<AdminService>,
+        accounts: Arc<AccountService>,
     ) -> Self {
         Self {
             settings: Arc::new(settings),
@@ -99,6 +104,7 @@ impl AppState {
             registry,
             orgs,
             admin,
+            accounts,
             upstream: None,
             downloads: Arc::new(DownloadRecorder::default()),
             events: Arc::new(EventBus::new(EventBusPolicy::default())),

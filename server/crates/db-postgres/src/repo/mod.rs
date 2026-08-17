@@ -47,7 +47,7 @@ mod tokens;
 mod upstream;
 mod users;
 
-pub use audit::PgAuditRepo;
+pub use audit::{PgAuditRepo, audit_page_sql};
 pub use credentials::PgCredentialRepo;
 pub use jobs::PgJobRepo;
 pub use locks::PgJobLock;

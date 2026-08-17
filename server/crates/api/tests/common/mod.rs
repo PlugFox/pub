@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use http_body_util::BodyExt as _;
-use pub_admin::{AdminService, OrgPolicy, OrgService};
+use pub_admin::{AccountService, AdminService, OrgPolicy, OrgService};
 use pub_api::AppState;
 use pub_auth::flows::{AuthPolicy, AuthService};
 use pub_auth::jwt::Keyring;
@@ -339,6 +339,10 @@ pub struct TestOptions {
     /// the repository or the admin route, never from here — the harness has to be able to
     /// produce each of the three states without the others.
     pub storage_quota_bytes: u64,
+    /// S-29.c disclosure contact; `None` = the shipped default, which publishes no file at all.
+    pub disclosure_contact: Option<String>,
+    /// S-29.c disclosure policy URL; only meaningful beside a contact.
+    pub disclosure_policy_url: Option<String>,
 }
 
 impl Default for TestOptions {
@@ -394,6 +398,10 @@ impl Default for TestOptions {
             // S-20.b: a default install has no wall, and every suite but the quota one must
             // keep publishing without thinking about it.
             storage_quota_bytes: 0,
+            // The default install advertises no security contact, which is what S-29.c makes
+            // observable: the route is a 404 until an operator configures somebody to listen.
+            disclosure_contact: None,
+            disclosure_policy_url: None,
         }
     }
 }
@@ -663,6 +671,8 @@ impl TestApp {
         settings.smtp.username = options.smtp_username.clone();
         settings.smtp.password = options.smtp_password.clone().map(pub_config::Secret::new);
         settings.smtp.security = options.smtp_security;
+        settings.disclosure.contact = options.disclosure_contact.clone().unwrap_or_default();
+        settings.disclosure.policy_url = options.disclosure_policy_url.clone().unwrap_or_default();
 
         let repos = store.connect().await;
 
@@ -797,11 +807,22 @@ impl TestApp {
             boot_smtp_password,
         ));
 
-        let state =
-            AppState::new(settings, Arc::clone(&runtime), repos.clone(), blob, kv_handle, auth, registry, orgs, admin)
-                .with_upstream(proxy)
-                .with_events(Arc::clone(&events))
-                .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
+        let accounts = Arc::new(AccountService::new(repos.clone(), Arc::clone(&auth), Arc::clone(&orgs)));
+        let state = AppState::new(
+            settings,
+            Arc::clone(&runtime),
+            repos.clone(),
+            blob,
+            kv_handle,
+            auth,
+            registry,
+            orgs,
+            admin,
+            accounts,
+        )
+        .with_upstream(proxy)
+        .with_events(Arc::clone(&events))
+        .with_clock(Arc::new(move || *clock_handle.lock().expect("clock mutex")));
         Self {
             router: pub_api::router(state.clone()),
             repos,
@@ -857,6 +878,7 @@ impl TestApp {
             registry,
             Arc::clone(&self.state.orgs),
             Arc::clone(&self.state.admin),
+            Arc::clone(&self.state.accounts),
         )
         .with_upstream(self.state.upstream.clone())
         .with_events(Arc::clone(&self.state.events))
@@ -1099,6 +1121,14 @@ impl TestApp {
     async fn drained_outbox(&self) -> usize {
         self.drain_jobs().await;
         self.mailer.sent().len()
+    }
+
+    /// Drains whatever is queued and reports how many messages have been sent so far.
+    ///
+    /// The public form of the baseline every mail assertion needs: without it, "exactly one mail
+    /// was sent" measures whatever an earlier step left in the queue as well as this step's own.
+    pub async fn drain_and_count_mail(&self) -> usize {
+        self.drained_outbox().await
     }
 
     /// Full OTP login; returns the login payload (`data` object).

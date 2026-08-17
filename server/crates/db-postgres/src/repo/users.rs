@@ -126,10 +126,14 @@ impl UserRepo for PgUserRepo {
 
     async fn update_status(&self, id: UserId, status: UserStatus, now: DateTime<Utc>) -> Result<User> {
         let row: Option<UserRow> = if status == UserStatus::Deleted {
-            // Anonymization (S-29): erase the profile, free the email slot, keep the row as
-            // the attribution tombstone.
+            // Anonymization (S-29.a): erase the profile, free the email slot, drop the
+            // instance-admin flag, keep the row as the attribution tombstone. The flag goes
+            // because `counts` would report tombstones as administrators and `claim_first_admin`
+            // asks whether *any* account holds it — a deleted admin would block the bootstrap
+            // promotion on an instance with nobody left to promote by hand.
             sqlx::query_as(q!("UPDATE users SET status = 'deleted', email = NULL, email_verified = FALSE, \
-                 display_name = 'deleted user', updated_at = $1 WHERE id = $2 RETURNING {COLS}"))
+                 display_name = 'deleted user', is_instance_admin = FALSE, updated_at = $1 \
+                 WHERE id = $2 RETURNING {COLS}"))
             .bind(now)
             .bind(*id.as_uuid())
             .fetch_optional(&self.pool)
@@ -145,6 +149,52 @@ impl UserRepo for PgUserRepo {
                 .map_err(db_err)?
         };
         row.ok_or_else(|| Error::NotFound { what: format!("user {id}") })?.try_into()
+    }
+
+    async fn update_profile(&self, id: UserId, display_name: &str, now: DateTime<Utc>) -> Result<User> {
+        let row: Option<UserRow> =
+            sqlx::query_as(q!("UPDATE users SET display_name = $1, updated_at = $2 WHERE id = $3 RETURNING {COLS}"))
+                .bind(display_name)
+                .bind(now)
+                .bind(*id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        row.ok_or_else(|| Error::NotFound { what: format!("user {id}") })?.try_into()
+    }
+
+    async fn change_email(&self, id: UserId, email: &str, now: DateTime<Utc>) -> Result<User> {
+        // One transaction, because the account's address lives in two places: the user row that
+        // `find_by_email` resolves sign-ins through, and the `email` credential row that is the
+        // account's own record of which addresses identify it (S-03.b). Half of this applied is
+        // an account whose credential inventory names an address that no longer signs in.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row: Option<UserRow> = sqlx::query_as(q!(
+            "UPDATE users SET email = $1, email_verified = TRUE, updated_at = $2 WHERE id = $3 RETURNING {COLS}"
+        ))
+        .bind(email)
+        .bind(now)
+        .bind(*id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        // The unique index is the check. A prior `find_by_email` would be a read another
+        // transaction can invalidate before this write lands; the index cannot be raced.
+        .map_err(|err| write_err(err, "email already in use", "user"))?;
+        let user: User = row.ok_or_else(|| Error::NotFound { what: format!("user {id}") })?.try_into()?;
+
+        // The account may have signed up through OIDC and never held an email identity at all,
+        // so this is an update-if-present rather than a required row. `credentials_email_key` is
+        // unique on `(user_id, lower(email))`, so a caller who somehow already holds the new
+        // address as a second identity collides here rather than silently keeping two.
+        sqlx::query("UPDATE credentials SET email = $1, updated_at = $2 WHERE user_id = $3 AND type = 'email'")
+            .bind(email)
+            .bind(now)
+            .bind(*id.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| write_err(err, "email already in use", "credential"))?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(user)
     }
 
     async fn list(&self, filter: &UserFilter, cursor: Option<&str>, limit: u32) -> Result<Page<User>> {

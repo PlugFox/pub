@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+  <body style="font-family: system-ui, sans-serif; color: #1a1a1a;">
+    <p>Confirm this address:</p>
+    <p style="font-size: 28px; font-weight: 700; letter-spacing: 6px; font-variant-numeric: tabular-nums;">{{ code }}</p>
+    <p style="color: #555;">
+      Somebody — we hope you — asked to move a {{ instance }} account to this address.<br />
+      Requested from IP: {{ requester_ip }}<br />
+      This code expires in {{ expiry_minutes }} minutes and can be used once.
+    </p>
+    <p style="color: #555;">
+      The account keeps its current address until this code is entered, so if you did not ask for
+      this, ignoring the message is enough.
+    </p>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+Confirm this address: {{ code }}
+
+Somebody — we hope you — asked to move a {{ instance }} account to this address.
+Requested from IP: {{ requester_ip }}
+This code expires in {{ expiry_minutes }} minutes and can be used once.
+
+The account keeps its current address until this code is entered, so if you
+did not ask for this, ignoring the message is enough: nothing changes, and
+this address is not connected to any account.

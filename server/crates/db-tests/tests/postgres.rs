@@ -343,6 +343,76 @@ async fn retention_contract_s23_s22a() {
     db.cleanup().await;
 }
 
+/// The account surface's writes (S-29.a, S-03.b) on the dialect whose case-insensitive
+/// uniqueness is a `lower()` expression index rather than a column collation — which is exactly
+/// the half of `change_email` that can diverge.
+#[tokio::test]
+async fn account_lifecycle_contract_s29a() {
+    let Some(db) = TestDb::create("account_lifecycle_contract_s29a").await else { return };
+    pub_db_tests::contract::account_lifecycle(&db.repos()).await;
+    db.cleanup().await;
+}
+
+/// **S-29.b.** An actor-filtered audit page seeks on this dialect too, on a backlog the planner
+/// takes seriously.
+///
+/// The SQLite sibling reads the plan; here the assertion has to be measured, because Postgres
+/// sequentially scans a small table whatever indexes exist — which is precisely how an index that
+/// was never used would pass an `EXPLAIN` on an empty database.
+///
+/// **The row distribution is the test.** An earlier fixture split 20 000 rows evenly between two
+/// actors and the planner correctly refused the index: with half the table matching, a backward
+/// walk of the primary key finds twenty-one of them immediately. That is not the shape this index
+/// exists for. One account's rows are a thin slice of an instance-wide log and they are usually
+/// *old*, so the fixture is fifty rows at the bottom of the id order under twenty thousand
+/// belonging to somebody else — where a `ORDER BY id DESC LIMIT 21` walk has to traverse almost
+/// everything before it finds a single match.
+///
+/// The SQL comes from the repository (`audit_page_sql`), never a copy ([D52](../../../../docs/roadmap.md)).
+#[tokio::test]
+async fn s29b_the_actor_filtered_audit_page_seeks() {
+    let Some(db) = TestDb::create("s29b_the_actor_filtered_audit_page_seeks").await else { return };
+    let mine = pub_core::UserId::new();
+    let theirs = pub_core::UserId::new();
+    // One statement rather than 20 000: the fixture is not what is being measured. The id is
+    // monotonic in `n`, like the ULIDs production mints, so "mine are the oldest fifty" is
+    // expressed by the threshold alone.
+    sqlx::query(
+        "INSERT INTO audit_log (id, created_at, actor_type, actor_id, action, result) \
+         SELECT lpad(to_hex(n), 26, '0'), now(), 'user', \
+                CASE WHEN n <= 50 THEN $1 ELSE $2 END, 'package.publish', 'success' \
+         FROM generate_series(1, 20000) AS n",
+    )
+    .bind(mine.to_string())
+    .bind(theirs.to_string())
+    .execute(&db.pool)
+    .await
+    .expect("seed the audit log");
+    sqlx::query("ANALYZE audit_log").execute(&db.pool).await.expect("analyze");
+
+    let filter = pub_core::audit::AuditFilter {
+        actor: Some(pub_core::audit::AuditActor::User(mine)),
+        ..pub_core::audit::AuditFilter::default()
+    };
+    for with_cursor in [false, true] {
+        let sql = pub_db_postgres::repo::audit_page_sql(&filter, with_cursor);
+        let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
+            .bind("user")
+            .bind(mine.to_string());
+        if with_cursor {
+            query = query.bind("ZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_owned());
+        }
+        let plan: String =
+            query.bind(21_i64).fetch_all(&db.pool).await.expect("explain").into_iter().map(|r| r.0).collect();
+        assert!(
+            plan.contains("audit_actor_idx"),
+            "an actor page (cursor: {with_cursor}) is not planned through the actor index: {plan}"
+        );
+        assert!(!plan.contains("Seq Scan on audit_log"), "an actor page (cursor: {with_cursor}) scans: {plan}");
+    }
+    db.cleanup().await;
+}
+
 /// The indexes the drain's per-tick statements need exist on this dialect too (SF2).
 ///
 /// The SQLite leg asserts query plans; here the assertion is that the paired migration actually

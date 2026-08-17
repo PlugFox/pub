@@ -259,4 +259,15 @@ impl CredentialRepo for SqliteCredentialRepo {
             .map_err(db_err)?;
         Ok(result.rows_affected())
     }
+
+    async fn delete_all_for_user(&self, user: UserId) -> Result<u64> {
+        // No type predicate on purpose: this is account deletion (S-29.a), and a type filter
+        // here is a list that silently stops covering `webauthn` the day those rows arrive.
+        let result = sqlx::query("DELETE FROM credentials WHERE user_id = ?")
+            .bind(user.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
 }

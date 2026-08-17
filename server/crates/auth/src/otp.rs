@@ -105,6 +105,51 @@ pub fn last_request_key(email: &str) -> String {
     format!("otp:last:{email}")
 }
 
+/// Server-side record of an email change awaiting confirmation
+/// ([S-03.b](../../../docs/security.md#1-authentication)), stored as JSON in KV under
+/// `email_change:pending:{id}`.
+///
+/// Deliberately a **distinct type and a distinct key space** from [`PendingAuth`] rather than a
+/// nullable `user_id` on that one. The two records authorize different things — one opens a
+/// session for whoever holds the code, the other moves an address on an account that is already
+/// signed in — and a single struct with an optional field is one `if` away from a code minted for
+/// one purpose being redeemed for the other.
+///
+/// It carries the account it belongs to, so redemption can require that the *same* account
+/// presents it: a code lifted from an inbox is worthless without the session that asked for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEmailChange {
+    /// The account this change belongs to, as a string (the crate does not depend on ids).
+    pub user_id: String,
+    /// Normalized (lowercase) address the account would move to.
+    pub email: String,
+    /// `HMAC-SHA-256(code, pepper)` hex — the code itself is never stored (S-03).
+    pub code_hmac: String,
+    /// Issue time (UTC); expiry is `created_at + PENDING_TTL`.
+    pub created_at: DateTime<Utc>,
+}
+
+/// KV key of a pending email-change record.
+pub fn email_change_key(pending_id: &str) -> String {
+    format!("email_change:pending:{pending_id}")
+}
+
+/// KV key of the atomic wrong-attempt counter for an email change (S-03.a's budget, same shape).
+pub fn email_change_attempt_key(pending_id: &str) -> String {
+    format!("email_change:attempts:{pending_id}")
+}
+
+/// KV key tracking the latest email-change request **per account** (resend throttle).
+///
+/// Keyed on the account rather than on the target address on purpose: the address is chosen by
+/// the requester, so a per-address key would let one account start an unbounded number of
+/// changes by varying it. The address still has a bound — it shares the per-address hourly
+/// budget with sign-in codes, because that budget is about somebody's inbox rather than about
+/// which flow reached it.
+pub fn email_change_last_request_key(user_id: &str) -> String {
+    format!("email_change:last:{user_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;

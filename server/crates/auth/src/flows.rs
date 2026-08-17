@@ -562,6 +562,226 @@ impl AuthService {
         .await
     }
 
+    // --- Email change (S-03.b, decision 39) ---
+
+    /// Starts an email change: mails a confirmation code to `new_email` and returns the opaque
+    /// pending id ([S-03.b](../../../docs/security.md#1-authentication)).
+    ///
+    /// The account is **not** touched here. Everything this call produces is a KV record and a
+    /// message; the address moves only when [`AuthService::confirm_email_change`] proves the
+    /// recipient read it, which is what makes a typo a dead record rather than a lockout.
+    ///
+    /// Unlike [`AuthService::request_otp`], this endpoint is **not** anti-enumeration-uniform, and
+    /// that is decision 39's recorded trade rather than an oversight: an address that already
+    /// belongs to an account is refused with a distinct conflict. The alternative — answering
+    /// success and mailing the code anyway — points the instance's mailer at a stranger's inbox on
+    /// demand and leaves the honest caller waiting for a code that can never work. The caller is
+    /// authenticated and step-up-fresh, and the refusal spends the buckets below.
+    pub async fn request_email_change(
+        &self,
+        user: &User,
+        new_email: &str,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<String> {
+        let email = normalize_email(new_email)?;
+        if user.email.as_deref().is_some_and(|current| current.eq_ignore_ascii_case(&email)) {
+            return Err(Error::Invalid { message: "this is already the address on the account".to_owned() });
+        }
+        // S-31 is a sign-in gate *and* a membership gate: an account may not move itself to a
+        // domain the instance would refuse to admit, or the allowlist becomes advisory.
+        if !self.domain_allowed(&email) {
+            self.audit_as(
+                AuditActor::User(user.id),
+                meta,
+                "account.email.requested",
+                Some(email.clone()),
+                AuditResult::Failure,
+                serde_json::json!({ "reason": "domain_blocked" }),
+                now,
+            )
+            .await;
+            return Err(Error::Invalid { message: "this email domain is not allowed on this instance".to_owned() });
+        }
+        // The index on `users.email` is the authority and it is re-checked at the swap; this read
+        // exists so the refusal arrives before a message does, rather than ten minutes later.
+        if self.repos.users.find_by_email(&email).await?.is_some() {
+            self.audit_as(
+                AuditActor::User(user.id),
+                meta,
+                "account.email.requested",
+                Some(email.clone()),
+                AuditResult::Failure,
+                serde_json::json!({ "reason": "email_taken" }),
+                now,
+            )
+            .await;
+            return Err(Error::Conflict { message: "that address already belongs to an account".to_owned() });
+        }
+
+        // Two budgets, because there are two things to bound. The per-account one stops one
+        // caller from walking an address list; the per-address one is the *same key* the sign-in
+        // codes spend, because a mailbox does not care which flow filled it (S-24).
+        for (limit, key) in [
+            ("email_change_actor", format!("rl:email_change:{}", user.id)),
+            ("email_change_target", format!("rl:otp:email:{email}")),
+        ] {
+            let decision = ratelimit::hit_or_fallback(
+                self.kv.as_ref(),
+                self.rate_limit_fallback(),
+                limit,
+                &key,
+                self.settings().rate_limits.otp_per_email_hour,
+                Duration::hours(1),
+                now,
+            )
+            .await;
+            if let ratelimit::Decision::Limited { retry_after_secs, .. } = decision {
+                metrics::counter!("rate_limit_trips_total", "limit" => limit).increment(1);
+                if decision.is_first_refusal() {
+                    self.audit_throttled(&email, meta, limit, now).await;
+                }
+                return Err(Error::RateLimited { retry_after_secs });
+            }
+        }
+
+        // Resend spacing, and a live record is replaced rather than joined: one address change
+        // can be in flight per account, so a second request cannot leave a stale code redeemable.
+        let last_key = otp::email_change_last_request_key(&user.id.to_string());
+        if let Some((prior_id, issued_at)) = self.kv.get(&last_key).await?.and_then(|raw| parse_last_request(&raw)) {
+            let elapsed = now - issued_at;
+            if elapsed < otp::RESEND_INTERVAL {
+                return Err(Error::RateLimited {
+                    retry_after_secs: (otp::RESEND_INTERVAL - elapsed).num_seconds().max(1) as u64,
+                });
+            }
+            self.kv.del(&otp::email_change_key(&prior_id)).await?;
+            self.kv.del(&otp::email_change_attempt_key(&prior_id)).await?;
+        }
+
+        let code = otp::generate_code(self.rng.as_ref());
+        let pending_id = otp::generate_pending_id(self.rng.as_ref());
+        let record = otp::PendingEmailChange {
+            user_id: user.id.to_string(),
+            email: email.clone(),
+            code_hmac: otp::code_hmac(&code, &self.policy.otp_pepper),
+            created_at: now,
+        };
+        let record_json = serde_json::to_string(&record)
+            .map_err(|err| Error::Internal { message: format!("pending email change serialization failed: {err}") })?;
+        let ttl = otp::PENDING_TTL.to_std().expect("PENDING_TTL is positive");
+        self.kv.set_ttl(&otp::email_change_key(&pending_id), &record_json, ttl).await?;
+        self.kv.set_ttl(&last_key, &format!("{pending_id}:{}", now.timestamp()), ttl).await?;
+
+        let instance = self.settings().branding.name.clone();
+        let rendered =
+            pub_mail::render_email_change_email(&code, &instance, meta.ip.as_deref(), otp::PENDING_TTL.num_minutes())?;
+        let payload = self.sealed_mail(&email, &rendered.subject, &rendered.text, Some(&rendered.html))?;
+        self.repos.queue.enqueue(&NewQueuedJob::pending(MailJob::KIND, payload), now).await?;
+        self.audit_as(
+            AuditActor::User(user.id),
+            meta,
+            "account.email.requested",
+            Some(email),
+            AuditResult::Success,
+            serde_json::json!({}),
+            now,
+        )
+        .await;
+        Ok(pending_id)
+    }
+
+    /// Redeems an email-change code and moves the address ([S-03.b](../../../docs/security.md#1-authentication)).
+    ///
+    /// Every failure — unknown or expired record, wrong code, exhausted attempts, a record
+    /// belonging to another account — surfaces as [`Error::InvalidCode`], for S-04's reason: the
+    /// distinctions are useful only to somebody guessing.
+    ///
+    /// The old address is told **after** the swap and best-effort: a notice that cannot be
+    /// delivered must not undo a change the account already made, which is the same stance the
+    /// S-02 link notice takes.
+    pub async fn confirm_email_change(
+        &self,
+        user: &User,
+        pending_id: &str,
+        code: &str,
+        meta: &ClientMeta,
+        now: DateTime<Utc>,
+    ) -> Result<User> {
+        let key = otp::email_change_key(pending_id);
+        let attempts = otp::email_change_attempt_key(pending_id);
+        let Some(raw) = self.kv.get(&key).await? else {
+            return Err(Error::InvalidCode);
+        };
+        let Ok(record) = serde_json::from_str::<otp::PendingEmailChange>(&raw) else {
+            self.kv.del(&key).await?;
+            return Err(Error::InvalidCode);
+        };
+
+        // The binding, and the reason a phished code is not enough: the record names the account
+        // that asked, and only that account can spend it.
+        if record.user_id != user.id.to_string() {
+            return Err(Error::InvalidCode);
+        }
+
+        let expires_at = record.created_at + otp::PENDING_TTL;
+        if now >= expires_at {
+            self.kv.del(&key).await?;
+            self.kv.del(&attempts).await?;
+            return Err(Error::InvalidCode);
+        }
+
+        // S-03.a's budget, unchanged: spent atomically and **before** the comparison.
+        let remaining_ttl = StdDuration::from_secs((expires_at - now).num_seconds().max(1) as u64);
+        let spent = self.kv.incr(&attempts, remaining_ttl).await?;
+        if spent > u64::from(otp::MAX_ATTEMPTS) {
+            self.kv.del(&key).await?;
+            return Err(Error::InvalidCode);
+        }
+        if !otp::verify_code(code, &self.policy.otp_pepper, &record.code_hmac) {
+            if spent >= u64::from(otp::MAX_ATTEMPTS) {
+                self.kv.del(&key).await?;
+            }
+            return Err(Error::InvalidCode);
+        }
+
+        // Single-use: the record dies before the account changes, so a retried request cannot
+        // move the address twice or resurrect a code whose swap failed halfway.
+        self.kv.del(&key).await?;
+        self.kv.del(&attempts).await?;
+        self.kv.del(&otp::email_change_last_request_key(&user.id.to_string())).await?;
+
+        // Re-evaluated at redemption, not only at request: ten minutes is long enough for an
+        // allowlist to change, and the gate that matters is the one at the write.
+        if !self.domain_allowed(&record.email) {
+            return Err(Error::Invalid { message: "this email domain is not allowed on this instance".to_owned() });
+        }
+
+        let previous = user.email.clone();
+        let updated = self.repos.users.change_email(user.id, &record.email, now).await?;
+        self.audit_as(
+            AuditActor::User(user.id),
+            meta,
+            "account.email.changed",
+            Some(record.email.clone()),
+            AuditResult::Success,
+            serde_json::json!({ "before": previous, "after": record.email }),
+            now,
+        )
+        .await;
+        if let Some(old) = previous {
+            let instance = self.settings().branding.name.clone();
+            let body = format!(
+                "The email address on your {instance} account was just changed to {}.\n\n\
+                 If this was not you, sign in with the new address is now the only way in — \
+                 contact your administrator immediately.",
+                record.email,
+            );
+            self.queue_mail(&old, "Your email address was changed", &body, "account.email.changed", now).await;
+        }
+        Ok(updated)
+    }
+
     // --- OIDC sign-in (S-01, S-02, S-31) ---
 
     /// The configured OIDC providers for the login screen (may be empty — OIDC is optional).

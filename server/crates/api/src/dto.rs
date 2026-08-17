@@ -1653,6 +1653,119 @@ pub struct NotificationPreferencesBody {
     pub preferences: Vec<NotificationPreferenceDto>,
 }
 
+// ---------------------------------------------------------------------- account (decision 39)
+
+/// The caller's own account: the row, plus the one credential fact the access token cannot carry.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeDto {
+    /// User id.
+    pub id: String,
+    /// Email; `null` only on an anonymized account, which cannot authenticate (S-29.a).
+    pub email: Option<String>,
+    /// Whether the email is verified.
+    pub email_verified: bool,
+    /// Display name.
+    pub display_name: String,
+    /// Whether this account administers the instance.
+    ///
+    /// Read from the row per request rather than from the token (S-07), so a demotion is visible
+    /// on the next call instead of at the next refresh.
+    pub is_instance_admin: bool,
+    /// Whether a TOTP second factor is enrolled (S-05).
+    ///
+    /// The field that ends the session-local guess: before this existed the account screen
+    /// tracked enrollment in a flag that was wrong on every device but the enrolling one.
+    pub totp_enabled: bool,
+    /// Account creation time.
+    pub created_at: DateTime<Utc>,
+    /// Last profile change.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&pub_admin::AccountProfile> for MeDto {
+    fn from(profile: &pub_admin::AccountProfile) -> Self {
+        Self {
+            id: profile.user.id.to_string(),
+            email: profile.user.email.clone(),
+            email_verified: profile.user.email_verified,
+            display_name: profile.user.display_name.clone(),
+            is_instance_admin: profile.user.is_instance_admin,
+            totp_enabled: profile.totp_enabled,
+            created_at: profile.user.created_at,
+            updated_at: profile.user.updated_at,
+        }
+    }
+}
+
+/// Body of `PATCH /api/v1/me`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ProfileUpdateBody {
+    /// New display name. The address is deliberately not here — it moves through the S-03.b
+    /// confirmation flow, and one body carrying both is how a change that needs a proof comes to
+    /// share a path with one that does not.
+    pub display_name: String,
+}
+
+/// Body of `POST /api/v1/me/email` — start an address change.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EmailChangeBody {
+    /// The address to move to. A code goes here; nothing on the account changes yet.
+    pub email: String,
+}
+
+/// Result of starting an address change.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailChangeStartedDto {
+    /// Opaque pending id to present with the code (S-03 binding).
+    pub pending_id: String,
+    /// The address the code was sent to — echoed normalized, so a caller sees what was used.
+    pub email: String,
+}
+
+/// Body of `POST /api/v1/me/email/verify`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EmailChangeVerifyBody {
+    /// The pending id from the start call.
+    pub pending_id: String,
+    /// The code that arrived at the new address.
+    pub code: String,
+}
+
+/// Body of `DELETE /api/v1/me`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AccountDeleteBody {
+    /// Must repeat the account's own email address (S-06.b: the factor proves who, this proves
+    /// what).
+    pub confirm: String,
+}
+
+/// What an account deletion removed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AccountDeletedDto {
+    /// Sessions revoked.
+    pub sessions_revoked: u64,
+    /// CLI tokens revoked.
+    pub tokens_revoked: u64,
+    /// Credential rows deleted.
+    pub credentials_deleted: u64,
+    /// Notification and preference rows deleted.
+    pub notifications_deleted: u64,
+    /// Organizations left.
+    pub memberships_removed: u64,
+}
+
+impl From<pub_admin::AccountDeletion> for AccountDeletedDto {
+    fn from(outcome: pub_admin::AccountDeletion) -> Self {
+        Self {
+            sessions_revoked: outcome.sessions_revoked,
+            tokens_revoked: outcome.tokens_revoked,
+            credentials_deleted: outcome.credentials_deleted,
+            notifications_deleted: outcome.notifications_deleted,
+            memberships_removed: outcome.memberships_removed,
+        }
+    }
+}
+
 /// Wire name of a role level (decision 19: names on the wire, numbers in storage) — the
 /// rendering lives on [`RoleLevel`]'s `Display` in core, shared with the service-layer
 /// denials, so no layer grows its own name table.

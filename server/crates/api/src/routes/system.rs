@@ -107,6 +107,64 @@ async fn probe(state: &AppState) -> Checks {
     checks
 }
 
+/// How long a published `security.txt` claims to be valid.
+///
+/// RFC 9116 requires `Expires` and recommends less than a year. It is computed from the current
+/// UTC **day** rather than from the request instant, which buys two things at once: the file can
+/// never be stale (the classic failure of a hand-maintained one), and it holds still for
+/// twenty-four hours, so the response is cacheable instead of changing on every request.
+const DISCLOSURE_VALIDITY_DAYS: i64 = 365;
+
+/// `/.well-known/security.txt` — the vulnerability-disclosure contact
+/// ([S-29.c](../../../../docs/security.md#7-platform), RFC 9116).
+///
+/// **404 when no contact is configured**, which is the shipped default: `Contact` is mandatory in
+/// the RFC, so an instance with nobody listening publishes nothing rather than a file naming
+/// nobody. The fields are validated at boot, so this handler renders and never decides.
+///
+/// Deliberately outside `/api`, deliberately unauthenticated, and deliberately not in the
+/// envelope: it is a plaintext file at a well-known path, read by scanners and by people, and
+/// wrapping it in this API's JSON shape would make it unreadable to both.
+#[utoipa::path(
+    get,
+    path = "/.well-known/security.txt",
+    tag = "system",
+    responses(
+        (status = OK, description = "The disclosure contact, RFC 9116", content_type = "text/plain"),
+        (status = NOT_FOUND, description = "No disclosure contact is configured on this instance"),
+    )
+)]
+pub async fn security_txt(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let disclosure = &state.settings.disclosure;
+    let contact = disclosure.contact.trim();
+    if contact.is_empty() {
+        return (axum::http::StatusCode::NOT_FOUND, "no disclosure contact is configured\n").into_response();
+    }
+    let expires = ((state.clock)().date_naive() + chrono::Duration::days(DISCLOSURE_VALIDITY_DAYS))
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let mut body = format!("Contact: {contact}\nExpires: {}\n", expires.to_rfc3339());
+    let policy = disclosure.policy_url.trim();
+    if !policy.is_empty() {
+        body.push_str(&format!("Policy: {policy}\n"));
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            // Stated rather than inherited. The S-28 pass applies `no-store` to the API and pub
+            // families and to `/healthz`; this path is none of them, so without a header here the
+            // file would carry no cache policy at all — and it is public, identical for every
+            // reader, and stable for a day by construction.
+            (axum::http::header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Trivial app-API echo endpoint proving the envelope contract end-to-end.
 #[utoipa::path(
     get,

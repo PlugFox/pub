@@ -1,0 +1,14 @@
+-- 0018_audit_actor (sqlite): the index behind "what did this account do".
+--
+-- `AuditFilter::actor` has been reachable from the admin audit viewer since the admin surface
+-- landed, and it has never been index-backed: the three indexes on `audit_log` cover `org_id`,
+-- `action` and `created_at`, so an actor filter scans the largest table in the instance and then
+-- discards almost all of it. Decision 39's personal export walks the same predicate page after
+-- page, which turns a slow admin query into a slow query issued in a loop.
+--
+-- The column order is the seek: `actor_type` and `actor_id` are equalities, `id` carries the
+-- keyset pagination (`ORDER BY id DESC`, the same total order every audit read uses), so a page
+-- after a cursor is a range scan inside one actor rather than a filter over the table.
+-- `actor_id` is NULL for system events; they are excluded because an actor filter never asks
+-- for them, and leaving them out keeps the index off every unattributed row the instance writes.
+CREATE INDEX audit_actor_idx ON audit_log (actor_type, actor_id, id) WHERE actor_id IS NOT NULL;
