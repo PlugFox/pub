@@ -13,6 +13,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@pub/ui/popover";
 import { Skeleton } from "@pub/ui/skeleton";
 import { createAsync, query, useSearchParams } from "@solidjs/router";
 import { createMemo, createSignal, ErrorBoundary, For, type JSX, Show, Suspense } from "solid-js";
+import { CursorNav, nextCursor } from "../cursor-nav";
 import { formatNumber } from "../format";
 import { PackageCard } from "../package-card";
 import {
@@ -202,27 +203,16 @@ function Results(props: ResultsProps): JSX.Element {
       </Show>
 
       {/*
-        Cursor pagination is forward-only by construction, so there is no page
-        number and no "previous": the honest controls are "next page" and
-        "start over". Both live in the URL, so the browser's own back button
-        walks the pages a reader visited.
+        The same forward-only paginator every other list uses (decision 40).
+        The cursor lives in the URL, so the browser's own back button walks the
+        pages a reader visited — and here it is bound to `sort`, which is why
+        "start over" goes through `onFirst` rather than merely dropping it.
       */}
-      <Show when={props.state.cursor !== null || results()?.has_more === true}>
-        <nav aria-label={t(app.searchPagination)} class="flex flex-wrap justify-center gap-3">
-          <Show when={props.state.cursor !== null}>
-            <Button intent="ghost" onClick={() => props.onFirst()}>
-              {t(app.searchFirstPage)}
-            </Button>
-          </Show>
-          <Show when={results()?.has_more === true && results()?.cursor}>
-            {(cursor) => (
-              <Button intent="outline" onClick={() => props.onNext(cursor())}>
-                {t(app.searchNextPage)}
-              </Button>
-            )}
-          </Show>
-        </nav>
-      </Show>
+      <CursorNav
+        cursor={props.state.cursor}
+        next={nextCursor(results())}
+        onGo={(cursor) => (cursor === null ? props.onFirst() : props.onNext(cursor))}
+      />
     </div>
   );
 }

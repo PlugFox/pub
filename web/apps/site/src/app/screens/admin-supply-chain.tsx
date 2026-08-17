@@ -8,10 +8,10 @@ import { EmptyState } from "@pub/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
 import { createAsync, query, revalidate, useSearchParams } from "@solidjs/router";
 import { createSignal, For, type JSX, Show } from "solid-js";
+import { CursorNav, nextCursor } from "../cursor-nav";
 import { formatNumber, formatRelative } from "../format";
 import { api, describeError } from "../state/api";
 import { pushToast } from "../state/toast-store";
-import { CursorNav } from "./admin-people";
 
 /*
  * The two supply-chain registers (S-17.b / S-19.b, decision 33).
@@ -219,7 +219,7 @@ function ShadowingRegister(): JSX.Element {
 
       <CursorNav
         cursor={cursor()}
-        next={page()?.has_more === true ? (page()?.cursor ?? null) : null}
+        next={nextCursor(page())}
         onGo={(next) => setParams({ shadowingCursor: next ?? undefined })}
       />
     </section>
@@ -306,7 +306,7 @@ function QuarantineRegister(): JSX.Element {
 
       <CursorNav
         cursor={cursor()}
-        next={page()?.has_more === true ? (page()?.cursor ?? null) : null}
+        next={nextCursor(page())}
         onGo={(next) => setParams({ quarantineCursor: next ?? undefined })}
       />
     </section>

@@ -49,6 +49,17 @@ describe("packageTabPath", () => {
     },
   );
 
+  test.each([...PACKAGE_TABS])(
+    "%s carries no query string, which is what drops the cursor",
+    (tab) => {
+      // The versions and dependents tabs share one `?cursor=` parameter
+      // (decision 40) and that is only safe while moving between them clears it.
+      // A tab link that preserved the query would hand a versions cursor to the
+      // dependents endpoint — a 400, on a link that looks like navigation.
+      expect(packageTabPath("http", tab)).not.toContain("?");
+    },
+  );
+
   test("round-trips through readPackageTab for every tab", () => {
     for (const tab of PACKAGE_TABS) {
       const path = packageTabPath("http", tab);

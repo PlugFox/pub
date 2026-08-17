@@ -14,8 +14,9 @@ import { cn } from "@pub/ui/cn";
 import { CopyButton } from "@pub/ui/copy-button";
 import { EmptyState } from "@pub/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
-import { A, createAsync, query, useNavigate, useParams } from "@solidjs/router";
+import { A, createAsync, query, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { createMemo, For, type JSX, Show } from "solid-js";
+import { CursorNav, nextCursor, readCursor } from "../cursor-nav";
 import { formatBytes, formatDate, formatNumber, formatRelative } from "../format";
 import { PackageCard, PackageFlags } from "../package-card";
 import { PACKAGE_TABS, type PackageTab, packageTabPath, readPackageTab } from "../package-tabs";
@@ -52,7 +53,8 @@ const versionsQuery = query(
   "package-versions",
 );
 const dependentsQuery = query(
-  (name: string) => api.packages.dependents(name, { limit: 50 }),
+  (input: { name: string; cursor: string | null }) =>
+    api.packages.dependents(input.name, { cursor: input.cursor ?? undefined, limit: 50 }),
   "package-dependents",
 );
 const versionQuery = query(
@@ -120,8 +122,24 @@ function TabLink(props: {
   );
 }
 
+/**
+ * The cursor of the open tab.
+ *
+ * ONE parameter for both paginated tabs, and that is safe for the reason a
+ * shared parameter usually is not: the tab is part of the PATH, so only one
+ * list is mounted at a time, and a tab link carries no query string — moving
+ * between them drops the cursor rather than presenting the versions cursor to
+ * the dependents endpoint (decision 40's slice rule; `search-query.ts` enforces
+ * the same thing for `sort`).
+ */
+function useTabCursor(): [() => string | null, (cursor: string | null) => void] {
+  const [params, setParams] = useSearchParams();
+  return [() => readCursor(params.cursor), (cursor) => setParams({ cursor: cursor ?? undefined })];
+}
+
 function VersionsTab(props: { readonly name: string }): JSX.Element {
-  const page = createAsync(() => versionsQuery({ name: props.name, cursor: null }));
+  const [cursor, goTo] = useTabCursor();
+  const page = createAsync(() => versionsQuery({ name: props.name, cursor: cursor() }));
   const rows = (): readonly VersionSummaryDto[] => page()?.items ?? [];
   return (
     <div class="flex flex-col gap-4">
@@ -167,38 +185,43 @@ function VersionsTab(props: { readonly name: string }): JSX.Element {
           </TableBody>
         </Table>
       </Show>
-      <Show when={page()?.has_more === true}>
-        {/*
-          The full listing is the pub protocol's job; this table is the human
-          view of the recent ones. Rather than build a second paginator that
-          nobody would page through, point at the machine-readable listing.
-        */}
-        <p class="text-xs text-ink-muted">{t(app.pkgVersionsTruncated)}</p>
-      </Show>
+      {/*
+        The pub protocol's listing is the machine view and keeps its own bounds
+        (decision 32); this is the human one, and a person looking for the
+        version they published last Tuesday is not going to read the JSON.
+      */}
+      <CursorNav cursor={cursor()} next={nextCursor(page())} onGo={goTo} />
     </div>
   );
 }
 
 function DependentsTab(props: { readonly name: string }): JSX.Element {
-  const page = createAsync(() => dependentsQuery(props.name));
+  const [cursor, goTo] = useTabCursor();
+  const page = createAsync(() => dependentsQuery({ name: props.name, cursor: cursor() }));
   const rows = (): readonly PackageSummaryDto[] => page()?.items ?? [];
   return (
-    <Show
-      when={rows().length > 0}
-      fallback={
-        <EmptyState title={t(app.pkgDependentsEmpty)} description={t(app.pkgDependentsEmptyBody)} />
-      }
-    >
-      <ul class="flex flex-col gap-4">
-        <For each={rows()}>
-          {(item) => (
-            <li>
-              <PackageCard item={item} />
-            </li>
-          )}
-        </For>
-      </ul>
-    </Show>
+    <div class="flex flex-col gap-4">
+      <Show
+        when={rows().length > 0}
+        fallback={
+          <EmptyState
+            title={t(app.pkgDependentsEmpty)}
+            description={t(app.pkgDependentsEmptyBody)}
+          />
+        }
+      >
+        <ul class="flex flex-col gap-4">
+          <For each={rows()}>
+            {(item) => (
+              <li>
+                <PackageCard item={item} />
+              </li>
+            )}
+          </For>
+        </ul>
+      </Show>
+      <CursorNav cursor={cursor()} next={nextCursor(page())} onGo={goTo} />
+    </div>
   );
 }
 

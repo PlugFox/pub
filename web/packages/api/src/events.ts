@@ -1,3 +1,4 @@
+import { parseRetryAfter } from "./errors";
 import type { StreamEventDto } from "./types";
 
 /*
@@ -25,11 +26,14 @@ import type { StreamEventDto } from "./types";
  *     then drops would reconnect at the maximum delay; without the jitter,
  *     every browser on an instance that just restarted reconnects in the same
  *     millisecond.
- *  4. **A 401 is not a retry.** The access token is refreshed by the API
- *     client, not here — reconnecting in a loop against a dead credential is
- *     how a client turns its own logout into a denial-of-service. The stream
- *     stops and reports it; the app reopens after a successful sign-in. A 429
- *     (S-32 per-user stream cap) is likewise terminal for this connection.
+ *  4. **A 401 is not a retry; a 429 is.** The access token is refreshed by the
+ *     API client, not here — reconnecting in a loop against a dead credential
+ *     is how a client turns its own logout into a denial-of-service, so an
+ *     unauthorized stream stops and reports it, and the app reopens after a
+ *     successful sign-in. A 429 is the opposite case ([decision 40], S-32.b):
+ *     the S-32 per-user cap refuses with `Retry-After`, the slot is released
+ *     by whichever of the account's other streams ends first, and the delay
+ *     the server named is honoured as a FLOOR — see `capRetryDelay`.
  */
 
 /** A parsed SSE frame: the `event:` name, the `data:` payload, and the `id:`. */
@@ -39,8 +43,15 @@ export type SseFrame = {
   readonly id: string | null;
 };
 
-/** Why the stream stopped for good. `null` means "still trying". */
-export type StreamStopReason = "unauthorized" | "rate_limited" | "closed";
+/**
+ * Why the stream stopped for good.
+ *
+ * One member, and the narrowing is the point (decision 40): `rate_limited` used
+ * to live here, and a cap refusal is not a stop — it is a delay the server
+ * named. The only terminal condition left is a credential this transport cannot
+ * repair.
+ */
+export type StreamStopReason = "unauthorized";
 
 /**
  * The slice of `fetch` this module needs.
@@ -66,6 +77,19 @@ export type EventStreamOptions = {
   readonly onStatus?: (status: StreamStatus) => void;
   /** The stream gave up; the app decides what to do (usually nothing). */
   readonly onStopped?: (reason: StreamStopReason) => void;
+  /**
+   * The S-32 cap refused this connection and a retry is scheduled in `delayMs`.
+   *
+   * Fired on EVERY refusal, deliberately: the transport reports facts and the
+   * app decides how often a person should hear about them (decision 40 — the
+   * shipped client toasts once per episode, not once per attempt).
+   */
+  readonly onThrottled?: (delayMs: number) => void;
+  /**
+   * Resume point for a stream that was paused rather than signed out — the
+   * `Last-Event-ID` of a previous connection. `null` starts blind.
+   */
+  readonly initialLastEventId?: string | null;
   readonly fetchImpl?: StreamFetch;
   /** Injectable timer for tests; must behave like `setTimeout`. */
   readonly setTimeoutImpl?: (handler: () => void, ms: number) => unknown;
@@ -73,6 +97,7 @@ export type EventStreamOptions = {
   /** Injectable jitter source in [0, 1); defaults to `Math.random`. */
   readonly random?: () => number;
   readonly backoff?: BackoffOptions;
+  readonly capRetry?: CapRetryOptions;
 };
 
 export type StreamStatus = "connecting" | "open" | "reconnecting" | "stopped";
@@ -91,6 +116,50 @@ export const DEFAULT_BACKOFF: Required<BackoffOptions> = {
   maxMs: 30_000,
   jitter: 0.5,
 };
+
+export type CapRetryOptions = {
+  /** Used when the refusal carries no parseable `Retry-After`. */
+  readonly fallbackMs?: number;
+  /** Ceiling for the ladder, raised to the server's number when it asks for longer. */
+  readonly ceilingMs?: number;
+  /** Fraction of the delay added on top, 0..1. */
+  readonly jitter?: number;
+};
+
+/**
+ * The ladder for an S-32 cap refusal: thirty seconds by the server's own
+ * default, doubling per consecutive refusal, five minutes at the top.
+ */
+export const DEFAULT_CAP_RETRY: Required<CapRetryOptions> = {
+  fallbackMs: 30_000,
+  ceilingMs: 300_000,
+  jitter: 0.25,
+};
+
+/**
+ * Delay before cap-refusal number `attempt` (1-based) is retried.
+ *
+ * TWO PROPERTIES, both the opposite of `backoffDelay`'s, and both because the
+ * server named a number rather than merely failing:
+ *
+ *   - **the jitter is additive**, so the delay is never *below* the
+ *     `Retry-After` the refusal carried — coming back sooner than the server
+ *     asked is ignoring it, and the whole point of the ladder is to be a good
+ *     citizen of a cap that clears by itself;
+ *   - **the ceiling is `max(ceilingMs, base)`**, so a server that asks for
+ *     longer than five minutes is obeyed instead of clamped.
+ */
+export function capRetryDelay(
+  attempt: number,
+  retryAfterMs: number | undefined,
+  options: CapRetryOptions = {},
+  random: () => number = Math.random,
+): number {
+  const { fallbackMs, ceilingMs, jitter } = { ...DEFAULT_CAP_RETRY, ...options };
+  const base = retryAfterMs !== undefined && retryAfterMs > 0 ? retryAfterMs : fallbackMs;
+  const grown = base * 2 ** Math.max(0, attempt - 1);
+  return Math.round(Math.min(Math.max(ceilingMs, base), grown * (1 + jitter * random())));
+}
 
 /**
  * Delay before retry number `attempt` (1-based), exponential and jittered.
@@ -191,7 +260,11 @@ export function createEventStream(options: EventStreamOptions): EventStream {
 
   let running = false;
   let attempt = 0;
-  let lastId: string | null = null;
+  /** Consecutive S-32 cap refusals. Counted apart from `attempt`: a refused
+   * slot and an unreachable server are different conditions with different
+   * ladders, and mixing them would let one reset the other. */
+  let capAttempt = 0;
+  let lastId: string | null = options.initialLastEventId ?? null;
   let controller: AbortController | null = null;
   let retryHandle: unknown = null;
   let status: StreamStatus = "stopped";
@@ -214,17 +287,28 @@ export function createEventStream(options: EventStreamOptions): EventStream {
     options.onStopped?.(reason);
   };
 
+  const scheduleAt = (delayMs: number): void => {
+    retryHandle = schedule(() => {
+      retryHandle = null;
+      void connect();
+    }, delayMs);
+  };
+
   const scheduleRetry = (): void => {
     if (!running) return;
     attempt += 1;
     setStatus("reconnecting");
-    retryHandle = schedule(
-      () => {
-        retryHandle = null;
-        void connect();
-      },
-      backoffDelay(attempt, options.backoff, random),
-    );
+    scheduleAt(backoffDelay(attempt, options.backoff, random));
+  };
+
+  /** The S-32 cap refused the connection; come back no sooner than it asked. */
+  const scheduleCapRetry = (retryAfterMs: number | undefined): void => {
+    if (!running) return;
+    capAttempt += 1;
+    const delay = capRetryDelay(capAttempt, retryAfterMs, options.capRetry, random);
+    setStatus("reconnecting");
+    options.onThrottled?.(delay);
+    scheduleAt(delay);
   };
 
   const connect = async (): Promise<void> => {
@@ -258,7 +342,8 @@ export function createEventStream(options: EventStreamOptions): EventStream {
       return;
     }
     if (response.status === 429) {
-      stopFor("rate_limited");
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+      scheduleCapRetry(retryAfter === undefined ? undefined : retryAfter * 1_000);
       return;
     }
     if (!response.ok || response.body === null) {
@@ -266,9 +351,11 @@ export function createEventStream(options: EventStreamOptions): EventStream {
       return;
     }
 
-    // A stream that produced its headers is healthy enough to reset the
-    // backoff: the next drop should retry fast, not an hour later.
+    // A stream that produced its headers is healthy enough to reset both
+    // ladders: the next drop should retry fast, not an hour later, and a slot
+    // that was granted says the cap episode is over.
     attempt = 0;
+    capAttempt = 0;
     setStatus("open");
 
     const reader = response.body.getReader();
@@ -302,6 +389,7 @@ export function createEventStream(options: EventStreamOptions): EventStream {
       if (running) return;
       running = true;
       attempt = 0;
+      capAttempt = 0;
       void connect();
     },
     stop(): void {

@@ -12,6 +12,7 @@ import { Label } from "@pub/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
 import { A, createAsync, query, revalidate, useSearchParams } from "@solidjs/router";
 import { createMemo, createSignal, For, type JSX, Show } from "solid-js";
+import { CursorNav, nextCursor } from "../cursor-nav";
 import { formatBytes, formatDate, formatNumber } from "../format";
 import { adminSettingsQuery } from "../state/admin-queries";
 import { api, describeError } from "../state/api";
@@ -196,7 +197,7 @@ export function AdminUsersPanel(): JSX.Element {
 
       <CursorNav
         cursor={filters().cursor}
-        next={page()?.has_more === true ? (page()?.cursor ?? null) : null}
+        next={nextCursor(page())}
         onGo={(cursor) => setParams({ cursor: cursor ?? undefined })}
       />
     </div>
@@ -489,35 +490,9 @@ export function AdminOrgsPanel(): JSX.Element {
 
       <CursorNav
         cursor={cursor()}
-        next={page()?.has_more === true ? (page()?.cursor ?? null) : null}
+        next={nextCursor(page())}
         onGo={(next) => setParams({ cursor: next ?? undefined })}
       />
     </div>
-  );
-}
-
-/** Forward-only cursor controls, shared by the admin tables. */
-export function CursorNav(props: {
-  readonly cursor: string | null;
-  readonly next: string | null;
-  readonly onGo: (cursor: string | null) => void;
-}): JSX.Element {
-  return (
-    <Show when={props.cursor !== null || props.next !== null}>
-      <nav aria-label={t(app.searchPagination)} class="flex flex-wrap justify-center gap-3">
-        <Show when={props.cursor !== null}>
-          <Button intent="ghost" onClick={() => props.onGo(null)}>
-            {t(app.searchFirstPage)}
-          </Button>
-        </Show>
-        <Show when={props.next}>
-          {(next) => (
-            <Button intent="outline" onClick={() => props.onGo(next())}>
-              {t(app.searchNextPage)}
-            </Button>
-          )}
-        </Show>
-      </nav>
-    </Show>
   );
 }

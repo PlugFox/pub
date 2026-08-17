@@ -10,8 +10,17 @@ import { CopyButton } from "@pub/ui/copy-button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@pub/ui/dialog";
 import { EmptyState } from "@pub/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
-import { A, createAsync, query, revalidate, useNavigate, useParams } from "@solidjs/router";
+import {
+  A,
+  createAsync,
+  query,
+  revalidate,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "@solidjs/router";
 import { createSignal, For, type JSX, Show } from "solid-js";
+import { CursorNav, nextCursor, readCursor } from "../cursor-nav";
 import { formatDate } from "../format";
 import { PackageCard } from "../package-card";
 import { api, describeError } from "../state/api";
@@ -43,7 +52,18 @@ import { registryBase } from "../urls";
  */
 
 const PROFILE_KEY = "org-profile";
-const profileQuery = query((slug: string) => api.orgs.profile(slug, { limit: 30 }), PROFILE_KEY);
+/*
+ * The package list is paginated INSIDE the profile document — `GET /orgs/{slug}`
+ * takes the cursor and answers with both — so a page turn re-reads the profile
+ * with it. Accepted over a second endpoint (decision 40): the profile is a small
+ * payload beside thirty package summaries, and a route whose only reason to
+ * exist is saving it would have its own visibility rules to keep in step.
+ */
+const profileQuery = query(
+  (input: { slug: string; cursor: string | null }) =>
+    api.orgs.profile(input.slug, { cursor: input.cursor ?? undefined, limit: 30 }),
+  PROFILE_KEY,
+);
 const membersQuery = query((slug: string) => api.orgs.members(slug), "org-members");
 
 function roleVariant(role: string): "accent" | "neutral" {
@@ -92,7 +112,9 @@ function MembersCard(props: { readonly slug: string }): JSX.Element {
 
 export function OrgDetailScreen(): JSX.Element {
   const params = useParams<{ slug: string }>();
-  const profile = createAsync(() => profileQuery(params.slug));
+  const [search, setParams] = useSearchParams();
+  const cursor = (): string | null => readCursor(search.cursor);
+  const profile = createAsync(() => profileQuery({ slug: params.slug, cursor: cursor() }));
   const packages = (): readonly PackageSummaryDto[] => profile()?.packages.items ?? [];
   const base = (): string => registryBase(params.slug, instancePublicUrl());
   const role = (): string | null => profile()?.role ?? null;
@@ -228,9 +250,11 @@ export function OrgDetailScreen(): JSX.Element {
                 </For>
               </ul>
             </Show>
-            <Show when={loaded().packages.has_more === true}>
-              <p class="text-xs text-ink-muted">{t(app.orgPackagesTruncated)}</p>
-            </Show>
+            <CursorNav
+              cursor={cursor()}
+              next={nextCursor(loaded().packages)}
+              onGo={(next) => setParams({ cursor: next ?? undefined })}
+            />
           </section>
 
           <Show when={isAuthenticated() && roleAtLeast(role(), "admin")}>

@@ -9,9 +9,9 @@ import { Label } from "@pub/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
 import { createAsync, query, useSearchParams } from "@solidjs/router";
 import { createMemo, For, type JSX, Show } from "solid-js";
+import { CursorNav, nextCursor } from "../cursor-nav";
 import { formatDateTime } from "../format";
 import { api } from "../state/api";
-import { CursorNav } from "./admin-people";
 
 /*
  * The audit log viewer (S-22/S-23).
@@ -200,7 +200,7 @@ export function AdminAuditPanel(): JSX.Element {
 
       <CursorNav
         cursor={filters().cursor}
-        next={page()?.has_more === true ? (page()?.cursor ?? null) : null}
+        next={nextCursor(page())}
         onGo={(cursor) => setParams({ cursor: cursor ?? undefined })}
       />
     </div>

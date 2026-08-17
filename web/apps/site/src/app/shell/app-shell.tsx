@@ -7,13 +7,14 @@ import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } fr
 import { ThemePicker } from "@pub/ui/theme-picker";
 import { ToastRegion } from "@pub/ui/toast";
 import { A, createAsync, query, useLocation, useNavigate } from "@solidjs/router";
-import { createEffect, For, type JSX, Show, Suspense } from "solid-js";
+import { createEffect, ErrorBoundary, For, type JSX, onCleanup, Show, Suspense } from "solid-js";
 import { api, seedUnreadCount, signOut } from "../state/api";
 import { instanceName, primeInstance } from "../state/instance-store";
 import { resetUnread, unreadCount } from "../state/notification-store";
 import { currentUser, isAuthenticated } from "../state/session-store";
-import { startEventStream, stopEventStream } from "../state/sse";
+import { pauseEventStream, startEventStream, stopEventStream, streamStatus } from "../state/sse";
 import { dismissToast, toasts } from "../state/toast-store";
+import { createVisibilityPauser } from "../state/visibility";
 import { StepUpDialog } from "./step-up-dialog";
 
 /*
@@ -28,11 +29,13 @@ import { StepUpDialog } from "./step-up-dialog";
  * placeholder, so there is nothing to show a skeleton for.
  *
  * THE EVENT STREAM'S LIFECYCLE LIVES HERE, in one effect keyed on
- * authentication. It is the one place that sees every transition — sign-in,
- * sign-out, and a refresh the server refused (which clears the session store
- * from an interceptor callback that has no component around it). Putting it in
- * `state/api.ts` instead would make the api module import the SSE module,
- * which imports the api module.
+ * authentication plus one listener keyed on document visibility. It is the one
+ * place that sees every transition — sign-in, sign-out, a refresh the server
+ * refused (which clears the session store from an interceptor callback that has
+ * no component around it), and a tab going away. Putting it in `state/api.ts`
+ * instead would make the api module import the SSE module, which imports the
+ * api module; putting the visibility half in `state/sse.ts` would make that
+ * module reach for `seedUnreadCount` and close the same cycle.
  */
 
 const orgsQuery = query(() => api.orgs.list(), "shell-orgs");
@@ -78,15 +81,23 @@ function OrgSwitcher(): JSX.Element {
       <MenuContent>
         <MenuLabel>{t(app.orgSwitcher)}</MenuLabel>
         <MenuItem onSelect={() => navigate("/orgs")}>{t(app.orgSwitcherAll)}</MenuItem>
-        <Suspense>
-          <For each={orgs()?.items ?? []}>
-            {(membership) => (
-              <MenuItem onSelect={() => navigate(`/orgs/${membership.org.slug}`)}>
-                <span class="truncate">{membership.org.name}</span>
-              </MenuItem>
-            )}
-          </For>
-        </Suspense>
+        {/*
+          A refused org list is a menu that cannot list organizations, not a
+          shell that cannot render. Without this boundary the rejection escapes
+          to the root one and takes the whole chrome with it — every screen,
+          because the header is on all of them.
+        */}
+        <ErrorBoundary fallback={<MenuLabel>{t(app.genericError)}</MenuLabel>}>
+          <Suspense>
+            <For each={orgs()?.items ?? []}>
+              {(membership) => (
+                <MenuItem onSelect={() => navigate(`/orgs/${membership.org.slug}`)}>
+                  <span class="truncate">{membership.org.name}</span>
+                </MenuItem>
+              )}
+            </For>
+          </Suspense>
+        </ErrorBoundary>
       </MenuContent>
     </Menu>
   );
@@ -203,10 +214,66 @@ export function AppShell(props: AppShellProps): JSX.Element {
   // suspend on the answer: the wordmark's fallback is the product default.
   primeInstance();
 
+  const accessToken = (): string | null => api.storage.read()?.accessToken ?? null;
+
+  /*
+   * The one repair the transport refuses to make itself.
+   *
+   * The server ends every stream at the access token's `exp` (S-32), and the
+   * reconnect then presents whatever is in storage. On a tab with no REST
+   * traffic that token is the expired one — the proactive refresh rides on
+   * requests, and an idle tab makes none — so the reconnect is answered 401
+   * and the transport stops, correctly: a loop against a revoked session is a
+   * client turning its own logout into a denial of service. What was missing
+   * is the other half. The refresh belongs to the api client, so the repair
+   * belongs where both are reachable, and it is tried ONCE per healthy
+   * connection: a session the server keeps refusing must not become a refresh
+   * loop, which is the failure the transport's rule exists to prevent.
+   */
+  let repairAttempted = false;
+  createEffect(() => {
+    if (streamStatus() === "open") repairAttempted = false;
+  });
+  const repairStream = (): void => {
+    if (repairAttempted || !isAuthenticated()) return;
+    repairAttempted = true;
+    void api
+      .renewAuth()
+      .catch(() => false)
+      .then((renewed) => {
+        if (!renewed) return;
+        startEventStream(accessToken, repairStream);
+        // The resume point died with the refused credential, so the badge is
+        // re-read rather than replayed.
+        void seedUnreadCount();
+      });
+  };
+
+  // A tab nobody is looking at gives back its S-32 slot (decision 40): the cap
+  // is five streams per account, and tabs are how a person reaches it. The
+  // pause keeps the last event id, so the resume replays the gap — and re-seeds
+  // the badge, because replay is bounded by the instance's ring buffer.
+  const pauser = createVisibilityPauser({
+    onPause: pauseEventStream,
+    onResume: () => {
+      if (!isAuthenticated()) return;
+      startEventStream(accessToken, repairStream);
+      void seedUnreadCount();
+    },
+  });
+  const onVisibilityChange = (): void => pauser.changed(document.hidden);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  onCleanup(() => {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    pauser.dispose();
+  });
+
   // One subscription per session, torn down the moment the credential goes.
   createEffect(() => {
     if (isAuthenticated()) {
-      startEventStream(() => api.storage.read()?.accessToken ?? null);
+      // Not while paused: signing in on a hidden tab would take a slot the
+      // visible one wants, and the resume path opens it anyway.
+      if (!pauser.paused()) startEventStream(accessToken, repairStream);
       // Seed the badge from the server. The stream only reports what happens
       // from now on, so without this a reader who signs in with a full inbox
       // sees a blank badge until they open the feed — which is precisely the

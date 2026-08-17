@@ -44,6 +44,10 @@ export const app = {
   revoke: { id: "app.revoke", en: "Revoke" },
   /** Fallback error message when the server refused a request for an unrecognized reason. */
   genericError: { id: "app.genericError", en: "Something went wrong. Try again." },
+  /** Heading of the last-resort error page shown when the app shell itself failed to render, so there is no navigation left to draw around it. */
+  shellErrorTitle: { id: "app.shellErrorTitle", en: "The application could not be displayed" },
+  /** Button on the last-resort error page that reloads the document, next to the retry that only re-runs the failed request. */
+  shellErrorReload: { id: "app.shellErrorReload", en: "Reload the page" },
   /** Error for HTTP 404. Deliberately vague: the server answers "unknown" and "not yours" the same way (S-04), so this message must not distinguish them either. */
   errorNotFound: { id: "app.errorNotFound", en: "Not found, or not visible to you." },
   /** Error for a refused credential (401) outside the session-expiry path. */
@@ -465,11 +469,11 @@ export const app = {
   /** Error message shown when the search request fails. */
   searchFailed: { id: "app.searchFailed", en: "The search could not be completed." },
   /** Accessible name of the pagination controls under a cursor-paginated list. */
-  searchPagination: { id: "app.searchPagination", en: "Result pages" },
+  paginationLabel: { id: "app.paginationLabel", en: "Result pages" },
   /** Button that loads the next page of a cursor-paginated list. */
-  searchNextPage: { id: "app.searchNextPage", en: "Next page" },
+  paginationNext: { id: "app.paginationNext", en: "Next page" },
   /** Button that drops the page cursor and returns to the first page of a list. */
-  searchFirstPage: { id: "app.searchFirstPage", en: "Back to first page" },
+  paginationFirst: { id: "app.paginationFirst", en: "Back to first page" },
   /** Button next to the search field that opens the query-syntax help popover. */
   searchSyntaxTrigger: { id: "app.searchSyntaxTrigger", en: "Syntax" },
   /** Title of the query-syntax help popover. */
@@ -522,8 +526,6 @@ export const app = {
   pkgVersionsTable: { id: "app.pkgVersionsTable", en: "Versions of this package" },
   /** Empty state on the versions tab when a package has no live versions. */
   pkgVersionsEmpty: { id: "app.pkgVersionsEmpty", en: "No versions" },
-  /** Footnote under a truncated version list on the package page. */
-  pkgVersionsTruncated: { id: "app.pkgVersionsTruncated", en: "Only the most recent versions are listed; the pub client sees all of them." },
   /** Empty state on the dependents tab. */
   pkgDependentsEmpty: { id: "app.pkgDependentsEmpty", en: "Nothing depends on this package" },
   /** Empty state body on the dependents tab. */
@@ -648,8 +650,6 @@ export const app = {
   orgPackagesEmpty: { id: "app.orgPackagesEmpty", en: "No packages you can see" },
   /** Empty state body of the organization's package list. */
   orgPackagesEmptyBody: { id: "app.orgPackagesEmptyBody", en: "Private packages appear here once you are a member of this organization." },
-  /** Footnote under a truncated organization package list. */
-  orgPackagesTruncated: { id: "app.orgPackagesTruncated", en: "Only the newest packages are listed. Use search to see the rest." },
   /** Heading of the organization member list. */
   orgMembersTitle: { id: "app.orgMembersTitle", en: "Members" },
   /** Empty state of the organization member list. */
@@ -754,8 +754,6 @@ export const app = {
   notifEmptyUnread: { id: "app.notifEmptyUnread", en: "Nothing unread" },
   /** Empty state body of the notification feed. */
   notifEmptyBody: { id: "app.notifEmptyBody", en: "Activity in your organizations shows up here." },
-  /** Footnote under a truncated notification feed. */
-  notifTruncated: { id: "app.notifTruncated", en: "Older notifications are not shown." },
   /** Alert shown while the event stream is reconnecting. */
   notifStreamReconnecting: { id: "app.notifStreamReconnecting", en: "Live updates are reconnecting. The list below is still correct; it just will not update on its own right now." },
   /** Notification category covering publishes, retractions, and option changes. */

@@ -5,7 +5,7 @@ import { Alert } from "@pub/ui/alert";
 import { Button, buttonVariants } from "@pub/ui/button";
 import { EmptyState } from "@pub/ui/empty-state";
 import { Skeleton } from "@pub/ui/skeleton";
-import { A, Navigate, revalidate, useLocation } from "@solidjs/router";
+import { A, Navigate, revalidate, useLocation, useSearchParams } from "@solidjs/router";
 import { ErrorBoundary, type JSX, Show, Suspense } from "solid-js";
 import { isAuthenticated } from "../state/session-store";
 import { toRouterPath } from "../urls";
@@ -66,6 +66,7 @@ export function RequireAuth(props: RequireAuthProps): JSX.Element {
  * generic, retryable branch.
  */
 export function ScreenBoundary(props: { readonly children: JSX.Element }): JSX.Element {
+  const [, setParams] = useSearchParams();
   return (
     <ErrorBoundary
       fallback={(error: unknown, reset: () => void) => {
@@ -107,6 +108,14 @@ export function ScreenBoundary(props: { readonly children: JSX.Element }): JSX.E
             <Button
               intent="outline"
               onClick={() => {
+                // A cursor is the one failure a plain retry cannot fix: the
+                // server refuses a malformed or foreign one identically every
+                // time it is presented, so a reader who reached a screen
+                // through a stale link would be stuck on a button that reruns
+                // the same 400. `?cursor=` is the app-wide name for "the page
+                // within a list" (decision 40) and dropping it returns to the
+                // first page — a no-op on a screen that carries none.
+                setParams({ cursor: undefined });
                 // The query cache holds the rejection, so dropping it has to
                 // happen before the boundary re-renders its children.
                 void revalidate(undefined, true).then(reset, reset);

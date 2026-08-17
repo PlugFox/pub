@@ -10,6 +10,7 @@ import { cn } from "@pub/ui/cn";
 import { EmptyState } from "@pub/ui/empty-state";
 import { A, createAsync, query, revalidate, useSearchParams } from "@solidjs/router";
 import { createEffect, createSignal, For, type JSX, Show } from "solid-js";
+import { CursorNav, nextCursor, readCursor } from "../cursor-nav";
 import { formatRelative } from "../format";
 import { api, describeError } from "../state/api";
 import { setUnreadCount } from "../state/notification-store";
@@ -31,6 +32,9 @@ import { pushToast } from "../state/toast-store";
  *     "your package was published" with nowhere to go is a dead end.
  *   - `?unread=1` narrows the feed. It is URL state so "show me what I missed"
  *     is a link, and so the filter survives the reload after marking all read.
+ *     `?cursor=` is the page within it, and toggling the filter **drops** it:
+ *     a keyset cursor belongs to the slice that minted it (decision 40), and
+ *     one taken from the full feed means nothing to the unread-only one.
  *
  * Live updates arrive over SSE (`state/sse.ts`) and bump the badge; the feed
  * itself is only revalidated on an explicit action. A list that reorders under
@@ -38,7 +42,12 @@ import { pushToast } from "../state/toast-store";
  */
 
 const feedQuery = query(
-  (unread: boolean) => api.notifications.list({ unread, limit: 30 }),
+  (input: { unread: boolean; cursor: string | null }) =>
+    api.notifications.list({
+      unread: input.unread,
+      cursor: input.cursor ?? undefined,
+      limit: 30,
+    }),
   "notifications",
 );
 const preferencesQuery = query(() => api.notifications.preferences(), "notification-prefs");
@@ -66,7 +75,9 @@ function categoryVariant(category: string): "accent" | "warning" | "neutral" {
 }
 
 function Feed(props: { readonly unread: boolean }): JSX.Element {
-  const feed = createAsync(() => feedQuery(props.unread));
+  const [params, setParams] = useSearchParams();
+  const cursor = (): string | null => readCursor(params.cursor);
+  const feed = createAsync(() => feedQuery({ unread: props.unread, cursor: cursor() }));
   const [busy, setBusy] = createSignal(false);
   const rows = (): readonly NotificationDto[] => feed()?.items ?? [];
 
@@ -174,9 +185,11 @@ function Feed(props: { readonly unread: boolean }): JSX.Element {
         </ul>
       </Show>
 
-      <Show when={feed()?.has_more === true}>
-        <p class="text-xs text-ink-muted">{t(app.notifTruncated)}</p>
-      </Show>
+      <CursorNav
+        cursor={cursor()}
+        next={nextCursor(feed())}
+        onGo={(next) => setParams({ cursor: next ?? undefined })}
+      />
     </div>
   );
 }
@@ -214,7 +227,7 @@ export function NotificationsScreen(): JSX.Element {
           intent={unreadOnly() ? "ghost" : "outline"}
           size="sm"
           aria-pressed={!unreadOnly()}
-          onClick={() => setParams({ unread: undefined })}
+          onClick={() => setParams({ unread: undefined, cursor: undefined })}
         >
           {t(app.notifFilterAll)}
         </Button>
@@ -222,7 +235,7 @@ export function NotificationsScreen(): JSX.Element {
           intent={unreadOnly() ? "outline" : "ghost"}
           size="sm"
           aria-pressed={unreadOnly()}
-          onClick={() => setParams({ unread: "1" })}
+          onClick={() => setParams({ unread: "1", cursor: undefined })}
         >
           {t(app.notifFilterUnread)}
         </Button>

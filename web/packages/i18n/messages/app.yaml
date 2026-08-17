@@ -120,6 +120,20 @@ genericError:
   ru: Что-то пошло не так. Попробуйте ещё раз.
   desc: Fallback error message when the server refused a request for an unrecognized reason.
 
+shellErrorTitle:
+  en: The application could not be displayed
+  ru: Не удалось отобразить приложение
+  desc: >-
+    Heading of the last-resort error page shown when the app shell itself failed to render, so
+    there is no navigation left to draw around it.
+
+shellErrorReload:
+  en: Reload the page
+  ru: Перезагрузить страницу
+  desc: >-
+    Button on the last-resort error page that reloads the document, next to the retry that only
+    re-runs the failed request.
+
 errorNotFound:
   en: Not found, or not visible to you.
   ru: Не найдено — или недоступно вам.
@@ -1227,17 +1241,17 @@ searchFailed:
   ru: Не удалось выполнить поиск.
   desc: Error message shown when the search request fails.
 
-searchPagination:
+paginationLabel:
   en: Result pages
   ru: Страницы результатов
   desc: Accessible name of the pagination controls under a cursor-paginated list.
 
-searchNextPage:
+paginationNext:
   en: Next page
   ru: Следующая страница
   desc: Button that loads the next page of a cursor-paginated list.
 
-searchFirstPage:
+paginationFirst:
   en: Back to first page
   ru: К первой странице
   desc: Button that drops the page cursor and returns to the first page of a list.
@@ -1379,11 +1393,6 @@ pkgVersionsEmpty:
   en: No versions
   ru: Нет версий
   desc: Empty state on the versions tab when a package has no live versions.
-
-pkgVersionsTruncated:
-  en: Only the most recent versions are listed; the pub client sees all of them.
-  ru: Показаны только последние версии; клиент pub видит все.
-  desc: Footnote under a truncated version list on the package page.
 
 pkgDependentsEmpty:
   en: Nothing depends on this package
@@ -1699,11 +1708,6 @@ orgPackagesEmptyBody:
   ru: Приватные пакеты появятся здесь, когда вы станете участником организации.
   desc: Empty state body of the organization's package list.
 
-orgPackagesTruncated:
-  en: Only the newest packages are listed. Use search to see the rest.
-  ru: Показаны только самые новые пакеты. Остальные — через поиск.
-  desc: Footnote under a truncated organization package list.
-
 orgMembersTitle:
   en: Members
   ru: Участники
@@ -1991,11 +1995,6 @@ notifEmptyBody:
   en: Activity in your organizations shows up here.
   ru: Здесь появится активность из ваших организаций.
   desc: Empty state body of the notification feed.
-
-notifTruncated:
-  en: Older notifications are not shown.
-  ru: Более старые уведомления не показаны.
-  desc: Footnote under a truncated notification feed.
 
 notifStreamReconnecting:
   en: Live updates are reconnecting. The list below is still correct; it just will not update on its own right now.

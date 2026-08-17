@@ -1,5 +1,6 @@
 import { Route, Router } from "@solidjs/router";
 import { type Component, type JSX, lazy } from "solid-js";
+import { AppBoundary } from "./shell/app-boundary";
 import { AppShell } from "./shell/app-shell";
 import { RequireAuth, ScreenBoundary } from "./shell/require-auth";
 
@@ -74,7 +75,16 @@ function Guarded(props: { readonly children: JSX.Element }): JSX.Element {
 
 export function App(): JSX.Element {
   return (
-    <Router base="/app" root={(props) => <AppShell>{props.children}</AppShell>}>
+    <Router
+      base="/app"
+      root={(props) => (
+        // Inside the router (the fallback revalidates) and around the shell (a
+        // boundary the shell renders cannot catch the shell) — decision 40.
+        <AppBoundary>
+          <AppShell>{props.children}</AppShell>
+        </AppBoundary>
+      )}
+    >
       <Route path="/login" component={LoginScreen} />
       <Route path="/auth/callback/:provider" component={OidcCallbackScreen} />
 

@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   backoffDelay,
+  capRetryDelay,
   createEventStream,
   createSseDecoder,
   DEFAULT_BACKOFF,
+  DEFAULT_CAP_RETRY,
   decodeStreamEvent,
   type StreamStopReason,
 } from "../src/events";
@@ -204,6 +206,41 @@ describe("backoffDelay", () => {
   });
 });
 
+describe("capRetryDelay", () => {
+  test("the server's number is a FLOOR — the jitter only ever adds", () => {
+    // The opposite of `backoffDelay`'s property, and the reason is that a 429
+    // named a time: coming back sooner than the server asked is ignoring it.
+    for (const random of [0, 0.25, 0.5, 0.999]) {
+      expect(capRetryDelay(1, 30_000, {}, () => random)).toBeGreaterThanOrEqual(30_000);
+    }
+  });
+
+  test("doubles per consecutive refusal", () => {
+    const zero = () => 0;
+    expect(capRetryDelay(1, 30_000, { jitter: 0 }, zero)).toBe(30_000);
+    expect(capRetryDelay(2, 30_000, { jitter: 0 }, zero)).toBe(60_000);
+    expect(capRetryDelay(3, 30_000, { jitter: 0 }, zero)).toBe(120_000);
+  });
+
+  test("saturates at the ceiling, jitter included", () => {
+    for (const random of [0, 0.999]) {
+      expect(capRetryDelay(20, 30_000, {}, () => random)).toBe(DEFAULT_CAP_RETRY.ceilingMs);
+    }
+  });
+
+  test("a server asking for longer than the ceiling is obeyed, not clamped", () => {
+    const hour = 3_600_000;
+    expect(capRetryDelay(1, hour, { jitter: 0 }, () => 0)).toBe(hour);
+  });
+
+  test("no Retry-After means the fallback, not zero", () => {
+    expect(capRetryDelay(1, undefined, { jitter: 0 }, () => 0)).toBe(DEFAULT_CAP_RETRY.fallbackMs);
+    // A malformed header parses to 0 seconds; treating that as "immediately"
+    // would turn a cap refusal into a hot loop.
+    expect(capRetryDelay(1, 0, { jitter: 0 }, () => 0)).toBe(DEFAULT_CAP_RETRY.fallbackMs);
+  });
+});
+
 // --------------------------------------------------------------- the stream
 
 describe("createEventStream", () => {
@@ -378,15 +415,25 @@ describe("createEventStream", () => {
     expect(stream.status()).toBe("stopped");
   });
 
-  test("a 429 (the S-32 per-user stream cap) is terminal too", async () => {
+  test("a 429 (the S-32 cap) schedules a retry at the time the server named", async () => {
     const timers = fakeTimers();
     const stopped: StreamStopReason[] = [];
+    const throttled: number[] = [];
+    let attempts = 0;
+    const live = openResponse();
     const stream = createEventStream({
       url: "/api/v1/events",
       token: () => "access",
       onEvent: () => {},
       onStopped: (reason) => stopped.push(reason),
-      fetchImpl: async () => new Response("{}", { status: 429 }),
+      onThrottled: (delay) => throttled.push(delay),
+      fetchImpl: async () => {
+        attempts += 1;
+        // First refusal, then a slot frees and the stream opens and stays open.
+        return attempts === 1
+          ? new Response("{}", { status: 429, headers: { "retry-after": "30" } })
+          : live.response;
+      },
       setTimeoutImpl: timers.schedule,
       clearTimeoutImpl: timers.cancel,
       random: () => 0,
@@ -394,8 +441,121 @@ describe("createEventStream", () => {
 
     stream.start();
     await flush();
-    expect(stopped).toEqual(["rate_limited"]);
-    expect(timers.pending()).toBe(0);
+
+    // Not a stop: a refusal is a delay, and the transport keeps the connection
+    // scheduled rather than reporting that it gave up (decision 40).
+    expect(stopped).toEqual([]);
+    expect(throttled).toEqual([30_000]);
+    expect(timers.delays).toEqual([30_000]);
+    expect(stream.status()).toBe("reconnecting");
+
+    await timers.runNext();
+    expect(attempts).toBe(2);
+    expect(stream.status()).toBe("open");
+    live.end();
+    stream.stop();
+  });
+
+  test("consecutive refusals double the delay; a granted slot resets the ladder", async () => {
+    const timers = fakeTimers();
+    const responses = [429, 429, 429, 200, 429];
+    let index = 0;
+    const stream = createEventStream({
+      url: "/api/v1/events",
+      token: () => "access",
+      onEvent: () => {},
+      fetchImpl: async () => {
+        const status = responses[index++] ?? 429;
+        return status === 429
+          ? new Response("{}", { status: 429, headers: { "retry-after": "30" } })
+          : streamingResponse([]);
+      },
+      setTimeoutImpl: timers.schedule,
+      clearTimeoutImpl: timers.cancel,
+      random: () => 0,
+      capRetry: { jitter: 0 },
+    });
+
+    stream.start();
+    await flush();
+    await timers.runNext();
+    await timers.runNext();
+    // The fourth attempt opens and then ends, so its delay comes from the
+    // ORDINARY backoff — the ladder under test is the cap one around it.
+    await timers.runNext();
+    await timers.runNext();
+
+    expect(timers.delays).toEqual([30_000, 60_000, 120_000, DEFAULT_BACKOFF.baseMs, 30_000]);
+    stream.stop();
+  });
+
+  test("a refusal with no Retry-After falls back rather than hammering", async () => {
+    const timers = fakeTimers();
+    const stream = createEventStream({
+      url: "/api/v1/events",
+      token: () => "access",
+      onEvent: () => {},
+      fetchImpl: async () => new Response("{}", { status: 429 }),
+      setTimeoutImpl: timers.schedule,
+      clearTimeoutImpl: timers.cancel,
+      random: () => 0,
+      capRetry: { jitter: 0 },
+    });
+
+    stream.start();
+    await flush();
+    expect(timers.delays).toEqual([DEFAULT_CAP_RETRY.fallbackMs]);
+    stream.stop();
+  });
+
+  test("stop() cancels a pending cap retry — a signed-out tab does not come back", async () => {
+    const timers = fakeTimers();
+    let attempts = 0;
+    const stream = createEventStream({
+      url: "/api/v1/events",
+      token: () => "access",
+      onEvent: () => {},
+      fetchImpl: async () => {
+        attempts += 1;
+        return new Response("{}", { status: 429, headers: { "retry-after": "30" } });
+      },
+      setTimeoutImpl: timers.schedule,
+      clearTimeoutImpl: timers.cancel,
+      random: () => 0,
+    });
+
+    stream.start();
+    await flush();
+    expect(timers.pending()).toBe(1);
+
+    stream.stop();
+    await timers.runNext();
+
+    expect(attempts).toBe(1);
+    expect(stream.status()).toBe("stopped");
+  });
+
+  test("a paused stream resumes from the id it was given, before any event", async () => {
+    const timers = fakeTimers();
+    const headers: (Headers | undefined)[] = [];
+    const stream = createEventStream({
+      url: "/api/v1/events",
+      token: () => "access",
+      initialLastEventId: "01JPAUSED",
+      onEvent: () => {},
+      fetchImpl: async (_url, init) => {
+        headers.push(new Headers(init?.headers));
+        return streamingResponse([]);
+      },
+      setTimeoutImpl: timers.schedule,
+      clearTimeoutImpl: timers.cancel,
+      random: () => 0,
+    });
+
+    stream.start();
+    await flush();
+    expect(headers[0]?.get("last-event-id")).toBe("01JPAUSED");
+    stream.stop();
   });
 
   test("a 5xx is retried — the server is unwell, the credential is not", async () => {
