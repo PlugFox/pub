@@ -2,6 +2,33 @@
 
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: SemVer per component — server crate and web package are versioned independently. Entries are tagged `(server)`, `(web)`, `(infra)`, `(docs)`.
 
+## 2026-08-17 — Phase 4 wave 9: a refused stream comes back, the chrome has a boundary, and four footnotes become pages
+
+Roadmap Phase 4 item 2 — frontend correctness and completeness. [Decision 40](docs/decisions.md#40--a-refused-stream-is-a-delay-not-a-death-the-client-half-of-the-s-32-cap-one-boundary-around-the-chrome-and-pages-where-footnotes-stood) and the [S-32.b](docs/security.md#6-realtime--notifications) amendment were recorded before any code. **This closes the two open clauses of [D32](docs/roadmap.md).**
+
+Three defects shared one property: the client knew something and threw it away. The server refuses an over-cap stream with `429 + Retry-After` and [S-32.a](docs/security.md#6-realtime--notifications) already said why that refusal is temporary — the client treated it exactly like a dead credential. `ScreenBoundary` wrapped every screen and nothing else, so the one surface present on every route had the weakest failure mode in the app. And four lists carried `has_more` from a keyset-paginated endpoint and rendered a sentence, or nothing at all.
+
+### Added
+
+- (web) **The event stream retries a cap refusal instead of dying on it.** The transport parses `Retry-After`, honours it as a **floor** (the jitter is additive here, the opposite of the reconnect backoff — a client that comes back sooner than the server asked has ignored it), doubles it per consecutive refusal to a five-minute ceiling, and obeys a server that asks for longer rather than clamping it. The toast fires once per episode and rearms when a connection opens; a warning every five minutes is how the one alarm this stream raises becomes noise.
+- (web) **A hidden tab gives its S-32 slot back.** Sixty seconds after the document is hidden the stream is *paused* — released with its place in the log kept, so the resume replays through `Last-Event-ID` and re-seeds the unread badge, because replay is bounded by the instance's ring buffer. The grace period is the design, not a knob: a slot lingers for up to one heartbeat after the client is gone, so pausing on every tab switch would spend more slots than it frees.
+- (web) **A root error boundary around the app chrome.** It sits inside the router (its retry revalidates) and around the shell (a boundary the shell renders cannot catch the shell), and its fallback draws no chrome — the component that failed is the one that draws the header. The org switcher gained a boundary of its own so a refused org list is a menu that cannot list organizations rather than a shell that cannot render.
+- (web) **One paginator, on five lists.** `CursorNav` moved out of the admin screen it happened to live in; package versions, dependents, the notification feed and an organization's packages now page through the URL like search and the admin tables always have, and search itself moved onto the same component. The three "only the most recent are listed" strings are deleted.
+
+### Changed
+
+- (web) **An idle tab no longer loses live updates permanently** — found by this wave's own review and worse than the defect the item was filed for. The server ends every stream at the access token's `exp`, the reconnect presents whatever is in storage, and the proactive refresh rides on REST requests a quiet tab never makes — so the reconnect was answered 401 and the transport stopped, correctly. The repair is the second half of the sentence its comment already carried: the shell calls `renewAuth` **once** per healthy connection and reopens. Once, because a session the server keeps refusing must not become a refresh loop.
+- (web) **A screen's retry now drops `?cursor=` before it revalidates.** A cursor the server refuses is refused identically every time it is presented, so a reader who followed a stale link would have been stuck on a button that reran the same 400. The search screen's own boundary has always done this for its `sort`-bound cursor; making `cursor` the app-wide name for "the page within a list" is what lets the generic boundary do it once.
+- (web) `StreamStopReason` is one member (`unauthorized`). A cap refusal is not a stop, and the narrowing is what makes the compiler say so.
+- (web) The three pagination strings are renamed `pagination*` from `search*`: they label five lists now, and a key named `searchNextPage` under a notification feed is a small lie in nine translators' files.
+
+### Notes
+
+- **Both new behaviours were demonstrated red.** The cap ladder against the reverted terminal branch (four tests), and the pause/stop distinction against a `pauseEventStream` that forgets its resume point.
+- **What the lifecycle test does not prove** is stated in the test: a *second* refusal inside one episode staying silent is not observable there, because the retry is 600 s away by the server's own `Retry-After` and that test drives real timers. The transport half — `onThrottled` fires on every refusal, so the suppression has to live in the app — is asserted separately.
+- **The versions paginator reverses an argument written in the code.** `package.tsx` declined one because "the full listing is the pub protocol's job"; that listing is for a resolver, and a person looking for the version they published last Tuesday is not going to read the JSON. The protocol listing keeps its own bounds ([decision 32](docs/decisions.md#32--quotas-and-limits-what-an-org-may-store-what-a-caller-may-write-and-one-identity-per-request)) and is untouched.
+- **Paging an organization's packages refetches its profile**, because the cursor paginates the list *inside* `GET /orgs/{slug}`. Accepted over a second endpoint whose only reason to exist would be saving a small payload.
+
 ## 2026-08-17 — Phase 4 wave 8: the account surface, and the last absent requirement that was not v1.1
 
 Roadmap Phase 4 item 1 — account and privacy. [Decision 39](docs/decisions.md#39--the-account-surface-one-me-the-client-can-trust-an-email-change-that-proves-both-addresses-an-export-that-streams-and-a-deletion-that-keeps-the-attribution-and-nothing-else) and the [S-29.a/b/c](docs/security.md#7-platform) plus [S-03.b](docs/security.md#1-authentication) amendments were recorded before any code. **This closes [S-29](docs/security.md#7-platform) — the last requirement marked absent that is not v1.1 by design — and [D40](docs/roadmap.md).**
