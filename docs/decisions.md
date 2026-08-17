@@ -43,6 +43,7 @@ Decisions were made on 2026-08-06 based on the research summarized in [product.m
 | 36 | Leader election leaves the process: a lease table, and a topology gate  | accepted |
 | 37 | A grant that reaches the tables that do not exist yet, and a check      | accepted |
 | 38 | Two replicas behind one proxy: a stand, four claims, and a number      | accepted |
+| 39 | The account surface: `/me`, an email change, an export, and a tombstone | accepted |
 
 ---
 
@@ -968,3 +969,89 @@ The acceptance run is **opt-in and manual for now**: no CI leg. That is a delibe
 - **The stand is not a production deployment recipe.** It publishes both replicas directly, which no real deployment should do, and it terminates no TLS. [ops/install.md](ops/install.md#more-than-one-replica) gains the two-replica section it lacks and says so; the nginx configuration in [ops/reverse-proxy.md](ops/reverse-proxy.md) gains the multi-upstream variant, which is the part an operator actually copies.
 - **Four claims proven at the wire do not make every claim true.** Nothing here proves behaviour under a *rolling* restart, under partition, or with more than two replicas; the acceptance run is the shape this project documents and nothing wider. What it does close is the phase's exit sentence and the audit's "multi-instance is permitted and unsafe", which is already false in its second half and becomes false in its first.
 - **A measurement dates.** The recorded numbers are a snapshot on one machine; they answer "is a publish milliseconds or seconds" and "does the second replica change throughput", not "what will your hardware do".
+
+## 39 — The account surface: one `/me` the client can trust, an email change that proves both addresses, an export that streams, and a deletion that keeps the attribution and nothing else
+
+> **Status: accepted.** Recorded 2026-08-17 before implementation, as the Phase 4 wave-8 enabling decision for [roadmap item 1](roadmap.md#phase-4--finish-the-product-surface-closes-d17-d19-d26-d32d36-and-the-account-gaps). It closes [S-29](security.md#7-platform) — the last requirement marked *absent* that is not v1.1 by design — and [D40](roadmap.md), the member-facing leave-organization route that was deferred to exactly this surface when the role ceiling landed.
+
+**Context.** S-29 has been absent since the first audit, and the shape of that absence is unusual: the *storage* was designed for it and never used. `users.email` is nullable behind a partial unique index that excludes `NULL` in both dialects, `UserStatus::Deleted` exists with the comment "profile erased, row kept as an attribution tombstone", and nothing in the product can reach either. What is missing is the whole surface. There is no `/api/v1/me` among the 62 inventoried routes, so the account screen builds its profile from the sign-in response and tracks whether a second factor is enrolled in a **session-local flag** whose own comment calls it a known gap; there is no profile edit, no export, no deletion, and no `/.well-known/security.txt`. [S-06](security.md#1-authentication) has carried "**Still a placeholder**: email change" since Phase 1, naming an endpoint that was never built.
+
+Four product forks in this wave were decided by the owner rather than defaulted by an implementer, and each one is recorded here as the reason a section reads the way it does: deletion **refuses** rather than cascades when the caller is an org's last Owner; the email change **is** in this wave; the export is a **synchronous stream** rather than a queued artifact; and deletion is **immediate and irreversible** rather than a cancellable window.
+
+**Decision.**
+
+### `/me` is a read, because the token deliberately cannot answer it
+
+[S-07](security.md#2-sessions--web-plane) limits the access JWT to `sub`, `sid`, org levels and timestamps, and that limit is load-bearing — it is why a demotion is effective immediately rather than at the next refresh. The consequence is that every fact the account screen wants is a **read**, not a claim: display name, email and its verified flag, the instance-admin bit, and whether a second factor is enrolled. `GET /api/v1/me` answers all of them in one request, and `totp_enabled` is the field that ends the local guess.
+
+Two things are deliberately **not** on it. The caller's org memberships stay on `GET /api/v1/orgs`, and their sessions stay on `GET /api/v1/sessions` — both already exist, both are already filtered, and an endpoint that accretes "everything about me" grows without a bound and is re-read on every screen that needs one field of it. `/me` answers the *account row* plus the one credential fact that has no other home.
+
+### The email change proves the new address before it moves, and tells the old one after
+
+`POST /api/v1/me/email` starts it and `POST /api/v1/me/email/verify` finishes it. Both are step-up gated — this is the endpoint S-06's placeholder has been waiting for since Phase 1.
+
+The mechanism is the [S-03](security.md#1-authentication) OTP primitives, reused rather than re-invented: an 8-digit CSPRNG code, `HMAC-SHA-256` at rest under the same pepper, a pending record in KV with a ten-minute life, an attempt budget spent **atomically before comparison**, resends no closer than sixty seconds, single use. Three properties are the whole security of it:
+
+- **The pending record is bound to the requesting user and to the new address.** A code is redeemable only by the account that asked for it, which is S-03's binding applied to a second flow: a code phished out of somebody's inbox cannot be replayed from another session or against another address.
+- **The new address is proven before it becomes the account's.** The code goes to the new address and the swap happens at verify, so a typo produces a dead pending record rather than an account nobody can sign in to. Until verify, the old address is still the account's.
+- **The old address is told after the swap, not before.** Before would announce a change that may never complete and would let a failed attempt spam a victim; after is the "if this was not you" message that is worth sending. Delivery failure does not undo the change — the same rule the S-02 credential-link notice already follows.
+
+**An address that belongs to a live account is refused at the request, with a distinct code and its own bucket.** This is an account-existence oracle and it is taken deliberately, because the alternative is worse: answering a uniform success would mail a code to a third party's inbox on demand, which turns the instance into a mailer aimed at strangers, and it would leave the honest caller waiting for a code that will never arrive — indistinguishable from a mail outage. The oracle costs a fresh second factor plus a bucket, and it is narrower than the one the invitation flow already carries.
+
+**A linked OIDC identity survives the change, and that is correct.** [S-01](security.md#1-authentication) keys an identity on `(iss, sub)`, never on the address, so changing the email does not sever the IdP link and cannot be used to. The `email` credential row moves with the user row in the same operation, because the two disagreeing would leave the account's own credential inventory naming an address that no longer signs in.
+
+### The export is a stream with sections, and it costs an index the audit viewer already needed
+
+`GET /api/v1/me/export` is NDJSON over a keyset walk, the same shape as the S-23 audit export: a bounded channel written by a walker task, one section per record kind, and an explicit `{"done": true}` terminator whose **absence** is how a caller learns the file is incomplete. Sections: the profile, the caller's org memberships, their sessions, their CLI tokens as metadata, their notification preferences, their notifications, and the audit rows whose actor is them.
+
+It is **step-up gated**, for [S-06.c](security.md#1-authentication)'s reason rather than by analogy: one request hands over every IP address and user agent the instance recorded for that account. The line there is bulk, not sensitivity, and this is bulk.
+
+What is deliberately **not** in it, so that nobody "completes" the export by adding it:
+
+- **No credential material.** TOTP seeds, recovery-code hashes and refresh-token hashes are what a second factor *is*; exporting them would let one stolen step-up window walk out with the factor that guards the next one.
+- **No other people's rows.** The export carries the caller's own membership in an org, never the roster — a Read member of an org is not entitled to its member list because they asked for their own data.
+- **No version attribution, and the reason is a number.** `versions.published_by` has no index and adding one taxes every publish forever to serve an export that runs a few times per account per year; the same facts are public on the package page and appear in the audit section within the retention window.
+
+The audit section, on the other hand, **does** get an index: migration 0018 adds `audit_actor_idx (actor_type, actor_id, id)` to both dialects. This is not a cost the export invents — `AuditFilter::actor` has been reachable from the admin audit viewer since the admin surface landed, and it has been a full scan of the largest table in the instance the whole time. The plan test reads its SQL from the repository rather than copying it (**[D52](roadmap.md)**'s exit shape applied to new code) and asserts the seek's usable columns, per the working agreement that an index test naming an index proves nothing.
+
+The walk shares the process-wide export permit with the audit export. One pool, because the cost being bounded is identical — a long walk holding a connection — and a second pool would only let the two starve each other in a different order.
+
+### Deletion is immediate, and the line it draws is identity versus attribution
+
+`DELETE /api/v1/me` takes a fresh second factor **and** `{"confirm": "<the account's own email address>"}`, per [S-06.b](security.md#1-authentication): the factor proves who is asking, the confirmation proves what they meant. Every account that can reach this endpoint has an address — the `Option` on `User::email` belongs to the tombstone, and a tombstone cannot authenticate — so a `None` there is a refusal rather than an empty string that matches.
+
+Then, in this order:
+
+1. **Refuse if the caller is the last Owner of any organization**, naming them all in the error. The repositories already enforce this transactionally, so the pre-check buys a usable message rather than the invariant. Refusing rather than cascading is the owner's decision and the right one: an org holds other people's packages, and a deletion that quietly took one down would destroy work that was never the caller's to delete.
+
+   **The same rule applies one plane up, and that half was found by this wave's own review rather than designed in.** Anonymization drops the instance-admin flag — it has to, because [`UserRepo::counts`] would otherwise report tombstones as administrators and `claim_first_admin` asks whether *any* account holds the flag, so a deleted admin would block the bootstrap promotion forever. But the same clearing means deleting the **only** administrator leaves an instance with none, and `claim_first_admin` then hands the flag to the next account that registers. On an open-registration instance that is a takeover armed by somebody acting on their own account, so the last instance administrator is refused exactly like a last Owner. The org rule and this one are checked **before** the first destructive step.
+2. **Sessions revoked, then CLI tokens revoked** — the S-09 sweep first and the token plane after, which is the ordering [D37](roadmap.md) already established for suspension: the sessions are the thing that must not survive.
+3. **Every credential row deleted** — OIDC links, the email identity, the TOTP seed, the recovery hashes. This is the step that is easy to skip and expensive to skip: the sign-in paths filter on `status == Active`, so a surviving OIDC credential would keep mapping `(iss, sub)` to a tombstone forever and answer `account_unavailable` to a person who later wants a *new* account with the same identity provider. The identity plane goes; the attribution plane stays.
+4. **Org memberships removed**, and the user's own notification rows deleted — a feed is not attribution.
+5. **The row is anonymized in place**: `email = NULL`, the display name replaced by a fixed placeholder, `status = deleted`. Both dialects exclude `NULL` from the unique index, so the address is free for a new sign-up **immediately**, which is the intended reading of "erases the profile": deletion must not reserve an address forever.
+6. **An audit row records it.** It survives the account, which is the point.
+
+What survives is exactly the supply-chain claim S-29 makes: `versions.published_by` still names the id, so a published archive stays attributable to *something*. Packages belong to orgs and are untouched.
+
+### Leaving an organization is the member's own action
+
+`DELETE /api/v1/orgs/{slug}/membership` removes the caller from an org at any role, subject to the same last-Owner refusal. This is [D40](roadmap.md)'s sanctioned route: the [decision 19](#19--rbac-model-and-permissions) ceiling addendum already permits self-directed reduction, and the repositories already refuse to strand an org — what was missing was a door a Read or Write member could reach, since they never see the member-management surface.
+
+### `security.txt` is generated from boot config, or the file does not exist
+
+`/.well-known/security.txt` is served by the server as `text/plain`, rendered from a new `[disclosure]` boot section (`contact`, `policy_url`), validated at startup like every other address in this codebase — a contact that is not a `mailto:`, `https:` or `tel:` URI is a boot refusal, not a warning.
+
+**With no contact configured the route answers 404.** RFC 9116 makes `Contact` mandatory, so an instance with nothing to say says nothing rather than publishing a file that names nobody, and a default install does not advertise a reporting channel its operator never agreed to monitor.
+
+`Expires` is computed as the current UTC **day** plus one year rather than from the request instant: it satisfies the RFC's "less than a year" without a hand-maintained date that will be expired the first time anybody looks, and it holds still for twenty-four hours so the response stays cacheable. Boot config rather than a runtime settings section, deliberately: this is set once per deployment by the person who owns the mailbox, it is not per-tenant, and the runtime cache exists for values that change while the instance is under load.
+
+**Consequences.**
+
+- **A deletion cannot be undone by anybody, including an operator.** No grace period was the owner's call; the step-up gate and the confirmation field are the entire protection, and support has no restore path. The audit row and the tombstone are all that remain.
+- **Two accounts on an instance cannot both be deleted while either is load-bearing.** The last Owner of an org and the last instance administrator are both refused, so an operator who is also the only administrator has to promote somebody before leaving. That is a real dead end for a single-person instance — and the alternative is an instance whose administrator is whoever registers next, which is worse. The membership removals inside a deletion are **fatal rather than best-effort** for the same reason: a co-owner who leaves between the pre-check and the write turns the removal into a `last_owner` refusal, and continuing past it would strand an org under a tombstone nobody can sign in as.
+- **The audit log is not rewritten by a deletion.** [S-22](security.md#5-audit--abuse) forbids it and the hardened Postgres role cannot do it, so rows keep the actor id and some rows carry the address in `target`. Retention (730 days) is the bound, and it is the honest answer rather than a claim of erasure the architecture cannot make.
+- **A freed address is genuinely free.** Signing up again with it produces a *new* account with no history and no packages — the tombstone is not reclaimable, by construction.
+- **The email-change refusal is an existence oracle**, bounded by a fresh second factor and a bucket. Accepted above, listed here so it is not rediscovered as a defect.
+- **A burst of personal exports can make an audit export wait**, since they share one permit pool; the per-account hourly budget is what keeps that bounded.
+- **One more index on the append-only table.** `audit_log` goes from three indexes to four, so every audited action pays a little more on write. It is bought back by the admin viewer's actor filter, which stops being a full scan on the same day.
+- **The account surface adds seven routes to the app API**, and `/me` becomes the first route a client is expected to call on every load. That is a deliberate coupling: the alternative was more claims in the token, and S-07 exists to refuse that.
