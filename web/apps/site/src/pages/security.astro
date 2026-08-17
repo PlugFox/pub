@@ -1,0 +1,40 @@
+---
+import { t } from "@pub/i18n";
+import { common } from "@pub/i18n/generated/common";
+import BaseLayout from "../layouts/base-layout.astro";
+
+/*
+ * The disclosure page S-29 asks for, and the target of security.txt's `Policy`
+ * field (S-29.c).
+ *
+ * Deliberately static and deliberately free of an address: the contact is
+ * per-instance boot configuration, so repeating it here would be a second
+ * source of truth that goes stale the first time an operator changes theirs.
+ * The page says where the machine-readable answer lives; the file answers it.
+ */
+---
+
+<BaseLayout title={`${t(common.securityPageTitle)} — ${t(common.siteTitle)}`}>
+  <main class="mx-auto flex w-full max-w-2xl flex-col gap-8 px-6 py-16">
+    <h1 class="text-3xl font-bold tracking-tight text-ink">{t(common.securityPageTitle)}</h1>
+    <p class="text-ink-muted">{t(common.securityPageIntro)}</p>
+
+    <section class="flex flex-col gap-2">
+      <h2 class="text-xl font-semibold text-ink">{t(common.securityPageContactTitle)}</h2>
+      <p class="text-ink-muted">{t(common.securityPageContactBody)}</p>
+      <a class="font-mono text-sm text-accent-ink underline" href="/.well-known/security.txt">
+        /.well-known/security.txt
+      </a>
+    </section>
+
+    <section class="flex flex-col gap-2">
+      <h2 class="text-xl font-semibold text-ink">{t(common.securityPageScopeTitle)}</h2>
+      <p class="text-ink-muted">{t(common.securityPageScopeBody)}</p>
+    </section>
+
+    <section class="flex flex-col gap-2">
+      <h2 class="text-xl font-semibold text-ink">{t(common.securityPageOperatorTitle)}</h2>
+      <p class="text-ink-muted">{t(common.securityPageOperatorBody)}</p>
+    </section>
+  </main>
+</BaseLayout>

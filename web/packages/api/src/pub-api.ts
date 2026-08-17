@@ -1,3 +1,4 @@
+import { type AccountApi, createAccountApi } from "./account";
 import { type AdminApi, createAdminApi } from "./admin";
 import { type AuthApi, createAuthApi } from "./auth";
 import { type ApiClient, createClient, type FetchLike } from "./client";
@@ -51,6 +52,7 @@ export type PubApi = {
   readonly client: ApiClient;
   readonly storage: TokenStorage;
   readonly auth: AuthApi;
+  readonly account: AccountApi;
   readonly sessions: SessionsApi;
   readonly tokens: TokensApi;
   readonly orgs: OrgsApi;
@@ -139,6 +141,7 @@ export function createPubApi(options: PubApiOptions = {}): PubApi {
     client,
     storage,
     auth: createAuthApi(client),
+    account: createAccountApi(client),
     sessions: createSessionsApi(client),
     tokens: createTokensApi(client),
     orgs: createOrgsApi(client),

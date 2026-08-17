@@ -416,6 +416,126 @@ accountEmailUnverified:
   ru: Не подтверждён
   desc: Badge next to an email address that has not been verified.
 
+accountTabPrivacy:
+  en: Privacy
+  ru: Приватность
+  desc: Tab of the account screen holding the data export and account deletion.
+
+accountNameSave:
+  en: Save name
+  ru: Сохранить имя
+  desc: Button that submits a new display name on the profile tab.
+
+accountNameSaved:
+  en: Display name updated.
+  ru: Отображаемое имя обновлено.
+  desc: Toast after a successful rename.
+
+accountEmailChange:
+  en: Change email
+  ru: Сменить почту
+  desc: Button on the profile tab that opens the email-change dialog.
+
+accountEmailChangeTitle:
+  en: Change your email address
+  ru: Смена адреса электронной почты
+  desc: Title of the email-change dialog.
+
+accountEmailChangeBody:
+  en: We send a code to the new address. Your current address keeps working until you enter it.
+  ru: Мы отправим код на новый адрес. Текущий адрес продолжит работать, пока вы его не введёте.
+  desc: Explanation in the email-change dialog, before a code is requested.
+
+accountEmailChangeNewLabel:
+  en: New email address
+  ru: Новый адрес
+  desc: Input label for the address an account is moving to.
+
+accountEmailChangeSend:
+  en: Send code
+  ru: Отправить код
+  desc: Button that requests the confirmation code for a new address.
+
+accountEmailChangeSent:
+  en: Enter the code we sent to {email}.
+  ru: Введите код, отправленный на {email}.
+  desc: Explanation in the email-change dialog after the code has been sent.
+
+accountEmailChangeCodeLabel:
+  en: Confirmation code
+  ru: Код подтверждения
+  desc: Input label for the emailed confirmation code.
+
+accountEmailChangeConfirm:
+  en: Confirm new address
+  ru: Подтвердить новый адрес
+  desc: Button that redeems the confirmation code and moves the address.
+
+accountEmailChanged:
+  en: Your email address was changed.
+  ru: Адрес электронной почты изменён.
+  desc: Toast after a completed email change.
+
+accountExportTitle:
+  en: Export your data
+  ru: Экспорт ваших данных
+  desc: Heading of the data-export section on the privacy tab.
+
+accountExportBody:
+  en: Downloads everything this instance holds about you as one file — your profile, organizations, sessions, tokens, notifications and activity log.
+  ru: Скачивает всё, что этот инстанс хранит о вас, одним файлом — профиль, организации, сессии, токены, уведомления и журнал действий.
+  desc: Explanation under the data-export heading.
+
+accountExportButton:
+  en: Download my data
+  ru: Скачать мои данные
+  desc: Button that starts the data export download.
+
+accountDeleteTitle:
+  en: Delete your account
+  ru: Удаление аккаунта
+  desc: Heading of the account-deletion section on the privacy tab.
+
+accountDeleteBody:
+  en: Your profile and sign-in methods are erased immediately and permanently. Versions you published stay, attributed to a deleted account. This cannot be undone.
+  ru: Профиль и способы входа удаляются немедленно и безвозвратно. Опубликованные вами версии остаются и числятся за удалённым аккаунтом. Отменить это нельзя.
+  desc: Explanation under the account-deletion heading; states plainly what survives.
+
+accountDeleteButton:
+  en: Delete account
+  ru: Удалить аккаунт
+  desc: Destructive button that opens the account-deletion dialog.
+
+accountDeleteConfirmLabel:
+  en: Type your email address to confirm
+  ru: Введите свой адрес для подтверждения
+  desc: Input label for the deletion confirmation field.
+
+accountDeleted:
+  en: Your account has been deleted.
+  ru: Ваш аккаунт удалён.
+  desc: Toast shown after the account has been deleted and the session cleared.
+
+orgLeave:
+  en: Leave organization
+  ru: Покинуть организацию
+  desc: Button that removes the signed-in member from an organization.
+
+orgLeaveTitle:
+  en: Leave this organization?
+  ru: Покинуть организацию?
+  desc: Title of the leave-organization confirmation dialog.
+
+orgLeaveBody:
+  en: You lose access to its private packages immediately. An administrator has to invite you back.
+  ru: Доступ к её приватным пакетам пропадёт сразу. Вернуться можно только по приглашению администратора.
+  desc: Explanation in the leave-organization dialog.
+
+orgLeft:
+  en: You left {org}.
+  ru: Вы покинули {org}.
+  desc: Toast after leaving an organization.
+
 securityTotpTitle:
   en: Two-factor authentication
   ru: Двухфакторная аутентификация

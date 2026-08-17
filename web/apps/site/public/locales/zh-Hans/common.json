@@ -1,5 +1,5 @@
 {
-  "__todo__": "TODO: translate from English: siteTitle, tagline, navHome, navApp, themePicker, themeSystem, themeLight, themeDark, themeAmoled, language, close, copy, copied, loading, notFound, appDashboard, appAbout, packagesCount",
+  "__todo__": "TODO: translate from English: siteTitle, tagline, navHome, navApp, themePicker, themeSystem, themeLight, themeDark, themeAmoled, language, close, copy, copied, loading, notFound, appDashboard, appAbout, packagesCount, securityPageTitle, securityPageIntro, securityPageContactTitle, securityPageContactBody, securityPageScopeTitle, securityPageScopeBody, securityPageOperatorTitle, securityPageOperatorBody",
   "common.siteTitle": "Pub",
   "common.tagline": "Self-hosted package registry for Dart and Flutter",
   "common.navHome": "Home",
@@ -20,5 +20,13 @@
   "common.packagesCount": {
     "one": "{count} package",
     "other": "{count} packages"
-  }
+  },
+  "common.securityPageTitle": "Security",
+  "common.securityPageIntro": "We want to hear about security problems in this registry, and we would rather hear about them early than read about them later.",
+  "common.securityPageContactTitle": "How to report",
+  "common.securityPageContactBody": "The address to write to is published at /.well-known/security.txt on this instance. Include what you did, what happened, and what you expected — a reproduction is worth more than a severity rating.",
+  "common.securityPageScopeTitle": "What we ask",
+  "common.securityPageScopeBody": "Please do not run automated scans against other people's data, do not access accounts that are not yours, and give the operator a chance to fix the problem before publishing it.",
+  "common.securityPageOperatorTitle": "For operators",
+  "common.securityPageOperatorBody": "This instance publishes a security.txt only when a contact is configured. Set disclosure.contact (a mailto:, https: or tel: URI) and, optionally, disclosure.policy_url pointing back at this page."
 }

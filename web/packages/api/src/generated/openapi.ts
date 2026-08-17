@@ -18,6 +18,33 @@
  */
 
 export interface paths {
+    "/.well-known/security.txt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `/.well-known/security.txt` — the vulnerability-disclosure contact
+         *     ([S-29.c](../../../../docs/security.md#7-platform), RFC 9116).
+         * @description **404 when no contact is configured**, which is the shipped default: `Contact` is mandatory in
+         *     the RFC, so an instance with nobody listening publishes nothing rather than a file naming
+         *     nobody. The fields are validated at boot, so this handler renders and never decides.
+         *
+         *     Deliberately outside `/api`, deliberately unauthenticated, and deliberately not in the
+         *     envelope: it is a plaintext file at a well-known path, read by scanners and by people, and
+         *     wrapping it in this API's JSON shape would make it unreadable to both.
+         */
+        get: operations["security_txt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/audit": {
         parameters: {
             query?: never;
@@ -615,6 +642,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The caller's account row plus whether a second factor is enrolled. */
+        get: operations["me"];
+        put?: never;
+        post?: never;
+        /**
+         * Deletes the account: erases the identity, keeps the attribution (S-29.a).
+         * @description **Step-up gated and confirmation-guarded** (S-06.b). Irreversible, with no grace period and no
+         *     operator-side restore — decision 39 records that as the owner's choice rather than an omission.
+         */
+        delete: operations["delete_account"];
+        options?: never;
+        head?: never;
+        /** Renames the account. */
+        patch: operations["update_profile"];
+        trace?: never;
+    };
+    "/api/v1/me/email": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Starts an email change: a code goes to the **new** address; nothing on the account moves yet.
+         * @description **Step-up gated** (S-06 has listed "changing email" since the first draft; this is the
+         *     endpoint it was waiting for).
+         */
+        post: operations["request_email_change"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/email/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirms an email change and moves the address.
+         * @description **Step-up gated**, at both ends of the flow: a stale session that somehow reached the request
+         *     must not be able to finish it fifteen minutes later.
+         */
+        post: operations["verify_email_change"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Streams everything the instance holds about the caller as NDJSON (S-29.b).
+         * @description The shape is the S-23 audit export's, deliberately: a bounded channel written by a walker
+         *     task, one record per line, and an explicit `{"done":true}` terminator whose **absence** is how
+         *     a caller learns the file is incomplete. **Step-up gated** for S-06.c's reason — the line is
+         *     bulk, not sensitivity, and one request hands over every IP address the instance recorded.
+         */
+        get: operations["export"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/notifications": {
         parameters: {
             query?: never;
@@ -819,6 +934,34 @@ export interface paths {
          *     session must not be able to lock the real owners out.
          */
         patch: operations["update_role"];
+        trace?: never;
+    };
+    "/api/v1/orgs/{slug}/membership": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Leaves an organization — the caller removes **themselves**, at any role
+         *     ([D40](../../../../docs/roadmap.md), decision 39).
+         * @description The route every other member-management endpoint on this module could not be: those all take
+         *     `Action::ManageMembers`, which a Read or Write member does not hold, so below Admin there was
+         *     no way out of an org through the API at all. Authorization here is membership itself —
+         *     `Action::ReadPackages`, the level every member holds — and the D39 self-reduction carve-out is
+         *     what lets the service accept it without a ceiling check.
+         *
+         *     The ≥1-Owner invariant still applies and is still the repository's: a sole Owner leaving is
+         *     `409 last_owner`, not an org without an owner.
+         */
+        delete: operations["leave"];
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/packages": {
@@ -1417,6 +1560,42 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Body of `DELETE /api/v1/me`. */
+        AccountDeleteBody: {
+            /**
+             * @description Must repeat the account's own email address (S-06.b: the factor proves who, this proves
+             *     what).
+             */
+            confirm: string;
+        };
+        /** @description What an account deletion removed. */
+        AccountDeletedDto: {
+            /**
+             * Format: int64
+             * @description Credential rows deleted.
+             */
+            credentials_deleted: number;
+            /**
+             * Format: int64
+             * @description Organizations left.
+             */
+            memberships_removed: number;
+            /**
+             * Format: int64
+             * @description Notification and preference rows deleted.
+             */
+            notifications_deleted: number;
+            /**
+             * Format: int64
+             * @description Sessions revoked.
+             */
+            sessions_revoked: number;
+            /**
+             * Format: int64
+             * @description CLI tokens revoked.
+             */
+            tokens_revoked: number;
+        };
         /** @description One row of the admin org table. */
         AdminOrgDto: {
             /**
@@ -1703,6 +1882,25 @@ export interface components {
              */
             total: number;
         };
+        /** @description Body of `POST /api/v1/me/email` — start an address change. */
+        EmailChangeBody: {
+            /** @description The address to move to. A code goes here; nothing on the account changes yet. */
+            email: string;
+        };
+        /** @description Result of starting an address change. */
+        EmailChangeStartedDto: {
+            /** @description The address the code was sent to — echoed normalized, so a caller sees what was used. */
+            email: string;
+            /** @description Opaque pending id to present with the code (S-03 binding). */
+            pending_id: string;
+        };
+        /** @description Body of `POST /api/v1/me/email/verify`. */
+        EmailChangeVerifyBody: {
+            /** @description The code that arrived at the new address. */
+            code: string;
+            /** @description The pending id from the start call. */
+            pending_id: string;
+        };
         /** @description Error details inside [`ErrorEnvelope`]. */
         ErrorBody: {
             /** @description Stable machine-readable code (`core::Error::code()`). */
@@ -1952,6 +2150,41 @@ export interface components {
             session_id?: string | null;
             user?: null | components["schemas"]["UserDto"];
         };
+        /** @description The caller's own account: the row, plus the one credential fact the access token cannot carry. */
+        MeDto: {
+            /**
+             * Format: date-time
+             * @description Account creation time.
+             */
+            created_at: string;
+            /** @description Display name. */
+            display_name: string;
+            /** @description Email; `null` only on an anonymized account, which cannot authenticate (S-29.a). */
+            email?: string | null;
+            /** @description Whether the email is verified. */
+            email_verified: boolean;
+            /** @description User id. */
+            id: string;
+            /**
+             * @description Whether this account administers the instance.
+             *
+             *     Read from the row per request rather than from the token (S-07), so a demotion is visible
+             *     on the next call instead of at the next refresh.
+             */
+            is_instance_admin: boolean;
+            /**
+             * @description Whether a TOTP second factor is enrolled (S-05).
+             *
+             *     The field that ends the session-local guess: before this existed the account screen
+             *     tracked enrollment in a flag that was wrong on every device but the enrolling one.
+             */
+            totp_enabled: boolean;
+            /**
+             * Format: date-time
+             * @description Last profile change.
+             */
+            updated_at: string;
+        };
         /** @description Body of `POST /api/v1/orgs/{slug}/members`. */
         MemberAddBody: {
             /** @description Verified email of an existing account. Unknown addresses are 404 — invite them instead. */
@@ -2111,6 +2344,39 @@ export interface components {
             flow_id: string;
         };
         /** @description Successful app API response. */
+        OkEnvelope_AccountDeletedDto: {
+            /** @description What an account deletion removed. */
+            data: {
+                /**
+                 * Format: int64
+                 * @description Credential rows deleted.
+                 */
+                credentials_deleted: number;
+                /**
+                 * Format: int64
+                 * @description Organizations left.
+                 */
+                memberships_removed: number;
+                /**
+                 * Format: int64
+                 * @description Notification and preference rows deleted.
+                 */
+                notifications_deleted: number;
+                /**
+                 * Format: int64
+                 * @description Sessions revoked.
+                 */
+                sessions_revoked: number;
+                /**
+                 * Format: int64
+                 * @description CLI tokens revoked.
+                 */
+                tokens_revoked: number;
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
         OkEnvelope_AdminOrgQuotaDto: {
             /**
              * @description Response of `PATCH /api/v1/admin/orgs/{id}`: the override that is now stored, and what it
@@ -2224,6 +2490,18 @@ export interface components {
                 instance_admin: boolean;
                 /** @description `active` | `suspended` | `deleted`. */
                 status: string;
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
+        OkEnvelope_EmailChangeStartedDto: {
+            /** @description Result of starting an address change. */
+            data: {
+                /** @description The address the code was sent to — echoed normalized, so a caller sees what was used. */
+                email: string;
+                /** @description Opaque pending id to present with the code (S-03 binding). */
+                pending_id: string;
             };
             /** @description Always `"ok"`. */
             status: string;
@@ -2806,6 +3084,46 @@ export interface components {
                 /** @description Session id backing the pair. */
                 session_id?: string | null;
                 user?: null | components["schemas"]["UserDto"];
+            };
+            /** @description Always `"ok"`. */
+            status: string;
+        };
+        /** @description Successful app API response. */
+        OkEnvelope_MeDto: {
+            /** @description The caller's own account: the row, plus the one credential fact the access token cannot carry. */
+            data: {
+                /**
+                 * Format: date-time
+                 * @description Account creation time.
+                 */
+                created_at: string;
+                /** @description Display name. */
+                display_name: string;
+                /** @description Email; `null` only on an anonymized account, which cannot authenticate (S-29.a). */
+                email?: string | null;
+                /** @description Whether the email is verified. */
+                email_verified: boolean;
+                /** @description User id. */
+                id: string;
+                /**
+                 * @description Whether this account administers the instance.
+                 *
+                 *     Read from the row per request rather than from the token (S-07), so a demotion is visible
+                 *     on the next call instead of at the next refresh.
+                 */
+                is_instance_admin: boolean;
+                /**
+                 * @description Whether a TOTP second factor is enrolled (S-05).
+                 *
+                 *     The field that ends the session-local guess: before this existed the account screen
+                 *     tracked enrollment in a flag that was wrong on every device but the enrolling one.
+                 */
+                totp_enabled: boolean;
+                /**
+                 * Format: date-time
+                 * @description Last profile change.
+                 */
+                updated_at: string;
             };
             /** @description Always `"ok"`. */
             status: string;
@@ -3489,6 +3807,15 @@ export interface components {
             /** @description Opaque pending-auth id to present at the verify step. */
             pending_id: string;
         };
+        /** @description Body of `PATCH /api/v1/me`. */
+        ProfileUpdateBody: {
+            /**
+             * @description New display name. The address is deliberately not here — it moves through the S-03.b
+             *     confirmation flow, and one body carrying both is how a change that needs a proof comes to
+             *     share a path with one that does not.
+             */
+            display_name: string;
+        };
         /** @description One configured OIDC provider for the login screen (public — no secrets). */
         ProviderDto: {
             /** @description Human label ("Sign in with …"). */
@@ -4166,6 +4493,33 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    security_txt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The disclosure contact, RFC 9116 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": unknown;
+                };
+            };
+            /** @description No disclosure contact is configured on this instance */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_audit: {
         parameters: {
             query?: never;
@@ -5401,6 +5755,277 @@ export interface operations {
             };
         };
     };
+    me: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The caller's account */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_MeDto"];
+                };
+            };
+            /** @description Missing or invalid access token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    delete_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountDeleteBody"];
+            };
+        };
+        responses: {
+            /** @description The account is a tombstone */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_AccountDeletedDto"];
+                };
+            };
+            /** @description confirm does not repeat the account's address */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description step_up_required — re-authenticate first */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The caller is the last owner of an organization */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    update_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProfileUpdateBody"];
+            };
+        };
+        responses: {
+            /** @description Updated account */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_MeDto"];
+                };
+            };
+            /** @description Empty, overlong, or control-bearing name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Missing or invalid access token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    request_email_change: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmailChangeBody"];
+            };
+        };
+        responses: {
+            /** @description A confirmation code was queued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_EmailChangeStartedDto"];
+                };
+            };
+            /** @description Malformed address, the current one, or a blocked domain */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description step_up_required — re-authenticate first */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The address already belongs to an account */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Per-account or per-address budget spent */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    verify_email_change: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmailChangeVerifyBody"];
+            };
+        };
+        responses: {
+            /** @description The address moved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_MeDto"];
+                };
+            };
+            /** @description invalid_code — unknown, expired, wrong, or spent */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description step_up_required — re-authenticate first */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The address was taken while the code was in flight */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    export: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description NDJSON export, terminated by {"done":true} */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": unknown;
+                };
+            };
+            /** @description step_up_required — re-authenticate first */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Hourly export budget spent */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     list: {
         parameters: {
             query?: never;
@@ -6123,6 +6748,47 @@ export interface operations {
                 };
             };
             /** @description last_owner — the org would be left without an Owner */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    leave: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Org slug */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The caller is no longer a member; their sessions were revoked (S-09) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OkEnvelope_MembershipChangedDto"];
+                };
+            };
+            /** @description Unknown org, or the caller is not a member */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description last_owner — transfer ownership first */
             409: {
                 headers: {
                     [name: string]: unknown;

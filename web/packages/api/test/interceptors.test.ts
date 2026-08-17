@@ -285,6 +285,22 @@ describe("reactive refresh on 401", () => {
     expect(h.refreshCalls).toBe(1);
     expect(h.requests).toHaveLength(2);
   });
+
+  /*
+   * `invalid_code` is a 401 about the code the user typed, not about the
+   * credential this interceptor manages. Retrying it replays the same body, and
+   * the server charges the S-03.a attempt budget atomically BEFORE comparing —
+   * so a blind retry spends two of the five attempts per wrong digit, on three
+   * flows: TOTP confirm, step-up, and the S-03.b email change.
+   */
+  test("a wrong code is surfaced without a refresh and without spending a second attempt", async () => {
+    const h = harness({ responses: [() => errorResponse(401, "invalid_code")] });
+    await expect(
+      h.client.request("/me/email/verify", jsonBody("POST", { code: "00000000" })),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(h.refreshCalls).toBe(0);
+    expect(h.requests).toHaveLength(1);
+  });
 });
 
 describe("denial latch", () => {

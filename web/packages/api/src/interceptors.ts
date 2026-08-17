@@ -129,6 +129,15 @@ export function createAuthInterceptor(options: AuthInterceptorOptions): AuthInte
     const response = await next(ctx);
     if (response.status !== 401 || retryable === null) return response;
 
+    // A 401 that is about the *code the user typed* is not about the credential
+    // this interceptor manages, and retrying it costs the user an attempt they
+    // never spent: the server's OTP budget is five per code (S-03.a) and it is
+    // charged atomically before the comparison, so a blind replay of the same
+    // body turns every wrong digit into two failures. Three flows answer
+    // `invalid_code` on an authenticated route — TOTP confirm, step-up, and the
+    // S-03.b email change — and none of them gets better by rotating a token.
+    if ((await peekErrorCode(response)) === ERROR_CODES.invalidCode) return response;
+
     // Reactive: one refresh, one retry. An anonymous 401 never reaches here.
     const refreshed = await refreshOnce();
     if (refreshed === null) return response;

@@ -3,19 +3,21 @@ import { roleAtLeast } from "@pub/api/types";
 import { t } from "@pub/i18n";
 import { app } from "@pub/i18n/generated/app";
 import { Badge } from "@pub/ui/badge";
-import { buttonVariants } from "@pub/ui/button";
+import { Button, buttonVariants } from "@pub/ui/button";
 import { Card, CardContent, CardHeader } from "@pub/ui/card";
 import { cn } from "@pub/ui/cn";
 import { CopyButton } from "@pub/ui/copy-button";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@pub/ui/dialog";
 import { EmptyState } from "@pub/ui/empty-state";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@pub/ui/table";
-import { A, createAsync, query, useParams } from "@solidjs/router";
-import { For, type JSX, Show } from "solid-js";
+import { A, createAsync, query, revalidate, useNavigate, useParams } from "@solidjs/router";
+import { createSignal, For, type JSX, Show } from "solid-js";
 import { formatDate } from "../format";
 import { PackageCard } from "../package-card";
-import { api } from "../state/api";
+import { api, describeError } from "../state/api";
 import { instancePublicUrl } from "../state/instance-store";
 import { isAuthenticated } from "../state/session-store";
+import { pushToast } from "../state/toast-store";
 import { registryBase } from "../urls";
 
 /*
@@ -40,7 +42,8 @@ import { registryBase } from "../urls";
  * surface; from here it is a link, so this screen stays the org's public face.
  */
 
-const profileQuery = query((slug: string) => api.orgs.profile(slug, { limit: 30 }), "org-profile");
+const PROFILE_KEY = "org-profile";
+const profileQuery = query((slug: string) => api.orgs.profile(slug, { limit: 30 }), PROFILE_KEY);
 const membersQuery = query((slug: string) => api.orgs.members(slug), "org-members");
 
 function roleVariant(role: string): "accent" | "neutral" {
@@ -93,6 +96,30 @@ export function OrgDetailScreen(): JSX.Element {
   const packages = (): readonly PackageSummaryDto[] => profile()?.packages.items ?? [];
   const base = (): string => registryBase(params.slug, instancePublicUrl());
   const role = (): string | null => profile()?.role ?? null;
+  const navigate = useNavigate();
+  const [confirmLeave, setConfirmLeave] = createSignal(false);
+  const [leaving, setLeaving] = createSignal(false);
+  const [leaveError, setLeaveError] = createSignal<string | null>(null);
+
+  const leave = async (): Promise<void> => {
+    if (leaving()) return;
+    setLeaving(true);
+    try {
+      await api.orgs.leave(params.slug);
+      // The membership left the token's `orgs` claim, and the server revoked
+      // this session along with it (S-09) — rotating is what keeps the next
+      // request from carrying authority that no longer exists.
+      await api.renewAuth().catch(() => false);
+      await revalidate(PROFILE_KEY);
+      setConfirmLeave(false);
+      pushToast(t(app.orgLeft, { org: profile()?.org.name ?? params.slug }), "success");
+      navigate("/orgs");
+    } catch (failure) {
+      setLeaveError(describeError(failure));
+    } finally {
+      setLeaving(false);
+    }
+  };
 
   return (
     <Show when={profile()}>
@@ -121,8 +148,8 @@ export function OrgDetailScreen(): JSX.Element {
               `/admin` — instance administration is an ORTHOGONAL plane
               (decision 19's addendum), and an org Owner holds nothing there.
             */}
-            <Show when={roleAtLeast(role(), "admin")}>
-              <div class="flex flex-wrap gap-3">
+            <div class="flex flex-wrap gap-3">
+              <Show when={roleAtLeast(role(), "admin")}>
                 <A
                   href={`/orgs/${encodeURIComponent(params.slug)}/manage`}
                   class={buttonVariants({ intent: "outline", size: "sm" })}
@@ -132,8 +159,28 @@ export function OrgDetailScreen(): JSX.Element {
                 <A href="/tokens" class={cn(buttonVariants({ intent: "ghost", size: "sm" }))}>
                   {t(app.orgTokensLink)}
                 </A>
-              </div>
-            </Show>
+              </Show>
+              {/*
+                The door D40 was filed about: below Admin a member never reaches
+                the management surface, so until this existed there was no way
+                out of an organization from the API at all. Shown to every
+                member — a sole Owner is refused by the server's ≥1-Owner
+                invariant (409 `last_owner`), which is the only place that check
+                can be race-free.
+              */}
+              <Show when={role() !== null}>
+                <Button
+                  intent="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setLeaveError(null);
+                    setConfirmLeave(true);
+                  }}
+                >
+                  {t(app.orgLeave)}
+                </Button>
+              </Show>
+            </div>
           </header>
 
           <Card>
@@ -189,6 +236,23 @@ export function OrgDetailScreen(): JSX.Element {
           <Show when={isAuthenticated() && roleAtLeast(role(), "admin")}>
             <MembersCard slug={params.slug} />
           </Show>
+          <Dialog open={confirmLeave()} onOpenChange={setConfirmLeave}>
+            <DialogContent>
+              <DialogTitle>{t(app.orgLeaveTitle)}</DialogTitle>
+              <DialogDescription>{t(app.orgLeaveBody)}</DialogDescription>
+              <Show when={leaveError()}>
+                {(message) => <p class="text-sm text-danger-ink">{message()}</p>}
+              </Show>
+              <div class="flex justify-end gap-3">
+                <Button intent="ghost" onClick={() => setConfirmLeave(false)}>
+                  {t(app.cancel)}
+                </Button>
+                <Button intent="danger" disabled={leaving()} onClick={() => void leave()}>
+                  {t(app.orgLeave)}
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
         </section>
       )}
     </Show>

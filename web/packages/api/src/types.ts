@@ -49,6 +49,12 @@ export type TotpEnrollDto = Schemas["TotpEnrollDto"];
 export type TotpConfirmedDto = Schemas["TotpConfirmedDto"];
 export type StepUpDto = Schemas["StepUpDto"];
 
+// --- the caller's own account (S-29, decision 39) ---
+
+export type MeDto = Schemas["MeDto"];
+export type EmailChangeStartedDto = Schemas["EmailChangeStartedDto"];
+export type AccountDeletedDto = Schemas["AccountDeletedDto"];
+
 // --- sessions (S-10) ---
 
 export type SessionDto = Schemas["SessionDto"];

@@ -50,6 +50,16 @@ export type ClientOptions = {
 
 export type ApiClient = {
   request<T>(path: string, init?: RequestInit, meta?: RequestMeta): Promise<T>;
+  /**
+   * Runs the same interceptor chain and hands back the raw `Response`.
+   *
+   * For the routes whose body is deliberately not the JSON envelope — the S-29.b
+   * account export and the S-23 audit export are NDJSON streams — where
+   * unwrapping would try to `JSON.parse` a whole file and fail on the second
+   * line. An error status still carries the envelope, so callers turn it into
+   * an `ApiError` with `throwIfError` rather than reading a failed download.
+   */
+  requestRaw(path: string, init?: RequestInit, meta?: RequestMeta): Promise<Response>;
 };
 
 const META_KEY = "pub.meta";
@@ -85,12 +95,16 @@ export function createClient(options: ClientOptions = {}): ApiClient {
 
   const run = composeInterceptors(options.interceptors ?? [], terminal);
 
+  const send = (path: string, init?: RequestInit, meta?: RequestMeta): Promise<Response> => {
+    const request = new Request(`${options.baseUrl ?? ""}${path}`, init);
+    return run({ request, state: { [META_KEY]: meta ?? {} } });
+  };
+
   return {
     async request<T>(path: string, init?: RequestInit, meta?: RequestMeta): Promise<T> {
-      const request = new Request(`${options.baseUrl ?? ""}${path}`, init);
-      const response = await run({ request, state: { [META_KEY]: meta ?? {} } });
-      return unwrapEnvelope<T>(response);
+      return unwrapEnvelope<T>(await send(path, init, meta));
     },
+    requestRaw: send,
   };
 }
 
@@ -142,6 +156,28 @@ export async function unwrapEnvelope<T>(response: Response): Promise<T> {
   throw new ApiError(
     "invalid_response",
     "envelope status is neither ok nor error",
+    response.status,
+    {
+      retryAfter,
+    },
+  );
+}
+
+/**
+ * Turns a failed response into an `ApiError`, leaving a successful one alone.
+ *
+ * The half of [`unwrapEnvelope`] that a non-envelope body still needs: an NDJSON
+ * export answers the ordinary error envelope when it is refused (401, 403
+ * `step_up_required`, 429), and a caller that skipped the check would save a
+ * file containing the refusal.
+ */
+export async function throwIfError(response: Response): Promise<Response> {
+  if (response.ok) return response;
+  const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+  const code = await peekErrorCode(response);
+  throw new ApiError(
+    code ?? "invalid_response",
+    `request failed with ${response.status}`,
     response.status,
     {
       retryAfter,

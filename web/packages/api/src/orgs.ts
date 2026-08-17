@@ -101,6 +101,19 @@ export function createOrgsApi(client: ApiClient) {
       );
     },
 
+    /**
+     * Leaves the organization — the caller removes themselves, at any role
+     * ([D40](../../../docs/roadmap.md), decision 39).
+     *
+     * Distinct from `removeMember` because the authorization is different: that
+     * one needs `ManageMembers` (Admin+), this one needs only membership, which
+     * is what makes it reachable for the Read and Write members who never see
+     * the management surface. A sole Owner is refused with `last_owner`.
+     */
+    leave(slug: string): Promise<MembershipChangedDto> {
+      return client.request<MembershipChangedDto>(`${base(slug)}/membership`, { method: "DELETE" });
+    },
+
     invitations(slug: string): Promise<ListDto<InvitationDto>> {
       return client.request<ListDto<InvitationDto>>(`${base(slug)}/invitations`);
     },

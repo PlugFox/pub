@@ -56,6 +56,19 @@ export async function signOut(): Promise<void> {
 }
 
 /**
+ * Drops the local session **without** telling the server.
+ *
+ * The counterpart of [`signOut`] for the one case where there is nothing left
+ * to log out of: after `DELETE /me` (S-29.a) the account is a tombstone and its
+ * sessions are already revoked, so a `logout` call would present a credential
+ * the server has revoked and answer 401 on the way out.
+ */
+export function forgetSession(): void {
+  clearSession(api.storage);
+  api.resetAuth();
+}
+
+/**
  * Reads the authoritative unread count into the badge store.
  *
  * `limit: 1` because only the `unread` total is wanted — the field is the

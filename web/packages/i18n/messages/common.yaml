@@ -104,3 +104,43 @@ packagesCount:
     many: "{count} пакетов"
     other: "{count} пакета"
   desc: How many packages a listing contains. `{count}` is the number, already formatted.
+
+securityPageTitle:
+  en: Security
+  ru: Безопасность
+  desc: Title of the vulnerability-disclosure page linked from /.well-known/security.txt.
+
+securityPageIntro:
+  en: We want to hear about security problems in this registry, and we would rather hear about them early than read about them later.
+  ru: Мы хотим узнавать о проблемах безопасности этого реестра и предпочитаем услышать о них раньше, чем прочитать позже.
+  desc: Opening paragraph of the disclosure page.
+
+securityPageContactTitle:
+  en: How to report
+  ru: Как сообщить
+  desc: Heading of the reporting-instructions section on the disclosure page.
+
+securityPageContactBody:
+  en: The address to write to is published at /.well-known/security.txt on this instance. Include what you did, what happened, and what you expected — a reproduction is worth more than a severity rating.
+  ru: Адрес для письма опубликован по пути /.well-known/security.txt на этом инстансе. Опишите, что вы сделали, что произошло и чего вы ожидали — воспроизведение ценнее оценки серьёзности.
+  desc: Body of the reporting-instructions section; points at the RFC 9116 file rather than repeating an address that is per-instance configuration.
+
+securityPageScopeTitle:
+  en: What we ask
+  ru: О чём мы просим
+  desc: Heading of the ground-rules section on the disclosure page.
+
+securityPageScopeBody:
+  en: Please do not run automated scans against other people's data, do not access accounts that are not yours, and give the operator a chance to fix the problem before publishing it.
+  ru: Пожалуйста, не запускайте автоматические сканы по чужим данным, не заходите в чужие аккаунты и дайте оператору возможность исправить проблему до публикации.
+  desc: Body of the ground-rules section.
+
+securityPageOperatorTitle:
+  en: For operators
+  ru: Операторам
+  desc: Heading of the section telling instance operators how to publish their own contact.
+
+securityPageOperatorBody:
+  en: "This instance publishes a security.txt only when a contact is configured. Set disclosure.contact (a mailto:, https: or tel: URI) and, optionally, disclosure.policy_url pointing back at this page."
+  ru: "Этот инстанс публикует security.txt только при заданном контакте. Укажите disclosure.contact (URI вида mailto:, https: или tel:) и при желании disclosure.policy_url со ссылкой на эту страницу."
+  desc: Body of the operator section; names the two configuration keys verbatim.

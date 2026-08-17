@@ -156,6 +156,54 @@ export const app = {
   accountEmailVerified: { id: "app.accountEmailVerified", en: "Verified" },
   /** Badge next to an email address that has not been verified. */
   accountEmailUnverified: { id: "app.accountEmailUnverified", en: "Unverified" },
+  /** Tab of the account screen holding the data export and account deletion. */
+  accountTabPrivacy: { id: "app.accountTabPrivacy", en: "Privacy" },
+  /** Button that submits a new display name on the profile tab. */
+  accountNameSave: { id: "app.accountNameSave", en: "Save name" },
+  /** Toast after a successful rename. */
+  accountNameSaved: { id: "app.accountNameSaved", en: "Display name updated." },
+  /** Button on the profile tab that opens the email-change dialog. */
+  accountEmailChange: { id: "app.accountEmailChange", en: "Change email" },
+  /** Title of the email-change dialog. */
+  accountEmailChangeTitle: { id: "app.accountEmailChangeTitle", en: "Change your email address" },
+  /** Explanation in the email-change dialog, before a code is requested. */
+  accountEmailChangeBody: { id: "app.accountEmailChangeBody", en: "We send a code to the new address. Your current address keeps working until you enter it." },
+  /** Input label for the address an account is moving to. */
+  accountEmailChangeNewLabel: { id: "app.accountEmailChangeNewLabel", en: "New email address" },
+  /** Button that requests the confirmation code for a new address. */
+  accountEmailChangeSend: { id: "app.accountEmailChangeSend", en: "Send code" },
+  /** Explanation in the email-change dialog after the code has been sent. */
+  accountEmailChangeSent: { id: "app.accountEmailChangeSent", en: "Enter the code we sent to {email}." },
+  /** Input label for the emailed confirmation code. */
+  accountEmailChangeCodeLabel: { id: "app.accountEmailChangeCodeLabel", en: "Confirmation code" },
+  /** Button that redeems the confirmation code and moves the address. */
+  accountEmailChangeConfirm: { id: "app.accountEmailChangeConfirm", en: "Confirm new address" },
+  /** Toast after a completed email change. */
+  accountEmailChanged: { id: "app.accountEmailChanged", en: "Your email address was changed." },
+  /** Heading of the data-export section on the privacy tab. */
+  accountExportTitle: { id: "app.accountExportTitle", en: "Export your data" },
+  /** Explanation under the data-export heading. */
+  accountExportBody: { id: "app.accountExportBody", en: "Downloads everything this instance holds about you as one file — your profile, organizations, sessions, tokens, notifications and activity log." },
+  /** Button that starts the data export download. */
+  accountExportButton: { id: "app.accountExportButton", en: "Download my data" },
+  /** Heading of the account-deletion section on the privacy tab. */
+  accountDeleteTitle: { id: "app.accountDeleteTitle", en: "Delete your account" },
+  /** Explanation under the account-deletion heading; states plainly what survives. */
+  accountDeleteBody: { id: "app.accountDeleteBody", en: "Your profile and sign-in methods are erased immediately and permanently. Versions you published stay, attributed to a deleted account. This cannot be undone." },
+  /** Destructive button that opens the account-deletion dialog. */
+  accountDeleteButton: { id: "app.accountDeleteButton", en: "Delete account" },
+  /** Input label for the deletion confirmation field. */
+  accountDeleteConfirmLabel: { id: "app.accountDeleteConfirmLabel", en: "Type your email address to confirm" },
+  /** Toast shown after the account has been deleted and the session cleared. */
+  accountDeleted: { id: "app.accountDeleted", en: "Your account has been deleted." },
+  /** Button that removes the signed-in member from an organization. */
+  orgLeave: { id: "app.orgLeave", en: "Leave organization" },
+  /** Title of the leave-organization confirmation dialog. */
+  orgLeaveTitle: { id: "app.orgLeaveTitle", en: "Leave this organization?" },
+  /** Explanation in the leave-organization dialog. */
+  orgLeaveBody: { id: "app.orgLeaveBody", en: "You lose access to its private packages immediately. An administrator has to invite you back." },
+  /** Toast after leaving an organization. */
+  orgLeft: { id: "app.orgLeft", en: "You left {org}." },
   /** Heading of the TOTP section on the account security tab. */
   securityTotpTitle: { id: "app.securityTotpTitle", en: "Two-factor authentication" },
   /** Explanation under the two-factor heading. */

@@ -38,4 +38,20 @@ export const common = {
   appAbout: { id: "common.appAbout", en: "About" },
   /** How many packages a listing contains. `{count}` is the number, already formatted. */
   packagesCount: { id: "common.packagesCount", en: {"one":"{count} package","other":"{count} packages"} },
+  /** Title of the vulnerability-disclosure page linked from /.well-known/security.txt. */
+  securityPageTitle: { id: "common.securityPageTitle", en: "Security" },
+  /** Opening paragraph of the disclosure page. */
+  securityPageIntro: { id: "common.securityPageIntro", en: "We want to hear about security problems in this registry, and we would rather hear about them early than read about them later." },
+  /** Heading of the reporting-instructions section on the disclosure page. */
+  securityPageContactTitle: { id: "common.securityPageContactTitle", en: "How to report" },
+  /** Body of the reporting-instructions section; points at the RFC 9116 file rather than repeating an address that is per-instance configuration. */
+  securityPageContactBody: { id: "common.securityPageContactBody", en: "The address to write to is published at /.well-known/security.txt on this instance. Include what you did, what happened, and what you expected — a reproduction is worth more than a severity rating." },
+  /** Heading of the ground-rules section on the disclosure page. */
+  securityPageScopeTitle: { id: "common.securityPageScopeTitle", en: "What we ask" },
+  /** Body of the ground-rules section. */
+  securityPageScopeBody: { id: "common.securityPageScopeBody", en: "Please do not run automated scans against other people's data, do not access accounts that are not yours, and give the operator a chance to fix the problem before publishing it." },
+  /** Heading of the section telling instance operators how to publish their own contact. */
+  securityPageOperatorTitle: { id: "common.securityPageOperatorTitle", en: "For operators" },
+  /** Body of the operator section; names the two configuration keys verbatim. */
+  securityPageOperatorBody: { id: "common.securityPageOperatorBody", en: "This instance publishes a security.txt only when a contact is configured. Set disclosure.contact (a mailto:, https: or tel: URI) and, optionally, disclosure.policy_url pointing back at this page." },
 } as const;

@@ -21,5 +21,13 @@
     "few": "{count} пакета",
     "many": "{count} пакетов",
     "other": "{count} пакета"
-  }
+  },
+  "common.securityPageTitle": "Безопасность",
+  "common.securityPageIntro": "Мы хотим узнавать о проблемах безопасности этого реестра и предпочитаем услышать о них раньше, чем прочитать позже.",
+  "common.securityPageContactTitle": "Как сообщить",
+  "common.securityPageContactBody": "Адрес для письма опубликован по пути /.well-known/security.txt на этом инстансе. Опишите, что вы сделали, что произошло и чего вы ожидали — воспроизведение ценнее оценки серьёзности.",
+  "common.securityPageScopeTitle": "О чём мы просим",
+  "common.securityPageScopeBody": "Пожалуйста, не запускайте автоматические сканы по чужим данным, не заходите в чужие аккаунты и дайте оператору возможность исправить проблему до публикации.",
+  "common.securityPageOperatorTitle": "Операторам",
+  "common.securityPageOperatorBody": "Этот инстанс публикует security.txt только при заданном контакте. Укажите disclosure.contact (URI вида mailto:, https: или tel:) и при желании disclosure.policy_url со ссылкой на эту страницу."
 }

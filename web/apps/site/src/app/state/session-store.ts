@@ -1,5 +1,5 @@
 import type { TokenPair, TokenStorage } from "@pub/api/storage";
-import type { LoginDto, UserDto } from "@pub/api/types";
+import type { LoginDto, MeDto, UserDto } from "@pub/api/types";
 import { createSignal } from "solid-js";
 
 /*
@@ -66,6 +66,27 @@ export function adoptLogin(login: LoginDto, pair: TokenPair, storage: TokenStora
     setUser(login.user);
     writeCachedUser(login.user);
   }
+}
+
+/**
+ * Adopts a fresh profile read (`GET /me`, decision 39) into the display cache.
+ *
+ * The cache exists so a reload shows a name before the first request answers;
+ * this keeps it honest after a rename or an address change. Only the fields the
+ * cache carries are copied — `totp_enabled` and `is_instance_admin` are read
+ * per screen from the server, never cached, because a stale copy of either is a
+ * UI that promises something the API will refuse.
+ */
+export function adoptProfile(me: MeDto): void {
+  const profile: UserDto = {
+    id: me.id,
+    email: me.email,
+    email_verified: me.email_verified,
+    display_name: me.display_name,
+    created_at: me.created_at,
+  };
+  setUser(profile);
+  writeCachedUser(profile);
 }
 
 /** Boot-time sync: reflect whatever the storage already holds. */
